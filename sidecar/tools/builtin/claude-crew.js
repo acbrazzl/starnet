@@ -49,7 +49,7 @@ function makeClaudeCrewTools(deps) {
   };
 
   const launchTool = {
-    name: 'claude.launch', capability: 'orchestrator', scope: 'execute', requiresConsent: true, timeoutMs: 60000,
+    name: 'claude.launch', capability: 'orchestrator', scope: 'execute', requiresConsent: true, confirmEveryTime: true, timeoutMs: 60000,
     description: 'Start a new background Claude Code session for the Commander, with Remote Control on so they can drive it from claude.ai or their phone. ' +
       'Optionally load one Claude Code skill (from claude.crew) — e.g. a social-media, dev or debugging specialist. ' +
       'Without a message, a skilled session loads the skill, orients itself read-only, reports readiness and waits. ' +
@@ -61,7 +61,7 @@ function makeClaudeCrewTools(deps) {
         skill: { type: 'string', maxLength: 64, description: 'Optional skill name exactly as claude.crew lists it.' },
         dir: { type: 'string', maxLength: 400, description: 'Absolute directory to work in; must already be trusted by Claude Code. Defaults to the station default.' },
         message: { type: 'string', maxLength: 4000, description: 'Optional first instruction for the session.' },
-        permissionMode: { type: 'string', enum: ['default', 'plan', 'acceptEdits', 'auto'], description: 'Omit to use the station default. default = asks the Commander before each action; auto = routine safe actions proceed, risky ones still ask; plan = read-only.' },
+        permissionMode: { type: 'string', enum: ['default', 'plan', 'acceptEdits', 'auto', 'bypassPermissions'], description: 'Omit to use the station default. default = asks the Commander before each action; auto = routine safe actions proceed, risky ones still ask; plan = read-only; bypassPermissions = no prompts at all (only if the station allows it).' },
       },
     },
     run: async (args) => {
@@ -91,7 +91,7 @@ function makeClaudeCrewTools(deps) {
   };
 
   const sendTool = {
-    name: 'claude.send', capability: 'orchestrator', scope: 'write', requiresConsent: true, timeoutMs: 180000,
+    name: 'claude.send', capability: 'orchestrator', scope: 'write', requiresConsent: true, confirmEveryTime: true, timeoutMs: 180000,
     description: 'Send a message into one of the Commander\'s live Claude Code sessions on this machine — terminal (interactive) sessions included — by its name from claude.crew. ' +
       'Use it to task or brief a Claude session. The session receives it as a teammate message and acts within its OWN permission settings; it cannot reply to you through this relay (its answer stays in its own session, where the Commander reads it). ' +
       'Delivery is verified: a failed or altered send is reported as such.',

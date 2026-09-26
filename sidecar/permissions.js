@@ -180,6 +180,20 @@
 
     function consent(call, tool) {
       const scope = scopeOf(tool);
+      /* 0. CONFIRM EVERY TIME — a tool that hands work to an agent this station does not govern (claude.send /
+         claude.launch: the Commander's own Claude Code sessions, which may run with no permission prompts of
+         their own) needs a live human yes for EACH call. It sits ABOVE Full Power and Full Access on purpose:
+         those postures let THIS station act freely, but the text being handed over can come from content the
+         lead read (a web page, a tool result, an inbound message), and this approval is the one human checkpoint
+         between that text and an unrestricted agent. So: never cached (any yes counts for this call only),
+         and an unattended run — no human to ask — is refused outright. */
+      if (tool && tool.confirmEveryTime === true) {
+        if (surface === 'autonomous' || !prompt) return { allow: false, scope: scope, reason: 'this action needs the Commander\'s approval every time — an unattended run cannot take it' };
+        return Promise.resolve(prompt(call, tool)).then(function (d) {
+          const yes = d === 'once' || d === 'session' || d === 'always' || d === 'full';
+          return yes ? { allow: true, scope: scope, reason: 'approved for this call (asks every time)' } : { allow: false, scope: scope, reason: 'denied' };
+        });
+      }
       // FULL POWER: the Commander's explicit host-wide authority outranks StarNet policy floors.
       // Input/schema validity, OS permissions and downstream service prerequisites still report normally.
       if (unrestrictedNow()) return { allow: true, scope: scope, reason: 'full-power' };

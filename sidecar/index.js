@@ -3963,7 +3963,8 @@ const claudeCrew = require('./claude-crew.js').makeClaudeCrew({
   // Claude Code skills a crew session can be launched with: the user's own (~/.claude/skills) plus any extra dirs
   fs, join: path.join,
   claudeHome: String(ENV('CLAUDE_HOME') || path.join(require('node:os').homedir(), '.claude')),
-  defaultMode: String(ENV('CLAUDE_CREW_MODE') || '').trim(),
+  defaultMode: String(ENV('CLAUDE_CREW_MODE') || '').trim(),   // default|plan|acceptEdits|auto (|bypassPermissions when allowed)
+  allowBypass: /^(1|true|yes|on)$/i.test(String(ENV('CLAUDE_CREW_ALLOW_BYPASS') || '').trim()),
   spawnProc: childSpawn, relayCwd: require('node:os').tmpdir(),   // the one-shot SendMessage relay (claude.send)   // default|plan|acceptEdits|auto; bypass modes are refused
   skillDirs: [path.join(require('node:os').homedir(), '.claude', 'skills')]
     .concat(String(ENV('CLAUDE_SKILL_DIRS') || '').split(path.delimiter).filter(Boolean)),
@@ -9599,7 +9600,7 @@ const ROUTES = [
   { m: 'POST', exact: '/api/claude-crew/stop', h: handleClaudeCrewStop },
   { m: 'POST', exact: '/api/claude-crew/send', h: handleClaudeCrewSend },
   { m: 'GET', qsplit: '/api/claude-crew/remote', h: handleClaudeCrewRemote },
-  { m: 'GET', exact: '/api/claude-crew/skills', h: (req, res) => claudeCrewJson(res, 200, { ok: true, enabled: claudeCrew.enabled, skills: claudeCrew.listSkills().map(sk => ({ name: sk.name, description: sk.description })), defaultDir: CLAUDE_CREW_DIR || undefined, defaultMode: claudeCrew.defaultMode }) },
+  { m: 'GET', exact: '/api/claude-crew/skills', h: (req, res) => claudeCrewJson(res, 200, { ok: true, enabled: claudeCrew.enabled, skills: claudeCrew.listSkills().map(sk => ({ name: sk.name, description: sk.description })), defaultDir: CLAUDE_CREW_DIR || undefined, defaultMode: claudeCrew.defaultMode, modes: claudeCrew.modes }) },
   // honest concurrency surface: how many distinct agents can RUN at once (the gate that silently 'refuses'
   // excess parallel workers). The summon bay reads this so the ceiling is visible BEFORE a fan-out, not only
   // inside the model's tool result. (WIRING_AUDIT P4: lie #7.)

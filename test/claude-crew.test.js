@@ -221,5 +221,38 @@ const RAW = JSON.stringify([
   A.ok(/delivered to meshflow-ff/.test((await sendT.run({ to: 'meshflow-ff', message: 'hi' }, { agentId: 'agent' })).summary), 'tool reports verified delivery');
   A.eq(relayed[relayed.length - 1].args[relayed[relayed.length - 1].args.indexOf('--name') + 1], 'starnet-overseer', 'the hero sends as starnet-overseer');
 
+
+  // ---- CONFIRM EVERY TIME: handoffs to Claude sessions ask on EVERY call, above Full Power, never cached ----
+  const { makeConsentBroker } = require('../sidecar/permissions.js');
+  const { makeTool } = require('../sidecar/tools/tool.js');
+  const handoff = makeTool({ name: 'claude.send', capability: 'orchestrator', scope: 'write', requiresConsent: true, confirmEveryTime: true });
+  const ordinary = makeTool({ name: 'task.manage', capability: 'orchestrator', scope: 'write', requiresConsent: true });
+  A.eq([handoff.confirmEveryTime, ordinary.confirmEveryTime], [true, false], 'makeTool carries confirmEveryTime');
+  let asked = 0, answer = 'always';
+  const perm = new Set();
+  const cb = makeConsentBroker({ bypass: true, unrestrictedHost: true, surface: 'interactive', grantsPermanent: perm, persist: () => {}, prompt: async () => { asked++; return answer; } });
+  A.eq((await cb({ name: 'task.manage' }, ordinary)).reason, 'full-power', 'ordinary tools: Full Power still skips the prompt');
+  A.eq(asked, 0, 'no prompt for the ordinary tool under Full Power');
+  const r1 = await cb({ name: 'claude.send' }, handoff);
+  const r2 = await cb({ name: 'claude.send' }, handoff);
+  A.eq([r1.allow, r2.allow, asked], [true, true, 2], 'handoff asks on every call even under Full Power + "always"');
+  A.eq(perm.size, 0, 'an "always" answer is never cached for a handoff');
+  answer = 'deny';
+  A.eq((await cb({ name: 'claude.send' }, handoff)).allow, false, 'a denied handoff does not run');
+  const auto = makeConsentBroker({ bypass: true, unrestrictedHost: true, surface: 'autonomous', prompt: async () => 'once' });
+  const ra2 = await auto({ name: 'claude.send' }, handoff);
+  A.ok(!ra2.allow && /every time/.test(ra2.reason), 'unattended runs cannot hand work to a Claude session at all');
+  const T2 = require('../sidecar/tools/builtin/claude-crew.js').makeClaudeCrewTools({ crew: fakeCrew });
+  A.eq([T2.launchTool.confirmEveryTime, T2.sendTool.confirmEveryTime, !!T2.stopTool.confirmEveryTime, !!T2.crewTool.confirmEveryTime], [true, true, false, false], 'launch + send confirm every time; stop/list do not');
+
+  // ---- opt-in bypass mode (STARNET_CLAUDE_CREW_ALLOW_BYPASS) ----
+  A.eq(C.buildSpawnArgs({ name: 'x', permissionMode: 'bypassPermissions' }).ok, false, 'bypass refused unless the station allows it');
+  const bp = C.buildSpawnArgs({ name: 'x', permissionMode: 'bypassPermissions', allowBypass: true }).args;
+  A.eq(bp[bp.indexOf('--permission-mode') + 1], 'bypassPermissions', 'bypass allowed when opted in');
+  A.eq(C.buildSpawnArgs({ name: 'x', permissionMode: 'dontAsk', allowBypass: true }).ok, false, 'dontAsk stays refused even with bypass allowed');
+  const bpc = C.makeClaudeCrew({ enabled: true, allowBypass: true, defaultMode: 'bypassPermissions' });
+  A.eq([bpc.defaultMode, bpc.modes.includes('bypassPermissions')], ['bypassPermissions', true], 'bypass can be the station default when allowed');
+  A.eq(C.makeClaudeCrew({ enabled: true, defaultMode: 'bypassPermissions' }).defaultMode, 'default', 'bypass default ignored when not allowed');
+
   A.report();
 })();

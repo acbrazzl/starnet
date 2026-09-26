@@ -224,6 +224,9 @@
     api('/api/claude-crew/skills').then(r => {
       for (const sk of (r && r.skills) || []) { const o = el('option', '', sk.name); o.value = sk.name; o.title = sk.description || ''; skill.appendChild(o); }
       if (r && r.defaultDir && !cwd.value) cwd.value = r.defaultDir;
+      if (r && Array.isArray(r.modes) && r.modes.indexOf('bypassPermissions') >= 0 && !mode.querySelector('option[value="bypassPermissions"]')) {
+        const o = el('option', '', 'skip permissions — no prompts at all'); o.value = 'bypassPermissions'; mode.insertBefore(o, mode.firstChild);
+      }
       if (r && r.defaultMode) mode.value = r.defaultMode;
     }).catch(() => {});
     skill.addEventListener('change', () => { if (skill.value && !name.value.trim()) name.value = skill.value.replace(/^meshflow-/, '').slice(0, 40); });

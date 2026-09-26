@@ -57,6 +57,14 @@ credential. It has no key to leak because it never touches one.
 
 ## Consent
 
+**Skip-permissions crews (opt-in).** `STARNET_CLAUDE_CREW_ALLOW_BYPASS=1` adds Claude Code's
+`bypassPermissions` mode, the one many users already run at their own terminal. It can also be the station
+default; `dontAsk` stays refused. What keeps this safe is that **handing work to a Claude session always needs a
+human yes**. `claude.launch` and `claude.send` are marked `confirmEveryTime`, a consent tier that sits **above**
+Full Power and Full Access. It asks on every call, never caches an "always" or "session" answer, and refuses
+unattended runs outright. So text the lead picked up from a web page or tool result can never reach an
+unrestricted agent without the Commander seeing it first.
+
 `STARNET_CLAUDE_CREW_MODE` sets the station's default mode for new sessions. The choices are `default` (ask
 before each action), `auto` (routine actions proceed and risky ones still ask), `plan` and `acceptEdits`.
 Unset means `default`. `dev/remote-station-zerotier.sh` reads personal settings from

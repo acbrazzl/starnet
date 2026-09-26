@@ -25,7 +25,11 @@
 const ID_PREFIX = 'cc-';                       // floor-body id namespace; 'cc-' + 36-char uuid = 39 <= roster id cap 40
 const SHORT_ID_RE = /^[0-9a-f]{8}$/;           // the short id `claude --bg` prints and `claude stop|logs` take
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const SPAWN_MODES = ['default', 'plan', 'acceptEdits', 'auto'];   // NEVER bypassPermissions / dontAsk
+const SPAWN_MODES = ['default', 'plan', 'acceptEdits', 'auto'];   // never bypassPermissions / dontAsk by default
+// STARNET_CLAUDE_CREW_ALLOW_BYPASS=1 is the Commander's explicit opt-in to run crew sessions with no permission
+// prompts (Claude Code's bypassPermissions — what they already use at their own terminal). dontAsk stays refused.
+const BYPASS_MODE = 'bypassPermissions';
+function modesFor(allowBypass) { return allowBypass ? SPAWN_MODES.concat([BYPASS_MODE]) : SPAWN_MODES; }
 const NAME_RE = /^[A-Za-z0-9 ._-]{1,40}$/;
 const PROMPT_MAX = 8000;
 // the first message a skilled session gets when the launcher gave none: load, orient read-only, report, wait
@@ -97,8 +101,9 @@ function buildSpawnArgs(o) {
   o = o || {};
   const name = str(o.name, 80).trim();
   if (!NAME_RE.test(name)) return { ok: false, error: 'name must be 1-40 chars of letters, digits, space, . _ -' };
-  const mode = o.permissionMode == null || o.permissionMode === '' ? (SPAWN_MODES.indexOf(o.defaultMode) >= 0 ? o.defaultMode : 'default') : String(o.permissionMode);
-  if (SPAWN_MODES.indexOf(mode) < 0) return { ok: false, error: 'permissionMode must be one of ' + SPAWN_MODES.join(', ') };
+  const modes = modesFor(!!o.allowBypass);
+  const mode = o.permissionMode == null || o.permissionMode === '' ? (modes.indexOf(o.defaultMode) >= 0 ? o.defaultMode : 'default') : String(o.permissionMode);
+  if (modes.indexOf(mode) < 0) return { ok: false, error: 'permissionMode must be one of ' + modes.join(', ') + (mode === BYPASS_MODE ? ' (bypassPermissions needs STARNET_CLAUDE_CREW_ALLOW_BYPASS=1)' : '') };
   let prompt = String(o.prompt == null ? '' : o.prompt);
   if (prompt.length > PROMPT_MAX) return { ok: false, error: 'prompt too long' };
   if (o.skill != null && o.skill !== '') {
@@ -183,7 +188,8 @@ function makeClaudeCrew(opts) {
   const pathJoin = typeof o.join === 'function' ? o.join : (a, b) => String(a).replace(/[\\/]+$/, '') + '/' + b;
   const claudeHome = o.claudeHome ? String(o.claudeHome) : '';
   // the station's default permission mode for new sessions (STARNET_CLAUDE_CREW_MODE); never a bypassing mode
-  const defaultMode = SPAWN_MODES.indexOf(o.defaultMode) >= 0 ? o.defaultMode : 'default';
+  const allowBypass = !!o.allowBypass;
+  const defaultMode = modesFor(allowBypass).indexOf(o.defaultMode) >= 0 ? o.defaultMode : 'default';
 
   function readJson(file) {
     try { return JSON.parse(fsx.readFileSync(file, 'utf8')); } catch (_) { return null; }   // absent/partial file = no record
@@ -285,7 +291,7 @@ function makeClaudeCrew(opts) {
     if (b.skill && !listSkills().some(sk => sk.name === String(b.skill))) return { ok: false, error: 'unknown skill: ' + str(b.skill, 64) };
     const cwd = str(b.cwd, 400);
     if (!cwd || !isDir(cwd)) return { ok: false, error: 'cwd must be an existing absolute directory' };
-    const built = buildSpawnArgs(Object.assign({}, b, { defaultMode }));
+    const built = buildSpawnArgs(Object.assign({}, b, { defaultMode, allowBypass }));
     if (!built.ok) return built;
     const r = await run(built.args, cwd);
     if (r.err) return { ok: false, error: why(r) };
@@ -345,7 +351,7 @@ function makeClaudeCrew(opts) {
     return Object.assign({ to: target.name }, verdict);
   }
 
-  return { list, spawn, stop, remoteUrl, listSkills, send, enabled, defaultMode };
+  return { list, spawn, stop, remoteUrl, listSkills, send, enabled, defaultMode, allowBypass, modes: modesFor(allowBypass) };
 }
 
 module.exports = { makeClaudeCrew, normalizeSessions, parseRemoteUrl, remoteUrlFromBridge, parseRelay, buildRelayArgs, relayPrompt, buildSpawnArgs, parseBackgroundId, parseSkill, SPAWN_MODES, ID_PREFIX, DEFAULT_SKILL_PROMPT };

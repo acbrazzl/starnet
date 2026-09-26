@@ -57,6 +57,8 @@
       capability: def.capability || null,
       impact: def.impact || null,
       requiresConsent: !!def.requiresConsent,
+      // CONFIRM EVERY TIME: a human yes for EACH call — above Full Access/Full Power and never cached (permissions.js)
+      confirmEveryTime: !!def.confirmEveryTime,
       timeoutMs: def.timeoutMs || 0,
       preconditions: normalizePreconditions(def.preconditions),
       run: def.run || (async () => { throw new Error('tool "' + def.name + '" has no run()'); })
