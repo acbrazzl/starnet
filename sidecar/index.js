@@ -345,9 +345,11 @@ const DESKTOP_SHELL = /^(1|true|yes|on)$/i.test(String(ENV('DESKTOP_SHELL') || '
 // can pass the same token as ?token= on /api/file only; all other fetch-driven calls use the custom header.
 const apiauth = require('./apiauth.js');
 const { isAllowedApiOrigin, isAllowedHost, requiresApiToken, TAURI_ORIGINS } = apiauth;
+// opt-in remote station names (e.g. a Tailscale `tailscale serve` hostname) — see apiauth.parseRemoteHosts for the trust note.
+const REMOTE_HOSTS = apiauth.parseRemoteHosts(ENV('REMOTE_HOSTS'));
 function applyApiCors(req, res) {
   const origin = String(req.headers.origin || '');
-  if (origin && isAllowedApiOrigin(origin, PORT)) {
+  if (origin && isAllowedApiOrigin(origin, PORT, REMOTE_HOSTS)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
   }
@@ -356,8 +358,8 @@ function applyApiCors(req, res) {
   res.setHeader('Access-Control-Max-Age', '600');
 }
 function rejectApi(req, res) {
-  if (!isAllowedHost(req.headers.host)) { res.writeHead(403); res.end('forbidden host'); return true; }
-  if (!isAllowedApiOrigin(String(req.headers.origin || ''), PORT)) { res.writeHead(403); res.end('forbidden origin'); return true; }
+  if (!isAllowedHost(req.headers.host, REMOTE_HOSTS)) { res.writeHead(403); res.end('forbidden host'); return true; }
+  if (!isAllowedApiOrigin(String(req.headers.origin || ''), PORT, REMOTE_HOSTS)) { res.writeHead(403); res.end('forbidden origin'); return true; }
   return false;
 }
 function rejectBadApiToken(req, res) {
@@ -3952,6 +3954,13 @@ async function executeCronScript(job, signal) {
 }
 try { console.log('[exec-env]', JSON.stringify(executionEnvironment.describe())); } catch (_) {}
 const subagents = makeSubagentManager({ fs: fs, pathMod: path, file: path.join(WORKSPACES, 'subagents.json'), clock: { now: () => Date.now() }, emit: chanEmit, newId: () => crypto.randomUUID(), keep: 200, hooks: hookSpine });
+// CLAUDE CREW (opt-in, STARNET_CLAUDE_CREW=1): the user's own `claude` CLI sessions projected onto the floor.
+// StarNet never runs, meters, or authenticates them — see sidecar/claude-crew.js for the auth + consent laws.
+const claudeCrew = require('./claude-crew.js').makeClaudeCrew({
+  enabled: /^(1|true|yes|on)$/i.test(String(ENV('CLAUDE_CREW') || '').trim()),
+  execFile, bin: String(ENV('CLAUDE_BIN') || 'claude'),
+  isDir: p => { try { return path.isAbsolute(p) && fs.statSync(p).isDirectory(); } catch (_) { return false; } },
+});
 const overseer = require('./overseer.js').makeOverseer({ fs, path, writeDurable: writeFileDurable,
   file: path.join(WORKSPACES, 'overseer.json'), now: () => Date.now(),
   newId: () => 'ws_' + crypto.randomUUID().replace(/-/g, ''),
@@ -9576,6 +9585,10 @@ const ROUTES = [
   { m: 'GET', prefix: '/api/subagents', h: handleSubagentsList },
   { m: 'POST', exact: '/api/subagents/interrupt', h: handleSubagentInterrupt },
   { m: 'POST', exact: '/api/subagents/steer', h: handleSubagentSteer },
+  { m: 'GET', exact: '/api/claude-crew', h: handleClaudeCrewList },
+  { m: 'POST', exact: '/api/claude-crew/spawn', h: handleClaudeCrewSpawn },
+  { m: 'POST', exact: '/api/claude-crew/stop', h: handleClaudeCrewStop },
+  { m: 'GET', qsplit: '/api/claude-crew/remote', h: handleClaudeCrewRemote },
   // honest concurrency surface: how many distinct agents can RUN at once (the gate that silently 'refuses'
   // excess parallel workers). The summon bay reads this so the ceiling is visible BEFORE a fan-out, not only
   // inside the model's tool result. (WIRING_AUDIT P4: lie #7.)
@@ -14166,6 +14179,25 @@ function handleSubagentsList(req, res) {
     }
     json(200, { records: subagents.list({ leadId: u.searchParams.get('leadId') || undefined, agentId: u.searchParams.get('agentId') || undefined, status: u.searchParams.get('status') || undefined }) });
   } catch (e) { json(500, { error: 'subagents list failed' }); }
+}
+
+/* CLAUDE CREW routes — thin wrappers over sidecar/claude-crew.js. All sit behind the standard /api token gate. */
+function claudeCrewJson(res, code, obj) { res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(obj)); }
+async function handleClaudeCrewList(req, res) { claudeCrewJson(res, 200, await claudeCrew.list()); }
+async function handleClaudeCrewSpawn(req, res) {
+  let body; try { body = JSON.parse(await readBody(req, 16384)) || {}; } catch (e) { return claudeCrewJson(res, 400, { ok: false, error: 'bad json' }); }
+  const out = await claudeCrew.spawn(body);
+  claudeCrewJson(res, out.ok ? 200 : 400, out);
+}
+async function handleClaudeCrewStop(req, res) {
+  let body; try { body = JSON.parse(await readBody(req, 1024)) || {}; } catch (e) { return claudeCrewJson(res, 400, { ok: false, error: 'bad json' }); }
+  const out = await claudeCrew.stop(body.id);
+  claudeCrewJson(res, out.ok ? 200 : 400, out);
+}
+async function handleClaudeCrewRemote(req, res) {
+  const id = new URL(req.url, 'http://x').searchParams.get('id') || '';
+  const out = await claudeCrew.remoteUrl(id);
+  claudeCrewJson(res, out.ok ? 200 : 400, out);
 }
 
 async function handleSubagentInterrupt(req, res) {

@@ -664,6 +664,8 @@ const App = (() => {
   // the same live registry StationUI receives so a summoned specialist opens its own record without changing
   // COMMS focus. Unknown/stale bodies fail closed instead of silently opening the Overseer.
   function openWorldAgent(agentId) {
+    // CLAUDE CREW bodies (cc-<sessionId>) are external CLI sessions, never roster agents: they open their own card.
+    if (typeof ClaudeCrew !== 'undefined' && ClaudeCrew.isClaudeBody(agentId)) return ClaudeCrew.open(agentId);
     const i = liveAgents().findIndex(a => a && a.id === agentId);
     if (i < 0 || typeof StationUI === 'undefined' || !StationUI.openAgent) return false;
     StationUI.openAgent(i);

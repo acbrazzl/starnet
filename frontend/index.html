@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#0b1020">
 <title>STARNET</title>
 <!-- VT323 — THE STARNET FONT — has exactly ONE source: the local @font-face in css/style.css
      (frontend/assets/fonts/vt323.woff2, SIL OFL, U+0-10FFFF — the whole range, no subsets).
@@ -986,6 +988,7 @@
 <script src="app/topbar.js"></script><!-- topbar instrument cluster: read-only STATION-XP + live SPEND-TODAY wiring (after app.js so Harness/Xp/XpStore/U exist) -->
 <script src="app/widgets.js"></script><!-- widget rails: pinnable read-only telemetry instruments (insights/cron polls + run.end/queue.status/cron.fire folds); own localStorage key, never emits -->
 <script src="app/autosessions.js"></script><!-- surface an unattended cron/routine run as a readable SESSION: cron.fire → adopt a 'cron-<runId>' workstream (busy, no focus-steal), cron.result → fold its durable transcript; boot backfill for runs finished while closed. Read-only on U.bus (after app.js so App/Workstreams/Channels/Chat/U exist) -->
+<script src="app/claude-crew.js"></script><!-- CLAUDE CREW: the user's own `claude` CLI sessions as floor bodies (cc-<sessionId>); inert unless the sidecar has STARNET_CLAUDE_CREW=1; never enters the App roster -->
 <script src="app/warroom.js"></script>
 <script src="app/worldlab.js"></script>
 <script src="app/glass-demo.js"></script>

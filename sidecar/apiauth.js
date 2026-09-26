@@ -24,18 +24,33 @@ function loopbackOrigins(port) { return new Set(['http://127.0.0.1:' + port, 'ht
 
 // Is this Origin one of ours? Absent Origin is allowed HERE because same-origin GETs and non-browser clients
 // omit it — but those callers are still gated by requiresApiToken (the token, not the origin, is their fence).
-function isAllowedApiOrigin(origin, port) {
+function isAllowedApiOrigin(origin, port, remoteHosts) {
   if (!origin) return true;
   if (origin === 'null') return false;                 // file:/sandboxed origins are never the app
-  return loopbackOrigins(port).has(origin) || TAURI_ORIGINS.has(origin);
+  if (loopbackOrigins(port).has(origin) || TAURI_ORIGINS.has(origin)) return true;
+  // an operator-named remote host (see parseRemoteHosts) is reached over TLS only, at its bare https origin
+  return !!(remoteHosts && remoteHosts.length && remoteHosts.some(h => origin === 'https://' + h));
+}
+
+/* REMOTE HOSTS (opt-in, STARNET_REMOTE_HOSTS). A comma-separated list of EXACT hostnames — e.g. the node's
+   Tailscale name `box.tailnet-1234.ts.net` fronted by `tailscale serve` — that may reach the station besides
+   loopback. This widens the DNS-rebinding pin by exactly the names listed: a rebinding attacker cannot make the
+   victim's browser send a Host it does not control, and these names resolve only inside the operator's tailnet.
+   The per-launch token still gates every /api route. What it does NOT defend: any device that can load the page
+   at that name can read the token injected into it — the network fence (tailnet ACLs) IS the trust boundary, so
+   never list a publicly reachable name. Wildcards, IPs-by-range, ports and schemes are rejected, not guessed. */
+const REMOTE_HOST_RE = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
+function parseRemoteHosts(raw) {
+  return String(raw || '').split(',').map(x => x.trim().toLowerCase()).filter(x => REMOTE_HOST_RE.test(x));
 }
 // Host must be loopback — this is the DNS-rebinding defense (a rebinding attacker's forged Host fails here).
-function isAllowedHost(host) {
+function isAllowedHost(host, remoteHosts) {
   let h = String(host || '').toLowerCase().trim();
   const br = h.match(/^\[([^\]]+)\](?::\d+)?$/);                              // [ipv6] or [ipv6]:port
   if (br) h = br[1];
   else if ((h.match(/:/g) || []).length === 1) h = h.replace(/:\d+$/, '');   // host:port (single colon = ipv4/name)
-  return h === '127.0.0.1' || h === 'localhost' || h === '::1';
+  if (h === '127.0.0.1' || h === 'localhost' || h === '::1') return true;
+  return !!(remoteHosts && remoteHosts.length && remoteHosts.indexOf(h) >= 0);   // opt-in exact names only
 }
 
 // the path portion of a request url, query stripped (so '/api/x?y=z' matches '/api/x').
@@ -97,6 +112,6 @@ function queryTokenRoute(req) {
 }
 
 module.exports = {
-  isAllowedApiOrigin, isAllowedHost, requiresApiToken, apiTokenOk, queryTokenOk, queryTokenRoute,
+  isAllowedApiOrigin, isAllowedHost, parseRemoteHosts, requiresApiToken, apiTokenOk, queryTokenOk, queryTokenRoute,
   headerToken, queryToken, constTimeEq, pathOf, loopbackOrigins, TAURI_ORIGINS, TOKEN_EXEMPT
 };
