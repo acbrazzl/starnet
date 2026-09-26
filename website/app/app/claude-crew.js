@@ -210,6 +210,7 @@
 
   window.ClaudeCrew = { isClaudeBody: id => typeof id === 'string' && id.indexOf('cc-') === 0, open: openSession, start, stop, _bodies: bodies };
   // after App has booted the world (the World body registry exists once the station loads)
-  if (document.readyState === 'complete') setTimeout(start, 1500);
-  else window.addEventListener('load', () => setTimeout(start, 1500));
+  // first look right after load (sync() tolerates a World that isn't up yet — the next poll spawns the bodies)
+  if (document.readyState === 'complete') setTimeout(start, 200);
+  else window.addEventListener('load', () => setTimeout(start, 200));
 })();
