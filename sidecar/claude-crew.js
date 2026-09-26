@@ -187,6 +187,22 @@ function makeClaudeCrew(opts) {
   const fsx = o.fs || null;   // { readdirSync, readFileSync } — injected; absent = no skill catalog
   const pathJoin = typeof o.join === 'function' ? o.join : (a, b) => String(a).replace(/[\\/]+$/, '') + '/' + b;
   const claudeHome = o.claudeHome ? String(o.claudeHome) : '';
+  /* MANAGED sessions — which Claude sessions the station may drive WITHOUT asking. Two ways in:
+       launched: the station started it (keyed by its 8-hex job id) — never needs approval;
+       adopted:  a PRE-EXISTING session the Commander approved taking over ONCE (keyed by session uuid).
+     Injected store { load() -> { launched:{}, adopted:{} }, save(obj) } so it persists across restarts. */
+  const store = o.managedStore && typeof o.managedStore.load === 'function' ? o.managedStore : null;
+  function loadManaged() {
+    let m = null; try { m = store ? store.load() : null; } catch (_) { m = null; }   // unreadable store = nothing managed yet
+    return { launched: (m && m.launched) || {}, adopted: (m && m.adopted) || {} };
+  }
+  function saveManaged(m) { if (store) store.save(m); }
+  function managedOf(sess, m) {
+    m = m || loadManaged();
+    if (sess.shortId && m.launched[sess.shortId]) return 'launched';
+    if (m.adopted[sess.sessionId]) return 'adopted';
+    return null;
+  }
   // the station's default permission mode for new sessions (STARNET_CLAUDE_CREW_MODE); never a bypassing mode
   const allowBypass = !!o.allowBypass;
   const defaultMode = modesFor(allowBypass).indexOf(o.defaultMode) >= 0 ? o.defaultMode : 'default';
@@ -258,7 +274,7 @@ function makeClaudeCrew(opts) {
       const r = await run(['agents', '--json']);
       const out = r.err
         ? { ok: true, enabled: true, available: false, reason: why(r), sessions: [] }
-        : { ok: true, enabled: true, available: true, sessions: enrich(normalizeSessions(r.stdout)) };
+        : { ok: true, enabled: true, available: true, sessions: markManaged(enrich(normalizeSessions(r.stdout))) };
       cache = out; cacheAt = now ? now() : 0;
       return out;
     })();
@@ -285,6 +301,50 @@ function makeClaudeCrew(opts) {
     return out;
   }
 
+  function markManaged(sessions) {
+    const m = loadManaged();
+    return sessions.map(x => Object.assign(x, { managed: managedOf(x, m) }));
+  }
+  /* resolveTarget(key) -> { session } | { error } — exactly one live session by name, 8-hex id, or uuid. */
+  async function resolveTarget(key) {
+    cache = null;
+    const listed = await list();
+    if (!listed.available) return { error: listed.reason || 'claude CLI unavailable' };
+    const k = String(key || '').trim();
+    const matches = listed.sessions.filter(x => x.name === k || x.shortId === k || x.sessionId === k.toLowerCase());
+    if (!matches.length) return { error: 'no live Claude session named ' + JSON.stringify(k) };
+    const target = matches[0];
+    if (matches.length > 1 || listed.sessions.filter(x => x.name === target.name).length > 1) {
+      return { error: 'more than one live session is named ' + JSON.stringify(target.name) + ' — rename one first' };
+    }
+    return { session: target };
+  }
+  const NOT_MANAGED = ' is not managed by the station — it was not launched here. Take it over first (claude.adopt); the Commander approves that once.';
+
+  /* adopt(key) — record the Commander's one-time approval to manage a pre-existing session. */
+  async function adopt(key) {
+    if (!enabled) return { ok: false, error: 'claude crew disabled' };
+    const t = await resolveTarget(key);
+    if (t.error) return { ok: false, error: t.error };
+    const m = loadManaged();
+    const already = managedOf(t.session, m);
+    if (already) return { ok: true, name: t.session.name, managed: already, already: true };
+    m.adopted[t.session.sessionId] = { name: t.session.name, at: now ? now() : null };
+    saveManaged(m); cache = null;
+    return { ok: true, name: t.session.name, managed: 'adopted' };
+  }
+  /* release(key) — hand an adopted session back (launched ones stay the station's). */
+  async function release(key) {
+    if (!enabled) return { ok: false, error: 'claude crew disabled' };
+    const t = await resolveTarget(key);
+    if (t.error) return { ok: false, error: t.error };
+    const m = loadManaged();
+    if (!m.adopted[t.session.sessionId]) return { ok: false, error: t.session.name + ' is not an adopted session' };
+    delete m.adopted[t.session.sessionId];
+    saveManaged(m); cache = null;
+    return { ok: true, name: t.session.name };
+  }
+
   async function spawn(body) {
     if (!enabled) return { ok: false, error: 'claude crew disabled (STARNET_CLAUDE_CREW=1)' };
     const b = body || {};
@@ -296,7 +356,20 @@ function makeClaudeCrew(opts) {
     const r = await run(built.args, cwd);
     if (r.err) return { ok: false, error: why(r) };
     cache = null;                                        // the next list() must see the new session
-    return { ok: true, shortId: parseBackgroundId(r.stdout) };
+    const shortId = parseBackgroundId(r.stdout);
+    if (shortId) { const m = loadManaged(); m.launched[shortId] = { name: str(b.name, 40), at: now ? now() : null }; saveManaged(m); }
+    return { ok: true, shortId };
+  }
+
+  /* stopManaged(key) — the lead's stop: by name or id, and only a managed background session. */
+  async function stopManaged(key) {
+    if (!enabled) return { ok: false, error: 'claude crew disabled' };
+    const t = await resolveTarget(key);
+    if (t.error) return { ok: false, error: t.error };
+    if (!managedOf(t.session)) return { ok: false, error: t.session.name + NOT_MANAGED };
+    if (!t.session.shortId) return { ok: false, error: t.session.name + ' is a terminal session — it can only be stopped from its own terminal' };
+    const out = await stop(t.session.shortId);
+    return Object.assign({ name: t.session.name }, out);
   }
 
   async function stop(shortId) {
@@ -332,17 +405,11 @@ function makeClaudeCrew(opts) {
     if (!message) return { ok: false, error: 'message is required' };
     if (message.length > SEND_MAX) return { ok: false, error: 'message too long' };
     const fromName = RELAY_NAME_RE.test(String(b.from || '')) ? String(b.from) : 'starnet';
-    cache = null;
-    const listed = await list();
-    if (!listed.available) return { ok: false, error: listed.reason || 'claude CLI unavailable' };
-    const key = String(b.to || '').trim();
-    const matches = listed.sessions.filter(x => x.name === key || x.shortId === key || x.sessionId === key.toLowerCase());
-    if (!matches.length) return { ok: false, error: 'no live Claude session named ' + JSON.stringify(key) };
-    const names = new Set(listed.sessions.map(x => x.name));
-    const target = matches[0];
-    if (matches.length > 1 || listed.sessions.filter(x => x.name === target.name).length > 1 || !names.has(target.name)) {
-      return { ok: false, error: 'more than one live session is named ' + JSON.stringify(target.name) + ' — rename one first' };
-    }
+    const t = await resolveTarget(b.to);
+    if (t.error) return { ok: false, error: t.error };
+    const target = t.session;
+    // the lead may only drive sessions the station manages; the Commander's own SEND box is not gated
+    if (b.requireManaged && !managedOf(target)) return { ok: false, error: target.name + NOT_MANAGED };
     // the relay exits right after sending, so say where answers should go instead of letting them vanish
     const full = message + '\n\n— sent via StarNet by ' + fromName + '. This relay cannot receive replies: answer in your own session (the Commander reads it there or over Remote Control).';
     const r = await runWithInput(buildRelayArgs(fromName), relayPrompt(target.name, full), relayCwd);
@@ -351,7 +418,7 @@ function makeClaudeCrew(opts) {
     return Object.assign({ to: target.name }, verdict);
   }
 
-  return { list, spawn, stop, remoteUrl, listSkills, send, enabled, defaultMode, allowBypass, modes: modesFor(allowBypass) };
+  return { list, spawn, stop, stopManaged, adopt, release, remoteUrl, listSkills, send, enabled, defaultMode, allowBypass, modes: modesFor(allowBypass) };
 }
 
 module.exports = { makeClaudeCrew, normalizeSessions, parseRemoteUrl, remoteUrlFromBridge, parseRelay, buildRelayArgs, relayPrompt, buildSpawnArgs, parseBackgroundId, parseSkill, SPAWN_MODES, ID_PREFIX, DEFAULT_SKILL_PROMPT };

@@ -3965,7 +3965,12 @@ const claudeCrew = require('./claude-crew.js').makeClaudeCrew({
   claudeHome: String(ENV('CLAUDE_HOME') || path.join(require('node:os').homedir(), '.claude')),
   defaultMode: String(ENV('CLAUDE_CREW_MODE') || '').trim(),   // default|plan|acceptEdits|auto (|bypassPermissions when allowed)
   allowBypass: /^(1|true|yes|on)$/i.test(String(ENV('CLAUDE_CREW_ALLOW_BYPASS') || '').trim()),
-  spawnProc: childSpawn, relayCwd: require('node:os').tmpdir(),   // the one-shot SendMessage relay (claude.send)   // default|plan|acceptEdits|auto; bypass modes are refused
+  spawnProc: childSpawn, relayCwd: require('node:os').tmpdir(),   // the one-shot SendMessage relay (claude.send)
+  // which sessions the station launched / the Commander let it take over — persisted beside the other stores
+  managedStore: {
+    load: () => { try { return JSON.parse(fs.readFileSync(path.join(WORKSPACES, 'claude-crew.managed.json'), 'utf8')); } catch (_) { return null; } },
+    save: (obj) => { const f = path.join(WORKSPACES, 'claude-crew.managed.json'); fs.writeFileSync(f + '.tmp', JSON.stringify(obj, null, 2)); fs.renameSync(f + '.tmp', f); },
+  },   // default|plan|acceptEdits|auto; bypass modes are refused
   skillDirs: [path.join(require('node:os').homedir(), '.claude', 'skills')]
     .concat(String(ENV('CLAUDE_SKILL_DIRS') || '').split(path.delimiter).filter(Boolean)),
 });
@@ -9599,6 +9604,8 @@ const ROUTES = [
   { m: 'POST', exact: '/api/claude-crew/spawn', h: handleClaudeCrewSpawn },
   { m: 'POST', exact: '/api/claude-crew/stop', h: handleClaudeCrewStop },
   { m: 'POST', exact: '/api/claude-crew/send', h: handleClaudeCrewSend },
+  { m: 'POST', exact: '/api/claude-crew/adopt', h: handleClaudeCrewAdopt },     // the Commander's click IS the one-time approval
+  { m: 'POST', exact: '/api/claude-crew/release', h: handleClaudeCrewRelease },
   { m: 'GET', qsplit: '/api/claude-crew/remote', h: handleClaudeCrewRemote },
   { m: 'GET', exact: '/api/claude-crew/skills', h: (req, res) => claudeCrewJson(res, 200, { ok: true, enabled: claudeCrew.enabled, skills: claudeCrew.listSkills().map(sk => ({ name: sk.name, description: sk.description })), defaultDir: CLAUDE_CREW_DIR || undefined, defaultMode: claudeCrew.defaultMode, modes: claudeCrew.modes }) },
   // honest concurrency surface: how many distinct agents can RUN at once (the gate that silently 'refuses'
@@ -14205,6 +14212,14 @@ async function handleClaudeCrewStop(req, res) {
   let body; try { body = JSON.parse(await readBody(req, 1024)) || {}; } catch (e) { return claudeCrewJson(res, 400, { ok: false, error: 'bad json' }); }
   const out = await claudeCrew.stop(body.id);
   claudeCrewJson(res, out.ok ? 200 : 400, out);
+}
+async function handleClaudeCrewAdopt(req, res) {
+  let body; try { body = JSON.parse(await readBody(req, 1024)) || {}; } catch (e) { return claudeCrewJson(res, 400, { ok: false, error: 'bad json' }); }
+  const out = await claudeCrew.adopt(body.session); claudeCrewJson(res, out.ok ? 200 : 400, out);
+}
+async function handleClaudeCrewRelease(req, res) {
+  let body; try { body = JSON.parse(await readBody(req, 1024)) || {}; } catch (e) { return claudeCrewJson(res, 400, { ok: false, error: 'bad json' }); }
+  const out = await claudeCrew.release(body.session); claudeCrewJson(res, out.ok ? 200 : 400, out);
 }
 async function handleClaudeCrewSend(req, res) {
   let body; try { body = JSON.parse(await readBody(req, 16384)) || {}; } catch (e) { return claudeCrewJson(res, 400, { ok: false, error: 'bad json' }); }

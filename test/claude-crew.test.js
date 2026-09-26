@@ -126,9 +126,11 @@ const RAW = JSON.stringify([
   const fakeCrew = { enabled: true, list: async () => ({ available: true, sessions: C.normalizeSessions(RAW) }),
     listSkills: () => [{ name: 'alpha', description: 'A' }],
     spawn: async b => { spawned.push(b); return b.skill === 'bad' ? { ok: false, error: 'unknown skill: bad' } : { ok: true, shortId: 'abcd1234' }; },
-    stop: async id => (id === 'abcd1234' ? { ok: true } : { ok: false, error: 'bad session id' }) };
+    stop: async id => (id === 'abcd1234' ? { ok: true } : { ok: false, error: 'bad session id' }),
+    stopManaged: async id => (id === 'abcd1234' ? { ok: true, name: 'social' } : { ok: false, error: 'x is not managed by the station' }) };
   const tools = T.makeClaudeCrewTools({ crew: fakeCrew, defaultCwd: '/home/u/code' });
-  A.eq([tools.crewTool.requiresConsent, tools.launchTool.requiresConsent, tools.launchTool.scope, tools.stopTool.requiresConsent], [false, true, 'execute', true], 'listing is free; launch (execute) and stop ask first');
+  A.eq([tools.crewTool.requiresConsent, tools.launchTool.requiresConsent, tools.stopTool.requiresConsent, tools.sendTool.requiresConsent, tools.adoptTool.requiresConsent],
+    [false, false, false, false, true], 'Commander policy: list/launch/stop/send never ask; only adopting a pre-existing session does');
   const listing = JSON.parse((await tools.crewTool.run({})).content);
   A.eq([listing.sessions.length, listing.sessions[2].status, listing.skills[0].name], [3, 'needs-you', 'alpha'], 'crew listing carries status incl. needs-you, plus skills');
   const launched = await tools.launchTool.run({ name: 'social', skill: 'alpha' });
@@ -138,11 +140,11 @@ const RAW = JSON.stringify([
   A.ok(err && /unknown skill/.test(err.message), 'a failed launch throws (never reported as done)');
   err = null; try { await T.makeClaudeCrewTools({ crew: fakeCrew }).launchTool.run({ name: 'x' }); } catch (e) { err = e; }
   A.ok(err && /no directory/.test(err.message), 'no default dir and no dir -> refused');
-  A.eq((await tools.stopTool.run({ id: 'abcd1234' })).summary, 'stopped Claude session abcd1234', 'stop ok');
+  A.eq((await tools.stopTool.run({ id: 'abcd1234' })).summary, 'stopped Claude session social', 'stop ok (managed session, by id)');
   err = null; try { await T.makeClaudeCrewTools({ crew: { enabled: false } }).crewTool.run({}); } catch (e) { err = e; }
   A.ok(err && /STARNET_CLAUDE_CREW/.test(err.message), 'crew off -> honest error');
   const capReg = fsm.readFileSync(require('node:path').join(__dirname, '..', 'sidecar', 'capability', 'registry.js'), 'utf8');
-  A.ok(['claude.crew', 'claude.launch', 'claude.stop', 'claude.send'].every(t => capReg.includes("capId: 'orchestrator', tool: '" + t + "'")), 'all four tools are on the orchestrator allowlist (lead-only)');
+  A.ok(['claude.crew', 'claude.launch', 'claude.stop', 'claude.send', 'claude.adopt'].every(t => capReg.includes("capId: 'orchestrator', tool: '" + t + "'")), 'all five tools are on the orchestrator allowlist (lead-only)');
 
 
   // ---- Claude Code's own records: remote link for any kind (terminal too) + what a blocked job waits on ----
@@ -216,10 +218,35 @@ const RAW = JSON.stringify([
   A.eq(relayed.length, 1, 'refusals never start a relay');
   A.eq((await sc.send({ to: '3439187a', message: 'x', from: 'bad name!' })).to, 'delta', 'recipient by short id; bad from-name falls back');
   A.eq(relayed[1].args[relayed[1].args.indexOf('--name') + 1], 'starnet', 'invalid sender name -> "starnet"');
-  const sendT = T.makeClaudeCrewTools({ crew: sc }).sendTool;
-  A.eq([sendT.requiresConsent, sendT.scope], [true, 'write'], 'claude.send asks first');
-  A.ok(/delivered to meshflow-ff/.test((await sendT.run({ to: 'meshflow-ff', message: 'hi' }, { agentId: 'agent' })).summary), 'tool reports verified delivery');
+  // ---- MANAGED sessions: the lead drives only sessions the station launched or the Commander let it take over ----
+  let mem = null;
+  const memStore = { load: () => mem && JSON.parse(JSON.stringify(mem)), save: o => { mem = JSON.parse(JSON.stringify(o)); } };
+  const mc = C.makeClaudeCrew({ enabled: true, execFile: (b, args, o, cb) => cb(null, args[0] === 'agents' ? RAW : args[0] === '--bg' ? 'backgrounded · 54946c2f' : 'stopped', ''),
+    spawnProc, now: () => 7, isDir: () => true, managedStore: memStore });
+  const mt = T.makeClaudeCrewTools({ crew: mc, defaultCwd: '/w' });
+  A.eq([mt.sendTool.requiresConsent, mt.adoptTool.requiresConsent, mt.adoptTool.confirmEveryTime], [false, true, true], 'send is free; adopt asks (every time, never cached)');
+  let merr = null; try { await mt.sendTool.run({ to: 'meshflow-ff', message: 'hi' }, { agentId: 'agent' }); } catch (e) { merr = e; }
+  A.ok(merr && /not managed.*claude\.adopt/.test(merr.message), 'the lead cannot message a pre-existing session it has not taken over');
+  const before = relayed.length;
+  A.eq(relayed.length, before, 'a refused send never starts a relay');
+  const ad = JSON.parse((await mt.adoptTool.run({ session: 'meshflow-ff' })).content);
+  A.eq([ad.ok, ad.managed], [true, 'adopted'], 'adopt records the one-time approval');
+  A.eq(Object.values(mem.adopted).map(x => x.name), ['meshflow-ff'], 'adoption persists in the managed store (by session uuid)');
+  A.ok(/delivered to meshflow-ff/.test((await mt.sendTool.run({ to: 'meshflow-ff', message: 'hi' }, { agentId: 'agent' })).summary), 'after adoption the lead messages it without asking');
   A.eq(relayed[relayed.length - 1].args[relayed[relayed.length - 1].args.indexOf('--name') + 1], 'starnet-overseer', 'the hero sends as starnet-overseer');
+  A.eq(JSON.parse((await mt.adoptTool.run({ session: 'meshflow-ff' })).content).already, true, 'adopting twice is a no-op');
+  await mt.launchTool.run({ name: 'ops' });
+  A.eq(Object.keys(mem.launched), ['54946c2f'], 'a launch records the session as station-launched');
+  const listedM = (await mc.list()).sessions;
+  A.eq(listedM.map(x => [x.name, x.managed]), [['ops', 'launched'], ['meshflow-ff', 'adopted'], ['delta', null]], 'listing marks launched / adopted / unmanaged');
+  merr = null; try { await mt.stopTool.run({ id: 'delta' }); } catch (e) { merr = e; }
+  A.ok(merr && /not managed/.test(merr.message), 'the lead cannot stop an unmanaged session');
+  A.eq((await mt.stopTool.run({ id: 'ops' })).summary, 'stopped Claude session ops', 'the lead stops a session it launched, no approval');
+  merr = null; try { await mt.stopTool.run({ id: 'meshflow-ff' }); } catch (e) { merr = e; }
+  A.ok(merr && /terminal session/.test(merr.message), 'an adopted TERMINAL session cannot be stopped from the station');
+  A.eq((await mc.release('meshflow-ff')).ok, true, 'release hands an adopted session back');
+  A.eq(Object.keys(mem.adopted).length, 0, 'release clears the record');
+  A.eq((await mc.send({ to: 'delta', message: 'from the commander' })).ok, true, 'the Commander\'s own SEND box is not gated by management');
 
 
   // ---- CONFIRM EVERY TIME: handoffs to Claude sessions ask on EVERY call, above Full Power, never cached ----
@@ -243,7 +270,7 @@ const RAW = JSON.stringify([
   const ra2 = await auto({ name: 'claude.send' }, handoff);
   A.ok(!ra2.allow && /every time/.test(ra2.reason), 'unattended runs cannot hand work to a Claude session at all');
   const T2 = require('../sidecar/tools/builtin/claude-crew.js').makeClaudeCrewTools({ crew: fakeCrew });
-  A.eq([T2.launchTool.confirmEveryTime, T2.sendTool.confirmEveryTime, !!T2.stopTool.confirmEveryTime, !!T2.crewTool.confirmEveryTime], [true, true, false, false], 'launch + send confirm every time; stop/list do not');
+  A.eq([T2.adoptTool.confirmEveryTime, !!T2.launchTool.confirmEveryTime, !!T2.sendTool.confirmEveryTime, !!T2.stopTool.confirmEveryTime], [true, false, false, false], 'only adopt (taking over a pre-existing session) confirms every time');
 
   // ---- opt-in bypass mode (STARNET_CLAUDE_CREW_ALLOW_BYPASS) ----
   A.eq(C.buildSpawnArgs({ name: 'x', permissionMode: 'bypassPermissions' }).ok, false, 'bypass refused unless the station allows it');

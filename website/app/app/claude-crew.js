@@ -141,6 +141,19 @@
     if (s.waitingOn) line(c, 'WAITING ON', s.waitingOn + ' — approve it in Remote Control');
     else if (s.detail) line(c, 'DOING', s.detail);
     line(c, 'DIR', s.cwd || '?');
+    // MANAGED: launched here / adopted (Commander approved once) / not yet — only managed sessions take the lead's orders
+    const mg = line(c, 'MANAGED', s.managed === 'launched' ? 'yes — launched by the station' : s.managed === 'adopted' ? 'yes — taken over (you approved)' : 'no — the Overseer cannot message or stop it');
+    if (s.managed !== 'launched') {
+      const toggle = el('button', BUTTON + 'margin:0 0 0 8px;padding:2px 8px;', s.managed === 'adopted' ? 'RELEASE' : 'LET OVERSEER MANAGE');
+      toggle.addEventListener('click', async () => {
+        toggle.disabled = true;
+        const r = await api('/api/claude-crew/' + (s.managed === 'adopted' ? 'release' : 'adopt'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session: s.sessionId }) });
+        if (r.ok) { s.managed = s.managed === 'adopted' ? null : 'adopted'; mg.lastChild.textContent = s.managed ? 'yes — taken over (you approved)' : 'no — the Overseer cannot message or stop it'; toggle.textContent = s.managed ? 'RELEASE' : 'LET OVERSEER MANAGE'; poll(); }
+        else mg.lastChild.textContent = r.error || 'failed';
+        toggle.disabled = false;
+      });
+      mg.appendChild(toggle);
+    }
     line(c, 'KIND', s.kind === 'background' ? 'background (started from the station or claude --bg)' : 'interactive terminal session');
     const row = el('div', 'margin-top:6px;');
     c.appendChild(row);

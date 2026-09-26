@@ -58,12 +58,19 @@ credential. It has no key to leak because it never touches one.
 ## Consent
 
 **Skip-permissions crews (opt-in).** `STARNET_CLAUDE_CREW_ALLOW_BYPASS=1` adds Claude Code's
-`bypassPermissions` mode, the one many users already run at their own terminal. It can also be the station
-default; `dontAsk` stays refused. What keeps this safe is that **handing work to a Claude session always needs a
-human yes**. `claude.launch` and `claude.send` are marked `confirmEveryTime`, a consent tier that sits **above**
-Full Power and Full Access. It asks on every call, never caches an "always" or "session" answer, and refuses
-unattended runs outright. So text the lead picked up from a web page or tool result can never reach an
-unrestricted agent without the Commander seeing it first.
+`bypassPermissions` mode. It can also be the station default; `dontAsk` stays refused.
+
+**Managed sessions — who the Overseer may drive.** The station records every Claude session it launched, and
+every pre-existing session the Commander let it take over (`claude-crew.managed.json` in the workspace).
+
+| Lead tool | Approval |
+|---|---|
+| `claude.launch` | never; launched sessions are the station's |
+| `claude.send`, `claude.stop` | never, but managed sessions only |
+| `claude.adopt` | taking over a pre-existing session (e.g. the Commander's own terminal): asked **once per session**. It uses the `confirmEveryTime` consent tier: above Full Power, never cached, and refused on unattended runs. It is then recorded, so it is never asked again. |
+
+The card's **LET OVERSEER MANAGE / RELEASE** button does the same from the station (the click is the approval).
+The Commander's own SEND box is never gated.
 
 `STARNET_CLAUDE_CREW_MODE` sets the station's default mode for new sessions. The choices are `default` (ask
 before each action), `auto` (routine actions proceed and risky ones still ask), `plan` and `acceptEdits`.

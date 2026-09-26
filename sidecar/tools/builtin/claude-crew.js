@@ -5,12 +5,14 @@
 
      claude.crew    read     the live Claude sessions (name, dir, working/idle/needs-you, remote-capable) plus the
                              Claude Code SKILLS a new session can be launched with. No consent — it spends nothing.
-     claude.launch  execute  start a BACKGROUND Claude session with Remote Control on, optionally loading one skill
-                             (its first line becomes `/<skill>`), in a directory Claude Code already trusts.
-                             Consent-gated like team.summon/team.spawn: it starts real, subscription-spending work
-                             that keeps running after this turn, and scope 'execute' means an autonomous run can
-                             never spend it off a cached grant.
-     claude.stop    write    stop a background Claude session. Consent-gated: it ends someone's running work.
+     claude.launch  write    start a BACKGROUND Claude session with Remote Control on, optionally loading one skill
+                             (its first line becomes `/<skill>`). NO approval — the Commander's standing policy is
+                             that the lead may staff as many sessions as it wants; they are the station's (launched).
+     claude.adopt   write    take over a PRE-EXISTING session (one the station did not launch). The Commander
+                             approves this ONCE per session (confirmEveryTime: never cached, never unattended);
+                             after that the session is the station's to message and stop without asking.
+     claude.send    write    message a MANAGED session (launched or adopted). No approval.
+     claude.stop    write    stop a MANAGED background session. No approval.
 
    A launched session is NOT a StarNet agent: StarNet never runs, meters, or authenticates it (see
    sidecar/claude-crew.js). The Commander talks to it over its claude.ai/code Remote Control link, which
@@ -27,7 +29,7 @@ function makeClaudeCrewTools(deps) {
   const crewTool = {
     name: 'claude.crew', capability: 'orchestrator', scope: 'read', requiresConsent: false,
     description: 'List the Commander\'s own Claude Code sessions (the "Claude crew" on the station floor) and the Claude Code skills a new session can be launched with. ' +
-      'Each session has a name, directory, status (working / idle / needs-you), and whether it is a background session the station can stop. ' +
+      'Each session has a name, directory, status (working / idle / needs-you), whether the station manages it (launched here or adopted — only managed sessions can be messaged or stopped), and whether it is a background session. ' +
       'Call this before claude.launch to pick a skill, and whenever the Commander asks what their Claude agents are doing.',
     schema: { type: 'object', properties: {} },
     run: async () => {
@@ -36,6 +38,7 @@ function makeClaudeCrewTools(deps) {
       const sessions = (listed.sessions || []).map(s => ({
         name: s.name, id: s.shortId || null, dir: s.cwd, kind: s.kind,
         status: s.needsInput ? 'needs-you' : s.busy ? 'working' : 'idle', stoppable: !!s.stoppable,
+        managed: s.managed || 'no — claude.adopt first',
       }));
       const skills = crew.listSkills().map(sk => ({ name: sk.name, description: sk.description }));
       const needs = sessions.filter(s => s.status === 'needs-you').length;
@@ -49,7 +52,7 @@ function makeClaudeCrewTools(deps) {
   };
 
   const launchTool = {
-    name: 'claude.launch', capability: 'orchestrator', scope: 'execute', requiresConsent: true, confirmEveryTime: true, timeoutMs: 60000,
+    name: 'claude.launch', capability: 'orchestrator', scope: 'write', requiresConsent: false, timeoutMs: 60000,
     description: 'Start a new background Claude Code session for the Commander, with Remote Control on so they can drive it from claude.ai or their phone. ' +
       'Optionally load one Claude Code skill (from claude.crew) — e.g. a social-media, dev or debugging specialist. ' +
       'Without a message, a skilled session loads the skill, orients itself read-only, reports readiness and waits. ' +
@@ -79,20 +82,20 @@ function makeClaudeCrewTools(deps) {
   };
 
   const stopTool = {
-    name: 'claude.stop', capability: 'orchestrator', scope: 'write', requiresConsent: true, timeoutMs: 30000,
-    description: 'Stop one of the Commander\'s BACKGROUND Claude sessions by its id from claude.crew. Terminal sessions cannot be stopped from the station. Its conversation is kept and can be resumed from the CLI.',
-    schema: { type: 'object', required: ['id'], properties: { id: { type: 'string', maxLength: 16, description: 'The 8-hex session id from claude.crew.' } } },
+    name: 'claude.stop', capability: 'orchestrator', scope: 'write', requiresConsent: false, timeoutMs: 30000,
+    description: 'Stop one of the station-managed BACKGROUND Claude sessions (launched here or adopted), by name or id from claude.crew. Terminal sessions cannot be stopped from the station. Its conversation is kept and can be resumed.',
+    schema: { type: 'object', required: ['id'], properties: { id: { type: 'string', maxLength: 80, description: 'Session name or 8-hex id from claude.crew.' } } },
     run: async (args) => {
       need();
-      const out = await crew.stop(String((args && args.id) || ''));
+      const out = await crew.stopManaged(String((args && args.id) || ''));
       if (!out.ok) throw new Error(out.error || 'stop failed');
-      return { content: JSON.stringify({ ok: true, id: args.id }), summary: 'stopped Claude session ' + args.id };
+      return { content: JSON.stringify({ ok: true, name: out.name }), summary: 'stopped Claude session ' + out.name };
     },
   };
 
   const sendTool = {
-    name: 'claude.send', capability: 'orchestrator', scope: 'write', requiresConsent: true, confirmEveryTime: true, timeoutMs: 180000,
-    description: 'Send a message into one of the Commander\'s live Claude Code sessions on this machine — terminal (interactive) sessions included — by its name from claude.crew. ' +
+    name: 'claude.send', capability: 'orchestrator', scope: 'write', requiresConsent: false, timeoutMs: 180000,
+    description: 'Send a message into a station-MANAGED Claude Code session (launched here, or a pre-existing one taken over with claude.adopt) — terminal (interactive) sessions included — by its name from claude.crew. ' +
       'Use it to task or brief a Claude session. The session receives it as a teammate message and acts within its OWN permission settings; it cannot reply to you through this relay (its answer stays in its own session, where the Commander reads it). ' +
       'Delivery is verified: a failed or altered send is reported as such.',
     schema: { type: 'object', required: ['to', 'message'], properties: {
@@ -102,16 +105,29 @@ function makeClaudeCrewTools(deps) {
       need();
       let from = String((ctx && (ctx.agentName || ctx.agentId)) || 'overseer').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').slice(0, 30);
       if (!from || from === 'agent') from = 'overseer';   // the hero's id is the generic 'agent'
-      const out = await crew.send({ to: args && args.to, message: args && args.message, from: 'starnet-' + from });
+      const out = await crew.send({ to: args && args.to, message: args && args.message, from: 'starnet-' + from, requireManaged: true });
       if (!out.ok) throw new Error(out.error || 'send failed');
       return { content: JSON.stringify({ ok: true, to: out.to, verbatim: out.verbatim, note: out.error || undefined }),
         summary: 'delivered to ' + out.to + (out.verbatim ? '' : ' — WARNING: ' + out.error) };
     },
   };
 
+  const adoptTool = {
+    name: 'claude.adopt', capability: 'orchestrator', scope: 'write', requiresConsent: true, confirmEveryTime: true, timeoutMs: 30000,
+    description: 'Take over a PRE-EXISTING Claude session (one the station did not launch — e.g. the Commander\'s own terminal session) so the station may message and stop it. ' +
+      'The Commander approves this once per session; afterwards claude.send / claude.stop work on it without asking. Sessions launched with claude.launch are already managed.',
+    schema: { type: 'object', required: ['session'], properties: { session: { type: 'string', maxLength: 80, description: 'Session name or id from claude.crew.' } } },
+    run: async (args) => {
+      need();
+      const out = await crew.adopt(String((args && args.session) || ''));
+      if (!out.ok) throw new Error(out.error || 'adopt failed');
+      return { content: JSON.stringify(out), summary: out.already ? out.name + ' was already managed (' + out.managed + ')' : 'took over ' + out.name + ' — the station may now message and stop it' };
+    },
+  };
+
   return {
-    crewTool, launchTool, stopTool, sendTool,
-    register(reg) { reg.register(crewTool); reg.register(launchTool); reg.register(stopTool); reg.register(sendTool); return reg; },
+    crewTool, launchTool, stopTool, sendTool, adoptTool,
+    register(reg) { reg.register(crewTool); reg.register(launchTool); reg.register(stopTool); reg.register(sendTool); reg.register(adoptTool); return reg; },
   };
 }
 
