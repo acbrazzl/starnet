@@ -3958,7 +3958,7 @@ const subagents = makeSubagentManager({ fs: fs, pathMod: path, file: path.join(W
 // StarNet never runs, meters, or authenticates them — see sidecar/claude-crew.js for the auth + consent laws.
 const claudeCrew = require('./claude-crew.js').makeClaudeCrew({
   enabled: /^(1|true|yes|on)$/i.test(String(ENV('CLAUDE_CREW') || '').trim()),
-  execFile, bin: String(ENV('CLAUDE_BIN') || 'claude'),
+  execFile, bin: String(ENV('CLAUDE_BIN') || 'claude'), now: () => Date.now(),
   isDir: p => { try { return path.isAbsolute(p) && fs.statSync(p).isDirectory(); } catch (_) { return false; } },
 });
 const overseer = require('./overseer.js').makeOverseer({ fs, path, writeDurable: writeFileDurable,

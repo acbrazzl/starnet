@@ -100,7 +100,7 @@ function makeClaudeCrew(opts) {
   const enabled = !!o.enabled;
   const execFile = o.execFile;
   const bin = o.bin || 'claude';
-  const now = typeof o.now === 'function' ? o.now : () => Date.now();
+  const now = typeof o.now === 'function' ? o.now : null;   // injected clock (lint-determinism); none = no list cache
   const isDir = typeof o.isDir === 'function' ? o.isDir : () => false;
   const minPollMs = Number.isFinite(o.minPollMs) ? o.minPollMs : 2500;
   const timeoutMs = Number.isFinite(o.timeoutMs) ? o.timeoutMs : 30000;
@@ -120,14 +120,14 @@ function makeClaudeCrew(opts) {
 
   async function list() {
     if (!enabled) return { ok: true, enabled: false, available: false, sessions: [] };
-    if (cache && now() - cacheAt < minPollMs) return cache;
+    if (cache && now && now() - cacheAt < minPollMs) return cache;
     if (inflight) return inflight;
     inflight = (async () => {
       const r = await run(['agents', '--json']);
       const out = r.err
         ? { ok: true, enabled: true, available: false, reason: why(r), sessions: [] }
         : { ok: true, enabled: true, available: true, sessions: normalizeSessions(r.stdout) };
-      cache = out; cacheAt = now();
+      cache = out; cacheAt = now ? now() : 0;
       return out;
     })();
     try { return await inflight; } finally { inflight = null; }
