@@ -30,7 +30,13 @@
     'font-family:VT323,monospace;font-size:20px;padding:12px 14px;box-shadow:0 0 0 2px #000,0 8px 24px rgba(0,0,0,.6);';
   const BUTTON = 'font:inherit;background:#1a2138;color:#e8e6df;border:1px solid ' + COLOR + ';padding:6px 10px;margin:6px 6px 0 0;cursor:pointer;';
 
-  function stateText(s) { return s.needsInput ? 'needs you (answer over Remote Control)' : s.busy ? 'working' : s.status; }
+  function stateText(s) { return s.needsInput ? 'NEEDS YOU' : s.busy ? 'working' : s.status; }
+  // an <a> that opens the session's claude.ai Remote Control page (never fabricated — only a URL the CLI recorded)
+  function remoteLink(url, label) {
+    const a = el('a', BUTTON + 'display:inline-block;text-decoration:none;', label || 'OPEN REMOTE');
+    a.href = url; a.target = '_blank'; a.rel = 'noopener';
+    return a;
+  }
 
   function closeCard() { if (card) { card.remove(); card = null; } }
 
@@ -72,7 +78,7 @@
   let railSig = '';
   function pushRail() {
     const list = [...bodies.values()];
-    const sig = JSON.stringify(list.map(x => [x.id, x.name, x.busy, x.needsInput, x.shortId]));
+    const sig = JSON.stringify(list.map(x => [x.id, x.name, x.busy, x.needsInput, x.shortId, !!x.remoteUrl]));
     if (sig === railSig) return;
     railSig = sig;
     try { if (typeof StationUI !== 'undefined' && StationUI.setExternalCrew) StationUI.setExternalCrew(list); } catch (_) {}
@@ -132,22 +138,24 @@
     if (!s) return false;
     const c = cardShell('CLAUDE · ' + s.name);
     line(c, 'STATUS', stateText(s));
+    if (s.waitingOn) line(c, 'WAITING ON', s.waitingOn + ' — approve it in Remote Control');
+    else if (s.detail) line(c, 'DOING', s.detail);
     line(c, 'DIR', s.cwd || '?');
     line(c, 'KIND', s.kind === 'background' ? 'background (started from the station or claude --bg)' : 'interactive terminal session');
     const row = el('div', 'margin-top:6px;');
     c.appendChild(row);
-    if (!s.shortId) {
-      line(c, '', 'Terminal sessions are shown read-only. Run /remote-control in that session to reach it from your phone.');
-      return true;
+    let url = s.remoteUrl || null;
+    let note = null;
+    if (!url && s.shortId) {                                   // older CLI without the session record: ask the logs
+      note = line(c, 'REMOTE', 'looking up…');
+      const r = await api('/api/claude-crew/remote?id=' + encodeURIComponent(s.shortId));
+      url = r.url || null;
+      note.lastChild.textContent = url || r.error || 'no Remote Control link recorded for this session';
     }
-    const note = line(c, 'REMOTE', 'looking up…');
-    const r = await api('/api/claude-crew/remote?id=' + encodeURIComponent(s.shortId));
-    note.lastChild.textContent = r.url ? r.url : (r.error || 'Remote Control not connected yet — try again shortly');
-    if (r.url) {
-      const open = el('a', BUTTON + 'display:inline-block;text-decoration:none;', 'OPEN REMOTE');
-      open.href = r.url; open.target = '_blank'; open.rel = 'noopener';
-      row.appendChild(open);
-    }
+    if (url) row.appendChild(remoteLink(url));
+    else if (!s.shortId) line(c, '', 'Remote Control is off for this terminal session — run /remote-control in it to reach it from your phone.');
+    if (!s.shortId) return true;
+    if (!note) note = line(c, '', '');
     const stopBtn = el('button', BUTTON, 'STOP');
     stopBtn.addEventListener('click', async () => {
       stopBtn.disabled = true; stopBtn.textContent = 'STOPPING…';
@@ -168,10 +176,16 @@
       const r = el('button', BUTTON + 'display:block;width:100%;text-align:left;margin:6px 0 0;');
       const mark = s.needsInput ? ['#ffd34a', '! '] : s.busy ? [COLOR, '● '] : ['#6fcf97', '○ '];
       r.append(el('span', 'color:' + mark[0] + ';', mark[1]), el('span', '', s.name),
-        el('span', 'color:#8a93b2;', ' · ' + stateText(s) + (s.shortId ? ' · remote' : '')));
+        el('span', 'color:#8a93b2;', ' · ' + stateText(s) + (s.remoteUrl ? ' · remote' : '')));
+      if (s.waitingOn) r.append(el('div', 'color:#8a93b2;font-size:.85em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;', '↳ ' + s.waitingOn));
       r.setAttribute('aria-label', 'Open ' + s.name);
       r.addEventListener('click', () => openSession(s.id));
-      c.appendChild(r);
+      if (s.needsInput && s.remoteUrl) {                      // one tap to where the approval happens
+        const wrap = el('div', 'display:flex;gap:6px;align-items:stretch;');
+        r.style.flex = '1'; r.style.minWidth = '0';
+        const go = remoteLink(s.remoteUrl, 'APPROVE ↗'); go.style.margin = '6px 0 0'; go.setAttribute('aria-label', 'Open ' + s.name + ' in Remote Control to approve');
+        wrap.append(r, go); c.appendChild(wrap);
+      } else c.appendChild(r);
     }
     const n = el('button', BUTTON + 'margin-top:12px;', '+ NEW SESSION');
     n.setAttribute('aria-label', 'Start a new Claude session');

@@ -3962,6 +3962,7 @@ const claudeCrew = require('./claude-crew.js').makeClaudeCrew({
   isDir: p => { try { return path.isAbsolute(p) && fs.statSync(p).isDirectory(); } catch (_) { return false; } },
   // Claude Code skills a crew session can be launched with: the user's own (~/.claude/skills) plus any extra dirs
   fs, join: path.join,
+  claudeHome: String(ENV('CLAUDE_HOME') || path.join(require('node:os').homedir(), '.claude')),
   skillDirs: [path.join(require('node:os').homedir(), '.claude', 'skills')]
     .concat(String(ENV('CLAUDE_SKILL_DIRS') || '').split(path.delimiter).filter(Boolean)),
 });

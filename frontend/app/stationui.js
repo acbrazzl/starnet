@@ -9845,7 +9845,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
           '<span class="dot on"></span>' +
           '<div class="crew-main">' +
           '<div class="crew-name" style="color:#d97757;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(x.name) + '">' + esc(x.name) + '</div>' +
-          '<div class="crew-status"' + (x.needsInput ? ' style="color:#ffd34a"' : '') + '>' + status + (x.shortId ? ' · REMOTE' : '') + '</div>' +
+          '<div class="crew-status"' + (x.needsInput ? ' style="color:#ffd34a"' : '') + '>' + status + (x.remote ? ' · REMOTE' : '') + '</div>' +
           '<div class="crew-prog bar-active" aria-hidden="true"><div></div></div>' +
           '</div></li>';
       }).join('');
@@ -9853,7 +9853,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   // CLAUDE CREW (display-only): claude-crew.js hands the live session list here; rows open ClaudeCrew's card.
   function setExternalCrew(list) {
     externalCrew = Array.isArray(list) ? list.map(x => ({ id: String(x.id), name: String(x.name || x.id), busy: !!x.busy,
-      needsInput: !!x.needsInput, shortId: x.shortId || null })) : [];
+      needsInput: !!x.needsInput, shortId: x.shortId || null, remote: !!(x.remoteUrl || x.shortId) })) : [];
     crewRender();
   }
   function setRoster(agents) {

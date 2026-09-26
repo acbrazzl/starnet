@@ -144,5 +144,28 @@ const RAW = JSON.stringify([
   const capReg = fsm.readFileSync(require('node:path').join(__dirname, '..', 'sidecar', 'capability', 'registry.js'), 'utf8');
   A.ok(['claude.crew', 'claude.launch', 'claude.stop'].every(t => capReg.includes("capId: 'orchestrator', tool: '" + t + "'")), 'all three tools are on the orchestrator allowlist (lead-only)');
 
+
+  // ---- Claude Code's own records: remote link for any kind (terminal too) + what a blocked job waits on ----
+  A.eq(C.remoteUrlFromBridge('cse_016qDg'), 'https://claude.ai/code/session_016qDg', 'cse_ bridge id -> session URL');
+  A.eq(C.remoteUrlFromBridge('session_01AB'), 'https://claude.ai/code/session_01AB', 'session_ bridge id -> URL');
+  A.eq([C.remoteUrlFromBridge(null), C.remoteUrlFromBridge('evil/../x')], [null, null], 'no/odd bridge id -> no link (never fabricated)');
+  const recFiles = {
+    '/ch/sessions/100.json': JSON.stringify({ sessionId: U2, bridgeSessionId: 'session_TERM1' }),
+    '/ch/sessions/200.json': '{broken',
+    '/ch/jobs/3439187a/state.json': JSON.stringify({ needs: 'approve Entering worktree', detail: 'orienting', bridgeSessionId: 'cse_JOB1' }),
+  };
+  const recFs = { readdirSync: d => { if (d === '/ch/sessions') return ['100.json', '200.json', 'x.key']; throw new Error('ENOENT'); },
+    readFileSync: f => { if (!(f in recFiles)) throw new Error('ENOENT'); return recFiles[f]; } };
+  const execOk = (bin, args, opts, cb) => cb(null, args[0] === 'agents' ? RAW : '', '');   // the shared fake was switched to ENOENT above
+  const rc = C.makeClaudeCrew({ enabled: true, execFile: execOk, fs: recFs, claudeHome: '/ch', now: () => 1 });
+  const enriched = (await rc.list()).sessions;
+  const byName = n => enriched.find(x => x.name === n);
+  A.eq(byName('meshflow-ff').remoteUrl, 'https://claude.ai/code/session_TERM1', 'interactive session gets its Remote Control link from the session record');
+  A.eq([byName('delta').remoteUrl, byName('delta').waitingOn], ['https://claude.ai/code/session_JOB1', 'approve Entering worktree'], 'blocked job: link + what it waits on');
+  A.eq(byName('ops').waitingOn, undefined, 'a working (not blocked) session has no waitingOn');
+  A.eq((await rc.remoteUrl('3439187a')).url, 'https://claude.ai/code/session_JOB1', 'remoteUrl prefers the job record over scraping logs');
+  const bare = C.makeClaudeCrew({ enabled: true, execFile: execOk, now: () => 1 });
+  A.eq((await bare.list()).sessions.length, 3, 'no fs/claudeHome -> listing unchanged (fail-soft)');
+
   A.report();
 })();

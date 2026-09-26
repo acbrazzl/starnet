@@ -117,7 +117,22 @@ function parseBackgroundId(text) {
   return m ? m[1] : null;
 }
 
-/* makeClaudeCrew({ enabled, execFile, bin, now, isDir, minPollMs, timeoutMs }) */
+/* CLAUDE CODE'S OWN RECORDS (best-effort, fail-soft). The CLI keeps two small JSON files per session that are
+   far more reliable than scraping `claude logs` (which only returns the recent SCREEN, so a Remote Control link
+   printed at startup scrolls out of it — the station then wrongly said "not connected yet"):
+     <claudeHome>/sessions/<pid>.json   { sessionId, name, kind, jobId?, bridgeSessionId: 'session_…' | null }
+                                        — every live session, interactive ones included; bridgeSessionId is set
+                                        while Remote Control is on
+     <claudeHome>/jobs/<id>/state.json  background jobs: { needs: 'approve Bash: …', detail: '…', bridgeSessionId }
+   These are undocumented internals: every field is optional, any read/parse failure just leaves the session as
+   the listing reported it, and the logs scrape remains the fallback for the URL. */
+function remoteUrlFromBridge(bridgeId) {
+  const b = String(bridgeId || '');
+  const m = b.match(/^(?:session_|cse_)([A-Za-z0-9]+)$/);
+  return m ? 'https://claude.ai/code/session_' + m[1] : null;
+}
+
+/* makeClaudeCrew({ enabled, execFile, bin, now, isDir, minPollMs, timeoutMs, fs, join, skillDirs, claudeHome }) */
 function makeClaudeCrew(opts) {
   const o = opts || {};
   const enabled = !!o.enabled;
@@ -128,6 +143,33 @@ function makeClaudeCrew(opts) {
   const skillDirs = Array.isArray(o.skillDirs) ? o.skillDirs.filter(Boolean) : [];
   const fsx = o.fs || null;   // { readdirSync, readFileSync } — injected; absent = no skill catalog
   const pathJoin = typeof o.join === 'function' ? o.join : (a, b) => String(a).replace(/[\\/]+$/, '') + '/' + b;
+  const claudeHome = o.claudeHome ? String(o.claudeHome) : '';
+
+  function readJson(file) {
+    try { return JSON.parse(fsx.readFileSync(file, 'utf8')); } catch (_) { return null; }   // absent/partial file = no record
+  }
+  /* enrich(sessions) — attach remoteUrl (any kind) and, for background jobs, what the session is waiting on. */
+  function enrich(sessions) {
+    if (!fsx || !claudeHome) return sessions;
+    const byId = new Map();
+    let files = [];
+    try { files = fsx.readdirSync(pathJoin(claudeHome, 'sessions')); } catch (_) { files = []; }   // no sessions dir = nothing to add
+    for (const f of files) {
+      if (!/^\d+\.json$/.test(f)) continue;
+      const j = readJson(pathJoin(pathJoin(claudeHome, 'sessions'), f));
+      if (j && typeof j.sessionId === 'string') byId.set(j.sessionId.toLowerCase(), j);
+    }
+    return sessions.map(s => {
+      const rec = byId.get(s.sessionId) || {};
+      const job = s.shortId ? (readJson(pathJoin(pathJoin(pathJoin(claudeHome, 'jobs'), s.shortId), 'state.json')) || {}) : {};
+      const url = remoteUrlFromBridge(rec.bridgeSessionId) || remoteUrlFromBridge(job.bridgeSessionId);
+      const out = Object.assign({}, s);
+      if (url) out.remoteUrl = url;
+      if (s.needsInput && typeof job.needs === 'string' && job.needs) out.waitingOn = str(job.needs, 240);
+      if (typeof job.detail === 'string' && job.detail) out.detail = str(job.detail, 160);
+      return out;
+    });
+  }
   const minPollMs = Number.isFinite(o.minPollMs) ? o.minPollMs : 2500;
   const timeoutMs = Number.isFinite(o.timeoutMs) ? o.timeoutMs : 30000;
   let cache = null, cacheAt = 0, inflight = null;
@@ -152,7 +194,7 @@ function makeClaudeCrew(opts) {
       const r = await run(['agents', '--json']);
       const out = r.err
         ? { ok: true, enabled: true, available: false, reason: why(r), sessions: [] }
-        : { ok: true, enabled: true, available: true, sessions: normalizeSessions(r.stdout) };
+        : { ok: true, enabled: true, available: true, sessions: enrich(normalizeSessions(r.stdout)) };
       cache = out; cacheAt = now ? now() : 0;
       return out;
     })();
@@ -208,6 +250,9 @@ function makeClaudeCrew(opts) {
     const id = str(shortId, 16);
     if (!SHORT_ID_RE.test(id)) return { ok: false, error: 'bad session id' };
     if (urls.has(id)) return { ok: true, url: urls.get(id) };
+    const job = (fsx && claudeHome) ? readJson(pathJoin(pathJoin(pathJoin(claudeHome, 'jobs'), id), 'state.json')) : null;
+    const fromJob = job && remoteUrlFromBridge(job.bridgeSessionId);
+    if (fromJob) { urls.set(id, fromJob); return { ok: true, url: fromJob }; }
     const r = await run(['logs', id]);
     if (r.err) return { ok: false, error: why(r) };
     const url = parseRemoteUrl(r.stdout);
@@ -218,4 +263,4 @@ function makeClaudeCrew(opts) {
   return { list, spawn, stop, remoteUrl, listSkills, enabled };
 }
 
-module.exports = { makeClaudeCrew, normalizeSessions, parseRemoteUrl, buildSpawnArgs, parseBackgroundId, parseSkill, SPAWN_MODES, ID_PREFIX, DEFAULT_SKILL_PROMPT };
+module.exports = { makeClaudeCrew, normalizeSessions, parseRemoteUrl, remoteUrlFromBridge, buildSpawnArgs, parseBackgroundId, parseSkill, SPAWN_MODES, ID_PREFIX, DEFAULT_SKILL_PROMPT };
