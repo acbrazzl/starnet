@@ -93,5 +93,15 @@ const RAW = JSON.stringify([
   A.eq(miss.available, false, 'missing binary -> unavailable, not a throw');
   A.ok(/not found/.test(miss.reason), 'missing binary reason is honest');
 
+
+  // ---- CREW rail: Claude sessions are a display-only group, never merged into the roster `present` ----
+  const fsm = require('node:fs');
+  const ui = fsm.readFileSync(require('node:path').join(__dirname, '..', 'frontend', 'app', 'stationui.js'), 'utf8');
+  const cc = fsm.readFileSync(require('node:path').join(__dirname, '..', 'frontend', 'app', 'claude-crew.js'), 'utf8');
+  A.ok(/function setExternalCrew\(list\)/.test(ui) && /setExternalCrew, leave/.test(ui), 'StationUI exposes setExternalCrew');
+  A.ok(!/present\s*=\s*[^;]*externalCrew/.test(ui) && !/present\.(push|concat)\([^)]*external/.test(ui), 'external crew never merges into the roster list');
+  A.ok(/crew-row crew-ext/.test(ui) && /ClaudeCrew\.open\(li\.dataset\.extId\)/.test(ui), 'rail rows open the Claude session card');
+  A.ok(/StationUI\.setExternalCrew\(list\)/.test(cc) && !/pushRoster\(|summonAgent\(/.test(cc), 'claude-crew feeds the rail and never touches the App roster');
+
   A.report();
 })();

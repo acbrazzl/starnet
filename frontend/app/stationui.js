@@ -66,6 +66,8 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   const THEMES = [['amber', '#ffaa33'], ['green', '#3dff70'], ['blue', '#46c8ff'], ['purple', '#b46bff'], ['red', '#ff4136'], ['white', '#e8f0e8']];
 
   let present = [];          // agent objects currently on the station
+  let externalCrew = [];     // CLAUDE CREW: display-only rows for the user's own `claude` sessions (frontend/app/claude-crew.js).
+                             // NEVER merged into `present` — that list is what dossiers, routing and permissions act on.
   const runningAgents = new Map();   // agentId -> live-run COUNT (concurrent streams can share an agentId, e.g. 'agent')
   const runSeenAt = new Map();       // agentId -> performance.now() of the last counted run.start (agentLive's veto grace)
   let crewLiveWired = false;         // the crew-status live listener is registered exactly once
@@ -1481,7 +1483,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   function crewRender() {
     wireCrewLive();   // ensure the per-agent run-state listener is live
     const ul = $('#crew'); if (!ul) return;
-    if (!present.length) {
+    if (!present.length && !externalCrew.length) {
       ul.innerHTML = '<li class="crew-empty"><div class="empty-state"><span class="es-glyph">▯</span><b>NO AGENTS ON STATION</b><span>Commission one from RECRUITMENT to begin.</span></div></li>';
       $('#crew-sum').innerHTML = '';
       return;
@@ -1498,9 +1500,13 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       // in-flight work bar: hidden until the row is .working (crewTick toggles it from the real run state).
       // The shimmer (.bar-active) reads as live activity; it's an indeterminate sweep, not a % readout.
       '<div class="crew-prog bar-active" id="cp-' + esc(a.id) + '" aria-hidden="true"><div></div></div>' +
-      '</div></li>').join('');
+      '</div></li>').join('') + externalCrewHtml();
     // (the head's roster count moved out — #crew-sum below the list already totals the same crew)
-    ul.querySelectorAll('.crew-row').forEach(li => {
+    ul.querySelectorAll('.crew-row.crew-ext').forEach(li => {
+      li.addEventListener('click', () => { sfx('click'); try { if (typeof ClaudeCrew !== 'undefined') ClaudeCrew.open(li.dataset.extId); } catch (_) {} });
+      li.addEventListener('keydown', ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); li.click(); } });
+    });
+    ul.querySelectorAll('.crew-row:not(.crew-ext)').forEach(li => {
       if (typeof AgentPortraits !== 'undefined') AgentPortraits.paint(li.querySelector('.crew-portrait img'), present[+li.dataset.i]);
       li.addEventListener('click', () => { sfx('click'); openAgent(+li.dataset.i); });
       li.addEventListener('keydown', ev => {
@@ -1513,7 +1519,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   // single global hero activity (which used to mark the whole crew WORKING in lockstep with the hero). The
   // talk/task text flavor still comes from the global activity (right for the common single-agent station).
   function crewTick() {
-    if (!present.length) return;
+    if (!present.length && !externalCrew.length) return;
     // self-heal: drop any tracked id no longer on the roster (a left agent, or a stale id left behind when an
     // aborted/dropped run's agent.run.end never reached the bus) so the panel can't get stuck showing it WORKING.
     for (const id of Array.from(runningAgents.keys())) { if (!present.some(a => a.id === id)) { runningAgents.delete(id); runSeenAt.delete(id); } }
@@ -1537,12 +1543,23 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       // H: mark the row WORKING so the in-flight shimmer bar shows only while it's actually running.
       if (e && e.parentElement && e.parentElement.parentElement) e.parentElement.parentElement.classList.toggle('working', live);
     });
+    // CLAUDE CREW rows: same search filter; their status text is set at render from the session's own state
+    const $ul = $('#crew');
+    if ($ul) $ul.querySelectorAll('.crew-row.crew-ext').forEach(row => {
+      const hide = !!crewQuery && !String(row.dataset.extName || '').toLowerCase().includes(crewQuery);
+      if (row.hidden !== hide) row.hidden = hide;
+      if (!row.hidden) visible++;
+    });
+    const extHead = $ul && $ul.querySelector('.crew-ext-head');
+    if (extHead) extHead.hidden = !!crewQuery && !$ul.querySelector('.crew-row.crew-ext:not([hidden])');
+    const extBusy = externalCrew.filter(x => x.busy).length, extNeeds = externalCrew.filter(x => x.needsInput).length;
     const sum = $('#crew-sum');
     const empty = $('#crew-search-empty');
     if (empty) empty.hidden = !crewQuery || visible > 0;
     if (sum) sum.innerHTML =
       '<span class="pos">▮ ' + working + ' WORKING</span>' +
-      '<span class="dim">▯ ' + (present.length - working) + ' IDLE</span>';
+      '<span class="dim">▯ ' + (present.length - working) + ' IDLE</span>' +
+      (externalCrew.length ? '<span class="dim">◆ ' + externalCrew.length + ' CLAUDE' + (extBusy ? ' · ' + extBusy + ' BUSY' : '') + (extNeeds ? ' · ' + extNeeds + ' NEED YOU' : '') + '</span>' : '');
     // #8: keep the canvas's screen-reader live region in sync (the <canvas> itself is opaque to AT).
     // Update only when the text actually changes so the region doesn't spam announcements every tick.
     const stageSum = $('#stage-summary');
@@ -9815,6 +9832,28 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
 
   // update the live roster WITHOUT re-running enter's one-time setup (legacy-task import, timer) — used
   // after a SUMMON adds a crew member so the crew panel + an open dossier reflect the new agent immediately.
+  function externalCrewHtml() {
+    if (!externalCrew.length) return '';
+    return '<li class="crew-ext-head" aria-hidden="true" style="padding:6px 8px 2px;opacity:.7;font-size:.85em;letter-spacing:.12em">◆ CLAUDE SESSIONS</li>' +
+      externalCrew.map((x, i) => {
+        const status = x.needsInput ? 'NEEDS YOU' : x.busy ? 'WORKING' : 'IDLE';
+        return '<li class="crew-row crew-ext' + (x.busy ? ' working' : '') + '" role="button" tabindex="0" aria-label="Open Claude session ' + esc(x.name) + '"' +
+          ' data-ext-id="' + esc(x.id) + '" data-ext-name="' + esc(x.name) + '" style="--ci:' + (present.length + i) + '">' +
+          '<span class="crew-portrait" aria-hidden="true" style="display:flex;align-items:center;justify-content:center;color:#d97757">◆</span>' +
+          '<span class="dot on"></span>' +
+          '<div class="crew-main">' +
+          '<div class="crew-name" style="color:#d97757;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(x.name) + '">' + esc(x.name) + '</div>' +
+          '<div class="crew-status"' + (x.needsInput ? ' style="color:#ffd34a"' : '') + '>' + status + (x.shortId ? ' · REMOTE' : '') + '</div>' +
+          '<div class="crew-prog bar-active" aria-hidden="true"><div></div></div>' +
+          '</div></li>';
+      }).join('');
+  }
+  // CLAUDE CREW (display-only): claude-crew.js hands the live session list here; rows open ClaudeCrew's card.
+  function setExternalCrew(list) {
+    externalCrew = Array.isArray(list) ? list.map(x => ({ id: String(x.id), name: String(x.name || x.id), busy: !!x.busy,
+      needsInput: !!x.needsInput, shortId: x.shortId || null })) : [];
+    crewRender();
+  }
   function setRoster(agents) {
     present = Array.isArray(agents) ? agents : (agents ? [agents] : []);
     if (sel >= present.length) sel = 0;
@@ -9865,7 +9904,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   // GROWTH Tier 3: repaint the Settings AUTONOMY panel's EARNED badge if it is open (no-op otherwise — the paint fn
   // queries its own (possibly detached) host nodes, so a closed panel costs nothing). Called after a trust accept.
   const repaintAutonomy = () => { try { if (repaintAutonomyDial) repaintAutonomyDial(); } catch (_) {} };
-  return { init, enter, setRoster, leave, clearRunning, runningCount: () => runningAgents.size, isAgentRunning: (id) => agentLive(id), notify, flashSave, openAgent, openArcade, toggleTerm, openTerm, closeTerm, rerender, refreshBoard: refreshBoardLive, pokeQuests, setTheme, getTheme, repaintAutonomy, registerWindow, h };
+  return { init, enter, setRoster, setExternalCrew, leave, clearRunning, runningCount: () => runningAgents.size, isAgentRunning: (id) => agentLive(id), notify, flashSave, openAgent, openArcade, toggleTerm, openTerm, closeTerm, rerender, refreshBoard: refreshBoardLive, pokeQuests, setTheme, getTheme, repaintAutonomy, registerWindow, h };
 })();
 
 if (typeof module !== 'undefined' && module.exports) module.exports = { visibleTerminalRect, clampTerminalSize };

@@ -66,6 +66,16 @@
       try { World.despawnAgent(id); } catch (_) {}
       bodies.delete(id);
     }
+    pushRail();
+  }
+  // the top-left CREW rail lists sessions too (display-only group); repaint it only when something visible changed
+  let railSig = '';
+  function pushRail() {
+    const list = [...bodies.values()];
+    const sig = JSON.stringify(list.map(x => [x.id, x.name, x.busy, x.needsInput, x.shortId]));
+    if (sig === railSig) return;
+    railSig = sig;
+    try { if (typeof StationUI !== 'undefined' && StationUI.setExternalCrew) StationUI.setExternalCrew(list); } catch (_) {}
   }
 
   async function poll() {
