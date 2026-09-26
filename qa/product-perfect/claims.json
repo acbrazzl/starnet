@@ -18,7 +18,7 @@
   "expectedClaimCount": 37,
   "releaseSurface": {
     "algorithm": "sha256",
-    "sourceCommit": "d17529c1577b26c3db05b7b4c7f4c3afafb40192",
+    "sourceCommit": "fb36bf10ef84bc1f1212f92bea2a7115a61f8378",
     "pathSetSha256": "28f326cff65f959e5a5c62528357c8a3ab8c9cd3f49284681d9d9766ebe79955",
     "files": [
       {
@@ -343,8 +343,8 @@
       },
       {
         "path": "frontend/app/claude-crew.js",
-        "bytes": 11619,
-        "sha256": "c7c4d4024c27090c58076e2bdfec026949f6242145460a2cedb99e106214f68b"
+        "bytes": 12292,
+        "sha256": "e428bfa3bf3e220e1c3d1acb4e02afd892bd61d524d4c7e712d5667ea6a6f40f"
       },
       {
         "path": "frontend/app/cloudsave.js",
