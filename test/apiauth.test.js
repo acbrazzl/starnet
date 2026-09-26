@@ -78,4 +78,23 @@ A.eq(auth.constTimeEq(null, TOK), false, 'null vs token -> false, no throw');
 A.eq(auth.constTimeEq(TOK, TOK), true, 'equal strings compare true');
 A.eq(auth.constTimeEq('x', 'yy'), false, 'unequal-length -> false');
 
+// ---- REMOTE HOSTS (opt-in STARNET_REMOTE_HOSTS): exact names / plain IPv4 only; loopback behaviour unchanged ----
+const RH = auth.parseRemoteHosts(' Box.Tail-1234.ts.net , *.evil.com, http://x.com, 10.0.0.1:80, bad_name.com, ok.lan, 10.147.17.5, 10.0.0.0/8, 999.1.1.1, 127.0.0.1, 010.1.1.1 ');
+A.eq(RH, ['box.tail-1234.ts.net', 'ok.lan', '10.147.17.5'], 'remote hosts: exact names + plain IPv4 kept; wildcard/scheme/port/underscore/CIDR/out-of-range/loopback/zero-padded rejected');
+A.eq(auth.parseRemoteHosts(''), [], 'remote hosts: unset -> none');
+A.eq(auth.isAllowedHost('box.tail-1234.ts.net', RH), true, 'listed name allowed');
+A.eq(auth.isAllowedHost('box.tail-1234.ts.net:443', RH), true, 'listed name with port allowed');
+A.eq(auth.isAllowedHost('10.147.17.5:' + PORT, RH), true, 'listed overlay IP with port allowed');
+A.eq(auth.isAllowedHost('box.tail-1234.ts.net'), false, 'remote name refused when not opted in');
+A.eq(auth.isAllowedHost('10.147.17.5'), false, 'overlay IP refused when not opted in');
+A.eq(auth.isAllowedHost('evil.box.tail-1234.ts.net', RH), false, 'subdomain of a listed name refused');
+A.eq(auth.isAllowedHost('10.147.17.6', RH), false, 'unlisted IP refused');
+A.eq(auth.isAllowedHost('127.0.0.1:' + PORT, RH), true, 'loopback still allowed with remote hosts set');
+A.eq(auth.isAllowedApiOrigin('https://box.tail-1234.ts.net', PORT, RH), true, 'https origin of a listed name allowed');
+A.eq(auth.isAllowedApiOrigin('http://10.147.17.5:' + PORT, PORT, RH), true, 'http origin of a listed IP on the station port allowed');
+A.eq(auth.isAllowedApiOrigin('http://10.147.17.5:9999', PORT, RH), false, 'http origin on another port refused');
+A.eq(auth.isAllowedApiOrigin('http://box.tail-1234.ts.net', PORT, RH), false, 'portless plain-http origin refused');
+A.eq(auth.isAllowedApiOrigin('https://box.tail-1234.ts.net', PORT), false, 'listed origin refused when not opted in');
+A.eq(auth.isAllowedApiOrigin('https://evil.com', PORT, RH), false, 'foreign origin still refused with remote hosts set');
+
 A.report('apiauth.test');

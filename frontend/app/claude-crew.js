@@ -46,15 +46,17 @@
     for (const s of sessions) {
       seen.add(s.id);
       const prev = bodies.get(s.id);
-      if (!prev) {
+      // relabel() doubles as the presence check (true iff a body with this id is on the floor). The floor is
+      // rebuilt by loadStation after onboarding / station switches, so a body can vanish under us: re-spawn it.
+      let present = false;
+      try { present = !!(World.relabel && World.relabel(s.id, s.name)); } catch (_) {}
+      if (!present) {
         try {
           if (typeof registerAgent === 'function') registerAgent(s.id, COLOR);
           World.spawnAgent({ id: s.id, name: s.name, color: COLOR, skin: SKIN });
         } catch (_) { continue; }
-      } else if (prev.name !== s.name && World.relabel) {
-        try { World.relabel(s.id, s.name); } catch (_) {}
       }
-      if (!prev || prev.busy !== s.busy) {
+      if (!present || !prev || prev.busy !== s.busy) {
         try { World.setActivityFor(s.id, s.busy ? 'task' : 'idle'); } catch (_) {}
       }
       bodies.set(s.id, s);

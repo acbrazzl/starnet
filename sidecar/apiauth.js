@@ -28,20 +28,29 @@ function isAllowedApiOrigin(origin, port, remoteHosts) {
   if (!origin) return true;
   if (origin === 'null') return false;                 // file:/sandboxed origins are never the app
   if (loopbackOrigins(port).has(origin) || TAURI_ORIGINS.has(origin)) return true;
-  // an operator-named remote host (see parseRemoteHosts) is reached over TLS only, at its bare https origin
-  return !!(remoteHosts && remoteHosts.length && remoteHosts.some(h => origin === 'https://' + h));
+  // an operator-named remote host (see parseRemoteHosts): its bare https origin (a TLS front such as
+  // `tailscale serve`), or plain http on the STATION'S OWN port (an encrypted overlay such as ZeroTier, where the
+  // page is reached as http://<overlay-ip>:<port> through dev/overlay-forward.js). No other port or scheme.
+  return !!(remoteHosts && remoteHosts.length && remoteHosts.some(h =>
+    origin === 'https://' + h || origin === 'http://' + h + ':' + port));
 }
 
-/* REMOTE HOSTS (opt-in, STARNET_REMOTE_HOSTS). A comma-separated list of EXACT hostnames — e.g. the node's
-   Tailscale name `box.tailnet-1234.ts.net` fronted by `tailscale serve` — that may reach the station besides
+/* REMOTE HOSTS (opt-in, STARNET_REMOTE_HOSTS). A comma-separated list of EXACT hostnames or IPv4 addresses —
+   e.g. a Tailscale name `box.tailnet-1234.ts.net` fronted by `tailscale serve`, or this machine's ZeroTier
+   address `10.147.17.5` reached through dev/overlay-forward.js — that may reach the station besides
    loopback. This widens the DNS-rebinding pin by exactly the names listed: a rebinding attacker cannot make the
    victim's browser send a Host it does not control, and these names resolve only inside the operator's tailnet.
    The per-launch token still gates every /api route. What it does NOT defend: any device that can load the page
    at that name can read the token injected into it — the network fence (tailnet ACLs) IS the trust boundary, so
-   never list a publicly reachable name. Wildcards, IPs-by-range, ports and schemes are rejected, not guessed. */
-const REMOTE_HOST_RE = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
+   never list a publicly reachable name or address. Wildcards, CIDR ranges, ports and schemes are rejected, not guessed. */
+// a dotted DNS name whose last label starts with a letter (so an all-digit string is never taken for a name)
+const REMOTE_HOST_RE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+function isIPv4(x) {
+  const m = String(x).match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  return !!m && m.slice(1).every(o => Number(o) <= 255 && String(Number(o)) === o) && m[1] !== '0' && m[1] !== '127';
+}
 function parseRemoteHosts(raw) {
-  return String(raw || '').split(',').map(x => x.trim().toLowerCase()).filter(x => REMOTE_HOST_RE.test(x));
+  return String(raw || '').split(',').map(x => x.trim().toLowerCase()).filter(x => REMOTE_HOST_RE.test(x) || isIPv4(x));
 }
 // Host must be loopback — this is the DNS-rebinding defense (a rebinding attacker's forged Host fails here).
 function isAllowedHost(host, remoteHosts) {
