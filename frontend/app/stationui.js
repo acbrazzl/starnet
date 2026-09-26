@@ -1519,7 +1519,9 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   // single global hero activity (which used to mark the whole crew WORKING in lockstep with the hero). The
   // talk/task text flavor still comes from the global activity (right for the common single-agent station).
   function crewTick() {
-    if (!present.length && !externalCrew.length) return;
+    // CLAUDE CREW rows ride along; read defensively because unit tests run crewTick alone in a vm sandbox
+    const ext = (typeof externalCrew === 'undefined') ? [] : externalCrew;
+    if (!present.length && !ext.length) return;
     // self-heal: drop any tracked id no longer on the roster (a left agent, or a stale id left behind when an
     // aborted/dropped run's agent.run.end never reached the bus) so the panel can't get stuck showing it WORKING.
     for (const id of Array.from(runningAgents.keys())) { if (!present.some(a => a.id === id)) { runningAgents.delete(id); runSeenAt.delete(id); } }
@@ -1552,14 +1554,14 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     });
     const extHead = $ul && $ul.querySelector('.crew-ext-head');
     if (extHead) extHead.hidden = !!crewQuery && !$ul.querySelector('.crew-row.crew-ext:not([hidden])');
-    const extBusy = externalCrew.filter(x => x.busy).length, extNeeds = externalCrew.filter(x => x.needsInput).length;
+    const extBusy = ext.filter(x => x.busy).length, extNeeds = ext.filter(x => x.needsInput).length;
     const sum = $('#crew-sum');
     const empty = $('#crew-search-empty');
     if (empty) empty.hidden = !crewQuery || visible > 0;
     if (sum) sum.innerHTML =
       '<span class="pos">▮ ' + working + ' WORKING</span>' +
       '<span class="dim">▯ ' + (present.length - working) + ' IDLE</span>' +
-      (externalCrew.length ? '<span class="dim">◆ ' + externalCrew.length + ' CLAUDE' + (extBusy ? ' · ' + extBusy + ' BUSY' : '') + (extNeeds ? ' · ' + extNeeds + ' NEED YOU' : '') + '</span>' : '');
+      (ext.length ? '<span class="dim">◆ ' + ext.length + ' CLAUDE' + (extBusy ? ' · ' + extBusy + ' BUSY' : '') + (extNeeds ? ' · ' + extNeeds + ' NEED YOU' : '') + '</span>' : '');
     // #8: keep the canvas's screen-reader live region in sync (the <canvas> itself is opaque to AT).
     // Update only when the text actually changes so the region doesn't spam announcements every tick.
     const stageSum = $('#stage-summary');
