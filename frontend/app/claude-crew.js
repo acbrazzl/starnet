@@ -191,13 +191,20 @@
     for (const [v, t] of [['default', 'ask me (answer over Remote Control)'], ['plan', 'plan only (read-only)'], ['acceptEdits', 'accept file edits'], ['auto', 'auto']]) {
       const o = el('option', '', t); o.value = v; mode.appendChild(o);
     }
-    const prompt = field('FIRST MESSAGE (optional)', el('textarea', IN + 'height:90px;'));
+    const skill = field('SKILL (optional)', el('select', IN));
+    { const o = el('option', '', '— none —'); o.value = ''; skill.appendChild(o); }
+    api('/api/claude-crew/skills').then(r => {
+      for (const sk of (r && r.skills) || []) { const o = el('option', '', sk.name); o.value = sk.name; o.title = sk.description || ''; skill.appendChild(o); }
+      if (r && r.defaultDir && !cwd.value) cwd.value = r.defaultDir;
+    }).catch(() => {});
+    skill.addEventListener('change', () => { if (skill.value && !name.value.trim()) name.value = skill.value.replace(/^meshflow-/, '').slice(0, 40); });
+    const prompt = field('FIRST MESSAGE (optional — a skill loads, reports and waits without one)', el('textarea', IN + 'height:90px;'));
     const status = el('div', 'min-height:22px;margin-top:4px;color:#8a93b2;');
     const go = el('button', BUTTON, 'LAUNCH');
     go.addEventListener('click', async () => {
       go.disabled = true; status.textContent = 'launching…';
       const res = await api('/api/claude-crew/spawn', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: name.value.trim(), cwd: cwd.value.trim(), permissionMode: mode.value, prompt: prompt.value }) });
+        body: JSON.stringify({ name: name.value.trim(), cwd: cwd.value.trim(), permissionMode: mode.value, prompt: prompt.value, skill: skill.value }) });
       if (res.ok) { status.textContent = 'launched ' + (res.shortId || '') + ' — it will walk in shortly'; setTimeout(closeCard, 1500); poll(); }
       else { go.disabled = false; status.textContent = res.error || 'launch failed'; }
     });

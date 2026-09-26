@@ -28,6 +28,10 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const SPAWN_MODES = ['default', 'plan', 'acceptEdits', 'auto'];   // NEVER bypassPermissions / dontAsk
 const NAME_RE = /^[A-Za-z0-9 ._-]{1,40}$/;
 const PROMPT_MAX = 8000;
+// the first message a skilled session gets when the launcher gave none: load, orient read-only, report, wait
+const DEFAULT_SKILL_PROMPT = 'Load this skill and orient yourself read-only (current state, open work, anything in flight). ' +
+  'Reply with a short readiness summary: what you own, what looks most useful to do first. ' +
+  'Do NOT make changes, run builds, touch devices, or push — wait for instructions from the operator over Remote Control.';
 const REMOTE_URL_RE = /https:\/\/claude\.ai\/code\/session_[A-Za-z0-9]+/g;
 const ANSI_RE = /\x1b\[[0-9;?]*[ -\/]*[@-~]|\x1b\][^\x07]*\x07/g;
 
@@ -73,7 +77,21 @@ function parseRemoteUrl(text) {
   return m && m.length ? m[m.length - 1] : null;
 }
 
-/* buildSpawnArgs({ name, prompt, permissionMode }) -> { ok, args } | { ok:false, error }.
+/* SKILLS. The user's Claude Code skills live as <dir>/<name>/SKILL.md with a YAML frontmatter `name:` and
+   `description:`. parseSkill reads just those two fields (no YAML dep); a directory without a SKILL.md is not a
+   skill. A session launched with a skill starts with `/<name>` as its first line — Claude Code's own way to load
+   one — so the skill text never passes through StarNet at all. */
+const SKILL_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
+function parseSkill(dirName, text) {
+  const t = String(text || '');
+  const fm = t.match(/^---\s*\n([\s\S]*?)\n---/);
+  const field = k => { const m = fm && fm[1].match(new RegExp('^' + k + ':\\s*(.*)$', 'm')); return m ? m[1].trim().replace(/^["']|["']$/g, '') : ''; };
+  const name = field('name') || dirName;
+  if (!SKILL_NAME_RE.test(name)) return null;
+  return { name, description: str(field('description'), 300) };
+}
+
+/* buildSpawnArgs({ name, prompt, permissionMode, skill }) -> { ok, args } | { ok:false, error }.
    argv only (execFile, no shell), so the prompt can carry any text without injection risk. */
 function buildSpawnArgs(o) {
   o = o || {};
@@ -81,8 +99,13 @@ function buildSpawnArgs(o) {
   if (!NAME_RE.test(name)) return { ok: false, error: 'name must be 1-40 chars of letters, digits, space, . _ -' };
   const mode = o.permissionMode == null || o.permissionMode === '' ? 'default' : String(o.permissionMode);
   if (SPAWN_MODES.indexOf(mode) < 0) return { ok: false, error: 'permissionMode must be one of ' + SPAWN_MODES.join(', ') };
-  const prompt = String(o.prompt == null ? '' : o.prompt);
+  let prompt = String(o.prompt == null ? '' : o.prompt);
   if (prompt.length > PROMPT_MAX) return { ok: false, error: 'prompt too long' };
+  if (o.skill != null && o.skill !== '') {
+    const skill = String(o.skill);
+    if (!SKILL_NAME_RE.test(skill)) return { ok: false, error: 'bad skill name' };
+    prompt = '/' + skill + '\n\n' + (prompt.trim() || DEFAULT_SKILL_PROMPT);
+  }
   const args = ['--bg', '--remote-control', name, '--name', name, '--permission-mode', mode];
   if (prompt.trim()) args.push('--', prompt);
   return { ok: true, args };
@@ -102,6 +125,9 @@ function makeClaudeCrew(opts) {
   const bin = o.bin || 'claude';
   const now = typeof o.now === 'function' ? o.now : null;   // injected clock (lint-determinism); none = no list cache
   const isDir = typeof o.isDir === 'function' ? o.isDir : () => false;
+  const skillDirs = Array.isArray(o.skillDirs) ? o.skillDirs.filter(Boolean) : [];
+  const fsx = o.fs || null;   // { readdirSync, readFileSync } — injected; absent = no skill catalog
+  const pathJoin = typeof o.join === 'function' ? o.join : (a, b) => String(a).replace(/[\\/]+$/, '') + '/' + b;
   const minPollMs = Number.isFinite(o.minPollMs) ? o.minPollMs : 2500;
   const timeoutMs = Number.isFinite(o.timeoutMs) ? o.timeoutMs : 30000;
   let cache = null, cacheAt = 0, inflight = null;
@@ -133,9 +159,30 @@ function makeClaudeCrew(opts) {
     try { return await inflight; } finally { inflight = null; }
   }
 
+  /* listSkills() -> [{ name, description, dir }] across skillDirs (first dir wins on a duplicate name). */
+  function listSkills() {
+    if (!enabled || !fsx) return [];
+    const out = [], seen = new Set();
+    for (const dir of skillDirs) {
+      let entries = [];
+      try { entries = fsx.readdirSync(dir); } catch (_) { entries = []; }   // a missing skills dir is simply empty
+      for (const ent of entries.sort()) {
+        let text = null;
+        try { text = fsx.readFileSync(pathJoin(pathJoin(dir, ent), 'SKILL.md'), 'utf8'); } catch (_) { text = null; }   // no SKILL.md = not a skill
+        if (text == null) continue;
+        const sk = parseSkill(ent, text);
+        if (!sk || seen.has(sk.name)) continue;
+        seen.add(sk.name);
+        out.push(Object.assign(sk, { dir }));
+      }
+    }
+    return out;
+  }
+
   async function spawn(body) {
     if (!enabled) return { ok: false, error: 'claude crew disabled (STARNET_CLAUDE_CREW=1)' };
     const b = body || {};
+    if (b.skill && !listSkills().some(sk => sk.name === String(b.skill))) return { ok: false, error: 'unknown skill: ' + str(b.skill, 64) };
     const cwd = str(b.cwd, 400);
     if (!cwd || !isDir(cwd)) return { ok: false, error: 'cwd must be an existing absolute directory' };
     const built = buildSpawnArgs(b);
@@ -168,7 +215,7 @@ function makeClaudeCrew(opts) {
     return { ok: true, url };                            // url:null = Remote Control not (yet) connected — said, not guessed
   }
 
-  return { list, spawn, stop, remoteUrl, enabled };
+  return { list, spawn, stop, remoteUrl, listSkills, enabled };
 }
 
-module.exports = { makeClaudeCrew, normalizeSessions, parseRemoteUrl, buildSpawnArgs, parseBackgroundId, SPAWN_MODES, ID_PREFIX };
+module.exports = { makeClaudeCrew, normalizeSessions, parseRemoteUrl, buildSpawnArgs, parseBackgroundId, parseSkill, SPAWN_MODES, ID_PREFIX, DEFAULT_SKILL_PROMPT };

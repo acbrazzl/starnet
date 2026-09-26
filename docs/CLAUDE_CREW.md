@@ -25,6 +25,18 @@ session in it would make StarNet try to drive it. Claude Crew is a projection of
 | tap a body / row → OPEN REMOTE | the `https://claude.ai/code/session_…` URL scraped from `claude logs <id>` |
 | STOP | `claude stop <id>` |
 
+**Skills.** A new session can start with one of your Claude Code skills (`~/.claude/skills/*/SKILL.md`, plus
+`STARNET_CLAUDE_SKILL_DIRS`). Its first line becomes `/<skill>`, so Claude Code loads the skill itself. With no
+message, it loads the skill, orients read-only, reports readiness and waits.
+
+**The Overseer can staff the crew.** The lead agent gets three tools on the orchestrator capability:
+- `claude.crew` (read): lists the sessions and the available skills.
+- `claude.launch` (execute, consent): starts a session, optionally skilled, in `STARNET_CLAUDE_CREW_DIR` or a
+  given trusted directory.
+- `claude.stop` (consent): stops a background session.
+
+So "spin up a social agent" works from COMMS.
+
 Terminal (interactive) sessions are shown read-only. They have no background id to stop or read logs from;
 run `/remote-control` inside one to reach it from your phone.
 

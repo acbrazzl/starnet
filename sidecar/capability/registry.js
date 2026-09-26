@@ -274,7 +274,13 @@
       // create or alter future autonomous work. Model tools never accept the host-run check command.
       { capId: 'orchestrator', tool: 'loop.list', scope: 'read', requiresConsent: false, network: false },
       { capId: 'orchestrator', tool: 'loop.create', scope: 'write', requiresConsent: true, network: false },
-      { capId: 'orchestrator', tool: 'loop.manage', scope: 'write', requiresConsent: true, network: false }
+      { capId: 'orchestrator', tool: 'loop.manage', scope: 'write', requiresConsent: true, network: false },
+      // CLAUDE CREW: the lead sees and staffs the Commander's own Claude Code sessions (tools/builtin/claude-crew.js).
+      // launch is execute+consent (starts real subscription-spending work that outlives the turn; never off a
+      // cached autonomous grant), stop is consent-gated (ends someone's running work), listing is free.
+      { capId: 'orchestrator', tool: 'claude.crew', scope: 'read', requiresConsent: false, network: false },
+      { capId: 'orchestrator', tool: 'claude.launch', scope: 'execute', requiresConsent: true, network: true },
+      { capId: 'orchestrator', tool: 'claude.stop', scope: 'write', requiresConsent: true, network: false }
     ],
     // STUDIO (media skills): text->image generation + image vision analysis, both on the SAME BYOK OpenRouter
     // key the agent already uses (no new provider). image_generate WRITES a file into the agent's workspace, so

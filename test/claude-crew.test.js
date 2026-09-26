@@ -103,5 +103,46 @@ const RAW = JSON.stringify([
   A.ok(/crew-row crew-ext/.test(ui) && /ClaudeCrew\.open\(li\.dataset\.extId\)/.test(ui), 'rail rows open the Claude session card');
   A.ok(/StationUI\.setExternalCrew\(list\)/.test(cc) && !/pushRoster\(|summonAgent\(/.test(cc), 'claude-crew feeds the rail and never touches the App roster');
 
+
+  // ---- SKILLS: catalog from SKILL.md frontmatter; a skilled launch starts with /<skill> ----
+  A.eq(C.parseSkill('x', '---\nname: meshflow-social\ndescription: "Posting plans"\n---\nbody'), { name: 'meshflow-social', description: 'Posting plans' }, 'frontmatter name + description parsed');
+  A.eq(C.parseSkill('dirname', 'no frontmatter'), { name: 'dirname', description: '' }, 'no frontmatter falls back to the dir name');
+  A.eq(C.parseSkill('x', '---\nname: ../evil\n---'), null, 'a hostile skill name is rejected');
+  const files = { '/s1/a/SKILL.md': '---\nname: alpha\ndescription: A\n---', '/s1/nope/README.md': 'x', '/s2/a/SKILL.md': '---\nname: alpha\ndescription: dup\n---', '/s2/b/SKILL.md': '---\nname: beta\n---' };
+  const dirs = { '/s1': ['a', 'nope'], '/s2': ['b', 'a'] };
+  const fakeFs = { readdirSync: d => { if (!dirs[d]) throw new Error('ENOENT'); return dirs[d].slice(); }, readFileSync: f => { if (!(f in files)) throw new Error('ENOENT'); return files[f]; } };
+  const sk = C.makeClaudeCrew({ enabled: true, execFile, fs: fakeFs, skillDirs: ['/s1', '/s2', '/missing'], isDir: () => true });
+  A.eq(sk.listSkills().map(x => [x.name, x.description]), [['alpha', 'A'], ['beta', '']], 'skills listed across dirs; no-SKILL.md dirs skipped; first dir wins; missing dir tolerated');
+  const skilled = C.buildSpawnArgs({ name: 'social', skill: 'alpha' }).args;
+  A.eq(skilled[skilled.length - 1], '/alpha\n\n' + C.DEFAULT_SKILL_PROMPT, 'skill with no message: /skill + load-and-wait prompt');
+  A.eq(C.buildSpawnArgs({ name: 's', skill: 'alpha', prompt: 'post today' }).args.slice(-1)[0], '/alpha\n\npost today', 'skill + message');
+  A.eq(C.buildSpawnArgs({ name: 's', skill: '../x' }).ok, false, 'bad skill name refused before spawn');
+  A.eq((await sk.spawn({ name: 's', skill: 'gamma', cwd: '/w' })).ok, false, 'unknown skill refused (catalog-checked)');
+  A.eq(C.makeClaudeCrew({ enabled: false, fs: fakeFs, skillDirs: ['/s1'] }).listSkills(), [], 'disabled: no catalog');
+
+  // ---- the lead's tools: claude.crew / claude.launch / claude.stop ----
+  const T = require('../sidecar/tools/builtin/claude-crew.js');
+  const spawned = [];
+  const fakeCrew = { enabled: true, list: async () => ({ available: true, sessions: C.normalizeSessions(RAW) }),
+    listSkills: () => [{ name: 'alpha', description: 'A' }],
+    spawn: async b => { spawned.push(b); return b.skill === 'bad' ? { ok: false, error: 'unknown skill: bad' } : { ok: true, shortId: 'abcd1234' }; },
+    stop: async id => (id === 'abcd1234' ? { ok: true } : { ok: false, error: 'bad session id' }) };
+  const tools = T.makeClaudeCrewTools({ crew: fakeCrew, defaultCwd: '/home/u/code' });
+  A.eq([tools.crewTool.requiresConsent, tools.launchTool.requiresConsent, tools.launchTool.scope, tools.stopTool.requiresConsent], [false, true, 'execute', true], 'listing is free; launch (execute) and stop ask first');
+  const listing = JSON.parse((await tools.crewTool.run({})).content);
+  A.eq([listing.sessions.length, listing.sessions[2].status, listing.skills[0].name], [3, 'needs-you', 'alpha'], 'crew listing carries status incl. needs-you, plus skills');
+  const launched = await tools.launchTool.run({ name: 'social', skill: 'alpha' });
+  A.eq([spawned[0].cwd, spawned[0].skill, spawned[0].permissionMode], ['/home/u/code', 'alpha', 'default'], 'launch defaults: station dir, ask-first permissions');
+  A.ok(/launched Claude session "social" with \/alpha \(abcd1234\)/.test(launched.summary), 'launch summary names skill and id');
+  let err = null; try { await tools.launchTool.run({ name: 'x', skill: 'bad' }); } catch (e) { err = e; }
+  A.ok(err && /unknown skill/.test(err.message), 'a failed launch throws (never reported as done)');
+  err = null; try { await T.makeClaudeCrewTools({ crew: fakeCrew }).launchTool.run({ name: 'x' }); } catch (e) { err = e; }
+  A.ok(err && /no directory/.test(err.message), 'no default dir and no dir -> refused');
+  A.eq((await tools.stopTool.run({ id: 'abcd1234' })).summary, 'stopped Claude session abcd1234', 'stop ok');
+  err = null; try { await T.makeClaudeCrewTools({ crew: { enabled: false } }).crewTool.run({}); } catch (e) { err = e; }
+  A.ok(err && /STARNET_CLAUDE_CREW/.test(err.message), 'crew off -> honest error');
+  const capReg = fsm.readFileSync(require('node:path').join(__dirname, '..', 'sidecar', 'capability', 'registry.js'), 'utf8');
+  A.ok(['claude.crew', 'claude.launch', 'claude.stop'].every(t => capReg.includes("capId: 'orchestrator', tool: '" + t + "'")), 'all three tools are on the orchestrator allowlist (lead-only)');
+
   A.report();
 })();

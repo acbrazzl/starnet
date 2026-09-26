@@ -3960,7 +3960,13 @@ const claudeCrew = require('./claude-crew.js').makeClaudeCrew({
   enabled: /^(1|true|yes|on)$/i.test(String(ENV('CLAUDE_CREW') || '').trim()),
   execFile, bin: String(ENV('CLAUDE_BIN') || 'claude'), now: () => Date.now(),
   isDir: p => { try { return path.isAbsolute(p) && fs.statSync(p).isDirectory(); } catch (_) { return false; } },
+  // Claude Code skills a crew session can be launched with: the user's own (~/.claude/skills) plus any extra dirs
+  fs, join: path.join,
+  skillDirs: [path.join(require('node:os').homedir(), '.claude', 'skills')]
+    .concat(String(ENV('CLAUDE_SKILL_DIRS') || '').split(path.delimiter).filter(Boolean)),
 });
+// where the Overseer's claude.launch works by default (an absolute dir Claude Code already trusts)
+const CLAUDE_CREW_DIR = String(ENV('CLAUDE_CREW_DIR') || '');
 const overseer = require('./overseer.js').makeOverseer({ fs, path, writeDurable: writeFileDurable,
   file: path.join(WORKSPACES, 'overseer.json'), now: () => Date.now(),
   newId: () => 'ws_' + crypto.randomUUID().replace(/-/g, ''),
@@ -9589,6 +9595,7 @@ const ROUTES = [
   { m: 'POST', exact: '/api/claude-crew/spawn', h: handleClaudeCrewSpawn },
   { m: 'POST', exact: '/api/claude-crew/stop', h: handleClaudeCrewStop },
   { m: 'GET', qsplit: '/api/claude-crew/remote', h: handleClaudeCrewRemote },
+  { m: 'GET', exact: '/api/claude-crew/skills', h: (req, res) => claudeCrewJson(res, 200, { ok: true, enabled: claudeCrew.enabled, skills: claudeCrew.listSkills().map(sk => ({ name: sk.name, description: sk.description })), defaultDir: CLAUDE_CREW_DIR || undefined }) },
   // honest concurrency surface: how many distinct agents can RUN at once (the gate that silently 'refuses'
   // excess parallel workers). The summon bay reads this so the ceiling is visible BEFORE a fan-out, not only
   // inside the model's tool result. (WIRING_AUDIT P4: lie #7.)
@@ -16035,6 +16042,9 @@ async function runOnceCore(o) {
     removeLoop: modelRemoveLoop,
     verdictLoop: modelVerdictLoop
   }).register(registry);
+  // claude.crew / claude.launch / claude.stop — the lead staffs the Commander's own Claude Code sessions
+  // (tools/builtin/claude-crew.js). Lead-only via the orchestrator capability; launch/stop are consent-gated.
+  require('./tools/builtin/claude-crew.js').makeClaudeCrewTools({ crew: claudeCrew, defaultCwd: CLAUDE_CREW_DIR }).register(registry);
   /* channel.targets / channel.send — OUTBOUND messaging reach (see tools/builtin/comms.js for the security
      rationale on known-targets-only). Both hang off the placed DISH under their own 'comms' capId. */
   makeCommsTools({
