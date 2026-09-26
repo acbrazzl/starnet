@@ -1,0 +1,14 @@
+{
+  "name": "StarNet",
+  "short_name": "StarNet",
+  "description": "A living pixel-art station where real AI agents do real work.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0b1020",
+  "theme_color": "#0b1020",
+  "icons": [
+    { "src": "assets/brand/app-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+  ]
+}

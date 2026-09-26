@@ -9,13 +9,16 @@ const RAW = JSON.stringify([
   { id: '54946c2f', cwd: '/home/u/code', kind: 'background', startedAt: 1, sessionId: U1, name: 'ops', state: 'working' },
   { pid: 9, cwd: '/home/u/code/x', kind: 'interactive', startedAt: 2, sessionId: U2, name: 'meshflow-ff', status: 'idle' },
   { kind: 'interactive', sessionId: 'not-a-uuid', status: 'busy' },
+  { id: '3439187a', kind: 'background', sessionId: '3439187a-0000-4000-8000-000000000000', name: 'delta', status: 'waiting', state: 'blocked' },
   null,
 ]);
 
 (async () => {
   // ---- normalizeSessions ----
   const s = C.normalizeSessions(RAW);
-  A.eq(s.length, 2, 'entries without a uuid sessionId are dropped');
+  A.eq(s.length, 3, 'entries without a uuid sessionId are dropped');
+  A.eq([s[2].needsInput, s[2].busy], [true, false], 'blocked session needs the operator and is not busy');
+  A.eq(s[0].needsInput, false, 'working session does not need input');
   A.eq(s[0].id, 'cc-' + U1, 'floor id is namespaced cc-<uuid>');
   A.ok(s[0].id.length <= 40, 'floor id fits the roster id cap');
   A.eq(s[0].busy, true, 'background state:working is busy');
@@ -64,7 +67,7 @@ const RAW = JSON.stringify([
 
   const crew = C.makeClaudeCrew({ enabled: true, execFile, bin: '/opt/claude', now: () => t, isDir: p => p === '/work', minPollMs: 2500 });
   const l1 = await crew.list();
-  A.eq([l1.available, l1.sessions.length, calls[0].bin], [true, 2, '/opt/claude'], 'list parses sessions via the configured bin');
+  A.eq([l1.available, l1.sessions.length, calls[0].bin], [true, 3, '/opt/claude'], 'list parses sessions via the configured bin');
   await crew.list();
   A.eq(calls.length, 1, 'list is cached inside minPollMs');
   t += 3000; await crew.list();

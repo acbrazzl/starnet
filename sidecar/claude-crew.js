@@ -57,6 +57,7 @@ function normalizeSessions(raw) {
       cwd: str(s.cwd, 400),
       kind,
       busy: status === 'busy' || state === 'working',
+      needsInput: state === 'blocked',                  // waiting on a permission prompt / question — only the operator can unblock it
       status: status || state || 'unknown',
       startedAt: Number.isFinite(s.startedAt) ? s.startedAt : null,
       stoppable: kind === 'background' && !!shortId,
