@@ -26,6 +26,8 @@
    the CLI binary are injectable for tests. */
 'use strict';
 
+const { note } = require('../failopen.js');   // fail-open seams leave a trace (failopen-ratchet)
+
 const MCP_SERVER = 'starnet';
 const MCP_PREFIX = 'mcp__' + MCP_SERVER + '__';
 const DEFAULT_CONTEXT = 200000;
@@ -196,7 +198,9 @@ function makeClaudeCliProvider(opts) {
     let stderr = '', buf = '', done = false, sawResult = false;
     const msgTools = new Map();   // message id -> [tool_use blocks]
     let lastUsage = null, curMsg = null;
-    const onAbort = () => { try { child.kill('SIGTERM'); } catch (_) {} finish(null); };
+    // ending the child is best-effort (it may already have exited); a failure is traced, never thrown
+    const killChild = () => { try { child.kill('SIGTERM'); } catch (e) { note('claude-cli.kill', e); } };
+    const onAbort = () => { killChild(); finish(null); };
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
 
     function endWith(finishReason, usage) {
@@ -204,7 +208,7 @@ function makeClaudeCliProvider(opts) {
       done = true;
       if (usage) push({ type: 'usage', usage: normalizeUsage(usage) });
       push({ type: 'done', finishReason });
-      try { child.kill('SIGTERM'); } catch (_) {}
+      killChild();
       finish(null);
     }
     function onLine(line) {
@@ -245,7 +249,7 @@ function makeClaudeCliProvider(opts) {
         if (j.is_error || (j.subtype && j.subtype !== 'success')) {
           const err = new Error('claude CLI: ' + String(j.result || j.subtype || 'error').slice(0, 400));
           err.code = 'claude_cli_error';
-          done = true; try { child.kill('SIGTERM'); } catch (_) {}
+          done = true; killChild();
           return finish(err);
         }
         endWith(j.stop_reason === 'max_tokens' ? 'length' : 'stop', j.usage || lastUsage);
@@ -280,7 +284,7 @@ function makeClaudeCliProvider(opts) {
 
     function cleanup() {
       if (signal) signal.removeEventListener('abort', onAbort);
-      try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { note('claude-cli.tmp-cleanup', e); }
     }
     try {
       while (true) {
@@ -291,7 +295,7 @@ function makeClaudeCliProvider(opts) {
       while (queue.length) yield queue.shift();
       if (failure) throw failure;
     } finally {
-      if (!ended || !done) { try { child.kill('SIGTERM'); } catch (_) {} }
+      if (!ended || !done) killChild();
       cleanup();
     }
   }
@@ -303,7 +307,7 @@ function makeClaudeCliProvider(opts) {
     return new Promise((resolve, reject) => {
       execFile(bin, ['auth', 'status'], { timeout: 20000, windowsHide: true }, (err, stdout) => {
         if (err && err.code === 'ENOENT') return reject(Object.assign(new Error('claude CLI not found — install Claude Code and sign in, or set STARNET_CLAUDE_BIN'), { code: 'provider_not_configured' }));
-        let j = null; try { j = JSON.parse(String(stdout || '')); } catch (_) {}
+        let j = null; try { j = JSON.parse(String(stdout || '')); } catch (_) { j = null; }   // unparseable = reported below
         if (!j) return reject(Object.assign(new Error('could not read `claude auth status`' + (err ? ': ' + err.message : '')), { code: 'provider_not_configured' }));
         if (!j.loggedIn) return reject(Object.assign(new Error('claude CLI is not signed in — run `claude` once and sign in with your Claude account'), { code: 'provider_not_configured' }));
         resolve(j);
