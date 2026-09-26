@@ -154,6 +154,20 @@
     }
     if (url) row.appendChild(remoteLink(url));
     else if (!s.shortId) line(c, '', 'Remote Control is off for this terminal session — run /remote-control in it to reach it from your phone.');
+    // MESSAGE: deliver text into this session (terminal sessions too) through Claude Code's own SendMessage
+    const msgBox = el('textarea', 'font:inherit;width:100%;box-sizing:border-box;background:#141a2e;color:#e8e6df;border:1px solid #39406a;padding:4px 6px;height:70px;margin-top:8px;');
+    msgBox.placeholder = 'message ' + s.name + ' (it replies in its own session)';
+    const msgStatus = el('div', 'min-height:20px;color:#8a93b2;');
+    const sendBtn = el('button', BUTTON, 'SEND');
+    sendBtn.addEventListener('click', async () => {
+      const text = msgBox.value.trim(); if (!text) return;
+      sendBtn.disabled = true; msgStatus.textContent = 'delivering…';
+      const r = await api('/api/claude-crew/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ to: s.name, message: text }) });
+      sendBtn.disabled = false;
+      msgStatus.textContent = r.ok ? (r.verbatim ? 'delivered to ' + r.to : 'delivered, but ' + (r.error || 'altered')) : (r.error || 'send failed');
+      if (r.ok) msgBox.value = '';
+    });
+    c.append(msgBox, sendBtn, msgStatus);
     if (!s.shortId) return true;
     if (!note) note = line(c, '', '');
     const stopBtn = el('button', BUTTON, 'STOP');

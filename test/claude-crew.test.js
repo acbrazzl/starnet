@@ -142,7 +142,7 @@ const RAW = JSON.stringify([
   err = null; try { await T.makeClaudeCrewTools({ crew: { enabled: false } }).crewTool.run({}); } catch (e) { err = e; }
   A.ok(err && /STARNET_CLAUDE_CREW/.test(err.message), 'crew off -> honest error');
   const capReg = fsm.readFileSync(require('node:path').join(__dirname, '..', 'sidecar', 'capability', 'registry.js'), 'utf8');
-  A.ok(['claude.crew', 'claude.launch', 'claude.stop'].every(t => capReg.includes("capId: 'orchestrator', tool: '" + t + "'")), 'all three tools are on the orchestrator allowlist (lead-only)');
+  A.ok(['claude.crew', 'claude.launch', 'claude.stop', 'claude.send'].every(t => capReg.includes("capId: 'orchestrator', tool: '" + t + "'")), 'all four tools are on the orchestrator allowlist (lead-only)');
 
 
   // ---- Claude Code's own records: remote link for any kind (terminal too) + what a blocked job waits on ----
@@ -177,6 +177,49 @@ const RAW = JSON.stringify([
   await autoCrew.spawn({ name: 'x', cwd: '/w', permissionMode: '' });
   A.eq([autoCrew.defaultMode, modeOf(autoCrew._last)], ['auto', 'auto'], 'factory default mode reaches the CLI argv');
   A.eq(C.makeClaudeCrew({ enabled: true, defaultMode: 'dontAsk' }).defaultMode, 'default', 'factory refuses a bypassing default');
+
+
+  // ---- SEND: one-shot SendMessage relay, verified ----
+  const ev = (o) => JSON.stringify(o);
+  const good = (to, msg, extra) => [ev({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'SendMessage', input: Object.assign({ to, message: msg }, extra || {}) }] } }),
+    ev({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: [{ type: 'text', text: '{"success":true,"message":"queued"}' }] }] } })].join('\n');
+  A.eq(C.parseRelay(good('ff', 'hi'), 'ff', 'hi'), { ok: true, verbatim: true }, 'verbatim delivery verified');
+  A.eq(C.parseRelay(good('ff', 'hi!'), 'ff', 'hi').verbatim, false, 'an altered text is flagged');
+  A.eq(C.parseRelay(ev({ type: 'result' }), 'ff', 'hi').ok, false, 'no SendMessage call -> not delivered');
+  const failed = good('ff', 'hi').replace('"success\\":true', '"success\\":false');
+  A.eq(C.parseRelay(failed, 'ff', 'hi').ok, false, 'tool result success:false -> not delivered');
+  const ra = C.buildRelayArgs('starnet-overseer');
+  A.eq(ra[ra.indexOf('--tools') + 1], 'SendMessage', 'relay can use SendMessage and nothing else');
+  A.ok(ra.includes('--strict-mcp-config') && ra[ra.indexOf('--mcp-config') + 1] === '{"mcpServers":{}}', 'relay loads no MCP servers');
+  A.eq(ra[ra.indexOf('--name') + 1], 'starnet-overseer', 'recipient sees who sent it');
+  // factory send() with a fake relay process that echoes a correct SendMessage for whatever it was asked
+  const { EventEmitter } = require('node:events'); const { PassThrough } = require('node:stream');
+  const relayed = [];
+  const spawnProc = (bin, args) => {
+    const ch = new EventEmitter(); ch.stdout = new PassThrough(); ch.stderr = new PassThrough(); ch.stdin = new PassThrough(); ch.kill = () => {};
+    let input = ''; ch.stdin.on('data', d => { input += d; });
+    ch.stdin.on('finish', () => {
+      const to = JSON.parse(input.match(/`to` set to ("[^"]*")/)[1]);
+      const msg = input.split('<<<MESSAGE\n')[1].split('\nMESSAGE>>>')[0];
+      relayed.push({ args, to, msg });
+      ch.stdout.write(good(to, msg) + '\n'); setImmediate(() => ch.emit('close', 0));
+    });
+    return ch;
+  };
+  const sc = C.makeClaudeCrew({ enabled: true, execFile: execOk, spawnProc, now: () => 1 });
+  const sent = await sc.send({ to: 'meshflow-ff', message: 'research spike: meshtastic', from: 'starnet-overseer' });
+  A.eq([sent.ok, sent.verbatim, sent.to], [true, true, 'meshflow-ff'], 'send to an interactive session by name is delivered + verified');
+  A.ok(/^research spike: meshtastic\n\n— sent via StarNet by starnet-overseer\. This relay cannot receive replies/.test(relayed[0].msg), 'message carries who sent it and where replies go');
+  A.eq((await sc.send({ to: 'nobody', message: 'x' })).ok, false, 'unknown recipient refused before any relay');
+  A.eq((await sc.send({ to: 'meshflow-ff', message: '  ' })).ok, false, 'empty message refused');
+  A.eq((await sc.send({ to: 'meshflow-ff', message: 'y'.repeat(6001) })).ok, false, 'oversized message refused');
+  A.eq(relayed.length, 1, 'refusals never start a relay');
+  A.eq((await sc.send({ to: '3439187a', message: 'x', from: 'bad name!' })).to, 'delta', 'recipient by short id; bad from-name falls back');
+  A.eq(relayed[1].args[relayed[1].args.indexOf('--name') + 1], 'starnet', 'invalid sender name -> "starnet"');
+  const sendT = T.makeClaudeCrewTools({ crew: sc }).sendTool;
+  A.eq([sendT.requiresConsent, sendT.scope], [true, 'write'], 'claude.send asks first');
+  A.ok(/delivered to meshflow-ff/.test((await sendT.run({ to: 'meshflow-ff', message: 'hi' }, { agentId: 'agent' })).summary), 'tool reports verified delivery');
+  A.eq(relayed[relayed.length - 1].args[relayed[relayed.length - 1].args.indexOf('--name') + 1], 'starnet-overseer', 'the hero sends as starnet-overseer');
 
   A.report();
 })();

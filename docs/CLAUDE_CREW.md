@@ -37,6 +37,15 @@ message, it loads the skill, orients read-only, reports readiness and waits.
 
 So "spin up a social agent" works from COMMS.
 
+**Messaging any session, terminal ones included.** The `claude` CLI has no send command, but every session has
+Claude Code's built-in SendMessage. `POST /api/claude-crew/send`, the card's MESSAGE box, and the lead's
+consent-gated `claude.send` all run a one-shot relay for this. The relay is `claude -p` restricted to
+`--tools SendMessage`, with no MCP servers, settings or persistence. It is told to call the tool once,
+verbatim. The relay's stream is then checked: recipient and text must match exactly, and the tool result must
+report success. Otherwise the send is reported failed or altered. The recipient handles the message as a
+teammate message within its own permission settings; a peer cannot escalate or approve pending prompts. The
+relay exits immediately, so the message says replies stay in the recipient's own session.
+
 Terminal (interactive) sessions are shown read-only. They have no background id to stop or read logs from;
 run `/remote-control` inside one to reach it from your phone.
 

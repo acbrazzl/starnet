@@ -280,7 +280,10 @@
       // cached autonomous grant), stop is consent-gated (ends someone's running work), listing is free.
       { capId: 'orchestrator', tool: 'claude.crew', scope: 'read', requiresConsent: false, network: false },
       { capId: 'orchestrator', tool: 'claude.launch', scope: 'execute', requiresConsent: true, network: true },
-      { capId: 'orchestrator', tool: 'claude.stop', scope: 'write', requiresConsent: true, network: false }
+      { capId: 'orchestrator', tool: 'claude.stop', scope: 'write', requiresConsent: true, network: false },
+      // claude.send tasks another Claude session (terminal ones included) via Claude Code's own SendMessage —
+      // consent-gated like team.dispatch: it hands work to an agent that may then act within its own permissions.
+      { capId: 'orchestrator', tool: 'claude.send', scope: 'write', requiresConsent: true, network: true }
     ],
     // STUDIO (media skills): text->image generation + image vision analysis, both on the SAME BYOK OpenRouter
     // key the agent already uses (no new provider). image_generate WRITES a file into the agent's workspace, so

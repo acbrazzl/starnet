@@ -132,7 +132,45 @@ function remoteUrlFromBridge(bridgeId) {
   return m ? 'https://claude.ai/code/session_' + m[1] : null;
 }
 
-/* makeClaudeCrew({ enabled, execFile, bin, now, isDir, minPollMs, timeoutMs, fs, join, skillDirs, claudeHome }) */
+/* SEND — deliver a message into ANY live session on this machine (interactive terminal sessions included).
+   The `claude` CLI has no "send" command, but every Claude Code session has the built-in SendMessage tool, which
+   delivers over Claude Code's own cross-session channel. So a send is a one-shot relay: `claude -p` restricted to
+   exactly that tool (--tools SendMessage, --strict-mcp-config with no servers, no settings/hooks, nothing
+   persisted), told to call it once with the text verbatim. The relay's stream is checked: the tool input must
+   match the requested recipient and text exactly, and the tool result must report success — otherwise the send
+   is reported failed/altered, never "delivered". The recipient treats it as a teammate message within ITS OWN
+   permission settings (Claude Code's guard: a peer cannot grant escalation or approve a pending prompt). */
+const SEND_MAX = 6000;
+const RELAY_NAME_RE = /^[A-Za-z0-9._-]{1,40}$/;
+function buildRelayArgs(fromName) {
+  return ['-p', '--output-format', 'stream-json', '--verbose', '--model', 'haiku', '--tools', 'SendMessage',
+    '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--setting-sources', '', '--no-session-persistence',
+    '--disable-slash-commands', '--name', fromName];
+}
+function relayPrompt(to, message) {
+  return 'You are a message relay. Call the SendMessage tool EXACTLY ONCE with `to` set to ' + JSON.stringify(to) +
+    ' and `message` set to the exact text between the markers below — verbatim, no edits, no additions, no quotes.' +
+    ' Then reply DONE and stop.\n<<<MESSAGE\n' + message + '\nMESSAGE>>>';
+}
+/* parseRelay(streamJsonText, to, message) -> { ok, verbatim, error? } */
+function parseRelay(text, to, message) {
+  let call = null, result = null;
+  for (const line of String(text || '').split('\n')) {
+    let j; try { j = JSON.parse(line); } catch (_) { continue; }   // non-JSON noise between events is ignored
+    if (j.type === 'assistant' && j.message) for (const c of j.message.content || []) if (c && c.type === 'tool_use' && c.name === 'SendMessage' && !call) call = c;
+    if (j.type === 'user' && j.message && call) for (const c of j.message.content || []) if (c && c.type === 'tool_result' && c.tool_use_id === call.id) result = c;
+  }
+  if (!call) return { ok: false, verbatim: false, error: 'relay did not call SendMessage' };
+  const inp = call.input || {};
+  const verbatim = String(inp.to || '') === to && String(inp.message || '') === message;
+  const rtext = result ? (Array.isArray(result.content) ? result.content.map(x => (x && x.text) || '').join('') : String(result.content || '')) : '';
+  let success = false;
+  try { success = !!JSON.parse(rtext).success; } catch (_) { success = /"success"\s*:\s*true/.test(rtext); }
+  if (!result || result.is_error || !success) return { ok: false, verbatim, error: 'delivery failed: ' + str(rtext || 'no tool result', 200) };
+  return verbatim ? { ok: true, verbatim: true } : { ok: true, verbatim: false, error: 'delivered, but the relay ALTERED the text or recipient' };
+}
+
+/* makeClaudeCrew({ enabled, execFile, bin, now, isDir, minPollMs, timeoutMs, fs, join, skillDirs, claudeHome, spawnProc, relayCwd }) */
 function makeClaudeCrew(opts) {
   const o = opts || {};
   const enabled = !!o.enabled;
@@ -176,6 +214,24 @@ function makeClaudeCrew(opts) {
   const timeoutMs = Number.isFinite(o.timeoutMs) ? o.timeoutMs : 30000;
   let cache = null, cacheAt = 0, inflight = null;
   const urls = new Map();                                // shortId -> remote url (stable for a session's life)
+
+  const spawnProc = typeof o.spawnProc === 'function' ? o.spawnProc : null;   // (bin, args, opts) -> ChildProcess
+  const relayCwd = o.relayCwd ? String(o.relayCwd) : undefined;
+  function runWithInput(args, input, cwd) {
+    return new Promise(resolve => {
+      if (!spawnProc) return resolve({ err: new Error('no process spawner'), stdout: '', stderr: '' });
+      let out = '', errOut = '', done = false;
+      const child = spawnProc(bin, args, { cwd: cwd || undefined, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+      const finish = r => { if (!done) { done = true; clearTimeout(t); resolve(r); } };
+      const t = setTimeout(() => { try { child.kill('SIGTERM'); } catch (e) { errOut += String(e); } finish({ err: new Error('relay timed out'), stdout: out, stderr: errOut }); }, timeoutMs * 4);
+      child.stdout.setEncoding('utf8'); child.stdout.on('data', c => { out += c; });
+      child.stderr.setEncoding('utf8'); child.stderr.on('data', c => { if (errOut.length < 8000) errOut += c; });
+      child.on('error', e => finish({ err: e, stdout: out, stderr: errOut }));
+      child.on('close', code => finish({ err: code ? new Error('relay exited ' + code) : null, stdout: out, stderr: errOut }));
+      child.stdin.on('error', () => {});
+      child.stdin.end(input);
+    });
+  }
 
   function run(args, cwd) {
     return new Promise(resolve => {
@@ -262,7 +318,34 @@ function makeClaudeCrew(opts) {
     return { ok: true, url };                            // url:null = Remote Control not (yet) connected — said, not guessed
   }
 
-  return { list, spawn, stop, remoteUrl, listSkills, enabled, defaultMode };
+  /* send({ to, message, from }) — `to` must be exactly one live session's name (or 8-hex id / session uuid). */
+  async function send(body) {
+    if (!enabled) return { ok: false, error: 'claude crew disabled' };
+    const b = body || {};
+    const message = String(b.message == null ? '' : b.message).trim();
+    if (!message) return { ok: false, error: 'message is required' };
+    if (message.length > SEND_MAX) return { ok: false, error: 'message too long' };
+    const fromName = RELAY_NAME_RE.test(String(b.from || '')) ? String(b.from) : 'starnet';
+    cache = null;
+    const listed = await list();
+    if (!listed.available) return { ok: false, error: listed.reason || 'claude CLI unavailable' };
+    const key = String(b.to || '').trim();
+    const matches = listed.sessions.filter(x => x.name === key || x.shortId === key || x.sessionId === key.toLowerCase());
+    if (!matches.length) return { ok: false, error: 'no live Claude session named ' + JSON.stringify(key) };
+    const names = new Set(listed.sessions.map(x => x.name));
+    const target = matches[0];
+    if (matches.length > 1 || listed.sessions.filter(x => x.name === target.name).length > 1 || !names.has(target.name)) {
+      return { ok: false, error: 'more than one live session is named ' + JSON.stringify(target.name) + ' — rename one first' };
+    }
+    // the relay exits right after sending, so say where answers should go instead of letting them vanish
+    const full = message + '\n\n— sent via StarNet by ' + fromName + '. This relay cannot receive replies: answer in your own session (the Commander reads it there or over Remote Control).';
+    const r = await runWithInput(buildRelayArgs(fromName), relayPrompt(target.name, full), relayCwd);
+    const verdict = parseRelay(r.stdout, target.name, full);
+    if (!verdict.ok && r.err && r.err.code === 'ENOENT') return { ok: false, error: why(r) };
+    return Object.assign({ to: target.name }, verdict);
+  }
+
+  return { list, spawn, stop, remoteUrl, listSkills, send, enabled, defaultMode };
 }
 
-module.exports = { makeClaudeCrew, normalizeSessions, parseRemoteUrl, remoteUrlFromBridge, buildSpawnArgs, parseBackgroundId, parseSkill, SPAWN_MODES, ID_PREFIX, DEFAULT_SKILL_PROMPT };
+module.exports = { makeClaudeCrew, normalizeSessions, parseRemoteUrl, remoteUrlFromBridge, parseRelay, buildRelayArgs, relayPrompt, buildSpawnArgs, parseBackgroundId, parseSkill, SPAWN_MODES, ID_PREFIX, DEFAULT_SKILL_PROMPT };

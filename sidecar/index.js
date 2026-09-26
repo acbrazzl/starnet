@@ -3963,7 +3963,8 @@ const claudeCrew = require('./claude-crew.js').makeClaudeCrew({
   // Claude Code skills a crew session can be launched with: the user's own (~/.claude/skills) plus any extra dirs
   fs, join: path.join,
   claudeHome: String(ENV('CLAUDE_HOME') || path.join(require('node:os').homedir(), '.claude')),
-  defaultMode: String(ENV('CLAUDE_CREW_MODE') || '').trim(),   // default|plan|acceptEdits|auto; bypass modes are refused
+  defaultMode: String(ENV('CLAUDE_CREW_MODE') || '').trim(),
+  spawnProc: childSpawn, relayCwd: require('node:os').tmpdir(),   // the one-shot SendMessage relay (claude.send)   // default|plan|acceptEdits|auto; bypass modes are refused
   skillDirs: [path.join(require('node:os').homedir(), '.claude', 'skills')]
     .concat(String(ENV('CLAUDE_SKILL_DIRS') || '').split(path.delimiter).filter(Boolean)),
 });
@@ -9596,6 +9597,7 @@ const ROUTES = [
   { m: 'GET', exact: '/api/claude-crew', h: handleClaudeCrewList },
   { m: 'POST', exact: '/api/claude-crew/spawn', h: handleClaudeCrewSpawn },
   { m: 'POST', exact: '/api/claude-crew/stop', h: handleClaudeCrewStop },
+  { m: 'POST', exact: '/api/claude-crew/send', h: handleClaudeCrewSend },
   { m: 'GET', qsplit: '/api/claude-crew/remote', h: handleClaudeCrewRemote },
   { m: 'GET', exact: '/api/claude-crew/skills', h: (req, res) => claudeCrewJson(res, 200, { ok: true, enabled: claudeCrew.enabled, skills: claudeCrew.listSkills().map(sk => ({ name: sk.name, description: sk.description })), defaultDir: CLAUDE_CREW_DIR || undefined, defaultMode: claudeCrew.defaultMode }) },
   // honest concurrency surface: how many distinct agents can RUN at once (the gate that silently 'refuses'
@@ -14201,6 +14203,11 @@ async function handleClaudeCrewSpawn(req, res) {
 async function handleClaudeCrewStop(req, res) {
   let body; try { body = JSON.parse(await readBody(req, 1024)) || {}; } catch (e) { return claudeCrewJson(res, 400, { ok: false, error: 'bad json' }); }
   const out = await claudeCrew.stop(body.id);
+  claudeCrewJson(res, out.ok ? 200 : 400, out);
+}
+async function handleClaudeCrewSend(req, res) {
+  let body; try { body = JSON.parse(await readBody(req, 16384)) || {}; } catch (e) { return claudeCrewJson(res, 400, { ok: false, error: 'bad json' }); }
+  const out = await claudeCrew.send({ to: body.to, message: body.message, from: 'commander' });
   claudeCrewJson(res, out.ok ? 200 : 400, out);
 }
 async function handleClaudeCrewRemote(req, res) {

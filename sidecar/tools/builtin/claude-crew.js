@@ -90,9 +90,28 @@ function makeClaudeCrewTools(deps) {
     },
   };
 
+  const sendTool = {
+    name: 'claude.send', capability: 'orchestrator', scope: 'write', requiresConsent: true, timeoutMs: 180000,
+    description: 'Send a message into one of the Commander\'s live Claude Code sessions on this machine — terminal (interactive) sessions included — by its name from claude.crew. ' +
+      'Use it to task or brief a Claude session. The session receives it as a teammate message and acts within its OWN permission settings; it cannot reply to you through this relay (its answer stays in its own session, where the Commander reads it). ' +
+      'Delivery is verified: a failed or altered send is reported as such.',
+    schema: { type: 'object', required: ['to', 'message'], properties: {
+      to: { type: 'string', maxLength: 80, description: 'The session name exactly as claude.crew lists it (e.g. "meshflow-ff").' },
+      message: { type: 'string', maxLength: 6000, description: 'The full message to deliver.' } } },
+    run: async (args, ctx) => {
+      need();
+      let from = String((ctx && (ctx.agentName || ctx.agentId)) || 'overseer').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').slice(0, 30);
+      if (!from || from === 'agent') from = 'overseer';   // the hero's id is the generic 'agent'
+      const out = await crew.send({ to: args && args.to, message: args && args.message, from: 'starnet-' + from });
+      if (!out.ok) throw new Error(out.error || 'send failed');
+      return { content: JSON.stringify({ ok: true, to: out.to, verbatim: out.verbatim, note: out.error || undefined }),
+        summary: 'delivered to ' + out.to + (out.verbatim ? '' : ' — WARNING: ' + out.error) };
+    },
+  };
+
   return {
-    crewTool, launchTool, stopTool,
-    register(reg) { reg.register(crewTool); reg.register(launchTool); reg.register(stopTool); return reg; },
+    crewTool, launchTool, stopTool, sendTool,
+    register(reg) { reg.register(crewTool); reg.register(launchTool); reg.register(stopTool); reg.register(sendTool); return reg; },
   };
 }
 
