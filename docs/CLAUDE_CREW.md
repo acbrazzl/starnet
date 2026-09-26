@@ -73,6 +73,11 @@ port. Wildcards, CIDR ranges, ports and schemes are rejected. The per-launch tok
 - **Tailscale** (`dev/remote-station.sh`): rootless userspace Tailscale plus `tailscale serve` for HTTPS at the
   tailnet name.
 
+**Caching:** the UI is about 230MB (mostly sprite and texture PNGs) across about 850 requests. Static files now carry an
+ETag with `no-cache`, so an unchanged file costs a 304. Images fetched through a listed remote host are cacheable for a day.
+The page itself stays `no-store`, because it carries the per-launch token. The first load on a new device still
+downloads everything, so do it on a fast link.
+
 **Trust boundary:** any device that can load the page at that name can read the token injected into it.
 The network fence (your tailnet) *is* the trust boundary. Never list a publicly reachable name.
 

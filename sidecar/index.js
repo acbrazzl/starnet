@@ -21346,9 +21346,26 @@ async function serveStatic(req, res) {
     const rel = (url === '/' ? 'index.html' : url.replace(/^\/+/, ''));
     const abs = path.resolve(FRONTEND, rel);
     if (abs !== FRONTEND && abs.indexOf(FRONTEND + path.sep) !== 0) { res.writeHead(403); return res.end('forbidden'); }
+    const isPage = abs.toLowerCase() === path.resolve(FRONTEND, 'index.html').toLowerCase() ||
+      (DEV_MODE && abs.toLowerCase() === path.resolve(FRONTEND, 'agent-station-demo.html').toLowerCase());
+    /* STATIC CACHING (remote stations). The page itself stays no-store (it carries the per-launch token).
+       Every other file gets a size+mtime ETag and `no-cache` — the browser keeps its copy but revalidates
+       each use, so a changed file is always picked up and an unchanged one costs a 304, not its bytes. The UI
+       is ~230MB of sprites/textures across ~850 requests; `no-store` made a phone on an overlay network
+       (STARNET_REMOTE_HOSTS) re-download all of it on every load. Images fetched through a listed remote host
+       may additionally be reused for a day without revalidation (~850 round trips on a high-latency link). */
+    let etag = '';
+    if (!isPage) {
+      const st = await fsp.stat(abs);
+      etag = 'W/"' + st.size.toString(16) + '-' + Math.floor(st.mtimeMs).toString(16) + '"';
+      const inm = String(req.headers['if-none-match'] || '');
+      if (inm && inm.split(',').map(x => x.trim()).includes(etag)) {
+        res.writeHead(304, { 'ETag': etag, 'Cache-Control': staticCacheControl(req, abs) });
+        return res.end();
+      }
+    }
     let data = await fsp.readFile(abs);
-    if (abs.toLowerCase() === path.resolve(FRONTEND, 'index.html').toLowerCase() ||
-        (DEV_MODE && abs.toLowerCase() === path.resolve(FRONTEND, 'agent-station-demo.html').toLowerCase())) {
+    if (isPage) {
       let boot = '<script>window.__STARNET_API_TOKEN__=' + JSON.stringify(API_TOKEN) + ';';
       // DEV fast-path: hand the page a model + provider hint so a fresh origin auto-resumes the seeded
       // save with no setup. No secret crosses here — the key stays server-side in runtimeKey.
@@ -21359,7 +21376,14 @@ async function serveStatic(req, res) {
       boot += '</script>';
       data = Buffer.from(String(data).replace(/<\/head>/i, boot + '\n</head>'), 'utf8');
     }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(abs).toLowerCase()] || 'application/octet-stream', 'Cache-Control': 'no-store' });
+    const headers = { 'Content-Type': MIME[path.extname(abs).toLowerCase()] || 'application/octet-stream', 'Cache-Control': isPage ? 'no-store' : staticCacheControl(req, abs) };
+    if (etag) headers['ETag'] = etag;
+    res.writeHead(200, headers);
     res.end(data);
   } catch (e) { res.writeHead(404); res.end('not found'); }
+}
+const STATIC_IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico', '.woff2', '.wav']);
+function staticCacheControl(req, abs) {
+  const remote = REMOTE_HOSTS.length && apiauth.isAllowedHost(req.headers.host, REMOTE_HOSTS) && !apiauth.isAllowedHost(req.headers.host);
+  return (remote && STATIC_IMAGE_EXT.has(path.extname(abs).toLowerCase())) ? 'max-age=86400' : 'no-cache';
 }

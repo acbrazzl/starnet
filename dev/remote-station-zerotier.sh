@@ -15,12 +15,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 PORT="${STARNET_PORT:-8787}"
+# stop ONLY the process listening on this station's port (never every `node sidecar/index.js` on the machine)
+stop_port() { local pid; pid=$(ss -ltnp 2>/dev/null | grep "$1:$PORT " | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2); [ -n "$pid" ] && kill "$pid" || true; }
 LOGDIR="${LOGDIR:-$HOME/.local/share/starnet-remote}"
 mkdir -p "$LOGDIR"
 
 if [ "${1:-}" = "stop" ]; then
-  pkill -f "dev/overlay-forward.js" || true
-  pkill -f "node sidecar/index.js" || true
+  for pid in $(ss -ltnp 2>/dev/null | grep ":$PORT " | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u); do kill "$pid" || true; done
   echo "stopped"; exit 0
 fi
 
@@ -35,14 +36,14 @@ fi
 
 # (re)start the station with the ZeroTier IP allowed — a station started without it would refuse the phone
 if curl -fs "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1; then
-  pkill -f "node sidecar/index.js" || true
+  stop_port "127.0.0.1"
   for _ in $(seq 1 20); do curl -fs "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1 || break; sleep 0.5; done
 fi
 STARNET_CLAUDE_CREW=1 STARNET_REMOTE_HOSTS="$ZT_IP" STARNET_PORT="$PORT" \
   nohup node sidecar/index.js >"$LOGDIR/station.log" 2>&1 &
 for _ in $(seq 1 40); do curl -fs "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1 && break; sleep 1; done
 
-pkill -f "dev/overlay-forward.js" || true
+stop_port "$ZT_IP"
 nohup node dev/overlay-forward.js "$ZT_IP" "$PORT" >"$LOGDIR/forward.log" 2>&1 &
 sleep 1
 echo "Station: http://$ZT_IP:$PORT/   (open on your phone with ZeroTier on; Chrome menu -> Add to Home screen)"
