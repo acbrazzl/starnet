@@ -202,7 +202,7 @@
     const known = [...bodies.values()].map(s => s.cwd).filter(Boolean);
     const cwd = field('DIRECTORY (absolute, already trusted by claude)', el('input', IN)); cwd.value = known[0] || '';
     const mode = field('PERMISSIONS', el('select', IN));
-    for (const [v, t] of [['default', 'ask me (answer over Remote Control)'], ['plan', 'plan only (read-only)'], ['acceptEdits', 'accept file edits'], ['auto', 'auto']]) {
+    for (const [v, t] of [['auto', 'auto — routine actions proceed, risky ones ask'], ['default', 'ask me before every action'], ['plan', 'plan only (read-only)'], ['acceptEdits', 'accept file edits']]) {
       const o = el('option', '', t); o.value = v; mode.appendChild(o);
     }
     const skill = field('SKILL (optional)', el('select', IN));
@@ -210,6 +210,7 @@
     api('/api/claude-crew/skills').then(r => {
       for (const sk of (r && r.skills) || []) { const o = el('option', '', sk.name); o.value = sk.name; o.title = sk.description || ''; skill.appendChild(o); }
       if (r && r.defaultDir && !cwd.value) cwd.value = r.defaultDir;
+      if (r && r.defaultMode) mode.value = r.defaultMode;
     }).catch(() => {});
     skill.addEventListener('change', () => { if (skill.value && !name.value.trim()) name.value = skill.value.replace(/^meshflow-/, '').slice(0, 40); });
     const prompt = field('FIRST MESSAGE (optional — a skill loads, reports and waits without one)', el('textarea', IN + 'height:90px;'));

@@ -48,6 +48,12 @@ credential. It has no key to leak because it never touches one.
 
 ## Consent
 
+`STARNET_CLAUDE_CREW_MODE` sets the station's default mode for new sessions. The choices are `default` (ask
+before each action), `auto` (routine actions proceed and risky ones still ask), `plan` and `acceptEdits`.
+Unset means `default`. `dev/remote-station-zerotier.sh` reads personal settings from
+`~/.config/starnet/remote.env`.
+
+
 Permission escalation defaults to deny. New sessions accept only `default` (ask; you answer over Remote
 Control), `plan`, `acceptEdits` or `auto`. `bypassPermissions` and `dontAsk` are refused. The directory
 must be one Claude Code already trusts; otherwise the CLI's "workspace not trusted" error is shown as-is.

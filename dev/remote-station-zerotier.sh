@@ -14,6 +14,8 @@
 # (and the per-launch token in the page) — keep the network private (authorization on, only your devices).
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# personal station settings (optional): e.g. STARNET_CLAUDE_CREW_MODE=auto, STARNET_CLAUDE_CREW_DIR=/abs/dir
+[ -f "${STARNET_REMOTE_ENV:-$HOME/.config/starnet/remote.env}" ] && set -a && . "${STARNET_REMOTE_ENV:-$HOME/.config/starnet/remote.env}" && set +a
 PORT="${STARNET_PORT:-8787}"
 # stop ONLY the process listening on this station's port (never every `node sidecar/index.js` on the machine)
 stop_port() { local pid; pid=$(ss -ltnp 2>/dev/null | grep "$1:$PORT " | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2); [ -n "$pid" ] && kill "$pid" || true; }

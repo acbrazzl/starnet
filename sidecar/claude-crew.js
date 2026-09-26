@@ -97,7 +97,7 @@ function buildSpawnArgs(o) {
   o = o || {};
   const name = str(o.name, 80).trim();
   if (!NAME_RE.test(name)) return { ok: false, error: 'name must be 1-40 chars of letters, digits, space, . _ -' };
-  const mode = o.permissionMode == null || o.permissionMode === '' ? 'default' : String(o.permissionMode);
+  const mode = o.permissionMode == null || o.permissionMode === '' ? (SPAWN_MODES.indexOf(o.defaultMode) >= 0 ? o.defaultMode : 'default') : String(o.permissionMode);
   if (SPAWN_MODES.indexOf(mode) < 0) return { ok: false, error: 'permissionMode must be one of ' + SPAWN_MODES.join(', ') };
   let prompt = String(o.prompt == null ? '' : o.prompt);
   if (prompt.length > PROMPT_MAX) return { ok: false, error: 'prompt too long' };
@@ -144,6 +144,8 @@ function makeClaudeCrew(opts) {
   const fsx = o.fs || null;   // { readdirSync, readFileSync } — injected; absent = no skill catalog
   const pathJoin = typeof o.join === 'function' ? o.join : (a, b) => String(a).replace(/[\\/]+$/, '') + '/' + b;
   const claudeHome = o.claudeHome ? String(o.claudeHome) : '';
+  // the station's default permission mode for new sessions (STARNET_CLAUDE_CREW_MODE); never a bypassing mode
+  const defaultMode = SPAWN_MODES.indexOf(o.defaultMode) >= 0 ? o.defaultMode : 'default';
 
   function readJson(file) {
     try { return JSON.parse(fsx.readFileSync(file, 'utf8')); } catch (_) { return null; }   // absent/partial file = no record
@@ -227,7 +229,7 @@ function makeClaudeCrew(opts) {
     if (b.skill && !listSkills().some(sk => sk.name === String(b.skill))) return { ok: false, error: 'unknown skill: ' + str(b.skill, 64) };
     const cwd = str(b.cwd, 400);
     if (!cwd || !isDir(cwd)) return { ok: false, error: 'cwd must be an existing absolute directory' };
-    const built = buildSpawnArgs(b);
+    const built = buildSpawnArgs(Object.assign({}, b, { defaultMode }));
     if (!built.ok) return built;
     const r = await run(built.args, cwd);
     if (r.err) return { ok: false, error: why(r) };
@@ -260,7 +262,7 @@ function makeClaudeCrew(opts) {
     return { ok: true, url };                            // url:null = Remote Control not (yet) connected — said, not guessed
   }
 
-  return { list, spawn, stop, remoteUrl, listSkills, enabled };
+  return { list, spawn, stop, remoteUrl, listSkills, enabled, defaultMode };
 }
 
 module.exports = { makeClaudeCrew, normalizeSessions, parseRemoteUrl, remoteUrlFromBridge, buildSpawnArgs, parseBackgroundId, parseSkill, SPAWN_MODES, ID_PREFIX, DEFAULT_SKILL_PROMPT };

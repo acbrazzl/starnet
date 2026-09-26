@@ -132,7 +132,7 @@ const RAW = JSON.stringify([
   const listing = JSON.parse((await tools.crewTool.run({})).content);
   A.eq([listing.sessions.length, listing.sessions[2].status, listing.skills[0].name], [3, 'needs-you', 'alpha'], 'crew listing carries status incl. needs-you, plus skills');
   const launched = await tools.launchTool.run({ name: 'social', skill: 'alpha' });
-  A.eq([spawned[0].cwd, spawned[0].skill, spawned[0].permissionMode], ['/home/u/code', 'alpha', 'default'], 'launch defaults: station dir, ask-first permissions');
+  A.eq([spawned[0].cwd, spawned[0].skill, spawned[0].permissionMode], ['/home/u/code', 'alpha', ''], 'launch defaults: station dir, station-default permission mode');
   A.ok(/launched Claude session "social" with \/alpha \(abcd1234\)/.test(launched.summary), 'launch summary names skill and id');
   let err = null; try { await tools.launchTool.run({ name: 'x', skill: 'bad' }); } catch (e) { err = e; }
   A.ok(err && /unknown skill/.test(err.message), 'a failed launch throws (never reported as done)');
@@ -166,6 +166,17 @@ const RAW = JSON.stringify([
   A.eq((await rc.remoteUrl('3439187a')).url, 'https://claude.ai/code/session_JOB1', 'remoteUrl prefers the job record over scraping logs');
   const bare = C.makeClaudeCrew({ enabled: true, execFile: execOk, now: () => 1 });
   A.eq((await bare.list()).sessions.length, 3, 'no fs/claudeHome -> listing unchanged (fail-soft)');
+
+
+  // ---- station default permission mode (STARNET_CLAUDE_CREW_MODE) ----
+  const modeOf = args => args[args.indexOf('--permission-mode') + 1];
+  A.eq(modeOf(C.buildSpawnArgs({ name: 'x', defaultMode: 'auto' }).args), 'auto', 'unset mode takes the station default');
+  A.eq(modeOf(C.buildSpawnArgs({ name: 'x', permissionMode: 'plan', defaultMode: 'auto' }).args), 'plan', 'an explicit mode beats the default');
+  A.eq(modeOf(C.buildSpawnArgs({ name: 'x', defaultMode: 'bypassPermissions' }).args), 'default', 'a bypassing default is ignored -> ask');
+  const autoCrew = C.makeClaudeCrew({ enabled: true, execFile: (b, args, o, cb) => { autoCrew._last = args; cb(null, 'backgrounded · 0badc0de', ''); }, isDir: () => true, defaultMode: 'auto', now: () => 1 });
+  await autoCrew.spawn({ name: 'x', cwd: '/w', permissionMode: '' });
+  A.eq([autoCrew.defaultMode, modeOf(autoCrew._last)], ['auto', 'auto'], 'factory default mode reaches the CLI argv');
+  A.eq(C.makeClaudeCrew({ enabled: true, defaultMode: 'dontAsk' }).defaultMode, 'default', 'factory refuses a bypassing default');
 
   A.report();
 })();

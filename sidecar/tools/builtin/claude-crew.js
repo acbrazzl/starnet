@@ -61,7 +61,7 @@ function makeClaudeCrewTools(deps) {
         skill: { type: 'string', maxLength: 64, description: 'Optional skill name exactly as claude.crew lists it.' },
         dir: { type: 'string', maxLength: 400, description: 'Absolute directory to work in; must already be trusted by Claude Code. Defaults to the station default.' },
         message: { type: 'string', maxLength: 4000, description: 'Optional first instruction for the session.' },
-        permissionMode: { type: 'string', enum: ['default', 'plan', 'acceptEdits', 'auto'], description: 'default = the session asks the Commander before acting (recommended); plan = read-only.' },
+        permissionMode: { type: 'string', enum: ['default', 'plan', 'acceptEdits', 'auto'], description: 'Omit to use the station default. default = asks the Commander before each action; auto = routine safe actions proceed, risky ones still ask; plan = read-only.' },
       },
     },
     run: async (args) => {
@@ -69,7 +69,7 @@ function makeClaudeCrewTools(deps) {
       const a = args || {};
       const cwd = String(a.dir || defaultCwd || '');
       if (!cwd) throw new Error('no directory: pass dir (an absolute path Claude Code trusts)');
-      const out = await crew.spawn({ name: a.name, skill: a.skill || '', cwd, prompt: a.message || '', permissionMode: a.permissionMode || 'default' });
+      const out = await crew.spawn({ name: a.name, skill: a.skill || '', cwd, prompt: a.message || '', permissionMode: a.permissionMode || '' });   // '' = the station default
       if (!out.ok) throw new Error(out.error || 'launch failed');
       return {
         content: JSON.stringify({ ok: true, id: out.shortId || null, name: a.name, skill: a.skill || null, dir: cwd }),
