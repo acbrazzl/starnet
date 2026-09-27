@@ -112,6 +112,10 @@ const S = require('../sidecar/overseer-session.js');
   const stopped = [];
   ov.stopSync((bin, args) => stopped.push(args));
   A.eq(stopped, [['stop', 'abcd1234']], 'StarNet shutdown stops the session');
+  const kept = [];
+  const ka = mk({ keepAlive: true }); await ka.start();
+  ka.stopSync((bin, args) => kept.push(args));
+  A.eq(kept, [], 'keep-alive: StarNet shutdown detaches and leaves the session running (same Remote Control link)');
   A.eq([ov.ownsSession(sid, null), ov.ownsSession('x', 'abcd1234'), ov.ownsSession('x', 'y')], [true, true, false], 'the crew list can tell the Overseer\'s own session apart');
   A.eq((await S.makeOverseerSession({ enabled: false }).start()).ok, false, 'disabled: never launches');
 

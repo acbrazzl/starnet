@@ -4009,6 +4009,7 @@ if (claudeCrew.enabled && /^(1|true|yes|on)$/i.test(String(ENV('OVERSEER_SESSION
     cwd: CLAUDE_CREW_DIR || require('node:os').homedir(), bin: String(ENV('CLAUDE_BIN') || 'claude'),
     name: () => overseerDocs().name, model: () => overseerDocs().model,
     permissionMode: claudeCrew.defaultMode, fresh: /^(1|true|yes|on)$/i.test(String(ENV('OVERSEER_SESSION_FRESH') || '').trim()),
+    keepAlive: /^(1|true|yes|on)$/i.test(String(ENV('OVERSEER_SESSION_KEEPALIVE') || '').trim()),   // survive StarNet restarts (same link)
     appendPrompt: overseerAppendPrompt, log: m => console.log('  · ' + m),
     spawnPty: (bin, args, opts) => ptyMod.spawn(bin, args, Object.assign({ env: process.env }, opts)),
     // the session's own tool activity animates the hero on the floor, exactly like a StarNet tool call would

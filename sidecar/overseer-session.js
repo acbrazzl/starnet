@@ -66,6 +66,10 @@ function makeOverseerSession(o) {
   const nameNow = () => String((typeof o.name === 'function' ? o.name() : o.name) || 'overseer').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').slice(0, 40) || 'overseer';
   const mode = String(o.permissionMode || 'default');
   const fresh = !!o.fresh;
+  // KEEP-ALIVE: StarNet shutting down only DETACHES — the session keeps running, so the next boot reattaches to the
+  // SAME session and its Remote Control link does not change. (A `claude remote-control --session-id` reattach does
+  // not apply to --bg sessions — verified; so a stopped session always comes back with a new link.)
+  const keepAlive = !!o.keepAlive;
   const appendPrompt = typeof o.appendPrompt === 'function' ? o.appendPrompt : () => '';
   const log = typeof o.log === 'function' ? o.log : () => {};
   const onActivity = typeof o.onActivity === 'function' ? o.onActivity : () => {};   // (kind, payload): tool activity for the floor
@@ -243,11 +247,12 @@ function makeOverseerSession(o) {
   function stopSync(execFileSync) {
     if (!state.shortId) return;
     try { if (pty) pty.kill(); } catch (_) { pty = null; }   // already gone
+    if (keepAlive) { log('overseer-session: detached; ' + state.shortId + ' keeps running (keep-alive)'); return; }
     // bounded to fit inside gracefulShutdown's 3s deadline
     try { execFileSync(bin, ['stop', state.shortId], { timeout: 2500, stdio: 'ignore' }); } catch (e) { log('overseer-session stop: ' + e.message); }
   }
 
-  function status() { return { enabled, name: nameNow(), shortId: state.shortId, sessionId: state.sessionId, busy, contextTokens: lastUsage, lastCompactAt: state.lastCompactAt || null }; }
+  function status() { return { enabled, keepAlive, name: nameNow(), shortId: state.shortId, sessionId: state.sessionId, busy, contextTokens: lastUsage, lastCompactAt: state.lastCompactAt || null }; }
   function ownsSession(sessionId, shortId) { return !!((state.sessionId && sessionId === state.sessionId) || (state.shortId && shortId === state.shortId)); }
 
   return { start, ask, poll, maintenance, stopSync, status, ownsSession, enabled };

@@ -122,6 +122,10 @@ list, because it *is* the Overseer.
 **Playbook.** `STARNET_OVERSEER_SKILL=<skill>` tells the session to load that Claude Code skill at start and after every
 compaction (e.g. a role playbook kept in `~/.claude/skills`).
 
+**Keep-alive.** With `STARNET_OVERSEER_SESSION_KEEPALIVE=1`, StarNet shutdown only detaches. The session keeps running, and the next boot
+reattaches to the same session, so its Remote Control link stays the same. Only a machine reboot or an explicit `claude stop` ends it, after which it
+is resumed with a new link. (`claude remote-control --session-id` cannot reattach `--bg` sessions: verified.)
+
 **Cleaning.** `/compact` runs when the context passes 70% of the model's window, and once a day while idle, never
 mid-turn. Status is at `GET /api/overseer-session`. Profile-file edits take effect at the next session start.
 
