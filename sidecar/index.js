@@ -4009,7 +4009,7 @@ if (claudeCrew.enabled && /^(1|true|yes|on)$/i.test(String(ENV('OVERSEER_SESSION
     appendPrompt: overseerAppendPrompt, log: m => console.log('  · ' + m),
     spawnPty: (bin, args, opts) => ptyMod.spawn(bin, args, Object.assign({ env: process.env }, opts)),
     // the session's own tool activity animates the hero on the floor, exactly like a StarNet tool call would
-    emit: (kind, p) => {
+    onActivity: (kind, p) => {
       if (!overseerRunId) return;
       if (kind === 'tool_call') chanEmit('agent.tool_call', { agentId: 'agent', runId: overseerRunId, callId: String(p.callId || ''), name: String(p.name || 'tool'), argsSummary: JSON.stringify(p.args || {}).slice(0, 160) });
       if (kind === 'tool_result') chanEmit('agent.tool_result', { agentId: 'agent', runId: overseerRunId, callId: String(p.callId || ''), ok: !!p.ok, ms: 0, summary: p.ok ? 'done' : 'error', isError: !p.ok });

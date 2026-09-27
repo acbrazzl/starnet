@@ -51,7 +51,7 @@ const S = require('../sidecar/overseer-session.js');
   };
   const events = []; let t = 1000;
   const mk = over => S.makeOverseerSession(Object.assign({ enabled: true, execFile, spawnPty, fs, path, now: () => t, stateDir: ws, claudeHome: home, cwd,
-    name: () => 'PROXIMA', model: () => 'sonnet', permissionMode: 'bypassPermissions', appendPrompt: () => 'You are PROXIMA.', emit: (k, p) => events.push([k, p.name || p.callId]) }, over || {}));
+    name: () => 'PROXIMA', model: () => 'sonnet', permissionMode: 'bypassPermissions', appendPrompt: () => 'You are PROXIMA.', onActivity: (k, p) => events.push([k, p.name || p.callId]) }, over || {}));
 
   // first boot: fresh session, Remote Control, the Commander's mode, appended role; no opening prompt
   const ov = mk();

@@ -65,7 +65,7 @@ function makeOverseerSession(o) {
   const fresh = !!o.fresh;
   const appendPrompt = typeof o.appendPrompt === 'function' ? o.appendPrompt : () => '';
   const log = typeof o.log === 'function' ? o.log : () => {};
-  const emit = typeof o.emit === 'function' ? o.emit : () => {};
+  const onActivity = typeof o.onActivity === 'function' ? o.onActivity : () => {};   // (kind, payload): tool activity for the floor
 
   let state = { shortId: null, sessionId: null, lastCompactAt: 0 };
   let pty = null, ptyReady = null, starting = null;
@@ -170,10 +170,10 @@ function makeOverseerSession(o) {
         const tot = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
         if (tot) lastUsage = tot;
         busy = j.message.stop_reason !== 'end_turn';
-        for (const c of j.message.content || []) if (c && c.type === 'tool_use') emit('tool_call', { callId: c.id, name: c.name, args: c.input });
+        for (const c of j.message.content || []) if (c && c.type === 'tool_use') onActivity('tool_call', { callId: c.id, name: c.name, args: c.input });
       }
       if (j.type === 'user' && j.message && Array.isArray(j.message.content)) {
-        for (const c of j.message.content) if (c && c.type === 'tool_result') emit('tool_result', { callId: c.tool_use_id, ok: !c.is_error });
+        for (const c of j.message.content) if (c && c.type === 'tool_result') onActivity('tool_result', { callId: c.tool_use_id, ok: !c.is_error });
       }
       if (isRealUserTurn(j)) busy = true;
       for (const w of waiters.slice()) { try { w(j); } catch (e) { log('overseer-session waiter: ' + e.message); } }
