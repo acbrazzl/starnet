@@ -119,6 +119,9 @@ internal or auxiliary runs keep the stateless brain, so they never pollute the c
 conversation (`STARNET_OVERSEER_SESSION_FRESH=1` starts clean instead). The session is excluded from the Claude crew
 list, because it *is* the Overseer.
 
+**Playbook.** `STARNET_OVERSEER_SKILL=<skill>` tells the session to load that Claude Code skill at start and after every
+compaction (e.g. a role playbook kept in `~/.claude/skills`).
+
 **Cleaning.** `/compact` runs when the context passes 70% of the model's window, and once a day while idle, never
 mid-turn. Status is at `GET /api/overseer-session`. Profile-file edits take effect at the next session start.
 

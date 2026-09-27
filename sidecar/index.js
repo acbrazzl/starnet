@@ -3982,6 +3982,8 @@ const CLAUDE_CREW_DIR = String(ENV('CLAUDE_CREW_DIR') || '');
    persistent Claude Code session with Remote Control — see sidecar/overseer-session.js. Only interactive COMMS turns
    to the hero go to it (runOnceCore); internal/auxiliary runs keep the stateless brain so they never pollute it. */
 let overseerRunId = '';
+// optional playbook skill the Overseer session loads at start and after every compaction (e.g. meshflow-overseer)
+const OVERSEER_SKILL = /^[A-Za-z0-9._-]{1,64}$/.test(String(ENV('OVERSEER_SKILL') || '').trim()) ? String(ENV('OVERSEER_SKILL')).trim() : '';
 function overseerDocs() {
   try {
     const d = JSON.parse(fs.readFileSync(path.join(WORKSPACES, 'agent.save.json'), 'utf8')).doc.agent;
@@ -3995,6 +3997,7 @@ function overseerAppendPrompt() {
     'This is one continuous Claude Code session: the Commander reaches you from the StarNet station (COMMS), the Claude app (Remote Control) or a terminal, and it is all the same conversation. ' +
     'You have Claude Code\'s full tools, skills and memory here. The Claude crew are other Claude Code sessions on this machine: list them with `claude agents --json`, start one with `claude --bg --remote-control <name> --name <name> --permission-mode ' + (claudeCrew.defaultMode || 'default') + ' -- "/<skill> ..."`, and message one with SendMessage. ' +
     'Only message or stop sessions the station launched; to take over one of the Commander\'s own sessions, ask the Commander first.' +
+    (OVERSEER_SKILL ? ' At the start of this session and again after every compaction, load the /' + OVERSEER_SKILL + ' skill — it is your playbook for this role.' : '') +
     part('YOUR PURPOSE:', d.purpose) + part('ABOUT THE COMMANDER AND MESHFLOW:', d.context) + part('STANDING ORDERS — always follow these:', d.manual);
 }
 if (claudeCrew.enabled && /^(1|true|yes|on)$/i.test(String(ENV('OVERSEER_SESSION') || '').trim())) {
