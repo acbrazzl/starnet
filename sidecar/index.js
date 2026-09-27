@@ -4026,13 +4026,20 @@ if (claudeCrew.enabled && /^(1|true|yes|on)$/i.test(String(ENV('OVERSEER_SESSION
 }
 // a StarNet provider whose stream IS a turn of the persistent session (only the newest user text crosses)
 function overseerSessionProvider(runId) {
+  let asked = false, lastReply = '';   // ONE typing per StarNet run: a loop re-call must never re-send the Commander's message
   return {
     stream: async function* (req) {
+      if (asked) {                     // a re-call within the same run: repeat the reply (the loop reads it as a duplicate and ends 'done')
+        if (lastReply) yield { type: 'text', delta: lastReply };
+        yield { type: 'done', finishReason: 'stop' };
+        return;
+      }
+      asked = true;
       overseerRunId = runId;
       try {
         let usage = null;
         for await (const x of overseerSession.ask(latestUserText((req && req.messages) || []), { signal: req && req.signal, interruptOnAbort: () => overseerExplicitStops.has(runId) })) {
-          if (x.text) yield { type: 'text', delta: x.text + '\n\n' };
+          if (x.text) { lastReply += x.text + '\n\n'; yield { type: 'text', delta: x.text + '\n\n' }; }
           if (x.done) usage = x.usage;
         }
         if (usage) yield { type: 'usage', usage: { prompt_tokens: (usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0), completion_tokens: usage.output_tokens || 0, total_tokens: 0, cost: 0 } };
@@ -16529,6 +16536,10 @@ async function runOnceCore(o) {
   }, runInputContext(accessSurface, isTask, remoteDesktopAuthorized, unrestrictedHostNow())));
 
   // ---- provider + cost ----
+  // OVERSEER SESSION routing: the session is its own agent with its own tools. StarNet offers it NO StarNet tools, so
+  // the loop's continuation gates (which all key off tools.length) never re-prompt it — that re-prompting re-typed the
+  // Commander's message into the session several times and ended runs 'empty' (seen live).
+  const routedToOverseer = !!(overseerSession && providerId === 'claudecode' && agentId === 'agent' && !internal && surface === 'interactive' && !workflowLine);
   // Codex (personal ChatGPT subscription) authenticates with a freshly-refreshed OAuth access_token instead of
   // an API key. A dead/missing token surfaces as a clean run.error so the UI can prompt a re-sign-in; everything
   // downstream of the provider seam (loop, cost, gauge) is identical to the OpenRouter path.
@@ -16556,7 +16567,7 @@ async function runOnceCore(o) {
       return;
     }
     provider = selectProvider({ provider: providerId, fetch: globalThis.fetch, token: oauthToken, headers: oauthInferenceHeaders(providerId), baseUrl, reasoningEffort });
-  } else if (overseerSession && providerId === 'claudecode' && agentId === 'agent' && !internal && surface === 'interactive' && !workflowLine) {
+  } else if (routedToOverseer) {
     // the hero's COMMS turn goes to its ONE persistent Claude Code session (Remote Control, full Claude Code)
     provider = overseerSessionProvider(runId);
   } else {
@@ -16752,8 +16763,8 @@ async function runOnceCore(o) {
   const directDomainWithheld = (name) => !!directDomainTask && (/^team\./.test(name) || /^browser\./.test(name) || name === 'web_search' || name === 'web_request');
   const deferredNames = new Set((deferralOff ? [] : (resolved.deferred || [])).filter(n => !directDomainWithheld(n)));
   const coreNames = resolved.tools.filter(n => !deferredNames.has(n) && !directDomainWithheld(n));
-  const toolDefs = isTask ? registry.wireFormat(registry.list(new Set(coreNames))) : [];
-  const deferredToolDefs = isTask ? registry.wireFormat(registry.list(deferredNames)) : [];
+  const toolDefs = (isTask && !routedToOverseer) ? registry.wireFormat(registry.list(new Set(coreNames))) : [];
+  const deferredToolDefs = (isTask && !routedToOverseer) ? registry.wireFormat(registry.list(deferredNames)) : [];
   const fromWire = new Map();
   // BOTH lists go through the SAME dotted -> underscored translation. A deferred def that skipped this would
   // be advertised as `browser.screenshot` the moment it was revealed, which 400s the request outright (the

@@ -183,12 +183,13 @@ function makeOverseerSession(o) {
         const u = j.message.usage || {};
         const tot = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
         if (tot) lastUsage = tot;
-        busy = j.message.stop_reason !== 'end_turn';
+        if (j.message.stop_reason !== 'end_turn') busy = true;
         for (const c of j.message.content || []) if (c && c.type === 'tool_use') onActivity('tool_call', { callId: c.id, name: c.name, args: c.input });
       }
       if (j.type === 'user' && j.message && Array.isArray(j.message.content)) {
         for (const c of j.message.content) if (c && c.type === 'tool_result') onActivity('tool_result', { callId: c.tool_use_id, ok: !c.is_error });
       }
+      if (j.type === 'system' && j.subtype === 'turn_duration') busy = false;
       if (isRealUserTurn(j)) { busy = true; if (!/^\(StarNet autopilot/.test(textOf(j.message.content))) lastUserTurnAt = now(); }
       for (const w of waiters.slice()) { try { w(j); } catch (e) { log('overseer-session waiter: ' + e.message); } }
     }
@@ -212,14 +213,22 @@ function makeOverseerSession(o) {
         if (isRealUserTurn(j) && (textOf(j.message.content).includes(probe) || now() - askedAt > 20000)) seenUser = true;
         return;
       }
+      // Claude Code writes each content block as its OWN entry and a thinking block can already carry
+      // stop_reason 'end_turn' ahead of the text (seen live: the reply was cut off). The turn is over when the
+      // session writes its `system/turn_duration` entry — or, as a fallback, an end_turn entry that carries text.
       if (j.type === 'assistant' && j.message) {
         const t = textOf(j.message.content);
+        if (j.message.usage) lastTurnUsage = j.message.usage;
         if (t) push({ text: t });
-        if (j.message.stop_reason === 'end_turn' || j.message.stop_reason === 'stop_sequence') { finished = true; push({ done: true, usage: j.message.usage || null }); }
+        const ended = j.message.stop_reason === 'end_turn' || j.message.stop_reason === 'stop_sequence';
+        if (ended && t) sawFinalText = true;
       }
+      if (j.type === 'system' && j.subtype === 'turn_duration') { finished = true; push({ done: true, usage: lastTurnUsage }); }
     };
+    let lastTurnUsage = null, sawFinalText = false;
     waiters.push(waiter);
     const timer = setInterval(poll, 400);
+    let quietTicks = 0;
     try {
       await type(text);
       while (true) {
@@ -233,6 +242,8 @@ function makeOverseerSession(o) {
           break;
         }
         if (queue.length) { const x = queue.shift(); yield x; if (x.done) break; continue; }
+        // fallback for a session that never writes turn_duration: text with end_turn, then a quiet moment
+        if (sawFinalText && !finished) { quietTicks++; if (quietTicks >= 3) { finished = true; yield { done: true, usage: lastTurnUsage }; break; } }
         await new Promise(r => { wake = r; setTimeout(r, 1000); });
       }
     } finally {

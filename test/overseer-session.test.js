@@ -44,10 +44,13 @@ const S = require('../sidecar/overseer-session.js');
       // someone ELSE typed in the Claude app first — must not be mistaken for our turn
       line({ type: 'user', message: { content: 'from the app: status?' } });
       line({ type: 'assistant', message: { content: [{ type: 'text', text: 'app reply' }], stop_reason: 'end_turn' } });
+      line({ type: 'system', subtype: 'turn_duration', durationMs: 900 });
       line({ type: 'user', message: { content: msg } });
       line({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: 'git status' } }], stop_reason: 'tool_use' } });
       line({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'ok' }] } });
+      line({ type: 'assistant', message: { content: [{ type: 'thinking', thinking: '' }], stop_reason: 'end_turn' } });   // thinking first, already end_turn (live shape)
       line({ type: 'assistant', message: { content: [{ type: 'text', text: 'On branch dev.' }], stop_reason: 'end_turn', usage: { input_tokens: 10, cache_read_input_tokens: 150000, output_tokens: 5 } } });
+      line({ type: 'system', subtype: 'turn_duration', durationMs: 1200 });
     } };
   };
   const events = []; let t = 1000;
