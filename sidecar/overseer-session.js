@@ -35,7 +35,10 @@ const DAILY_MS = 24 * 3600 * 1000;
 const ANSI_RE = /\x1b\[[0-9;?]*[ -\/]*[@-~]|\x1b\][^\x07]*\x07/g;
 
 function cwdSlug(cwd) { return String(cwd || '').replace(/[^A-Za-z0-9]/g, '-'); }
-function windowFor(model) { return /\[1m\]|1m/i.test(String(model || '')) ? 1000000 : 200000; }
+function windowFor(model) { return /\[1m\]/i.test(String(model || '')) ? 1000000 : 200000; }
+/* The station stores the brain as a plain alias ('opus'); the Commander's own sessions run Opus with the 1M window
+   ('opus[1m]'). Launch the Overseer the same way, so its window — and the 70% cleaning rule — match reality. */
+function sessionModel(model) { const m = String(model || '').trim(); return m === 'opus' ? 'opus[1m]' : m; }
 function textOf(content) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
@@ -105,7 +108,7 @@ function makeOverseerSession(o) {
       const name = nameNow();
       const model = typeof o.model === 'function' ? o.model() : o.model;
       const args = ['--bg', '--remote-control', name, '--name', name, '--permission-mode', mode];
-      if (model) args.push('--model', String(model));
+      if (model) args.push('--model', sessionModel(model));
       const extra = String(appendPrompt() || '').trim();
       if (extra) args.push('--append-system-prompt', extra);
       if (state.sessionId && !fresh) args.push('--resume', state.sessionId);
@@ -226,7 +229,7 @@ function makeOverseerSession(o) {
     const js = jobState(state.shortId);
     const idle = !busy && !(js && (js.tempo === 'active' || js.state === 'working'));
     if (!idle) return;
-    const full = lastUsage > COMPACT_AT * windowFor((js && (js.respawnFlags || []).join(' ')) || (typeof o.model === 'function' ? o.model() : o.model));
+    const full = lastUsage > COMPACT_AT * (o.contextWindow || windowFor((js && (js.respawnFlags || []).join(' ')) || sessionModel(typeof o.model === 'function' ? o.model() : o.model)));
     const daily = state.lastCompactAt && (now() - state.lastCompactAt) > DAILY_MS;
     if (!state.lastCompactAt) { state.lastCompactAt = now(); saveState(); return; }   // start the daily clock
     if (full || daily) {
@@ -250,4 +253,4 @@ function makeOverseerSession(o) {
   return { start, ask, poll, maintenance, stopSync, status, ownsSession, enabled };
 }
 
-module.exports = { makeOverseerSession, isRealUserTurn, textOf, cwdSlug, windowFor };
+module.exports = { makeOverseerSession, isRealUserTurn, textOf, cwdSlug, windowFor, sessionModel };

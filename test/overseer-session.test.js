@@ -10,7 +10,8 @@ const S = require('../sidecar/overseer-session.js');
 (async () => {
   // ---- pure helpers ----
   A.eq(S.cwdSlug('/home/u/code/meshFlow'), '-home-u-code-meshFlow', 'transcript dir slug matches Claude Code\'s');
-  A.eq([S.windowFor('opus[1m]'), S.windowFor('sonnet')], [1000000, 200000], 'context window from the model');
+  A.eq([S.windowFor('opus[1m]'), S.windowFor('sonnet'), S.windowFor('--model opus')], [1000000, 200000, 200000], 'context window from the model');
+  A.eq([S.sessionModel('opus'), S.sessionModel('sonnet'), S.sessionModel('opus[1m]')], ['opus[1m]', 'sonnet', 'opus[1m]'], 'the Overseer launches Opus with the 1M window, like the Commander\'s sessions');
   A.eq(S.isRealUserTurn({ type: 'user', message: { content: 'hello' } }), true, 'typed text is a real user turn');
   A.eq(S.isRealUserTurn({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't' }] } }), false, 'a tool result is not');
   A.eq(S.isRealUserTurn({ type: 'user', message: { content: '<command-name>/compact</command-name>' } }), false, 'a slash-command echo is not');
