@@ -108,6 +108,37 @@ const S = require('../sidecar/overseer-session.js');
   t += 25 * 3600 * 1000; await ov.maintenance();
   A.eq(typed, ['/compact'], 'daily compaction when idle');
 
+  // a fresh session waiting for its first message (state working, tempo blocked) counts as idle
+  fs.writeFileSync(path.join(home, 'jobs', 'abcd1234', 'state.json'), JSON.stringify({ sessionId: sid, state: 'working', tempo: 'blocked', needs: 'send a prompt to start' }));
+  // ---- scheduled check-ins (one brain): every N hours while idle + once each morning; quiet while the Commander talks ----
+  const typedN = []; let tn = new Date(2026, 8, 27, 6, 0).getTime();   // 06:00 local
+  const wsN = path.join(root, 'wsN'); fs.mkdirSync(wsN, { recursive: true });   // own state: no stale compaction clock
+  const nz = mk({ stateDir: wsN, now: () => tn, nudgeEveryMs: 3 * 3600 * 1000, morningHour: 8,
+    spawnPty: () => { let b = ''; return { onExit() {}, kill() {}, write(d) { if (d === '\r') { typedN.push(b); b = ''; } else b += d; } }; } });
+  await nz.start();
+  global.setTimeout = (fn, ms) => origSetTimeout(fn, Math.min(ms, 5));
+  await nz.maintenance();                                   // starts the clocks
+  A.eq(typedN.length, 0, 'first tick only starts the clocks');
+  tn += 3600 * 1000; await nz.maintenance();                // 07:00 — 1h later, before morning
+  A.eq(typedN.length, 0, 'no check-in before the interval');
+  tn += 3600 * 1000; await nz.maintenance();                // 08:00 — morning
+  A.ok(/morning check-in/.test(typedN[0] || ''), 'morning check-in at the morning hour');
+  tn += 3600 * 1000; await nz.maintenance();                // 09:00 — only 1h since the morning one
+  A.eq(typedN.length, 1, 'the morning check-in resets the interval; one per morning');
+  tn += 3 * 3600 * 1000; await nz.maintenance();            // 12:00
+  A.ok(/scheduled check-in/.test(typedN[1] || '') && /ledger/.test(typedN[1] || ''), 'interval check-in points the Overseer at its ledger');
+  // the Commander talking holds check-ins off for 30 minutes
+  const n2 = await nz.nudge('hello from the Commander');   // simulate a real turn landing in the transcript
+  line({ type: 'user', message: { content: 'the Commander says hi' } });
+  line({ type: 'assistant', message: { content: [{ type: 'text', text: 'hi' }], stop_reason: 'end_turn' } });
+  tn += 3 * 3600 * 1000; nz.poll(); const before = typedN.length; await nz.maintenance();
+  A.eq([n2.ok, typedN.length], [true, before], 'no check-in within 30 minutes of the Commander speaking');
+  global.setTimeout = origSetTimeout;
+  const src = fs.readFileSync(path.join(__dirname, '..', 'sidecar', 'index.js'), 'utf8');
+  A.ok(/if \(overseerSession\) return; try \{ nightshiftDriver\.applyTick/.test(src), 'one brain: the night-shift ticker is quiet while the Overseer session runs');
+  A.ok(['nightshiftChat', 'runNightshiftActShift', 'runWorkshopShift'].every(f => { const i = src.indexOf('function ' + f + '('); return i >= 0 && src.slice(i, i + 700).includes('the Overseer session drives away work'); }), 'one brain: night shift + away builds defer to the Overseer session');
+  A.ok(/Commander pressed IMPLEMENT/.test(src), 'IMPLEMENT is handed to the Overseer session as an order');
+
   // second boot: resume the SAME conversation (session still running -> reuse; stopped -> --resume)
   running = false; calls.length = 0;
   const ov3 = mk();

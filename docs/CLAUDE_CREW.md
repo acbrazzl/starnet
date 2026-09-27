@@ -126,6 +126,12 @@ compaction (e.g. a role playbook kept in `~/.claude/skills`).
 reattaches to the same session, so its Remote Control link stays the same. Only a machine reboot or an explicit `claude stop` ends it, after which it
 is resumed with a new link. (`claude remote-control --session-id` cannot reattach `--bg` sessions: verified.)
 
+**One brain.** With the session on, StarNet's own autopilot never acts as the Overseer. Night Shift and away
+builds stand down, and a deliverable's **IMPLEMENT** is handed to the session as an order. Instead, the station types a
+short check-in into the session every `STARNET_OVERSEER_CHECKIN_HOURS` (default 3; 0 = off) while it is idle and the
+Commander hasn't spoken in the last 30 minutes. It also sends a morning check-in at `STARNET_OVERSEER_MORNING_HOUR`
+(default 8; -1 = off). Idle is Claude Code's job `tempo` (only `active` means generating).
+
 **Cleaning.** `/compact` runs when the context passes 70% of the model's window, and once a day while idle, never
 mid-turn. Status is at `GET /api/overseer-session`. Profile-file edits take effect at the next session start.
 

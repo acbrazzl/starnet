@@ -4011,6 +4011,9 @@ if (claudeCrew.enabled && /^(1|true|yes|on)$/i.test(String(ENV('OVERSEER_SESSION
     name: () => overseerDocs().name, model: () => overseerDocs().model,
     permissionMode: claudeCrew.defaultMode, fresh: /^(1|true|yes|on)$/i.test(String(ENV('OVERSEER_SESSION_FRESH') || '').trim()),
     keepAlive: /^(1|true|yes|on)$/i.test(String(ENV('OVERSEER_SESSION_KEEPALIVE') || '').trim()),   // survive StarNet restarts (same link)
+    // one brain: scheduled check-ins replace StarNet's own autopilot for the Overseer (hours; 0 = off) + a morning one
+    nudgeEveryMs: Math.max(0, Number(ENV('OVERSEER_CHECKIN_HOURS') == null ? 3 : ENV('OVERSEER_CHECKIN_HOURS')) || 0) * 3600 * 1000,
+    morningHour: ENV('OVERSEER_MORNING_HOUR') == null ? 8 : (Number(ENV('OVERSEER_MORNING_HOUR')) >= 0 ? Number(ENV('OVERSEER_MORNING_HOUR')) : -1),
     appendPrompt: overseerAppendPrompt, log: m => console.log('  · ' + m),
     spawnPty: (bin, args, opts) => ptyMod.spawn(bin, args, Object.assign({ env: process.env }, opts)),
     // the session's own tool activity animates the hero on the floor, exactly like a StarNet tool call would
@@ -5574,6 +5577,9 @@ function autonomyLedgerAppend(entry) {
 // a reason-only internal run through runOnce: no tools (no `station`/extraObjects), surface:'autonomous', assemble
 // the reply from agent.token deltas (the SAME contract cron-driver/hub use — there is no agent.message event).
 async function nightshiftChat(o) {
+  // ONE BRAIN: with the Overseer as a persistent Claude session, StarNet's separate night-shift "Overseer" would be a
+  // second brain acting under the same name. Its scheduled check-ins replace this (overseer-session.js).
+  if (overseerSession && String((o && o.agentId) || 'agent') === 'agent') return { fired: false, reason: 'the Overseer session drives away work' };
   const agentId = String((o && o.agentId) || NIGHTSHIFT_AGENT);
   const ident = cronIdentityFor(agentId) || {};
   const provider = cronProviderFor({ agentId: agentId });
@@ -6637,6 +6643,7 @@ async function resolveProjectPatchTarget(foc) {
 }
 
 async function runNightshiftActShift(opts) {
+  if (overseerSession && String((opts && opts.agentId) || 'agent') === 'agent') return { fired: false, reason: 'the Overseer session drives away work' };   // one brain
   opts = opts || {};
   const agentId = String(opts.agentId || NIGHTSHIFT_AGENT);
   const signal = opts.signal;
@@ -6795,7 +6802,8 @@ let nightshiftTimer = null;
 function nightshiftShouldArm() { try { return NIGHTSHIFT_ENABLED || !!(commanderPosture.summary() || {}).actsUnattended; } catch (_) { return NIGHTSHIFT_ENABLED; } }
 function armNightshift() {
   if (processFaultQuiesced || nightshiftTimer) return false;
-  nightshiftTimer = setInterval(() => { try { nightshiftDriver.applyTick(Date.now()); } catch (e) { console.warn('[nightshift] tick error:', (e && e.message) || e); } }, NIGHTSHIFT_TICK_MS);
+  // one brain: with the Overseer session on, it drives away work — StarNet's own night shift stays quiet
+  nightshiftTimer = setInterval(() => { if (overseerSession) return; try { nightshiftDriver.applyTick(Date.now()); } catch (e) { console.warn('[nightshift] tick error:', (e && e.message) || e); } }, NIGHTSHIFT_TICK_MS);
   if (nightshiftTimer.unref) nightshiftTimer.unref();   // the http server keeps the process alive; the ticker alone shouldn't
   console.log('  · night-shift armed (tick ' + Math.round(NIGHTSHIFT_TICK_MS / 1000) + 's, beat ' + Math.round(NIGHTSHIFT_BEAT_MS / 60000) + 'm, away ' + Math.round(NIGHTSHIFT_AWAY_MS / 60000) + 'm)');
   return true;
@@ -12806,6 +12814,7 @@ async function validateWorkshopManifest(agentId, runId) {
 // manifest, and (only if valid) emit workshop.built. Reuses the SAME runOnce host + autonomous posture as cron.
 // Returns { fired, runId?, reason }. An empty/denied backlog is a SILENT no-op (fired:false, no event, no toast).
 async function runWorkshopShift(agentId, opts) {
+  if (overseerSession && String(agentId || 'agent') === 'agent') return { fired: false, reason: 'the Overseer session drives away work' };   // one brain
   const o = opts || {};
   const id = String(agentId || '');
   if (!/^[A-Za-z0-9_-]{1,40}$/.test(id)) return { fired: false, reason: 'bad-agent' };
@@ -13006,6 +13015,14 @@ async function runImplementBuild(agentId, sourceRunId, opts) {
   const source = await validateWorkshopManifest(id, sourceRunId);
   if (!source) return { fired: false, reason: 'source-gone' };
   if (source.implementOf) return { fired: false, reason: 'already-an-implementation' };   // loop guard
+  // ONE BRAIN: the Commander's IMPLEMENT press goes to the real Overseer session as an order, not to a second brain
+  if (overseerSession && id === 'agent') {
+    const where = path.join(WORKSPACES, id, 'workshop', String(sourceRunId));
+    const r = await overseerSession.nudge('(StarNet — the Commander pressed IMPLEMENT on a deliverable) Implement "' + String(source.title || 'the deliverable') +
+      '". Its files are in ' + where + (o.note ? '. The Commander added: ' + String(o.note).slice(0, 1000) : '') +
+      '. Plan it, staff it with the right crew, verify the result, and update your ledger; ask the Commander before anything outside your bounds.');
+    return r.ok ? { fired: true, reason: 'handed to the Overseer session', delegated: true } : { fired: false, reason: 'overseer session unavailable: ' + r.error };
+  }
 
   const model = cronModelFor({ agentId: id });
   const provider = cronProviderFor({ agentId: id });

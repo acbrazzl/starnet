@@ -70,11 +70,18 @@ function makeOverseerSession(o) {
   // SAME session and its Remote Control link does not change. (A `claude remote-control --session-id` reattach does
   // not apply to --bg sessions — verified; so a stopped session always comes back with a new link.)
   const keepAlive = !!o.keepAlive;
+  /* ONE BRAIN: StarNet's own autopilot (Night Shift, away builds) is off for the Overseer; instead the station types a
+     short check-in into THIS session every `nudgeEveryMs` while it is idle and the Commander hasn't spoken recently,
+     plus once each morning (local `morningHour`). The Overseer decides what to do with it (its playbook's bounds). */
+  const nudgeEveryMs = Number.isFinite(o.nudgeEveryMs) ? o.nudgeEveryMs : 0;          // 0 = no scheduled check-ins
+  const morningHour = Number.isFinite(o.morningHour) ? o.morningHour : -1;
+  const QUIET_MS = 30 * 60 * 1000;                                                  // the Commander spoke recently -> hold off
+  let lastUserTurnAt = 0;
   const appendPrompt = typeof o.appendPrompt === 'function' ? o.appendPrompt : () => '';
   const log = typeof o.log === 'function' ? o.log : () => {};
   const onActivity = typeof o.onActivity === 'function' ? o.onActivity : () => {};   // (kind, payload): tool activity for the floor
 
-  let state = { shortId: null, sessionId: null, lastCompactAt: 0 };
+  let state = { shortId: null, sessionId: null, lastCompactAt: 0, lastNudgeAt: 0, lastMorningDay: '' };
   let pty = null, ptyReady = null, starting = null;
   let offset = 0;                                 // bytes of the transcript already consumed
   let lastUsage = 0, busy = false;
@@ -182,7 +189,7 @@ function makeOverseerSession(o) {
       if (j.type === 'user' && j.message && Array.isArray(j.message.content)) {
         for (const c of j.message.content) if (c && c.type === 'tool_result') onActivity('tool_result', { callId: c.tool_use_id, ok: !c.is_error });
       }
-      if (isRealUserTurn(j)) busy = true;
+      if (isRealUserTurn(j)) { busy = true; if (!/^\(StarNet autopilot/.test(textOf(j.message.content))) lastUserTurnAt = now(); }
       for (const w of waiters.slice()) { try { w(j); } catch (e) { log('overseer-session waiter: ' + e.message); } }
     }
   }
@@ -234,20 +241,49 @@ function makeOverseerSession(o) {
     }
   }
 
+  /* nudge(text): type a station message into the session (autopilot check-ins, IMPLEMENT hand-offs). Fire-and-forget:
+     the reply lives in the session (the Claude app / a terminal); it is not a COMMS turn. */
+  async function nudge(text) {
+    const st = await start();
+    if (!st.ok) return st;
+    await type(String(text));
+    return { ok: true };
+  }
+  function localDay(ms) { const d = new Date(ms); return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate(); }
+  const CHECKIN = '(StarNet autopilot — scheduled check-in) No one has messaged you for a while. Review your deliverables ledger and drive the work within your playbook\'s bounds: check on the crew, advance what is in flight, start what should be next, and update the ledger. Only message the Commander if something genuinely needs them.';
+  const MORNING = '(StarNet autopilot — morning check-in) Start of the Commander\'s day. Review your deliverables ledger and the crew, drive the work within your bounds, and put a short morning brief at the top of the ledger: what landed, what is in flight, and what is waiting on the Commander (with your recommendation). Only message the Commander if something genuinely needs them.';
+
   /* maintenance(): the cleaning rule — never mid-turn */
   async function maintenance() {
     if (!enabled || !state.shortId) return;
     poll();
     const js = jobState(state.shortId);
-    const idle = !busy && !(js && (js.tempo === 'active' || js.state === 'working'));
+    // `tempo` is the truth: only 'active' means Claude is generating. A fresh/resumed session waiting for its first
+    // message reports state:'working' + tempo:'blocked' ("send a prompt to start") — that is idle, not busy.
+    const idle = !busy && !(js && js.tempo === 'active');
     if (!idle) return;
     const full = lastUsage > COMPACT_AT * (o.contextWindow || windowFor((js && (js.respawnFlags || []).join(' ')) || sessionModel(typeof o.model === 'function' ? o.model() : o.model)));
     const daily = state.lastCompactAt && (now() - state.lastCompactAt) > DAILY_MS;
-    if (!state.lastCompactAt) { state.lastCompactAt = now(); saveState(); return; }   // start the daily clock
+    if (!state.lastCompactAt) { state.lastCompactAt = now(); if (!state.lastNudgeAt) state.lastNudgeAt = now(); saveState(); return; }   // start the clocks
     if (full || daily) {
       log('overseer-session: compacting (' + (full ? 'context ' + lastUsage + ' tokens' : 'daily') + ')');
       await type('/compact');
       state.lastCompactAt = now(); lastUsage = 0; saveState();
+      return;                                             // one action per tick
+    }
+    // scheduled check-ins (one brain): hold off while the Commander is actively talking to the Overseer
+    if (lastUserTurnAt && now() - lastUserTurnAt < QUIET_MS) return;
+    const t = now(), day = localDay(t);
+    if (morningHour >= 0 && new Date(t).getHours() >= morningHour && state.lastMorningDay !== day) {
+      log('overseer-session: morning check-in');
+      await type(MORNING);
+      state.lastMorningDay = day; state.lastNudgeAt = t; saveState();
+      return;
+    }
+    if (nudgeEveryMs > 0 && t - (state.lastNudgeAt || 0) >= nudgeEveryMs) {
+      log('overseer-session: scheduled check-in');
+      await type(CHECKIN);
+      state.lastNudgeAt = t; saveState();
     }
   }
 
@@ -260,10 +296,10 @@ function makeOverseerSession(o) {
     try { execFileSync(bin, ['stop', state.shortId], { timeout: 2500, stdio: 'ignore' }); } catch (e) { log('overseer-session stop: ' + e.message); }
   }
 
-  function status() { return { enabled, keepAlive, name: nameNow(), shortId: state.shortId, sessionId: state.sessionId, busy, contextTokens: lastUsage, lastCompactAt: state.lastCompactAt || null }; }
+  function status() { return { enabled, keepAlive, nudgeEveryMs, morningHour, lastNudgeAt: state.lastNudgeAt || null, name: nameNow(), shortId: state.shortId, sessionId: state.sessionId, busy, contextTokens: lastUsage, lastCompactAt: state.lastCompactAt || null }; }
   function ownsSession(sessionId, shortId) { return !!((state.sessionId && sessionId === state.sessionId) || (state.shortId && shortId === state.shortId)); }
 
-  return { start, ask, poll, maintenance, stopSync, status, ownsSession, enabled };
+  return { start, ask, nudge, poll, maintenance, stopSync, status, ownsSession, enabled };
 }
 
 module.exports = { makeOverseerSession, isRealUserTurn, textOf, cwdSlug, windowFor, sessionModel };
