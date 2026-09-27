@@ -84,6 +84,19 @@ const S = require('../sidecar/overseer-session.js');
   A.eq(typedRaw.slice(0, 2), ['\x1b[200~line one\nline two\x1b[201~', '\r'], 'multi-line message pasted as one message');
   void pending;
 
+  // an aborted StarNet run: a dropped connection detaches; only an explicit stop sends Esc
+  const escs = [];
+  const quiet = mk({ spawnPty: () => ({ onExit() {}, kill() {}, write: d => escs.push(d) }) });
+  await quiet.start();
+  for (const [label, explicit] of [['connection drop', false], ['explicit stop', true]]) {
+    escs.length = 0;
+    const ac = new AbortController();
+    const g = quiet.ask('long task', { signal: ac.signal, interruptOnAbort: () => explicit })[Symbol.asyncIterator]();
+    global.setTimeout = (fn, ms) => origSetTimeout(fn, Math.min(ms, 5));
+    const nx = g.next(); await new Promise(r => origSetTimeout(r, 40)); ac.abort(); await nx; global.setTimeout = origSetTimeout;
+    A.eq(escs.includes('\x1b'), explicit, label + (explicit ? ' interrupts the Overseer (Esc)' : ' does NOT interrupt the Overseer'));
+  }
+
   // cleaning rule: first check starts the daily clock; >70% of the window compacts when idle
   typed.length = 0;
   await ov.maintenance();

@@ -3982,6 +3982,7 @@ const CLAUDE_CREW_DIR = String(ENV('CLAUDE_CREW_DIR') || '');
    persistent Claude Code session with Remote Control — see sidecar/overseer-session.js. Only interactive COMMS turns
    to the hero go to it (runOnceCore); internal/auxiliary runs keep the stateless brain so they never pollute it. */
 let overseerRunId = '';
+const overseerExplicitStops = new Set();   // runIds the Commander explicitly stopped (POST /api/cancel)
 // optional playbook skill the Overseer session loads at start and after every compaction (e.g. meshflow-overseer)
 const OVERSEER_SKILL = /^[A-Za-z0-9._-]{1,64}$/.test(String(ENV('OVERSEER_SKILL') || '').trim()) ? String(ENV('OVERSEER_SKILL')).trim() : '';
 function overseerDocs() {
@@ -4027,13 +4028,13 @@ function overseerSessionProvider(runId) {
       overseerRunId = runId;
       try {
         let usage = null;
-        for await (const x of overseerSession.ask(latestUserText((req && req.messages) || []), { signal: req && req.signal })) {
+        for await (const x of overseerSession.ask(latestUserText((req && req.messages) || []), { signal: req && req.signal, interruptOnAbort: () => overseerExplicitStops.has(runId) })) {
           if (x.text) yield { type: 'text', delta: x.text + '\n\n' };
           if (x.done) usage = x.usage;
         }
         if (usage) yield { type: 'usage', usage: { prompt_tokens: (usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0), completion_tokens: usage.output_tokens || 0, total_tokens: 0, cost: 0 } };
         yield { type: 'done', finishReason: 'stop' };
-      } finally { overseerRunId = ''; }
+      } finally { overseerRunId = ''; overseerExplicitStops.delete(runId); }
     },
     listModels: async () => [], contextLimit: () => 1000000, priceOf: () => null, supportsTools: () => true, reasoningEfforts: () => ['low', 'medium', 'high'],
   };
@@ -18799,6 +18800,7 @@ async function handleCancel(req, res) {
   if (body === null) return respondJson(res, 400, { error: 'bad json' });
   const runId = body.runId;
   const ac = runId && runs.get(runId);
+  if (runId) overseerExplicitStops.add(String(runId));   // an explicit STOP may interrupt the Overseer session; a dropped connection may not
   if (ac) ac.abort();
   res.writeHead(200); res.end('ok');
 }

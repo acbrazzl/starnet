@@ -216,7 +216,15 @@ function makeOverseerSession(o) {
     try {
       await type(text);
       while (true) {
-        if (signal && signal.aborted) { if (pty) pty.write('\x1b'); break; }   // Esc interrupts the turn, like a human would
+        if (signal && signal.aborted) {
+          // Only an explicit STOP interrupts the Overseer (Esc, like a human would). A StarNet run also aborts when the
+          // page's connection drops (phone backgrounded, overlay blip) — that must NOT kill the session's real work:
+          // detach and let the turn finish in the session (visible in the Claude app / a terminal).
+          const explicit = opts && typeof opts.interruptOnAbort === 'function' && opts.interruptOnAbort();
+          if (explicit && pty) pty.write('\x1b');
+          else log('overseer-session: StarNet run ended (connection) — the Overseer keeps working in its session');
+          break;
+        }
         if (queue.length) { const x = queue.shift(); yield x; if (x.done) break; continue; }
         await new Promise(r => { wake = r; setTimeout(r, 1000); });
       }
