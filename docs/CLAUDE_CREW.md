@@ -102,6 +102,26 @@ key; `providers/claude-cli.js` drives `claude -p` as a pure model:
 - The provider shows as ready only when `claude auth status` reports a signed-in CLI. A missing or signed-out
   CLI is an honest error, not a catalog.
 
+## The Overseer as one persistent Claude Code session (opt-in)
+
+`STARNET_OVERSEER_SESSION=1` (with the Claude-login brain and Claude crew on) runs the hero agent as **one
+continuous Claude Code background session with Remote Control**, instead of a fresh `claude -p` per turn. It is
+the same kind of session the Commander uses at their own terminal: full tools, skills, CLAUDE.md, auto-memory and
+subagents, in `STARNET_CLAUDE_CREW_DIR`, with the station's crew permission mode. The Overseer's name, purpose,
+context and standing orders are appended to Claude Code's own prompt.
+
+**One session, three screens.** StarNet types each COMMS message into the session through a `claude attach` PTY
+(a genuine user turn) and streams the reply from the session's transcript. The same conversation is open in the
+Claude app (Remote Control) and at a terminal (`claude attach`). Only interactive COMMS turns to the hero go to it;
+internal or auxiliary runs keep the stateless brain, so they never pollute the conversation.
+
+**Lifecycle.** The session starts with StarNet and stops in `gracefulShutdown`. The next boot resumes the same
+conversation (`STARNET_OVERSEER_SESSION_FRESH=1` starts clean instead). The session is excluded from the Claude crew
+list, because it *is* the Overseer.
+
+**Cleaning.** `/compact` runs when the context passes 70% of the model's window, and once a day while idle, never
+mid-turn. Status is at `GET /api/overseer-session`. Profile-file edits take effect at the next session start.
+
 ## Remote access to the station (phone)
 
 The sidecar binds loopback only, and the API pins `Host` to loopback as its DNS-rebinding defense.

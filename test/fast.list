@@ -237,6 +237,7 @@ test/autopilot-focus.test.js
 test/apiauth.test.js
 test/claude-crew.test.js
 test/claude-cli-provider.test.js
+test/overseer-session.test.js
 test/notebook.test.js
 test/skills.test.js
 test/skill-exchange.test.js

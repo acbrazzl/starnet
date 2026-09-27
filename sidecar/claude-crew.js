@@ -301,9 +301,10 @@ function makeClaudeCrew(opts) {
     return out;
   }
 
+  const exclude = typeof o.exclude === 'function' ? o.exclude : null;   // e.g. the Overseer's own session: it is the hero, not crew
   function markManaged(sessions) {
     const m = loadManaged();
-    return sessions.map(x => Object.assign(x, { managed: managedOf(x, m) }));
+    return sessions.filter(x => !(exclude && exclude(x))).map(x => Object.assign(x, { managed: managedOf(x, m) }));
   }
   /* resolveTarget(key) -> { session } | { error } — exactly one live session by name, 8-hex id, or uuid. */
   async function resolveTarget(key) {

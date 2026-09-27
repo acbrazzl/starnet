@@ -3956,7 +3956,9 @@ try { console.log('[exec-env]', JSON.stringify(executionEnvironment.describe()))
 const subagents = makeSubagentManager({ fs: fs, pathMod: path, file: path.join(WORKSPACES, 'subagents.json'), clock: { now: () => Date.now() }, emit: chanEmit, newId: () => crypto.randomUUID(), keep: 200, hooks: hookSpine });
 // CLAUDE CREW (opt-in, STARNET_CLAUDE_CREW=1): the user's own `claude` CLI sessions projected onto the floor.
 // StarNet never runs, meters, or authenticates them — see sidecar/claude-crew.js for the auth + consent laws.
+let overseerSession = null;   // assigned right after the crew (below); the crew list excludes the Overseer's own session
 const claudeCrew = require('./claude-crew.js').makeClaudeCrew({
+  exclude: s => !!(overseerSession && overseerSession.ownsSession(s.sessionId, s.shortId)),
   enabled: /^(1|true|yes|on)$/i.test(String(ENV('CLAUDE_CREW') || '').trim()),
   execFile, bin: String(ENV('CLAUDE_BIN') || 'claude'), now: () => Date.now(),
   isDir: p => { try { return path.isAbsolute(p) && fs.statSync(p).isDirectory(); } catch (_) { return false; } },
@@ -3976,6 +3978,62 @@ const claudeCrew = require('./claude-crew.js').makeClaudeCrew({
 });
 // where the Overseer's claude.launch works by default (an absolute dir Claude Code already trusts)
 const CLAUDE_CREW_DIR = String(ENV('CLAUDE_CREW_DIR') || '');
+/* OVERSEER SESSION (opt-in, STARNET_OVERSEER_SESSION=1, needs the Claude-login brain + claude crew): the hero runs as ONE
+   persistent Claude Code session with Remote Control — see sidecar/overseer-session.js. Only interactive COMMS turns
+   to the hero go to it (runOnceCore); internal/auxiliary runs keep the stateless brain so they never pollute it. */
+let overseerRunId = '';
+function overseerDocs() {
+  try {
+    const d = JSON.parse(fs.readFileSync(path.join(WORKSPACES, 'agent.save.json'), 'utf8')).doc.agent;
+    return { name: d.name || 'Overseer', model: d.provider === 'claudecode' ? d.model : '', docs: d.docs || {} };
+  } catch (_) { return { name: 'Overseer', model: '', docs: {} }; }
+}
+function overseerAppendPrompt() {
+  const a = overseerDocs(), d = a.docs;
+  const part = (t, s) => (String(s || '').trim() ? '\n\n' + t + '\n' + String(s).trim() : '');
+  return 'You are ' + a.name + ', the OVERSEER of the Commander\'s StarNet station — its orchestrating lead. ' +
+    'This is one continuous Claude Code session: the Commander reaches you from the StarNet station (COMMS), the Claude app (Remote Control) or a terminal, and it is all the same conversation. ' +
+    'You have Claude Code\'s full tools, skills and memory here. The Claude crew are other Claude Code sessions on this machine: list them with `claude agents --json`, start one with `claude --bg --remote-control <name> --name <name> --permission-mode ' + (claudeCrew.defaultMode || 'default') + ' -- "/<skill> ..."`, and message one with SendMessage. ' +
+    'Only message or stop sessions the station launched; to take over one of the Commander\'s own sessions, ask the Commander first.' +
+    part('YOUR PURPOSE:', d.purpose) + part('ABOUT THE COMMANDER AND MESHFLOW:', d.context) + part('STANDING ORDERS — always follow these:', d.manual);
+}
+if (claudeCrew.enabled && /^(1|true|yes|on)$/i.test(String(ENV('OVERSEER_SESSION') || '').trim())) {
+  let ptyMod = null;
+  try { ptyMod = require('node-pty'); } catch (e) { console.warn('  · overseer session needs node-pty: ' + e.message); }
+  if (ptyMod) overseerSession = require('./overseer-session.js').makeOverseerSession({
+    enabled: true, execFile, fs, path, now: () => Date.now(), stateDir: WORKSPACES,
+    claudeHome: String(ENV('CLAUDE_HOME') || path.join(require('node:os').homedir(), '.claude')),
+    cwd: CLAUDE_CREW_DIR || require('node:os').homedir(), bin: String(ENV('CLAUDE_BIN') || 'claude'),
+    name: () => overseerDocs().name, model: () => overseerDocs().model,
+    permissionMode: claudeCrew.defaultMode, fresh: /^(1|true|yes|on)$/i.test(String(ENV('OVERSEER_SESSION_FRESH') || '').trim()),
+    appendPrompt: overseerAppendPrompt, log: m => console.log('  · ' + m),
+    spawnPty: (bin, args, opts) => ptyMod.spawn(bin, args, Object.assign({ env: process.env }, opts)),
+    // the session's own tool activity animates the hero on the floor, exactly like a StarNet tool call would
+    emit: (kind, p) => {
+      if (!overseerRunId) return;
+      if (kind === 'tool_call') chanEmit('agent.tool_call', { agentId: 'agent', runId: overseerRunId, callId: String(p.callId || ''), name: String(p.name || 'tool'), argsSummary: JSON.stringify(p.args || {}).slice(0, 160) });
+      if (kind === 'tool_result') chanEmit('agent.tool_result', { agentId: 'agent', runId: overseerRunId, callId: String(p.callId || ''), ok: !!p.ok, ms: 0, summary: p.ok ? 'done' : 'error', isError: !p.ok });
+    },
+  });
+}
+// a StarNet provider whose stream IS a turn of the persistent session (only the newest user text crosses)
+function overseerSessionProvider(runId) {
+  return {
+    stream: async function* (req) {
+      overseerRunId = runId;
+      try {
+        let usage = null;
+        for await (const x of overseerSession.ask(latestUserText((req && req.messages) || []), { signal: req && req.signal })) {
+          if (x.text) yield { type: 'text', delta: x.text + '\n\n' };
+          if (x.done) usage = x.usage;
+        }
+        if (usage) yield { type: 'usage', usage: { prompt_tokens: (usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0), completion_tokens: usage.output_tokens || 0, total_tokens: 0, cost: 0 } };
+        yield { type: 'done', finishReason: 'stop' };
+      } finally { overseerRunId = ''; }
+    },
+    listModels: async () => [], contextLimit: () => 1000000, priceOf: () => null, supportsTools: () => true, reasoningEfforts: () => ['low', 'medium', 'high'],
+  };
+}
 const overseer = require('./overseer.js').makeOverseer({ fs, path, writeDurable: writeFileDurable,
   file: path.join(WORKSPACES, 'overseer.json'), now: () => Date.now(),
   newId: () => 'ws_' + crypto.randomUUID().replace(/-/g, ''),
@@ -9604,7 +9662,8 @@ const ROUTES = [
   { m: 'POST', exact: '/api/claude-crew/spawn', h: handleClaudeCrewSpawn },
   { m: 'POST', exact: '/api/claude-crew/stop', h: handleClaudeCrewStop },
   { m: 'POST', exact: '/api/claude-crew/send', h: handleClaudeCrewSend },
-  { m: 'POST', exact: '/api/claude-crew/adopt', h: handleClaudeCrewAdopt },     // the Commander's click IS the one-time approval
+  { m: 'POST', exact: '/api/claude-crew/adopt', h: handleClaudeCrewAdopt },
+  { m: 'GET', exact: '/api/overseer-session', h: (req, res) => claudeCrewJson(res, 200, overseerSession ? Object.assign({ ok: true }, overseerSession.status()) : { ok: true, enabled: false }) },     // the Commander's click IS the one-time approval
   { m: 'POST', exact: '/api/claude-crew/release', h: handleClaudeCrewRelease },
   { m: 'GET', qsplit: '/api/claude-crew/remote', h: handleClaudeCrewRemote },
   { m: 'GET', exact: '/api/claude-crew/skills', h: (req, res) => claudeCrewJson(res, 200, { ok: true, enabled: claudeCrew.enabled, skills: claudeCrew.listSkills().map(sk => ({ name: sk.name, description: sk.description })), defaultDir: CLAUDE_CREW_DIR || undefined, defaultMode: claudeCrew.defaultMode, modes: claudeCrew.modes }) },
@@ -9775,6 +9834,11 @@ server.on('error', (e) => {
 });
 server.listen(PORT, '127.0.0.1', () => {
   const url = 'http://127.0.0.1:' + PORT;
+  if (overseerSession) {
+    overseerSession.start().then(r => console.log('  · overseer session: ' + (r.ok ? 'online ' + r.id + (r.reused ? ' (reused)' : '') : 'FAILED — ' + r.error)));
+    const t = setInterval(() => { overseerSession.maintenance().catch(e => console.warn('  · overseer maintenance: ' + e.message)); }, 60000);
+    if (t.unref) t.unref();
+  }
   const bar = '═'.repeat(58);
   console.log('\n' + bar);
   console.log('  ▲ STARNET — THE FULL APP IS RUNNING (UI + agent engine).');
@@ -9971,6 +10035,7 @@ function gracefulShutdown(signal) {
   try { if (typeof lspManager !== 'undefined' && lspManager && lspManager.closeAll) Promise.resolve(lspManager.closeAll()).catch(() => {}); } catch (_) {}   // reap detected language-server children
   try { if (typeof subagents !== 'undefined' && subagents && subagents.interruptAll) subagents.interruptAll(); } catch (_) {}   // stop watchable background workers
   try { if (typeof connectors !== 'undefined' && connectors && connectors.close) Promise.resolve(connectors.close()).catch(() => {}); } catch (_) {}   // close MCP connectors (stdio children get taskkill/SIGTERM)
+  try { if (overseerSession) overseerSession.stopSync(require('node:child_process').execFileSync); } catch (e) { failNote('overseer.shutdown', e); }   // StarNet down => the Overseer session stops (kept; resumed next boot)
   try { stopTelegram(); } catch (_) {}   // disconnect the Telegram long-poll adapter
   try { stopAllTelegramBots(); } catch (_) {}   // …and every agent-bound bot's poller
   try { stopDiscord(); } catch (_) {}    // disconnect the Discord gateway socket
@@ -16469,6 +16534,9 @@ async function runOnceCore(o) {
       return;
     }
     provider = selectProvider({ provider: providerId, fetch: globalThis.fetch, token: oauthToken, headers: oauthInferenceHeaders(providerId), baseUrl, reasoningEffort });
+  } else if (overseerSession && providerId === 'claudecode' && agentId === 'agent' && !internal && surface === 'interactive' && !workflowLine) {
+    // the hero's COMMS turn goes to its ONE persistent Claude Code session (Remote Control, full Claude Code)
+    provider = overseerSessionProvider(runId);
   } else {
     provider = selectProvider({ provider: providerId, fetch: globalThis.fetch, key: runKey, baseUrl, reasoningEffort });
   }
