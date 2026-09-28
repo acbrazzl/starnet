@@ -198,6 +198,7 @@ function makeClaudeCliProvider(opts) {
     let stderr = '', buf = '', done = false, sawResult = false;
     const msgTools = new Map();   // message id -> [tool_use blocks]
     let lastUsage = null, curMsg = null;
+    let capHit = null;   // a rate_limit_event whose status is not allowed* = the subscription's usage cap (e.g. five_hour)
     // ending the child is best-effort (it may already have exited); a failure is traced, never thrown
     const killChild = () => { try { child.kill('SIGTERM'); } catch (e) { note('claude-cli.kill', e); } };
     const onAbort = () => { killChild(); finish(null); };
@@ -244,11 +245,22 @@ function makeClaudeCliProvider(opts) {
         }
         return;
       }
+      if (j.type === 'rate_limit_event' && j.rate_limit_info) {
+        const st = String(j.rate_limit_info.status || '');
+        if (st && !/^allowed/.test(st)) capHit = j.rate_limit_info;
+        return;
+      }
       if (j.type === 'result') {
         sawResult = true;
         if (j.is_error || (j.subtype && j.subtype !== 'success')) {
-          const err = new Error('claude CLI: ' + String(j.result || j.subtype || 'error').slice(0, 400));
-          err.code = 'claude_cli_error';
+          const text = String(j.result || j.subtype || 'error');
+          // The subscription's usage cap is QUOTA, not a generic failure: code usage_limit_reached makes errorClass
+          // classify it quota_exhausted (no pointless retries; fallback allowed). Reported + verified independently by
+          // an outside tester on androoAGI/starnet#46.
+          const cap = capHit || /usage limit|limit reached|out of (extra )?usage/i.test(text);
+          const resetsAt = capHit && Number(capHit.resetsAt) ? ' (resets at ' + new Date(Number(capHit.resetsAt) * 1000).toISOString() + ')' : '';
+          const err = new Error('claude CLI: ' + text.slice(0, 400) + (cap ? ' — Claude subscription usage limit reached' + resetsAt : ''));
+          err.code = cap ? 'usage_limit_reached' : 'claude_cli_error';
           done = true; killChild();
           return finish(err);
         }

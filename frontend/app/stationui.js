@@ -4390,7 +4390,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   function keysFor(id) { return connectedKeys().filter(x => x.provider === id); }
   function providerAcceptsKey(provider) {
     provider = provider || activeProv();
-    return !isOAuthProvider(provider) && provider !== 'ollama';
+    return !isOAuthProvider(provider) && provider !== 'ollama' && provider !== 'claudecode';   // claudecode: the CLI's own login, no key
   }
   function addKeyHtml(provider, empty) {
     provider = provider || 'openrouter';

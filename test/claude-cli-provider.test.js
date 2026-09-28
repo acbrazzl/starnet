@@ -110,6 +110,22 @@ const TOOLS = [{ type: 'function', function: { name: 'fs.read', description: 're
   const errP = P.makeClaudeCliProvider({ spawn: fakeSpawn({ lines: [{ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'usage limit reached' }] }, []) });
   let threw = null; try { await collect(errP, { messages: [{ role: 'user', content: 'x' }] }); } catch (e) { threw = e; }
   A.ok(threw && /usage limit/.test(threw.message), 'CLI error result surfaces as an error');
+  // the subscription usage cap is classified as QUOTA (fallback allowed), not a generic CLI error
+  const capP = P.makeClaudeCliProvider({ spawn: fakeSpawn({ lines: [
+    { type: 'rate_limit_event', rate_limit_info: { status: 'rejected', rateLimitType: 'five_hour', resetsAt: 1790500000 } },
+    { type: 'result', subtype: 'error_during_execution', is_error: true, result: 'Claude AI usage limit reached' }] }, []) });
+  threw = null; try { await collect(capP, { messages: [{ role: 'user', content: 'x' }] }); } catch (e) { threw = e; }
+  A.eq(threw && threw.code, 'usage_limit_reached', 'a usage-cap rate_limit_event + failing result -> usage_limit_reached');
+  const EC = require('../sidecar/providers/errorClass.js');
+  const cls = EC.classifyApiError(threw);
+  A.eq([cls.reason, cls.shouldFallback, cls.retryable], ['quota_exhausted', true, false], 'StarNet classifies it quota_exhausted: fallback allowed, no retry');
+  const okCap = P.makeClaudeCliProvider({ spawn: fakeSpawn({ lines: [
+    { type: 'rate_limit_event', rate_limit_info: { status: 'allowed_warning' } },
+    { type: 'result', subtype: 'success', stop_reason: 'end_turn', usage: {} }] }, []) });
+  const evOk = await collect(okCap, { messages: [{ role: 'user', content: 'x' }] });
+  A.eq(evOk[evOk.length - 1].finishReason, 'stop', 'an allowed_warning is not a cap');
+  A.ok(/provider !== 'claudecode'/.test(require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'frontend', 'app', 'stationui.js'), 'utf8').match(/function providerAcceptsKey[\s\S]{0,200}/)[0]), 'no stray ADD KEY box on the Claude-login provider card');
+
   const exitP = P.makeClaudeCliProvider({ spawn: fakeSpawn({ lines: [], code: 1, stderr: 'Invalid API key · Please run /login' }, []) });
   threw = null; try { await collect(exitP, { messages: [{ role: 'user', content: 'x' }] }); } catch (e) { threw = e; }
   A.ok(threw && /exited 1.*login/.test(threw.message), 'non-zero exit surfaces with its stderr');
