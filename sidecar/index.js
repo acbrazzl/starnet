@@ -16589,6 +16589,13 @@ async function runOnceCore(o) {
     .map(s => String(s || '').trim()).filter(Boolean);
   const savedProviderFallbacks = !Array.isArray(o.fallbackModels) && fallbackSaved != null && providerId !== 'openrouter' && providerId !== 'starnet'
     ? fallbackModels.splice(0).map(m => ({ provider: 'openrouter', model: m })) : [];
+  // The Claude subscription (claudecode) is capped; when it is primary, no fallback chain is configured, and an
+  // Anthropic key is on file, fail over to it on cap exhaustion (usage_limit_reached -> quota_exhausted).
+  const hasExplicitChain = savedProviderFallbacks.length > 0 || (Array.isArray(o.fallbackProviders) && o.fallbackProviders.length > 0);
+  const autoClaudeCodeFallback = (providerId === 'claudecode' && !hasExplicitChain)
+    ? require('./providers/claude-cli.js').autoAnthropicFallback({ providerId, model, hasExplicitChain,
+        hasAnthropicKey: providerHasCredential('anthropic', providerRuntimeKey('anthropic', ''), '') })
+    : [];
   for (let i = fallbackModels.length - 1; i >= 0; i--) if (fallbackModels[i] === model) fallbackModels.splice(i, 1);
   // COMPETENCE PREFLIGHT: an explicitly configured fallback chain is already the Commander's authority to use
   // another model when the primary cannot serve the run. A definitively tool-less primary used to hard-refuse
@@ -16643,7 +16650,7 @@ async function runOnceCore(o) {
     }));
   }
   const providerFallbacks = [];
-  const rawProviderFallbacks = savedProviderFallbacks.concat(Array.isArray(o.fallbackProviders) ? o.fallbackProviders : []);
+  const rawProviderFallbacks = savedProviderFallbacks.concat(Array.isArray(o.fallbackProviders) ? o.fallbackProviders : [], autoClaudeCodeFallback);
   for (const fb of rawProviderFallbacks) {
     if (!fb || typeof fb !== 'object') continue;
     const fbProviderId = normalizeProvider(fb.provider || providerId);
