@@ -13265,7 +13265,7 @@ function gracefulShutdown(signal) {
   try { if (typeof lspManager !== 'undefined' && lspManager && lspManager.closeAll) Promise.resolve(lspManager.closeAll()).catch(() => {}); } catch (_) {}   // reap detected language-server children
   try { if (typeof subagents !== 'undefined' && subagents && subagents.interruptAll) subagents.interruptAll(); } catch (_) {}   // stop watchable background workers
   try { if (typeof connectors !== 'undefined' && connectors && connectors.close) Promise.resolve(connectors.close()).catch(() => {}); } catch (_) {}   // close MCP connectors (stdio children get taskkill/SIGTERM)
-  try { if (overseerSession) overseerSession.stopSync(require('node:child_process').execFileSync); } catch (e) { failNote('overseer.shutdown', e); }   // StarNet down => the Overseer session stops (kept; resumed next boot)
+  try { if (overseerSession) overseerSession.stopSync(stationChildProcess.execFileSync); } catch (e) { failNote('overseer.shutdown', e); }   // StarNet down => the Overseer session stops (kept; resumed next boot)
   try { shutdownClaudeCliLogins(); } catch (e) { failNote('claudecli.login.shutdown', e); }   // a half-finished `claude auth login` never outlives the station
   try { stopTelegram(); } catch (_) {}   // disconnect the Telegram long-poll adapter
   try { stopAllTelegramBots(); } catch (_) {}   // …and every agent-bound bot's poller

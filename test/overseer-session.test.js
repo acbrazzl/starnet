@@ -137,7 +137,7 @@ const S = require('../sidecar/overseer-session.js');
   tn += 3 * 3600 * 1000; nz.poll(); const before = typedN.length; await nz.maintenance();
   A.eq([n2.ok, typedN.length], [true, before], 'no check-in within 30 minutes of the Commander speaking');
   global.setTimeout = origSetTimeout;
-  const src = fs.readFileSync(path.join(__dirname, '..', 'sidecar', 'index.js'), 'utf8');
+  const src = require('./helpers/source.js').readSidecarSource();
   A.ok(/if \(overseerSession( \|\| updateHolding\(\))?\) return;[^\n]*\n?\s*try \{ nightshiftDriver\.applyTick|if \(overseerSession \|\| updateHolding\(\)\) return;/.test(src), 'one brain: the night-shift ticker is quiet while the Overseer session runs');
   A.ok(['nightshiftChat', 'runNightshiftActShift', 'runWorkshopShift'].every(f => { const i = src.indexOf('function ' + f + '('); return i >= 0 && src.slice(i, i + 700).includes('the Overseer session drives away work'); }), 'one brain: night shift + away builds defer to the Overseer session');
   A.ok(/Commander pressed IMPLEMENT/.test(src), 'IMPLEMENT is handed to the Overseer session as an order');
