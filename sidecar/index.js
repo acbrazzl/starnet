@@ -9260,7 +9260,8 @@ let nightshiftTimer = null;
 function nightshiftShouldArm() { try { return NIGHTSHIFT_ENABLED || !!(commanderPosture.summary() || {}).actsUnattended; } catch (_) { return NIGHTSHIFT_ENABLED; } }
 function armNightshift() {
   if (processFaultQuiesced || nightshiftTimer) return false;
-  nightshiftTimer = setInterval(() => { if (overseerSession || updateHolding()) return;   /* one brain: with the Overseer session on, it drives away work */ try { nightshiftDriver.applyTick(Date.now()); } catch (e) { console.warn('[nightshift] tick error:', (e && e.message) || e); } }, NIGHTSHIFT_TICK_MS);
+  // one brain: with the Overseer session on, it drives away work — StarNet's own night shift stays quiet
+  nightshiftTimer = setInterval(() => { if (updateHolding()) return; if (overseerSession) return; try { nightshiftDriver.applyTick(Date.now()); } catch (e) { console.warn('[nightshift] tick error:', (e && e.message) || e); } }, NIGHTSHIFT_TICK_MS);
   if (nightshiftTimer.unref) nightshiftTimer.unref();   // the http server keeps the process alive; the ticker alone shouldn't
   console.log('  · night-shift armed (tick ' + Math.round(NIGHTSHIFT_TICK_MS / 1000) + 's, beat ' + Math.round(NIGHTSHIFT_BEAT_MS / 60000) + 'm, away ' + Math.round(NIGHTSHIFT_AWAY_MS / 60000) + 'm)');
   return true;
