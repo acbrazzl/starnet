@@ -334,6 +334,7 @@ test/autopilot-focus-veto.test.js
 test/apiauth.test.js
 test/claude-crew.test.js
 test/overseer-session.test.js
+test/auto-build.test.js
 test/peerowner.test.js
 test/provider-key-check.test.js
 test/custom-provider-model-id.test.js

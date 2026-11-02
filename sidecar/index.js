@@ -5699,6 +5699,16 @@ const claudeCrew = require('./claude-crew.js').makeClaudeCrew({
   skillDirs: [path.join(require('node:os').homedir(), '.claude', 'skills')]
     .concat(String(ENV('CLAUDE_SKILL_DIRS') || '').split(path.delimiter).filter(Boolean)),
 });
+/* AUTO-BUILD (fork, opt-in STARNET_AUTO_BUILD=1 — the Commander's decision 2026-11-02): the LEAD builds the station, lays
+   out workflow lines and sets schedules without an approval card. One-step UNDO (station.plan { undo: true } / Build mode
+   UNDO) is the safety net. Named tools only: station.make_prop (spends StarNet credits), station.power / station.control
+   and every other orchestrator write still ask exactly as before. See permissions.js autoBuilt and docs/CLAUDE_CREW.md. */
+const AUTO_BUILD = /^(1|true|yes|on)$/i.test(String(ENV('AUTO_BUILD') || '').trim());
+const AUTO_BUILD_TOOLS = new Set(['station.plan', 'station.build', 'station.test_line', 'station.start_line',
+  'routine.create', 'routine.manage', 'task.create', 'task.manage']);
+function autoBuildAllows(agentId, call) {
+  return AUTO_BUILD && String(agentId || '') === 'agent' && !!call && AUTO_BUILD_TOOLS.has(String(call.name || ''));
+}
 // where the Overseer's claude.launch works by default (an absolute dir Claude Code already trusts)
 const CLAUDE_CREW_DIR = String(ENV('CLAUDE_CREW_DIR') || '');
 /* OVERSEER SESSION (opt-in, STARNET_OVERSEER_SESSION=1, needs the Claude-login brain + claude crew): the hero runs as ONE
@@ -21010,6 +21020,7 @@ async function handleRun(req, res) {
       // (the terminal CLI is on that same computer, token-authenticated, so its runs may too)
       stationBrowser: true,
       viewer: terminalClient ? 'terminal' : '',   // the terminal CLI: no GUI — the manual and capability notes say so
+      stationClient: (body && (body.client === 'terminal' || body.client === 'editor')) ? body.client : '',   // fork: never routed into the Overseer session
       idempotencyScope: connectorContinuationScope,
       parentRunId: connectorContinuationScope ? body.connectorContinuationOf : undefined,
       askCommander,            // in-turn clarify: brief.ask blocks + resumes the SAME turn on this watched surface
@@ -22788,6 +22799,8 @@ async function runOnceCore(o) {
     // cabinet:write / notebook:write (jail-scoped) — exec stays locked, non-jail tools unchanged. A read of the
     // live store each check keeps it honest (a toggle flip takes effect on the very next tool call, no restart).
     workshop: (call, tool) => workshopOf(agentId),
+    // AUTO-BUILD: the Commander's standing yes for the lead's named build/workflow/schedule tools (opt-in STARNET_AUTO_BUILD=1)
+    autoBuild: (call) => autoBuildAllows(agentId, call),
     // UNATTENDED CREDENTIAL GRANT: every ${VAR} this call references must name a service key the Commander
     // approved for unattended use. Read live from the store, so revoking the toggle takes effect on the very
     // next tool call. The tool re-checks independently at send time — this tier only decides consent.
@@ -22957,7 +22970,9 @@ async function runOnceCore(o) {
   // OVERSEER SESSION routing: the session is its own agent with its own tools. StarNet offers it NO StarNet tools, so
   // the loop's continuation gates (which all key off tools.length) never re-prompt it — that re-prompting re-typed the
   // Commander's message into the session several times and ended runs 'empty' (seen live).
-  const routedToOverseer = !!(overseerSession && providerId === 'claude-cli' && agentId === 'agent' && !internal && surface === 'interactive' && !workflowLine);
+  // A terminal (`starnet -p`) or editor (ACP) run is NOT the Commander typing in COMMS: it keeps the station's own brain
+  // and tools, so the Overseer session can hand station work (build, lay out a line, schedule) to the station's lead.
+  const routedToOverseer = !!(overseerSession && providerId === 'claude-cli' && agentId === 'agent' && !internal && surface === 'interactive' && !workflowLine && !o.stationClient);
   // Codex (personal ChatGPT subscription) authenticates with a freshly-refreshed OAuth access_token instead of
   // an API key. A dead/missing token surfaces as a clean run.error so the UI can prompt a re-sign-in; everything
   // downstream of the provider seam (loop, cost, gauge) is identical to the OpenRouter path.

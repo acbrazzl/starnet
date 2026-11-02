@@ -88,6 +88,11 @@
     // never run a command. Pure: like hardline/networkOf, all state comes from the injected function. Default: none.
     const workshop = typeof opts.workshop === 'function' ? opts.workshop : null;
     const credentialed = typeof opts.credentialed === 'function' ? opts.credentialed : null;
+    // AUTO-BUILD (fork, the Commander's decision 2026-11-02): "when the lead builds or reschedules, it just happens; one-step
+    // UNDO is the safety net; anything that spends money still asks". An injected, host-owned predicate naming the exact
+    // station-building / workflow / scheduling tools the Commander pre-approved for the lead (index.js AUTO_BUILD_TOOLS,
+    // opt-in STARNET_AUTO_BUILD=1). Nothing the model emits can reach it. Default: none -> this file behaves as before.
+    const autoBuild = typeof opts.autoBuild === 'function' ? opts.autoBuild : null;
     // UNATTENDED TERMINAL GRANT (2026-07-25): the Commander's recorded per-ROUTINE "may use the terminal"
     // approval for THIS run. Injected like workshop/credentialed; index.js derives it from the durable cron job
     // record only. Default: none -> the exec lockout below is untouched and this file behaves exactly as before.
@@ -127,6 +132,21 @@
     // 'toString' would read as granted. No such capability exists today — this is the allowlist being an
     // allowlist rather than a near-miss, matching the same repair in channels/store.js and shared/schema.js.
     const jailWritableCap = (cap) => Object.prototype.hasOwnProperty.call(JAIL_WRITE_CAPS, cap) && !!JAIL_WRITE_CAPS[cap];
+    /* AUTO-BUILD — the Commander's standing yes for the lead's station building, workflow lines and schedules, on
+       every surface (a terminal or editor run, a routine, the page). Deliberately narrow:
+         • the injected predicate names each tool; there is no capability-wide match, so a sibling on the same
+           orchestrator:write class (station.make_prop spends StarNet credits) is NOT covered and still asks
+         • never scope 'execute' (no shell, ever, from this tier)
+         • never a fresh-consent tool (station.power and kin: widening the leash stays per call)
+         • confirm-every-time (tier 0) and the hardline floor (tier 1) are checked before it, so neither is reachable
+       The taint lock on persisted briefs (taint.js) is enforced at dispatch, independently of consent. */
+    function autoBuilt(call, tool) {
+      if (!autoBuild) return false;
+      if (scopeOf(tool) === 'execute') return false;
+      if (tool && tool.freshConsent === true) return false;
+      try { return autoBuild(call, tool) === true; } catch (_) { return false; }
+    }
+
     function workshopWritable(call, tool) {
       if (!workshop) return false;
       if (surface !== 'autonomous') return false;               // interactive already asks a live human
@@ -236,6 +256,8 @@
       if (hr) return { allow: false, scope: scope, hardline: true, reason: String(hr) + ANTI_RETRY };
       // 2. BYPASS — boot Full Access, live master bypass, or persisted per-agent Full Access.
       if (bypassNow()) return { allow: true, scope: scope, reason: 'full-access' };
+      // 2.1 AUTO-BUILD — the Commander's standing yes for the lead's named build/workflow/schedule tools (see autoBuilt).
+      if (autoBuilt(call, tool)) return { allow: true, scope: scope, reason: 'auto-build (the Commander pre-approved station building and scheduling)' };
       // 2.4 UNATTENDED TERMINAL GRANT — checked BEFORE the exec lockout because opening that lockout for exactly
       // this case IS the feature (see terminalAutonomy). Ordering is load-bearing: below tier 2.5 it would be
       // dead code. Still below the hardline floor (tier 1), so protected paths remain unwritable.

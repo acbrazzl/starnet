@@ -125,6 +125,33 @@ Commander hasn't spoken in the last 30 minutes. It also sends a morning check-in
 **Cleaning.** `/compact` runs when the context passes 70% of the model's window, and once a day while idle, never
 mid-turn. Status is at `GET /api/overseer-session`. Profile-file edits take effect at the next session start.
 
+## The Overseer builds the station (AUTO-BUILD, opt-in)
+
+The Commander does not click-ops the station. Upstream gives the station's LEAD agent a full station builder
+(`station.map` / `station.plan` / `station.build`, workflow lines, `station.start_line`, `routine.create`); the fork
+adds two things so the Overseer session can drive it in plain words:
+
+- **`STARNET_AUTO_BUILD=1`** — the Commander's standing yes (2026-11-02): when the lead builds or reschedules, it just
+  happens, and one-step UNDO is the safety net. A named set of tools is approved for the lead with no approval card,
+  on every surface: `station.plan`, `station.build`, `station.test_line`, `station.start_line`, `routine.create`,
+  `routine.manage`, `task.create`, `task.manage` (`AUTO_BUILD_TOOLS` in `sidecar/index.js`; the tier is `autoBuilt` in
+  `sidecar/permissions.js`). **Not covered, still asks:** `station.make_prop` (spends StarNet credits),
+  `station.power` / `station.control`, every other write, shell, and the Claude crew hand-offs (confirm-every-time).
+  The hardline floor and the taint lock on persisted briefs still apply.
+- **Terminal and editor runs are not routed into the Overseer session.** A `starnet -p` (client `terminal`) or ACP
+  (client `editor`) run keeps the station's own brain and tools, so the Overseer can hand station work to the lead:
+
+  ```bash
+  node ~/code/starnet/bin/starnet.js -p "Give each Claude crew member an office off the main hall, and lay out a nightly
+  release-check line that starts at 02:00."
+  ```
+
+  Never pass `--yes`: it approves every prompt, paid ones included. Without it, anything outside AUTO-BUILD is refused.
+
+**A station page must be attached for a build.** The floor is page-owned state (`sidecar/station-bridge.js`): with no
+station tab open anywhere, `station.map`, `station.plan` and `station.build` fail visibly with a reason instead of
+pretending. Routines (`routine.*`, server-side cron store) do not need a page.
+
 ## Remote access to the station (phone)
 
 The sidecar binds loopback only, and the API pins `Host` to loopback as its DNS-rebinding defense.
