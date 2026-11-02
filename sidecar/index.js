@@ -26173,7 +26173,7 @@ async function handleCancel(req, res) {
   if (body === null) return respondJson(res, 400, { error: 'bad json' });
   const runId = body.runId;
   const ac = runId && runs.get(runId);
-  if (runId) overseerExplicitStops.add(String(runId));   // an explicit STOP may interrupt the Overseer session; a dropped connection may not
+  if (runId && typeof overseerExplicitStops !== 'undefined') overseerExplicitStops.add(String(runId));   // an explicit STOP may interrupt the Overseer session; a dropped connection may not
   if (ac) ac.abort();
   // a routine/line/hub/step-test run is not in `runs`: stop it through its runOnce stop handle (QA 2026-10-02)
   const kc = runId && runStopHandles.get(String(runId));
