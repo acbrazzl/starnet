@@ -53,7 +53,7 @@ async function arm(autoBuild) {
     await sleep(3000);   // the page's SSE subscription (the station bridge) settles
     const roomsOf = () => evalJS(cdp, `App.station().rooms().filter(r=>r&&r.kind!=='corridor').map(r=>r.name||'')`);
     const before = await roomsOf();
-    const cli = spawnSync(process.execPath, [join(REPO, 'bin', 'starnet.js'), '--port', String(port), '--no-spawn', '--json', '--timeout', '420', '-p', ask],
+    const cli = spawnSync(process.execPath, [join(REPO, 'bin', 'starnet.js'), '--port', String(port), '--no-spawn', '--json', '--provider', 'claude-cli', '--model', MODEL, '--timeout', '420', '-p', ask],
       { env: Object.assign({}, env), encoding: 'utf8', timeout: 480000, cwd: REPO });
     await sleep(1500);
     const after = await roomsOf();
@@ -66,7 +66,9 @@ async function arm(autoBuild) {
     console.log('rooms after:  ' + JSON.stringify(after));
     console.log('room "' + ROOM + '" built: ' + built + '   (cli exit ' + cli.status + ')');
     console.log('consent/tool lines from the CLI:\n  ' + (consentLines.join('\n  ') || '(none)'));
-    if (receipt) console.log('receipt: ' + JSON.stringify({ reason: receipt.reason, text: String(receipt.text || receipt.result || '').slice(0, 300) }));
+    if (receipt) console.log('receipt: ' + JSON.stringify({ reason: receipt.reason, text: String(receipt.text || '').slice(0, 400), error: receipt.error }));
+    if (receipt && Array.isArray(receipt.toolCalls)) console.log('tool calls:\n  ' + (receipt.toolCalls.map(t => JSON.stringify(t).slice(0, 260)).join('\n  ') || '(none)'));
+    if (cli.status !== 0) console.log('cli stderr tail:\n  ' + stderr.trim().split('\n').slice(-6).join('\n  '));
     writeFileSync(log, Buffer.concat(logs));
     return { autoBuild, built, exit: cli.status, ws };
   } finally {
