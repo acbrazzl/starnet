@@ -12,27 +12,33 @@
 
    The upstream LLM is mocked via SKYNET_OPENROUTER_BASE (no real key, no network). Modeled on e2e.run.test.js. */
 'use strict';
+const { readSidecarSource, sidecarTopLevelFunction } = require('./helpers/source');
 const A = require('./_assert.js');
+const { userWords } = require('./helpers/host-notes.js');   // the caller's own words: the run-context note leads the newest user message on this wire
 const http = require('http');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const { spawn } = require('child_process');
+const { allocatePort, BIND_REFUSED } = require('./helpers/ports.js');
 const HOST = '127.0.0.1';
 const INDEX = path.resolve(__dirname, '..', 'sidecar', 'index.js');
 const KEY = 'e2e-strong-key-0123456789abcdef';   // >=16 chars so /v1 is allowed to enable
 
 // ---- a mock OpenRouter: /models -> a minimal catalog; /chat/completions -> a short SSE completion ----
 function startMockOpenRouter() {
+  const toolsByPrompt = [];   // issue #96: the tool names each main-run request ADVERTISED, keyed by the last user turn
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       if (req.url.indexOf('/models') >= 0) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ data: [{ id: 'test/model', context_length: 8000, pricing: { prompt: '0', completion: '0' } }] }));
+        res.end(JSON.stringify({ data: [{ id: 'test/model', context_length: 8000, pricing: { prompt: '0', completion: '0' }, supported_parameters: ['tools'] }] }));
         return;
       }
       if (req.url.indexOf('/chat/completions') >= 0) {
         let body = ''; req.on('data', d => { body += d; }); req.on('end', () => {
+          try { const pb = JSON.parse(body); const msgs = pb.messages || []; const lu = [...msgs].reverse().find(m => m && m.role === 'user');
+            toolsByPrompt.push({ user: userWords(lu), tools: (pb.tools || []).map(t => t && t.function && t.function.name) }); } catch (_) {}
           res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
           // DRIPFEED sentinel: a long slow stream so the concurrency test can hold a run in flight.
           if (body.indexOf('DRIPFEED') >= 0) {
@@ -57,11 +63,11 @@ function startMockOpenRouter() {
       }
       res.writeHead(404); res.end();
     });
-    server.listen(0, HOST, () => resolve({ server, base: 'http://' + HOST + ':' + server.address().port + '/api/v1' }));
+    server.listen(0, HOST, () => resolve({ server, toolsByPrompt, base: 'http://' + HOST + ':' + server.address().port + '/api/v1' }));
   });
 }
 
-// spawn the real sidecar; resolve once it logs its listen URL. Retries the next port on EADDRINUSE.
+// spawn the real sidecar; resolve once it logs its listen URL. Retries a refused bind (BIND_REFUSED) on a fresh allocatePort().
 function boot(port, env, attemptsLeft) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [INDEX], {
@@ -71,8 +77,8 @@ function boot(port, env, attemptsLeft) {
     const onData = d => {
       out += d.toString();
       if (!settled && out.indexOf('http://' + HOST + ':' + port) >= 0) { settled = true; resolve({ child, port }); }
-      else if (!settled && /already in use/i.test(out)) { settled = true; try { child.kill(); } catch (_) {}
-        if (attemptsLeft > 0) resolve(boot(port + 1, env, attemptsLeft - 1)); else reject(new Error('no free port')); }
+      else if (!settled && BIND_REFUSED.test(out)) { settled = true; try { child.kill(); } catch (_) {}
+        if (attemptsLeft > 0) resolve(allocatePort().then(next => boot(next, env, attemptsLeft - 1))); else reject(new Error('no free port')); }
     };
     child.stdout.on('data', onData); child.stderr.on('data', onData);
     child.on('error', e => { if (!settled) { settled = true; reject(e); } });
@@ -94,7 +100,7 @@ async function drain(res) {
   // ---- (a) NO key configured -> /v1/* is disabled (403) ----------------------------------------------------
   {
     const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'sk-v1-nokey-'));
-    const { child, port } = await boot(8940 + (process.pid % 40), Object.assign({ SKYNET_WORKSPACES: ws }, baseEnv), 20);
+    const { child, port } = await boot(await allocatePort(), Object.assign({ SKYNET_WORKSPACES: ws }, baseEnv), 20);
     const B = 'http://' + HOST + ':' + port;
     try {
       const models = await fetch(B + '/v1/models');
@@ -113,7 +119,7 @@ async function drain(res) {
   // ---- keyed sidecar for (b)-(g). max-concurrent 1 so the 429 path is cheap to induce. ---------------------
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'sk-v1-'));
   const env = Object.assign({ SKYNET_WORKSPACES: ws, STARNET_API_KEY: KEY, STARNET_V1_MAX_CONCURRENT: '1' }, baseEnv);
-  const { child, port } = await boot(8970 + (process.pid % 40), env, 20);
+  const { child, port } = await boot(await allocatePort(), env, 20);
   const B = 'http://' + HOST + ':' + port;
   const auth = { Authorization: 'Bearer ' + KEY };
   try {
@@ -139,6 +145,10 @@ async function drain(res) {
     A.ok(cc.usage && cc.usage.total_tokens > 0, '(d) usage carries real (non-zero) token counts');
     A.eq(cc.usage.prompt_tokens + cc.usage.completion_tokens, cc.usage.total_tokens, '(d) usage totals are internally consistent (real, not synthesized)');
     A.eq(cc.usage.total_tokens, 6, '(d) usage matches the mock provider numbers exactly (prompt 4 + completion 2)');
+    // issue #96: /v1's own prompt says "use your REAL tools" — the provider request must actually carry them
+    const hiCall = mock.toolsByPrompt.find(r => r.user === 'hi');
+    A.ok(hiCall && hiCall.tools.length > 0, '(d) the /v1 run advertised tools to the model: ' + JSON.stringify(hiCall && hiCall.tools.slice(0, 8)));
+    A.ok(hiCall && hiCall.tools.some(n => /^fs_(read|write)$/.test(n)), '(d) including a real file tool (fs_read/fs_write)');
 
     // ---- (e) stream:true -> chat.completion.chunk deltas then [DONE] --------------------------------------
     const stRes = await fetch(B + '/v1/chat/completions', { method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, auth), body: JSON.stringify({ model: 'starnet-agent', stream: true, messages: [{ role: 'user', content: 'hi' }] }) });
@@ -195,6 +205,21 @@ async function drain(res) {
   } finally {
     try { child.kill(); } catch (_) {}
     try { mock.server.close(); } catch (_) {}
+  }
+  // #96 follow-up: tools ride /v1, but a model the catalog KNOWS is tool-less still answers in text (pre-#96), never refused
+  {
+    const compat = fs.readFileSync(path.resolve(__dirname, '..', 'sidecar', 'openai-compat.js'), 'utf8');
+    const core = readSidecarSource();
+    A.ok(/isTask: !o\.outputOnly, toolsOptional: true/.test(compat), '/v1 runs are tasks with tools OPTIONAL');
+    A.ok(/if \(isTask && o\.toolsOptional && provider\.supportsTools\(model\) === false\) isTask = false;/.test(core), 'a tools-optional run on a known tool-less model drops to text instead of the "can\'t run tasks" refusal');
+    const runCore = sidecarTopLevelFunction('runOnceCore');   // ordering inside the run itself, never across files
+    const downgradeAt = runCore.indexOf('o.toolsOptional && provider.supportsTools(model) === false');
+    A.ok(downgradeAt >= 0 && downgradeAt < runCore.indexOf('fallbackChain.promoteToolCapable('), 'the text downgrade happens before any fallback promotion (the caller named its model)');
+    // review findings: /v1 keeps its pre-#96 admission and never shares a per-agent durable brief or fires paid aux passes
+    A.ok(/const imageTask = isTask && !o\.toolsOptional \?/.test(core) && /const directDomainTask = isTask && !o\.toolsOptional \?/.test(core), 'a /v1 request is never classified as an image/domain task ("Image task blocked: no STUDIO" on a text model)');
+    A.ok(/if \(isTask && o\.taskKey && !o\.toolsOptional\) \{/.test(core), 'a /v1 request never prepares the per-agent durable brief (one client\'s open question cannot swallow the next client\'s request)');
+    // the scout knob reads through ENV('SCOUT') since quick win 32 (STARNET_ or SKYNET_ spelling: test/aux-env-knobs.test.js)
+    A.ok(/isTask && !o\.toolsOptional && !internal && _skillToolsOn/.test(core) && /ENV\('SCOUT'\) !== '0' && isTask && !o\.toolsOptional && _auxDone/.test(core), 'external /v1 traffic never fires skill review or scout on the user\'s key');
   }
   A.report('openai-compat.e2e');
 })().catch(e => { console.error(e); process.exit(1); });

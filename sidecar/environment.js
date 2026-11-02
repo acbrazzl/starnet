@@ -23,12 +23,17 @@
   const AID_RE = /^[A-Za-z0-9_-]{1,40}$/;
   const nodeCrypto = require('node:crypto');
   const { note: envFailNote } = require('./failopen.js');
+  const { trackChild } = require('./procledger.js');   // F2: foreground receipts for the boot orphan sweep
+  const { stationChildEnv } = require('./child-env.js');   // the shared station-secret strip (audit 2026-09-25 #13)
+  const { assertWorkspaceId } = require('./workspace-reserved.js');   // station-owned dirs are never agent jails
+  const { makeFullCapture } = require('./output-capture.js');   // fullOut is bounded (head + tail), never one unbounded string
   const WIN = (typeof process !== 'undefined' && process.platform) === 'win32';
   const DEFAULT_DOCKER_IMAGE = 'node:20-bookworm';
 
   function safeAgentId(id) {
     if (!AID_RE.test(id || '')) throw new Error('bad agentId');
-    return id;
+    // WORKSPACES/<id> is this agent's jail on every backend; a station-owned directory name is never one.
+    return assertWorkspaceId(id);
   }
   function clamp(n, lo, hi) {
     n = Number(n);
@@ -62,8 +67,10 @@
   const SECRET_ENV_NAME_RE = /(?:^|_)(?:TOKEN|KEY|SECRET|PASSWORD|PASS|AUTH|BEARER|COOKIE|CREDENTIAL)(?:_|$)|(?:APIKEY|ACCESSTOKEN|ACCESSKEY|SECRETKEY|AUTHTOKEN|APITOKEN|PRIVATEKEY|PASSWD)|(?:^|_)PAT(?:_|$)/i;
   const INTERNAL_ENV_NAME_RE = /^(?:STARNET|SKYNET)_/i;
   const EXECUTION_HOOK_ENV_RE = /^(?:NODE_OPTIONS|NODE_PATH|npm_config_script_shell|COMSPEC)$/i;
+  /* Agent-driven commands: the shared station-secret strip (child-env.js — StarNet's own names, the service-key
+     names the sidecar exported, any held secret VALUE), then every secret-SHAPED name on top. */
   function sanitizeChildEnv(base) {
-    const src = base || {};
+    const src = stationChildEnv(base || {});
     const out = {};
     for (const k of Object.keys(src)) {
       if (SECRET_ENV_NAME_RE.test(k) || INTERNAL_ENV_NAME_RE.test(k) || EXECUTION_HOOK_ENV_RE.test(k)) continue;
@@ -133,8 +140,12 @@
      leader first raced that discovery — taskkill reported "process not found" while the command and its
      grandchildren kept running, holding workspace file locks after every shell.exec timeout/abort (this
      module is the production path: index.js wires environment.execute ahead of shell.js's runCommand).
-     child.kill() is now only the fallback when taskkill itself fails. */
-  function killTree(spawn, child, isWin) {
+     child.kill() is now only the fallback when taskkill itself fails.
+     POSIX (macOS/Linux): runProcess spawns the child detached — the leader of its OWN process group — so `group`
+     is true and one SIGKILL to -pid reaches the whole tree. Killing only the /bin/sh wrapper orphaned everything
+     the command started (still running, still holding ports/files and the stdout pipe, so the call did not even
+     settle until they exited). A group that can't be signalled falls back to the leader, as before. */
+  function killTree(spawn, child, isWin, group) {
     if (isWin && child.pid) {
       let fellBack = false;
       const fallback = () => {
@@ -164,6 +175,10 @@
         return;
       }
     }
+    // pid > 1 always: process.kill(-1) would signal EVERY process this user owns
+    if (group && typeof process !== 'undefined' && Number.isInteger(child.pid) && child.pid > 1) {
+      try { process.kill(-child.pid, 'SIGKILL'); return; } catch (e) { envFailNote('environment.killTree.group', e); }   // no group -> leader fallback below
+    }
     try { child.kill(); } catch (_) {}
     try {
       if (child.pid && typeof process !== 'undefined') process.kill(child.pid, 'SIGKILL');
@@ -171,12 +186,20 @@
   }
 
   function runProcess(opts) {
-    const spawn = opts.spawn, file = opts.file, args = opts.args, spawnOptions = opts.spawnOptions || {};
+    const spawn = opts.spawn, file = opts.file, args = opts.args;
     const timeoutMs = clamp(opts.timeoutMs, 1000, opts.maxTimeoutMs || 600000);
     const maxBytes = opts.maxBytes || 64000;
     const now = (opts.clock && typeof opts.clock.now === 'function') ? opts.clock.now : function () { return 0; };
     const sig = opts.signal;
     const isWin = opts.isWin != null ? opts.isWin : WIN;
+    /* POSIX: every runProcess child leads its own process group (detached) unless the caller decided otherwise,
+       so a timeout/abort kills the command's whole tree, not just its wrapper. Only on a REAL POSIX host: a test
+       injecting isWin:false on Windows must not get detached (a new console window there). Stdio is untouched and
+       the child is never unref'd — its 'close' is still awaited. */
+    const realPosix = !isWin && typeof process !== 'undefined' && process.platform !== 'win32';
+    const baseSpawnOptions = opts.spawnOptions || {};
+    const group = realPosix && baseSpawnOptions.detached !== false;
+    const spawnOptions = (group && baseSpawnOptions.detached !== true) ? Object.assign({}, baseSpawnOptions, { detached: true }) : baseSpawnOptions;
 
     return new Promise(function (resolve, reject) {
       let child;
@@ -185,22 +208,30 @@
       } catch (e) {
         return reject(new Error('could not start environment process: ' + ((e && e.message) || e)));
       }
+      // F2 (h2 process supervision): a ledgered child is receipted while it runs so a sidecar crash mid-command
+      // leaves an orphan the next boot's sweep can find; released when the command is over (procledger.trackChild).
+      const receipt = trackChild(opts.ledger || null, child && child.pid, { cmd: opts.ledgerCmd != null ? opts.ledgerCmd : '', kind: 'shell.fg', pinAfterMs: opts.ledgerPinAfterMs, exitStampMs: opts.ledgerExitStampMs });
+      if (child && typeof child.on === 'function') child.on('exit', function () { receipt.exited(); });
 
       if (opts.input != null && child.stdin) {
         try {
           if (typeof child.stdin.write === 'function') child.stdin.write(String(opts.input));
           if (typeof child.stdin.end === 'function') child.stdin.end();
         } catch (e) {
-          try { killTree(spawn, child, isWin); } catch (_) {}
+          try { killTree(spawn, child, isWin, group); } catch (_) {}
+          // the child is being torn down: keep its receipt until it has really closed
+          if (child && typeof child.on === 'function') child.on('close', function () { receipt.done(); });
           return reject(new Error('could not write environment process input: ' + ((e && e.message) || e)));
         }
       }
 
       const t0 = now();
-      let out = '', fullOut = '', total = 0, truncated = false, timedOut = false, aborted = false, settled = false;
+      let out = '', total = 0, truncated = false, timedOut = false, aborted = false, settled = false;
+      // BOUNDED (output-capture.js): an unbounded `fullOut +=` crashed the station at V8's max string length.
+      const full = opts.captureFullOut !== false ? makeFullCapture(opts.fullOutMax) : null;
       const append = function (text) {
         const complete = text == null ? '' : String(text);
-        fullOut += complete;
+        if (full) full.push(complete);
         if (total >= maxBytes) { truncated = true; return; }
         let s = complete;
         if (total + s.length > maxBytes) { s = s.slice(0, maxBytes - total); truncated = true; }
@@ -218,8 +249,8 @@
       if (child.stdout && child.stdout.on) child.stdout.on('data', mkDecoded());
       if (child.stderr && child.stderr.on) child.stderr.on('data', mkDecoded());
 
-      const timer = setTimeout(function () { timedOut = true; killTree(spawn, child, isWin); }, timeoutMs);
-      const onAbort = function () { aborted = true; killTree(spawn, child, isWin); };
+      const timer = setTimeout(function () { timedOut = true; killTree(spawn, child, isWin, group); }, timeoutMs);
+      const onAbort = function () { aborted = true; killTree(spawn, child, isWin, group); };
       if (sig) {
         if (sig.aborted) onAbort();
         else { try { sig.addEventListener('abort', onAbort, { once: true }); } catch (_) {} }
@@ -229,10 +260,12 @@
         settled = true;
         clearTimeout(timer);
         if (sig) { try { sig.removeEventListener('abort', onAbort); } catch (_) {} }
+        receipt.done();
         resolve({
           exitCode: (typeof code === 'number' && !timedOut && !aborted) ? code : -1,
           out: out,
-          fullOut: fullOut,
+          fullOut: full ? full.value() : '',
+          fullOutElided: full ? full.elided() : 0,
           ms: Math.max(0, now() - t0),
           truncated: truncated,
           timedOut: timedOut,
@@ -245,6 +278,7 @@
           settled = true;
           clearTimeout(timer);
           if (sig) { try { sig.removeEventListener('abort', onAbort); } catch (_) {} }
+          receipt.done();
           reject(new Error('environment process error: ' + ((e && e.message) || e)));
         });
         child.on('close', finish);
@@ -277,6 +311,8 @@
   function makeLocalBackend(deps) {
     const spawn = deps.spawn, fs = deps.fs, P = deps.pathMod, ROOT = deps.root;
     const bg = deps.bg || null;
+    const ledger = (deps.ledger && typeof deps.ledger.record === 'function') ? deps.ledger : null;
+    const redactFn = typeof deps.redact === 'function' ? deps.redact : function (s) { return s; };
     const clock = deps.clock || { now: function () { return 0; } };
     const platform = deps.platform || (WIN ? 'win32' : 'posix');
     const isWin = platform === 'win32';
@@ -333,7 +369,8 @@
         opts = opts || {};
         const aid = safeAgentId(opts.agentId || 'agent');
         return runProcess({
-          spawn: spawn,
+          // opts.breakaway: a command that opens the person's own window runs outside the station's job (sidecar/breakaway.js)
+          spawn: opts.breakaway ? require('./breakaway.js').makeBreakaway({ platform: isWin ? 'win32' : 'posix' }).spawnVia(spawn) : spawn,
           file: String(opts.cmd || ''),
           args: null,
           spawnOptions: { cwd: opts.cwd || getCwd(aid), shell: true, windowsHide: true, env: spawnEnv(opts.surface) },
@@ -342,7 +379,10 @@
           maxBytes: opts.maxBytes,
           signal: opts.signal,
           clock: opts.clock || clock,
-          isWin: isWin
+          isWin: isWin,
+          // F2: the foreground child is receipted for the next boot's orphan sweep while it runs (REDACTED command)
+          ledger: ledger,
+          ledgerCmd: opts.ledgerCmd != null ? String(opts.ledgerCmd) : redactFn(String(opts.cmd || ''))
         });
       },
       startBackground: function (opts) {
@@ -365,6 +405,9 @@
       killBackground: function (agentId, bgId) {
         return bg && typeof bg.kill === 'function' ? bg.kill(safeAgentId(agentId || 'agent'), bgId) : { ok: false, error: 'background processes are not available for the local backend' };
       },
+      waitBackground: function (agentId, bgId, opts) {
+        return bg && typeof bg.wait === 'function' ? bg.wait(safeAgentId(agentId || 'agent'), bgId, opts) : null;
+      },
       killAllBackground: function (agentId) {
         return bg && typeof bg.killAll === 'function' ? bg.killAll(agentId) : 0;
       },
@@ -382,6 +425,7 @@
     const cfg = deps.config || {};
     const sessions = new Map();
     const ready = new Set();
+    const revivals = new Map();  // agent → how many ensures had to start or create its container (read by reviveStale)
     const ensuring = new Map();
     const active = new Map();
     const lastUsed = new Map();
@@ -520,8 +564,8 @@
 
     /* Start one duplex MCP child INSIDE an already-probed per-agent container. This is deliberately
        synchronous because the stdio transport lazily asks for a ChildProcess when its first JSON-RPC
-       frame is sent; configureConnectorCfg performs the asynchronous ensureReady() before the manager
-       is allowed to build this transport.
+       frame is sent; the connector manager awaits the host's prepareConnect hook (index.js), which runs the
+       asynchronous ensureReady() — re-checking a cached cell — before EVERY connect builds this transport.
 
        No shell is involved. The connector command and every argument become exact docker-exec argv.
        Environment VALUES ride only in the docker client's environment; `docker exec -e NAME` forwards
@@ -608,6 +652,7 @@
       if (ensuring.has(aid)) return ensuring.get(aid);
       const promise = inspectContainer(aid).then(function (state) {
         if (state.exists && state.running) return { reused: true };
+        revivals.set(aid, (revivals.get(aid) || 0) + 1);   // this ensure is what brings the container up (starts or creates it)
         if (state.exists) {
           return dockerRun(['start', containerName(aid)], { timeoutMs: 30000 }).then(function (r) {
             if (r.exitCode !== 0) throw new Error('could not start persistent Docker environment: ' + String(r.out || '').trim());
@@ -638,6 +683,38 @@
         runtimeStatus.state = 'unavailable';
         runtimeStatus.error = String((e && e.message) || e || 'Docker environment unavailable').slice(0, 300);
         throw e;
+      });
+    }
+
+    /* THE READY CACHE GOES STALE. `ready` is set at the first good probe and every later exec trusts it, so after
+       a Docker daemon restart (or the container stopped/removed outside the station) every command failed with
+       docker's own refusal until the sidecar restarted, while describe() still said ready. A docker CLI refusal
+       that says the container or the daemon was not there drops the cache and re-runs the full ensure (inspect →
+       start → probe); a failed ensure marks the backend unavailable, as on first use.
+       The command is re-run ONCE, and only when an ensure since the exec reached docker had to START or CREATE the
+       container: then the refused exec cannot have run it. That is EVERY exec the same restart refused — the ones
+       joining the ensure the first refusal began, and one whose refusal arrives after the cell is already back —
+       not only the first. A container that was running all along (output that merely looks like the refusal)
+       keeps its original result: a command that ran is never run twice. Nor is one whose run was Stopped while the
+       revival waited (its abort signal fired): it keeps docker's refusal. */
+    const DOCKER_GONE_RE = /^\s*(?:Error response from daemon:\s*(?:No such container\b|[Cc]ontainer \S+ is not running)|Cannot connect to the Docker daemon|error during connect|failed to connect to the docker API)/;
+    function containerGone(r) {
+      return !!r && r.exitCode !== 0 && !r.timedOut && !r.aborted && DOCKER_GONE_RE.test(String(r.out || ''));
+    }
+    function reviveStale(aid, before) {
+      ready.delete(aid);
+      return ensureContainer(aid, false).then(function () { return (revivals.get(aid) || 0) > before; }, function () { return false; });
+    }
+    /* The paths with no refusal to read afterwards re-check a cached cell BEFORE use instead: ensureReady (connector
+       configure, Reload, and every stdio MCP connect — the docker exec -i child is spawned synchronously right after)
+       and a background start (its exec outlives the call). One `docker inspect`: a cell that is no longer running,
+       or a daemon that does not answer, drops the cache and the full ensure brings the cell back (or marks the
+       backend unavailable, as on first use). A foreground exec skips the inspect: it reads docker's refusal instead. */
+    function ensureFresh(aid) {
+      if (!ready.has(aid) || ensuring.has(aid)) return ensureContainer(aid, false);
+      return inspectContainer(aid).then(function (state) {
+        if (!(state.exists && state.running)) ready.delete(aid);
+        return ensureContainer(aid, false);
       });
     }
 
@@ -711,7 +788,7 @@
           }
         };
       },
-      ensureReady: function (agentId) { touch(safeAgentId(agentId || 'agent')); return ensureContainer(agentId, false); },
+      ensureReady: function (agentId) { const aid = safeAgentId(agentId || 'agent'); touch(aid); return ensureFresh(aid); },
       cleanupAgent: cleanupAgent,
       cleanupIdle: cleanupIdle,
       syncWorkspace: function (agentId) { return Promise.resolve({ ok: true, needed: false, agentId: safeAgentId(agentId || 'agent'), backend: 'docker' }); },
@@ -727,10 +804,18 @@
         // in a command line, and a container only ever receives keys the Commander connected.
         const svc = serviceEnvFor(opts.surface);
         const names = Object.keys(svc);
-        return withActivity(aid, function () { return ensureContainer(aid, false).then(function () {
+        const run = function () {
           return dockerRun(dockerExecArgs(aid, opts.cmd, cwd, names), {
             env: dockerClientEnv(svc), timeoutMs: opts.timeoutMs, maxTimeoutMs: opts.maxTimeoutMs,
             maxBytes: opts.maxBytes, signal: opts.signal, clock: opts.clock || clock
+          });
+        };
+        return withActivity(aid, function () { return ensureContainer(aid, false).then(function () {
+          const before = revivals.get(aid) || 0;   // the revivals before this exec reaches docker
+          return run().then(function (r) {
+            if (!containerGone(r)) return r;
+            // a Stop during the revival wait means no re-run: the caller keeps docker's refusal (the command never ran)
+            return reviveStale(aid, before).then(function (revivedSince) { return revivedSince && !(opts.signal && opts.signal.aborted) ? run() : r; });
           });
         }); });
       },
@@ -741,7 +826,7 @@
         const aid = safeAgentId(opts.agentId || 'agent');
         const svc = serviceEnvFor(opts.surface);
         touch(aid);
-        return ensureContainer(aid, false).then(function () {
+        return ensureFresh(aid).then(function () {
           return bg.start({
             agentId: aid, cmd: String(opts.cmd || ''), cwd: workspaceRoot(aid), isWin: WIN,
             file: cfg.dockerBin || 'docker', args: dockerExecArgs(aid, opts.cmd, opts.cwd || getCwd(aid), Object.keys(svc)),
@@ -754,6 +839,8 @@
       writeBackground: function (agentId, bgId, opts) { return deps.bg && deps.bg.write ? deps.bg.write(safeAgentId(agentId || 'agent'), bgId, opts) : { ok: false, error: 'background processes are not available for the docker backend' }; },
       closeBackgroundStdin: function (agentId, bgId) { return deps.bg && deps.bg.closeStdin ? deps.bg.closeStdin(safeAgentId(agentId || 'agent'), bgId) : { ok: false, error: 'background processes are not available for the docker backend' }; },
       killBackground: function (agentId, bgId) { return deps.bg && deps.bg.kill ? deps.bg.kill(safeAgentId(agentId || 'agent'), bgId) : { ok: false, error: 'background processes are not available for the docker backend' }; },
+      // the host-side `docker exec` child is a shellbg record, so its exit is observable the same way
+      waitBackground: function (agentId, bgId, opts) { return deps.bg && deps.bg.wait ? deps.bg.wait(safeAgentId(agentId || 'agent'), bgId, opts) : null; },
       killAllBackground: function (agentId) { return deps.bg && deps.bg.killAll ? deps.bg.killAll(agentId) : 0; },
       spawnStdio: spawnStdio,
       _internals: { dockerCreateArgs: dockerCreateArgs, dockerExecArgs: dockerExecArgs, containerName: containerName, inspectContainer: inspectContainer, posixInside: posixInside, spawnStdio: spawnStdio, active: active, lastUsed: lastUsed }
@@ -765,6 +852,7 @@
     const clock = deps.clock || { now: function () { return 0; } };
     const cfg = deps.config || {};
     const targetFn = typeof deps.sshConfig === 'function' ? deps.sshConfig : function () { return null; };
+    const agentIdsFn = typeof deps.sshAgentIds === 'function' ? deps.sshAgentIds : function () { return []; };   // agents with a configured target (station-wide reap)
     const serviceEnvFn = typeof deps.serviceEnv === 'function' ? deps.serviceEnv : null;
     const states = new Map();
     const sessions = new Map();
@@ -1127,16 +1215,61 @@
     function readBackground(agentId, bgId, opts) {
       opts = opts || {};
       const aid = safeAgentId(agentId || 'agent');
+      /* COUNT, GREP AND PAGE ON THE REMOTE HOST. This used to `cat` the whole remote log into one string and page it
+         here: unbounded RAM (a big log could crash the station), and once captures were bounded (output-capture.js)
+         a grep could no longer see the dropped middle. Now only the requested page crosses the wire, line numbers
+         are the file's own, and paging follows the local backend (shellbg.read): grep is a literal substring match,
+         case-insensitive for ASCII letters (awk's tolower; the local backend also folds non-ASCII), no offset = the
+         first match; without grep, no offset = the last `limit` lines. A line longer than LINE_MAX is cut, visibly.
+         Both passes read ONE size snapshot of out + err, so a job still writing cannot shift lines between the count
+         and the page; a failed scan, a timeout or a cancel is an error, never an empty page. */
       return enqueue(aid, async function () {
         const row = target(aid), dir = remoteJobDir(row, bgId);
-        const result = await runSsh(row, 'test -d ' + quote(dir) + ' || exit 44\ncat ' + quote(dir + '/out') + ' ' + quote(dir + '/err') + ' 2>/dev/null || true\n', { timeoutMs: 30000, maxBytes: 512000 });
+        const limit = Math.trunc(clamp(opts.limit || 200, 1, 1000)), LINE_MAX = 4000;   // an integer: it enters shell arithmetic
+        const grep = opts.grep == null ? '' : String(opts.grep);
+        const rawOffset = Number(opts.offset);
+        const offsetArg = Number.isFinite(rawOffset) ? String(Math.max(-1e9, Math.min(1e9, Math.trunc(rawOffset)))) : '';
+        const outFile = quote(dir + '/out'), errFile = quote(dir + '/err');
+        const match = 'p=="" || index(tolower($0),p)>0';
+        const script = [
+          'test -d ' + quote(dir) + ' || exit 44',
+          'P=' + quote(grep) + '; export P',
+          'sz() { if test -f "$1"; then wc -c < "$1" | tr -d " "; else echo 0; fi; }',
+          'so=$(sz ' + outFile + '); so=${so:-0}; se=$(sz ' + errFile + '); se=${se:-0}',
+          'rd() { if test "$so" -gt 0; then head -c "$so" ' + outFile + ' 2>/dev/null; fi; if test "$se" -gt 0; then head -c "$se" ' + errFile + ' 2>/dev/null; fi; return 0; }',
+          "n=$(rd | awk 'BEGIN{p=tolower(ENVIRON[\"P\"])} {t++} " + match + " {m++} END{printf \"%d %d\", t+0, m+0}') || exit 45",
+          'set -- $n; t=${1:-0}; m=${2:-0}',
+          'if test -n "$P"; then c=$m; else c=$t; fi',
+          'o=' + quote(offsetArg),
+          'if test -z "$o"; then if test -n "$P"; then o=0; else o=$((c - ' + limit + ')); fi; elif test "$o" -lt 0; then o=$((c + o)); fi',
+          'test "$o" -lt 0 && o=0',
+          'test "$o" -gt "$c" && o=$c',
+          'printf "starnet-page %s %s %s\\n" "$t" "$m" "$o"',
+          "rd | O=$o L=" + limit + " W=" + LINE_MAX + " awk 'BEGIN{p=tolower(ENVIRON[\"P\"]);o=ENVIRON[\"O\"]+0;l=ENVIRON[\"L\"]+0;w=ENVIRON[\"W\"]+0} "
+            + match + " {if(k>=o){s=$0; if(length(s)>w) s=substr(s,1,w) \" …[line cut at \" w \" characters]\"; print NR \"\\t\" s} k++; if(k>=o+l) exit}' || exit 46",
+          'exit 0'
+        ].join('\n') + '\n';
+        const result = await runSsh(row, script, { timeoutMs: 30000, maxBytes: 512000 });
         if (result.exitCode === 44) return { ok: false, error: 'no such background process' };
-        let lines = String(result.fullOut || result.out || '').split(/\r?\n/), grep = opts.grep == null ? '' : String(opts.grep);
-        if (grep) lines = lines.filter(x => x.indexOf(grep) >= 0);
-        const total = lines.length, limit = clamp(opts.limit || 200, 1, 1000);
-        let offset = Number(opts.offset); if (!isFinite(offset)) offset = Math.max(0, total - limit); if (offset < 0) offset = Math.max(0, total + offset);
-        const page = lines.slice(offset, offset + limit);
-        return { ok: true, bgId: String(bgId), running: false, exitCode: null, killed: false, cmd: 'remote background process', totalLines: total, returned: page.length, offset, firstLineNo: page.length ? offset + 1 : 0, lines: page, lineNos: page.map((_x, i) => offset + i + 1), grep: grep || null, matchedLines: grep ? total : 0, truncatedStart: !!result.truncated };
+        if (result.timedOut) return { ok: false, error: 'the remote log read did not finish within 30 s (a very large log): read it with shell.exec and grep/tail/sed on the remote host' };
+        if (result.aborted) return { ok: false, error: 'the remote log read was cancelled' };
+        if (result.exitCode === 45 || result.exitCode === 46) return { ok: false, error: 'the remote host could not scan the log (awk failed, exit ' + result.exitCode + ')' };
+        if (result.exitCode !== 0) return { ok: false, error: 'could not read the remote background output (ssh exit ' + result.exitCode + ')' };
+        let total = 0, matched = 0, offset = 0, header = false;
+        const lines = [], lineNos = [];
+        for (const text of String(result.fullOut || result.out || '').split('\n')) {
+          if (!header) {
+            const h = /^starnet-page (\d+) (\d+) (\d+)\r?$/.exec(text);
+            if (h) { total = Number(h[1]); matched = Number(h[2]); offset = Number(h[3]); header = true; }
+            continue;
+          }
+          const m = /^(\d+)\t/.exec(text);
+          if (!m) continue;
+          lineNos.push(Number(m[1]));
+          lines.push(text.slice(m[0].length).replace(/\r$/, ''));
+        }
+        if (!header) return { ok: false, error: 'could not read the remote background output' + (result.exitCode ? ' (ssh exit ' + result.exitCode + ')' : '') };
+        return { ok: true, bgId: String(bgId), running: false, exitCode: null, killed: false, cmd: 'remote background process', totalLines: total, returned: lines.length, offset, firstLineNo: lines.length ? lineNos[0] : 0, lines, lineNos, grep: grep || null, matchedLines: grep ? matched : 0, truncatedStart: false };
       });
     }
     function killBackground(agentId, bgId) {
@@ -1148,14 +1281,30 @@
         return result.exitCode === 0 ? { ok: true, bgId: String(bgId), killed: true } : { ok: false, error: result.exitCode === 44 ? 'no such background process' : 'remote kill could not be verified' };
       });
     }
-    function killAllBackground(agentId) {
+    function killAllForAgent(agentId) {
       const aid = safeAgentId(agentId || 'agent');
+      // no owner-configured target = no remote root this station could have started a job under: nothing to reap
+      let row = null;
+      try { row = target(aid); } catch (_) { return Promise.resolve(0); }
       return enqueue(aid, async function () {
-        const row = target(aid), root = row.remoteRoot + '/.starnet/jobs';
+        const root = row.remoteRoot + '/.starnet/jobs';
         const script = 'n=0\nfor d in ' + quote(root) + '/sshbg_*; do test -d "$d" || continue; pid=$(cat "$d/pid" 2>/dev/null || true); want=$(cat "$d/identity" 2>/dev/null || true); got=$(ps -o lstart= -p "$pid" 2>/dev/null | sha256sum | cut -d" " -f1); if test -n "$pid" && test -n "$want" && test "$want" = "$got" && kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null && n=$((n+1)); printf killed > "$d/exit"; fi; done\nprintf "STARNET_KILLED\\t%s\\n" "$n"\n';
         const result = await runSsh(row, script, { timeoutMs: 30000, maxBytes: 4096 });
         const m = /STARNET_KILLED\t(\d+)/.exec(String(result.out || '')); return m ? Number(m[1]) : 0;
       });
+    }
+    // Station-wide (no agentId: E-STOP / Quit / shutdown): remote jobs are per agent (per-agent target +
+    // remoteRoot) and restart-persistent, so reap under EVERY agent with a configured target — not the
+    // current profile (a job outlives a profile switch or a Full Power reroute). Never rejects: one
+    // unreachable host is noted and counted 0, it must not become a process-level unhandledRejection.
+    function killAllBackground(agentId) {
+      if (agentId != null) return killAllForAgent(agentId);
+      let ids = [];
+      try { ids = Array.from(new Set((agentIdsFn() || []).map(String))).filter(function (id) { return AID_RE.test(id); }); }
+      catch (e) { envFailNote('environment.ssh.killAll.roster', e); }
+      return Promise.all(ids.map(function (id) {
+        return Promise.resolve(id).then(killAllForAgent).then(function (n) { return Number(n) || 0; }, function (e) { envFailNote('environment.ssh.killAll', e); return 0; });
+      })).then(function (counts) { return counts.reduce(function (a, n) { return a + n; }, 0); });
     }
     function describe(agentId) {
       let row = null, state = null;
@@ -1221,6 +1370,8 @@
       writeBackground: backend.writeBackground,
       closeBackgroundStdin: backend.closeBackgroundStdin,
       killBackground: backend.killBackground,
+      // null from a backend without an event-driven wait (ssh): the shell.bg.wait tool then polls statusBackground
+      waitBackground: backend.waitBackground || function () { return null; },
       killAllBackground: backend.killAllBackground,
       createCheckpoint: backend.createCheckpoint,
       listCheckpoints: backend.listCheckpoints,

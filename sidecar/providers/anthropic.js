@@ -9,6 +9,7 @@
   'use strict';
 
   const normalizeFinish = provider.normalizeFinish;
+  const { note: failNote } = (typeof require === 'function') ? require('../failopen.js') : { note: function (tag, e) { console.warn('[failopen] ' + tag + ':', (e && e.message) || e); } };
   const classifyApiError = errorClass.classifyApiError;
   const timeouts = provider.timeouts;
   const isAbort = provider.runtime.isAbort;
@@ -17,7 +18,6 @@
   const ANTHROPIC_VERSION = '2023-06-01';
   const RETRY_DELAYS = [400, 1200];
   const REWARM_MIN_MS = 5 * 60 * 1000;
-  const DEFAULT_CONTEXT = 200000;
   const FALLBACK_MAX_TOKENS = 32000;   // Anthropic requires max_tokens; when the model's real ceiling is unknown, cap here
                                        // (well above the old 4096 so long deliverables aren't silently truncated) — decided 2026-07-04.
   // resolve the env override once, tolerant of a garbage value (a typo must never wedge generation).
@@ -49,6 +49,13 @@
     } catch (_) { return false; }
   })();
   const cacheControl = () => (CACHE_TTL_1H ? { type: 'ephemeral', ttl: '1h' } : { type: 'ephemeral' });
+  // TOOL ANCHOR kill switch (see buildBody): STARNET_ANTHROPIC_TOOL_ANCHOR=0 restores the system-only anchor layout.
+  // Read per call, so flipping it takes effect on the next request without a restart.
+  function toolAnchorOn() {
+    const env = (typeof process !== 'undefined' && process.env) ? process.env : {};
+    const raw = env.STARNET_ANTHROPIC_TOOL_ANCHOR != null ? env.STARNET_ANTHROPIC_TOOL_ANCHOR : env.SKYNET_ANTHROPIC_TOOL_ANCHOR;
+    return String(raw == null ? '' : raw).trim() !== '0';
+  }
   // the block kinds Anthropic documents as legal carriers of cache_control (plus schema-less tool defs)
   const CACHEABLE_BLOCK = { text: 1, image: 1, tool_use: 1, tool_result: 1, document: 1 };
 
@@ -89,11 +96,36 @@
   // offered; saved OFF settings clamp to adaptive thinking at the lowest supported effort.
   // Opus 5.5 rejects disabled thinking; Opus 5 still supports it, so do not match all Opus 5.x.
   const ALWAYS_THINKING_CLAUDE = ['claude-fable', 'claude-mythos', 'claude-opus-5-5', 'claude-opus-5.5'];
+  /* SONNET 5.5 OFF (#73). `{type:'disabled'}` is a 400 on Sonnet 5.5 ("send {type:'between_tools'} instead"); its OFF
+     switch is `{type:'between_tools'}` — NO other field inside `thinking` (no display/budget_tokens/block_binding),
+     accepted only at effort `high` or below, so it rides with no effort at all (the server default, high, is
+     accepted). Sonnet 5 / Opus 5 still take `disabled` and keep it. */
+  const BETWEEN_TOOLS_CLAUDE = ['claude-sonnet-5-5', 'claude-sonnet-5.5'];
+  /* PRESERVED THINKING (#73). On these models a thinking block's signature records the conversation prefix that
+     produced it (top-level system, the tool set, every earlier message). If that prefix changes between requests —
+     a tool.search reveal growing `tools`, a stale screenshot swapped for a placeholder, a compaction fold — replaying
+     the block is a hard 400 ("bound to a different conversation") for accounts created on/after 2026-08-31. The
+     opt-in recovery is the `thinking-binding-controls-2026-08-01` beta plus
+     `thinking.block_binding.prefix_mismatch_behavior:'drop_block'`: the API then drops the mismatched block (and every
+     later one) for that request only and reports it in `input_transformations`. It is valid only alongside
+     adaptive/enabled thinking, and sending it WITHOUT the beta header is itself a 400 — so the two always travel
+     together. Conservative list: the models the docs name as enforcing (Mythos 5.1 accepts it without enforcing).
+     Anything else that still answers "bound to a different conversation" is caught by the strip-and-retry rescue in
+     wireStream, so an unlisted future model degrades to one extra request, never a dead run.
+     Haiku 5.5 runs the same check (claude-api skill, model-migration "Migrating to Claude Haiku 5.5"); its OFF is a
+     plain `disabled`, which never carries block_binding (applyThinking returns before adding it). */
+  const BINDING_CLAUDE = [
+    'claude-fable-5-1', 'claude-fable-5.1', 'claude-mythos-5-1', 'claude-mythos-5.1',
+    'claude-opus-5-5', 'claude-opus-5.5', 'claude-sonnet-5-5', 'claude-sonnet-5.5',
+    'claude-haiku-5-5', 'claude-haiku-5.5'
+  ];
+  const BINDING_BETA = 'thinking-binding-controls-2026-08-01';
 
   const modelKey = (id) => String(id == null ? '' : id).toLowerCase();
   function hasAny(id, list) { const k = modelKey(id); for (const s of list) if (k.indexOf(s) >= 0) return true; return false; }
   function isClaude(id) { return modelKey(id).indexOf('claude') >= 0; }
   function alwaysThinks(id) { return hasAny(id, ALWAYS_THINKING_CLAUDE); }
+  function bindsThinking(id) { return isClaude(id) && hasAny(id, BINDING_CLAUDE); }
   function normalizeEffort(v) {
     const k = String(v == null ? '' : v).trim().toLowerCase().replace(/[\s_-]+/g, '');
     const map = {
@@ -132,14 +164,27 @@
   function cleanBaseUrl(value) {
     return String(value || DEFAULT_BASE).trim().replace(/\/+$/, '');
   }
-  function headerBag(key, accept) {
+  function headerBag(key, accept, betas) {
     const h = {
       'anthropic-version': ANTHROPIC_VERSION,
       'Content-Type': 'application/json',
       'Accept': accept || 'text/event-stream'
     };
     if (key) h['x-api-key'] = key;
+    for (const b of (betas || [])) mergeBeta(h, b);
     return h;
+  }
+  // anthropic-beta is ONE comma-separated header: a second beta joins the existing value, never replaces it.
+  function mergeBeta(h, name) {
+    const cur = String(h['anthropic-beta'] || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (cur.indexOf(name) < 0) cur.push(name);
+    h['anthropic-beta'] = cur.join(',');
+    return h;
+  }
+  // The betas a built body needs on the wire — derived FROM the body so the header and the field it unlocks can
+  // never drift apart (block_binding without its beta is a 400 of its own).
+  function betasFor(body) {
+    return (body && body.thinking && body.thinking.block_binding) ? [BINDING_BETA] : [];
   }
   function safeJson(value, fallback) {
     if (value && typeof value === 'object') return value;
@@ -210,7 +255,7 @@
     let i = 0;
     for (; i < (messages || []).length; i++) {
       const msg = messages[i];
-      if (!msg || msg.role !== 'system') break;
+      if (!msg || msg.role !== 'system' || provider.isRunContextNote(msg)) break;   // the run-context note rides the user side (provider.js)
       const text = textFromContent(msg.content).trim();
       if (text) system.push(text);
     }
@@ -235,20 +280,57 @@
   // Replay-safe thinking blocks: only the two shapes the wire defines, only when they carry the field that
   // makes them verifiable. A half-captured block is worse than none (it fails validation and ends the run),
   // so anything unrecognized is dropped rather than guessed at.
-  function thinkingBlocks(reasoning) {
+  // Each entry carries the wire block plus, when the stream recorded it, WHERE in the turn it was produced (`pos`:
+  // text characters and tool_use blocks that preceded it). `pos` never reaches the wire.
+  function thinkingEntries(reasoning) {
     if (!Array.isArray(reasoning)) return [];
     const out = [];
     for (const b of reasoning) {
       if (!b || typeof b !== 'object') continue;
+      const pos = (b.pos && typeof b.pos === 'object' && Number.isFinite(Number(b.pos.text)) && Number.isFinite(Number(b.pos.tools)))
+        ? { text: Math.max(0, Number(b.pos.text)), tools: Math.max(0, Number(b.pos.tools)) } : null;
       if (b.type === 'thinking' && typeof b.signature === 'string' && b.signature) {
-        out.push({ type: 'thinking', thinking: String(b.thinking == null ? '' : b.thinking), signature: b.signature });
+        out.push({ block: { type: 'thinking', thinking: String(b.thinking == null ? '' : b.thinking), signature: b.signature }, pos });
         continue;
       }
-      if (b.type === 'redacted_thinking' && typeof b.data === 'string' && b.data) out.push({ type: 'redacted_thinking', data: b.data });
+      if (b.type === 'redacted_thinking' && typeof b.data === 'string' && b.data) out.push({ block: { type: 'redacted_thinking', data: b.data }, pos });
     }
     return out;
   }
-  function messagesToAnthropic(messages) {
+  /* REPLAY IN THE ORDER THE MODEL PRODUCED (#73). A thinking block's signature binds everything before it — inside
+     its own turn too — so a turn that streamed [text, thinking, tool_use] or [thinking, tool_use, thinking, tool_use]
+     must come back in that order; hoisting every thinking block to the front rewrites the prefix of each one that
+     was not first. The stream stamps each block's position (`pos`); without positions (older transcripts, other
+     adapters) the original thinking-first shape is kept byte-identical. Within a gap, text precedes tool_use —
+     the order the model emits them in. */
+  function assistantBlocks(msg, skipReasoning) {
+    const think = skipReasoning ? [] : thinkingEntries(msg.reasoning);
+    const textBlocks = contentToTextBlocks(msg.content);
+    const tools = assistantToolBlocks(msg.tool_calls);
+    if (!think.length || !think.every(t => t.pos)) return think.map(t => t.block).concat(textBlocks).concat(tools);
+    const text = textBlocks.length ? textBlocks[0].text : '';
+    const out = [];
+    let ti = 0, ui = 0;
+    for (const t of think) {
+      const tc = Math.min(text.length, Math.max(ti, t.pos.text));
+      if (tc > ti) { out.push({ type: 'text', text: text.slice(ti, tc) }); ti = tc; }
+      const uc = Math.min(tools.length, Math.max(ui, t.pos.tools));
+      while (ui < uc) out.push(tools[ui++]);
+      out.push(t.block);
+    }
+    if (ti < text.length) out.push({ type: 'text', text: text.slice(ti) });
+    while (ui < tools.length) out.push(tools[ui++]);
+    return out;
+  }
+  function hasThinking(messages) {
+    for (const m of (messages || [])) {
+      if (m && m.role === 'assistant' && Array.isArray(m.content) && m.content.some(b => b && (b.type === 'thinking' || b.type === 'redacted_thinking'))) return true;
+    }
+    return false;
+  }
+  // opts.skipReasoning(arr) -> true drops that turn's thinking blocks (stripped by a rescue, see wireStream).
+  function messagesToAnthropic(messages, opts) {
+    const skip = (opts && typeof opts.skipReasoning === 'function') ? opts.skipReasoning : null;
     const picked = extractLeadingSystem(messages || []);
     const out = [];
     for (const msg of picked.rest) {
@@ -269,9 +351,7 @@
         // degrade: it fails the ordering/signature check and kills the turn. loop.js parks whatever this
         // adapter emitted on `msg.reasoning`, so a replay is a passthrough, never a reconstruction. Absent
         // (every other provider, every pre-thinking transcript) = byte-identical to the old behavior.
-        appendMessage(out, 'assistant', thinkingBlocks(msg.reasoning)
-          .concat(contentToTextBlocks(msg.content))
-          .concat(assistantToolBlocks(msg.tool_calls)));
+        appendMessage(out, 'assistant', assistantBlocks(msg, !!(skip && skip(msg.reasoning))));
         continue;
       }
       appendMessage(out, 'user', userContentToBlocks(msg.content));
@@ -292,7 +372,9 @@
       out.push({
         name,
         description: fn.description || '',
-        input_schema: toolschema.normalize(fn.parameters || { type: 'object', properties: {} })
+        // sanitizeKeys first: a property key outside ^[a-zA-Z0-9_.-]{1,64}$ 400s the WHOLE request here (the
+        // model's args are mapped back to the declared names on the way in — see stream()).
+        input_schema: toolschema.normalize(toolschema.sanitizeKeys(fn.parameters || { type: 'object', properties: {} }))
       });
     }
     return out.length ? out : null;
@@ -320,7 +402,9 @@
     return {
       id,
       name: m.display_name || m.name || id,
-      context_length: Number(m.context_length || m.input_token_limit || DEFAULT_CONTEXT) || DEFAULT_CONTEXT,
+      // The Models API reports the window as max_input_tokens (1M on every Claude 4.6+; no context_window field). A row
+      // that reports none stays unknown (0): an invented 200000 hid the real 1M window from the run on every Claude.
+      context_length: Number(m.context_length || m.input_token_limit || m.max_input_tokens || 0) || 0,
       max_completion_tokens: m.max_output_tokens || m.output_token_limit || null,
       // /v1/models reports no pricing, so this comes from the dated list-rate table (prices.js) rather than
       // the wire. Same {prompt, completion} per-token shape every other adapter publishes, so listModels()
@@ -342,7 +426,8 @@
     if (!doFetch) throw new Error('anthropic provider requires fetch (Node 18+) or opts.fetch');
     const key = opts.key || '';
     const baseUrl = cleanBaseUrl(opts.baseUrl);
-    const defaultContext = Number(opts.defaultContext || DEFAULT_CONTEXT) || DEFAULT_CONTEXT;
+    // an explicit caller default only: an unknown window is 0, so a run's setup waits briefly for the real one
+    const defaultContext = Number(opts.defaultContext || 0) || 0;
     // The composition root already resolves this (registry profile `defaultReasoningEffort: 'medium'` for
     // anthropic) and has been handing it to this adapter since the provider seam existed — the adapter simply
     // dropped it on the floor. 'medium' is the fallback for a caller that passes nothing, matching the profile.
@@ -352,8 +437,29 @@
     let catalogPromise = null;
     let catalogRewarmAt = 0;
     let rewarmKicked = false;
+    // #90: the HTTP status of the last /models answer the API REFUSED (401 bad key, 403 wrong scope …); 0 when the
+    // last answer loaded or never arrived. The catalog stays [] either way — only the key check reads this.
+    let catalogStatus = 0;
+    // and the error of the last /models request that never got an answer (DNS, refused connection, proxy): the key
+    // check names THAT cause (#62 wording) instead of blaming the key. null once anything answered.
+    let catalogError = null;
+    // SHARED CATALOG (providers/catalog-cache.js, attached by the factory): the list this key last loaded from this
+    // endpoint (any instance) answers this one synchronously, so a run is sized from max_input_tokens instead of a
+    // guess, and a fresh adapter no longer re-fetches /models. The key check's refusal status stays per instance: only
+    // this instance's own live read sets it. Absent = as before.
+    const shared = (opts.catalogCache && typeof opts.catalogCache.bind === 'function')
+      ? opts.catalogCache.bind({ scope: opts.catalogScope, endpoint: baseUrl, fetchList: sharedList }) : null;
+    let adoptedVersion = 0;
+    function adoptShared() {
+      if (!shared || !shared.shared) return;
+      const hit = shared.peek();
+      if (!hit || hit.version === adoptedVersion) return;
+      adoptedVersion = hit.version;
+      catalog = hit.models.slice();
+    }
 
     function maybeRewarmCatalog() {
+      if (shared && shared.shared) { adoptShared(); shared.ensure(); return; }
       if (catalog && catalog.length) return;
       if (catalogPromise) return;
       if (clock) {
@@ -423,7 +529,7 @@
        and caches by prefix, so these keys never shift the cached prefix — but they DO invalidate it when they
        CHANGE, which is why effort is resolved once per request from a value that is stable for a run's life
        rather than recomputed per turn. */
-    function applyThinking(body, req) {
+    function applyThinking(body, req, wire) {
       const model = body.model;
       if (!isClaude(model)) return;                        // third-party Anthropic-compatible endpoint: send nothing
       const allowed = effortsFor(model);
@@ -443,19 +549,28 @@
       }
       // MODERN. A disable is sent WITHOUT an effort: the wire refuses `{type:'disabled'}` above `high`, and an
       // omitted effort leaves the server default — the one value a disable is always accepted alongside.
-      if (effort === 'none') { body.thinking = { type: 'disabled' }; return; }
+      // Sonnet 5.5 has no `disabled`: its OFF is `between_tools`, bare (see BETWEEN_TOOLS_CLAUDE).
+      if (effort === 'none') { body.thinking = { type: hasAny(model, BETWEEN_TOOLS_CLAUDE) ? 'between_tools' : 'disabled' }; return; }
       body.thinking = { type: 'adaptive' };
+      // Sent on EVERY request (the drop applies to that request only); withheld once this endpoint refused the beta.
+      if (bindsThinking(model) && !(wire && wire.noBinding)) body.thinking.block_binding = { prefix_mismatch_behavior: 'drop_block' };
       body.output_config = Object.assign({}, body.output_config, { effort });
     }
-    function buildBody(req) {
-      const converted = messagesToAnthropic(req.messages || []);
+    // wire: { noBinding, skipReasoning } — set only by the rescue in wireStream; absent = the normal request.
+    function buildBody(req, wire) {
+      // ONE pre-send normalization (provider.js prepareWireMessages): every tool_use gets its tool_result in the
+      // next turn (a run that died at the tool boundary left one mid-history), and ids minted by another provider
+      // (Kimi's functions.read_file:0) are rewritten into this wire's ^[a-zA-Z0-9_-]+$ grammar, call and result alike.
+      // Then the ONE role projection (provider.js projectRoles 'native'): the loop's later system messages are user
+      // turns, which messagesToAnthropic merges with their neighbours exactly as it merged them before.
+      const converted = messagesToAnthropic(provider.projectRoles(provider.prepareWireMessages(req.messages || [], 'anthropic'), 'native'), { skipReasoning: wire && wire.skipReasoning });
       const body = {
         model: req.model,
         max_tokens: resolveMaxTokens(req),
         messages: converted.messages,
         stream: true
       };
-      applyThinking(body, req);   // must run BEFORE the breakpoints: it can add top-level keys, never blocks
+      applyThinking(body, req, wire);   // must run BEFORE the breakpoints: it can add top-level keys, never blocks
       const tools = toAnthropicTools(req.tools);
       if (tools) body.tools = tools;
       // One breakpoint for the whole static prefix. System is the preferred anchor because it sits AFTER the
@@ -467,8 +582,24 @@
         const prefix = typeof req.cacheSystemPrefix === 'string' ? req.cacheSystemPrefix.trim() : '';
         const split = prefix && converted.system.startsWith(prefix) && converted.system.slice(prefix.length).trim();
         const texts = split ? [prefix, converted.system.slice(prefix.length)] : [converted.system];
-        systemAnchors = texts.length;
-        body.system = texts.map(text => breakpoint([{ type: 'text', text }])[0]);
+        if (tools && split && toolAnchorOn()) {
+          /* TOOL ANCHOR (lean-prompt, 2026-10-12). With a system prompt the tool array carried no breakpoint, so ANY
+             system change — a Dossier edit, a persona toggle, a new connector line — re-wrote the ~19k-token catalogue
+             sitting in front of it (issue #105: the first message after a relaunch read 0 and wrote 42k). The last tool
+             now anchors the catalogue on its own. Budget (the API allows 4): tools 1 + ONE system anchor + the 2 newest
+             messages — two message anchors are the minimum that lets the next message READ the previous one's history
+             (its last anchor sits on the turn the next request no longer ends with). The one system anchor is the
+             STABLE prefix: with the per-run block now on the user side the tail is small, and the prefix is the part
+             a new conversation can reuse. Only a SPLIT system (a task run's cacheSystemPrefix + its per-conversation
+             tail) takes this layout: an unsplit system has no stable block to keep, so it keeps the old one system
+             anchor over the tools + 3 sliding tail anchors. */
+          breakpoint(tools);
+          body.system = texts.map((text, i) => (i === 0 ? breakpoint([{ type: 'text', text }])[0] : { type: 'text', text }));
+          systemAnchors = 2;
+        } else {
+          systemAnchors = texts.length;
+          body.system = texts.map(text => breakpoint([{ type: 'text', text }])[0]);
+        }
       } else if (tools) breakpoint(tools);
       /* SLIDING TAIL ANCHORS: up to THREE messages (TWO with a split system) each carry a
          breakpoint — with the static-prefix anchor above, exactly the API's 4-breakpoint maximum.
@@ -484,14 +615,57 @@
       return body;
     }
 
-    async function* stream(req) {
+    /* THINKING RESCUE STATE (#73). `bindingRefused` latches when this endpoint rejects the binding beta; the WeakSet
+       holds the loop's own `msg.reasoning` arrays a rescue stripped, keyed by identity so the caller's transcript is
+       never mutated (the loop re-sends the same assistant objects every turn). */
+    let bindingRefused = false;
+    const strippedReasoning = (typeof WeakSet === 'function') ? new WeakSet() : null;
+    function isStripped(arr) { return !!(strippedReasoning && arr && typeof arr === 'object' && strippedReasoning.has(arr)); }
+    function markStripped(messages) {
+      if (!strippedReasoning) return;
+      for (const m of (messages || [])) if (m && m.role === 'assistant' && Array.isArray(m.reasoning)) strippedReasoning.add(m.reasoning);
+    }
+    function rescueKind(e, body) {
+      if (!e || Number(e.status) !== 400 || !body || !body.thinking) return null;
+      const b = e.body && e.body.error;
+      const msg = String(e.message || '') + ' ' + String((b && (b.message || b.type)) || '');
+      // 'bound' first: its own message names block_binding and the beta header too.
+      if (/bound to a different conversation|prefix_binding_mismatch|model_binding_mismatch/i.test(msg)) return hasThinking(body.messages) ? 'bound' : null;
+      if (body.thinking.block_binding && (/block_binding/i.test(msg) || msg.indexOf(BINDING_BETA) >= 0 || /anthropic-beta|unknown beta|unsupported beta|invalid beta/i.test(msg))) return 'beta';
+      return null;
+    }
+
+    // A tool advertised under sanitized property keys gets its args mapped back to the declared names before
+    // the loop sees them; with no such tool this is the raw stream itself.
+    function stream(req) { return toolschema.withRestoredArgKeys(wireStream(req), req && req.tools); }
+
+    async function* wireStream(req) {
       req = req || {};
       maybeRewarmCatalog();
-      const body = buildBody(req);
+      const normalWire = { noBinding: bindingRefused, skipReasoning: isStripped };
+      let body = buildBody(req, normalWire);
       let res;
-      try { res = await requestWithRetry(body, req.signal); }
-      catch (e) { if (isAbort(e, req.signal)) return; throw e; }
-      const reader = timeouts.idleGuardedReader(res.body.getReader(), { signal: req.signal });
+      try { res = await requestWithRetry(body, req.signal, provider.runtime.preStreamRetries(req, RETRY_DELAYS.length)); }
+      catch (e) {
+        if (isAbort(e, req.signal)) return;
+        /* THINKING RESCUE (#73) — ONE resend, never a loop. A 400 is refused before generation, so it bills nothing
+           and no event has been yielded yet: the loop sees a single attempt and books a single usage. Two shapes:
+             'bound' — a replayed thinking block no longer matches its conversation prefix (a model outside
+                       BINDING_CLAUDE, a `between_tools` request that cannot carry block_binding, or drop_block absent);
+             'beta'  — this endpoint refused block_binding / the beta itself (third-party gateways): stop sending it
+                       for the life of this provider, and strip, since without drop_block the mismatch would 400 next.
+           Either way every thinking block in this history is stripped AND remembered as stripped: a later turn that
+           brought them back would change the prefix the NEW blocks were signed against and fail the same way. */
+        const kind = rescueKind(e, body);
+        if (!kind) throw e;
+        if (kind === 'beta') bindingRefused = true;
+        markStripped(req.messages);
+        failNote('providers.anthropic.thinking_rescue', 'http 400 (' + kind + ') on ' + String(body.model || '') + ': resending once with replayed thinking blocks stripped' + (kind === 'beta' ? ' and block_binding off' : ''));
+        body = buildBody(req, { noBinding: bindingRefused, skipReasoning: () => true });
+        try { res = await requestWithRetry(body, req.signal, provider.runtime.preStreamRetries(req, RETRY_DELAYS.length)); }
+        catch (e2) { if (isAbort(e2, req.signal)) return; throw e2; }
+      }
+      const reader = timeouts.idleGuardedReader(res.body.getReader(), { signal: req.signal, url: res.url || baseUrl });
       const dec = new TextDecoder();
       let buf = '';
       const toolIndexOf = new Map();
@@ -504,6 +678,11 @@
       let doneEmitted = false;
       let lastStopReason = '';
       let baseUsage = {};
+      // Where each thinking block sits in the turn (see assistantBlocks): text characters and tool_use blocks
+      // already streamed when it STARTED. Counted from exactly what is yielded, so it indexes the loop's acc.text.
+      let textChars = 0;
+      // input_transformations (message_start): thinking blocks the API dropped under drop_block, reported honestly.
+      let droppedThinking = 0;
 
       function parseLine(line) {
         const t = line.replace(/\r$/, '').trim();
@@ -513,23 +692,41 @@
         if (data === '[DONE]') return { done: true };
         try { return { json: JSON.parse(data) }; } catch (_) { return null; }
       }
+      // additive field on the terminal event; absent when nothing was dropped (byte-identical otherwise)
+      function withDrops(ev) { if (droppedThinking > 0) ev.thinkingDropped = droppedThinking; return ev; }
       function* emitFrom(ev) {
         if (!ev || typeof ev !== 'object') return;
-        if (ev.error) throw new Error('anthropic stream error: ' + ((ev.error && (ev.error.message || ev.error.type)) || 'unknown'));
+        if (ev.error) {
+          const err = new Error('anthropic stream error: ' + ((ev.error && (ev.error.message || ev.error.type)) || 'unknown'));
+          err.body = ev;   // the typed error ({type:'error', error:{type:'overloaded_error'}}) — errorClass reads the type
+          err.ownMessage = true;
+          throw err;
+        }
         switch (ev.type) {
-          case 'message_start':
+          case 'message_start': {
             baseUsage = Object.assign({}, (ev.message && ev.message.usage) || {});
+            const tx = ev.message && ev.message.input_transformations;
+            if (Array.isArray(tx) && tx.length) {
+              const reasons = {};
+              for (const t of tx) {
+                const r = String((t && (t.reason || t.type)) || 'unknown').slice(0, 60);
+                reasons[r] = (reasons[r] || 0) + 1;
+                droppedThinking++;
+              }
+              failNote('providers.anthropic.thinking_dropped', 'the API dropped ' + droppedThinking + ' replayed thinking block(s) on ' + String(body.model || '') + ' (' + Object.keys(reasons).map(k => k + ' x' + reasons[k]).join(', ') + ')');
+            }
             if (ev.message && ev.message.usage) yield { type: 'usage', usage: normalizeUsage(ev.message.usage) };
             return;
+          }
           case 'content_block_start': {
             const block = ev.content_block || {};
             if (block.type === 'thinking') {
-              thinkingAt.set(ev.index, { type: 'thinking', thinking: String(block.thinking || ''), signature: String(block.signature || '') });
+              thinkingAt.set(ev.index, { type: 'thinking', thinking: String(block.thinking || ''), signature: String(block.signature || ''), pos: { text: textChars, tools: nextToolIndex } });
               return;
             }
             if (block.type === 'redacted_thinking') {
               // Arrives whole — there are no deltas for an encrypted block.
-              if (block.data) thinkingAt.set(ev.index, { type: 'redacted_thinking', data: String(block.data) });
+              if (block.data) thinkingAt.set(ev.index, { type: 'redacted_thinking', data: String(block.data), pos: { text: textChars, tools: nextToolIndex } });
               return;
             }
             if (block.type !== 'tool_use') return;
@@ -542,6 +739,7 @@
           case 'content_block_delta': {
             const d = ev.delta || {};
             if (d.type === 'text_delta' && typeof d.text === 'string' && d.text) {
+              textChars += d.text.length;
               yield { type: 'text', delta: d.text };
               return;
             }
@@ -580,14 +778,14 @@
             if (ev.usage) yield { type: 'usage', usage: normalizeUsage(Object.assign({}, baseUsage, ev.usage)) };
             if (d.stop_reason && !doneEmitted) {
               doneEmitted = true;
-              yield { type: 'done', finishReason: normalizeFinish(d.stop_reason) };
+              yield withDrops({ type: 'done', finishReason: normalizeFinish(d.stop_reason) });
             }
             return;
           }
           case 'message_stop':
             if (!doneEmitted) {
               doneEmitted = true;
-              yield { type: 'done', finishReason: normalizeFinish(lastStopReason || 'stop') };
+              yield withDrops({ type: 'done', finishReason: normalizeFinish(lastStopReason || 'stop') });
             }
             return;
           default:
@@ -623,14 +821,18 @@
         // whether the stream really ENDED or merely stopped arriving. A clean mid-generation FIN yields neither
         // a `message_stop` (which sets doneEmitted) nor a sentinel; the loop cannot otherwise tell that apart
         // from a finished answer, so it shipped the fragment as a completed — and $0 — delivery.
-        if (!doneEmitted) yield { type: 'done', finishReason: null, truncated: !sawSentinel };
+        if (!doneEmitted) yield withDrops({ type: 'done', finishReason: null, truncated: !sawSentinel });
       } catch (e) {
         if (isAbort(e, req.signal)) return;
         throw e;
       }
     }
 
-    async function requestWithRetry(body, signal) {
+    async function requestWithRetry(body, signal, maxRetries) {
+      // maxRetries: the loop may LOWER this ladder (req.preStreamRetries = 0 once it owns the pacing — provider.js).
+      // `waited` is the backoff actually spent; the exhaustion marker reports it so the loop counts it, not repeats it.
+      const retries = (maxRetries == null) ? RETRY_DELAYS.length : maxRetries;
+      let waited = 0;
       for (let attempt = 0; ; attempt++) {
         if (signal && signal.aborted) throw abortError();
         let res;
@@ -640,28 +842,43 @@
         try {
           res = await doFetch(baseUrl + '/messages', {
             method: 'POST',
-            headers: headerBag(key),
+            headers: headerBag(key, null, betasFor(body)),
             body: JSON.stringify(body),
             signal: guard.signal
           });
         } catch (e) {
           if (isAbort(e, signal)) throw e;
-          if (attempt < RETRY_DELAYS.length) { await delay(RETRY_DELAYS[attempt], signal); continue; }
-          throw provider.runtime.markPreStreamRetriesExhausted(e);
+          provider.runtime.stampRequestHost(e, baseUrl);   // a TLS/socket cause names no host: say which one we dialled
+          // a TLS rejection or a crash in our own request code cannot heal by re-sending: fail fast, unmarked
+          const failure = classifyApiError(e, { model: body.model });   // unreachable: one retry (its retryBudget), then name the host
+          if (!failure.retryable) throw e;
+          if (attempt < provider.runtime.retryLimit(failure, retries)) { const wait = provider.runtime.retryDelay(failure, attempt, RETRY_DELAYS); waited += wait; await delay(wait, signal); continue; }
+          throw provider.runtime.markPreStreamRetriesExhausted(e, { attempts: attempt + 1, waitedMs: waited });
         } finally {
           guard.disarm();
         }
         if (res.ok && res.body) return res;
-        let detail = res.statusText || '';
-        try { const j = await res.json(); detail = (j && j.error && (j.error.message || j.error.type)) || JSON.stringify(j); }
-        catch (_) { try { detail = (await res.text()).slice(0, 300); } catch (_) {} }
+        // The body is read ONCE, as text, through the idle watchdog and the caller's Stop (provider.runtime.readErrorBody):
+        // a stalled error body ignored Stop for up to 300 s. Only a JSON error's own words are quoted. A non-JSON page (a
+        // proxy's 503 "... reset reason: connection reset") keeps the status text: the browser's error copy reads
+        // transport and policy words before the status (friendlyerror kindFromRaw), so its prose would be told as a
+        // dropped connection or a content block the harness cannot prove.
+        const eb = await provider.runtime.readErrorBody(res, { signal, url: baseUrl, tag: 'providers.anthropic' });
+        const errBody = eb.parsed ? eb.data : null;
+        let detail = eb.parsed ? ((errBody && errBody.error && (errBody.error.message || errBody.error.type)) || JSON.stringify(errBody)) : (res.statusText || '');
+        if (eb.stalled) detail += ' (error body did not finish)';
         const err = new Error('anthropic http ' + res.status + ' - ' + detail);
         err.status = res.status;
         err.headers = res.headers;
+        /* KEEP THE PROVIDER'S ERROR BODY (same law as codex.js). The message above keeps only error.message, but the
+           classifier's decisive signal can be the typed error ({error:{type:'overloaded_error'|'rate_limit_error'|…}});
+           dropping the body left errorClass reading prose. The message stays the adapter's own sentence (label +
+           status — what the UI routes on; err.ownMessage tells errorClass so); the body rides alongside for its type. */
+        if (errBody && typeof errBody === 'object') { err.body = errBody; err.ownMessage = true; }
         const cls = classifyApiError(err, { model: body.model });
         err.transient = cls.retryable;
-        if (cls.retryable && attempt < RETRY_DELAYS.length) { await delay(Math.min(60000, Math.max(RETRY_DELAYS[attempt], cls.retryAfterMs || 0)), signal); continue; }
-        throw cls.retryable ? provider.runtime.markPreStreamRetriesExhausted(err) : err;
+        if (cls.retryable && attempt < retries) { const wait = Math.min(60000, Math.max(RETRY_DELAYS[attempt], cls.retryAfterMs || 0)); waited += wait; await delay(wait, signal); continue; }
+        throw cls.retryable ? provider.runtime.markPreStreamRetriesExhausted(err, { attempts: attempt + 1, waitedMs: waited }) : err;
       }
     }
 
@@ -674,34 +891,75 @@
       if (catalog && catalog.length) return catalog;
       if (!catalogPromise) {
         catalogPromise = (async () => {
-          try {
-            const res = await doFetch(baseUrl + '/models', { headers: headerBag(key, 'application/json') });
-            if (!res.ok) return [];
-            const j = await res.json();
-            const raw = Array.isArray(j.data) ? j.data : (Array.isArray(j.models) ? j.models : []);
-            return raw.map(normalizeModel).filter(Boolean);
-          } catch (_) { return []; }
+          const list = await fetchList(true);
+          const version = shared ? shared.share(list) : 0;   // a live list: kept for this key, its windows noted
+          if (version) adoptedVersion = version;
+          return list;
         })();
       }
       catalog = await catalogPromise;
       if (!catalog.length) catalogPromise = null;
       return catalog;
     }
+    // One live /models read. `own` = this instance's read, which keeps the refusal status / network error the key check
+    // reports; the cache's background read leaves them alone. [] on any failure.
+    async function fetchList(own) {
+      let res = null;
+      try {
+        if (own) { catalogStatus = 0; catalogError = null; }
+        res = await doFetch(baseUrl + '/models', { headers: headerBag(key, 'application/json') });
+        if (!res.ok) { if (own) catalogStatus = Number(res.status) || 0; return []; }
+        const j = await res.json();
+        const raw = Array.isArray(j.data) ? j.data : (Array.isArray(j.models) ? j.models : []);
+        return raw.map(normalizeModel).filter(Boolean);
+      } catch (e) { if (!res && own) catalogError = e; return []; }
+    }
+    function sharedList() { return fetchList(false); }   // the cache's background load
     async function listModels() { return (await loadCatalog()).map(m => Object.assign({}, m)); }
-    function findModel(id) { return catalog ? catalog.find(m => m.id === id) : null; }
-    function contextLimit(id) { const m = findModel(id); return (m && m.context_length) || defaultContext; }
+    function catalogHttpStatus() { return catalogStatus; }
+    function catalogFetchError() { return catalogError; }
+    function findModel(id) {
+      adoptShared();
+      const m = catalog ? catalog.find(x => x.id === id) : null;
+      // a warm list without this id (a model released after it loaded): one throttled refresh can find it
+      if (!m && id && shared && catalog && catalog.length) shared.ensure({ miss: true });
+      return m;
+    }
+    // Learn the window before a run is built (catalog-cache.js runWindow bounds the wait): this key's shared list, else
+    // ONE deduped load of it (none while the endpoint is in its failure back-off). Resolves to the catalog it has.
+    async function warmCatalog() {
+      adoptShared();
+      if (catalog && catalog.length) { maybeRewarmCatalog(); return catalog; }
+      if (shared && shared.shared) {
+        if (shared.inBackoff()) return catalog || [];
+        await shared.load();
+        adoptShared();
+        return catalog || [];
+      }
+      return loadCatalog();
+    }
+    // First known source wins, none invented: the catalog row, what this endpoint reported to any instance, an explicit
+    // default, 0 (unknown).
+    function contextLimit(id) {
+      const m = findModel(id);
+      if (m && m.context_length) return m.context_length;
+      return (shared && shared.windowFact(id)) || defaultContext;
+    }
     // Anthropic's API never reports a price, and returning null here left spentUsd at 0.00 for the whole run
     // — which silently disabled the per-run spend ceiling and the day/global pools (loop.js only stops when
     // spentUsd crosses the cap). Resolved off the dated list-rate table, independent of catalog warm state so
     // the cap works from the first turn; an unrecognized model still returns null and stays 'unpriced'.
     function priceOf(id) { return prices.priceOf('anthropic', id); }
+    // the most output one call can bill (provider.js outputLimit): the max_tokens this adapter sends a request that names
+    // none — Anthropic requires one, so it is always known (the catalog's, a configured one, or the 32000 fallback)
+    function outputLimit(id) { return resolveMaxTokens({ model: id }); }
     function supportsTools(id) { const m = findModel(id); return m ? m.supportsTools : true; }
     // Resolved from the model NAME, not the warm catalog: /v1/models publishes no capability data, and the
     // dock asks this before a catalog fetch has necessarily landed.
     function reasoningEfforts(id) { return effortsFor(id); }
 
-    return { stream, listModels, contextLimit, priceOf, supportsTools, reasoningEfforts };
+    return { stream, listModels, warmCatalog, catalogHttpStatus, catalogFetchError, contextLimit, outputLimit, priceOf, supportsTools, reasoningEfforts };
   }
 
-  return { makeAnthropicProvider, _internals: { messagesToAnthropic, toAnthropicTools, normalizeUsage, normalizeModel, cleanBaseUrl } };
+  return { makeAnthropicProvider, _internals: { messagesToAnthropic, toAnthropicTools, normalizeUsage, normalizeModel, cleanBaseUrl, headerBag } };
 });

@@ -13,10 +13,15 @@
                   or   none
 
    THE CONFIDENCE FLOOR (the anti-slop heart): an idle agent that confidently does the WRONG work is worse than
-   one that does nothing — the first autonomous deliverable sets trust forever. So ACTING is EARNED, not just
-   permitted. readiness() reads the (confirmed-only, never-inferred) dossier — breadth, the required dim, and
-   recency — into a tier; decide() acts only when the dial permits AND the tier is hot; otherwise it EARNS more
-   context first (the flywheel: when it doesn't know enough to act, it acts to know more).
+   one that does nothing — the first autonomous deliverable sets trust forever. So every act must be GROUNDED:
+   readiness() reads the (confirmed-only, never-inferred) dossier — the required dim and recency — plus recent user
+   runs into a tier; decide() acts only when the dial permits AND the tier is hot; otherwise it EARNS more context
+   first (the flywheel: when it has nothing to act on, it acts to know more). Hot is a GROUNDING floor, not a
+   breadth count (bug 41b2d015, 2026-10-21): one grounded aim or one recent user run, never 4 areas / 4 runs. ONLY
+   CONFIRMED BELIEFS CROSS THE ACTING LINE (AUTONOMY_DRIVER_PLAN §2 trust line; dossier.js WEIGHTS): a goals area
+   held only by 'seed' beliefs — the quick-setup chip's canned purpose, a thin run's synthesis, any doc copy — is
+   known breadth (warm) but never grounds acting. The per-job guard is downstream — grounding veto, confidence
+   gate, self-critique. Whether a chosen away posture may lift even that seed hold is Andrew's open ruling (bug).
 
    THE GOVERNING RULE — ceiling vs earned: the dial is the ceiling the Commander PERMITS; the tier is the level the
    station has EARNED; it operates at the LOWER of the two and names which is BINDING (legibility — "you set me
@@ -38,10 +43,15 @@
   const DEFAULT_TICK_MS = 20000;    // how often the store re-checks idleness
 
   // the readiness floor constants. goals is the keystone dim (you can't usefully act without knowing what they
-  // want); the breadth bars mirror the existing self-initiation gate (goals + ≥2 known = the propose floor).
+  // want). THE ACT FLOOR IS GROUNDING, NOT BREADTH (bug 41b2d015): the old bar (goals + 4 usable areas, or 4 recent
+  // runs) held a chosen acting posture off until the station had been used enough. Now one GROUNDED aim is enough —
+  // a goals belief in the Commander's own words, a synthesis of them, or observed work (weight stated/synth/observed).
+  // A SEED never is: the awakening always authors purpose.md, but a quick-setup chip or a thin run lands there as
+  // 'seed' (onboarding.js), and a canned line must never convince the station it knows what they want (dossier.js
+  // WEIGHTS). A job still has to cite something real (the grounding veto in parseCandidates) and clear MIN_ACT_SCORE.
   const REQUIRE_DIM = 'goals';
-  const WARM_MIN = 2;               // goals usable + this many usable dims → warm (may propose / earn)
-  const HOT_MIN = 4;                // goals usable + this many usable dims → hot  (has EARNED the right to act)
+  const WARM_MIN = 1;               // ≥ this many usable dims but NO grounded keystone → warm (knows something, not yet what they want)
+  const HOT_MIN = 1;                // a grounded, fresh goals belief (+ this many usable dims, goals included) → hot (has grounding to act)
   const STALE_MS = 1000 * 60 * 60 * 24 * 45;   // a belief older than ~45 days is stale: still known, but too old to ground ACTING on
 
   // is the clock idle? (now - lastActivity ≥ the idle span). A bad/unknown clock is never idle (fail safe).
@@ -62,21 +72,22 @@
   }
 
   // ACTIVITY-AS-GROUNDING (NS-2): with the context pack, a "cold dossier" no longer means the station can do
-  // nothing. If the Commander has been visibly working — enough recent USER-INITIATED runs (real evidence of what
-  // he's doing) — the station has honest grounding to act on that work even before the six dossier dims are filled.
-  // These bars are deliberately CONSERVATIVE (activity must be substantial, not a single stray run) and the grant is
-  // capped at HOT so heavy activity can license real acting, exactly as a full dossier does. It is a SEPARATE path,
-  // never a discount on the dossier bars — a thin-activity night still falls back to the dossier tier.
-  const ACTIVITY_WARM_MIN = 2;      // ≥ this many recent user runs → the station has enough to usefully PROPOSE
-  const ACTIVITY_HOT_MIN = 4;       // ≥ this many recent user runs → the station has EARNED the right to ACT on it
+  // nothing. A recent USER-INITIATED run is real evidence of what the Commander is doing, so it is honest grounding
+  // to act on that work even before the dossier knows their goals. ONE run is enough (bug 41b2d015): the act
+  // pipeline's grounding veto still drops any job that does not cite it, so a count bar only delayed the choice the
+  // Commander already made. It is a SEPARATE path, never a discount on the dossier — no runs → the dossier tier alone.
+  const ACTIVITY_HOT_MIN = 1;       // ≥ this many recent user runs → the station has grounding to ACT on that work
 
   // READINESS — derive the confidence tier, purely. TWO grounding paths, take the HIGHER:
   //   (a) DOSSIER — a dim is USABLE iff known AND its freshest belief is not stale (recency gates acting). An undated
-  //       belief (legacy/seeded) counts as fresh — never punish an old save. goals is the keystone; breadth sets warm/hot.
-  //   (b) ACTIVITY (NS-2) — substantial recent user-run activity is its own grounding: it directly evidences the work
-  //       the Commander is doing, so a brand-new-dossier user who is heavily active gets useful beats, not endless
-  //       get-to-know-you stand-downs. Conservative bars; capped at HOT. opts.activityCount (a count the caller derives
-  //       from the context pack's user-run evidence) drives it; 0/absent → this path contributes nothing (pure dossier).
+  //       belief (legacy/seeded) counts as fresh — never punish an old save. The keystone is hot only when goals holds
+  //       a fresh GROUNDED belief (weight not 'seed'; a legacy record with no weight is inferred non-seed, exactly as
+  //       dossier.js weightOf does); a seed-only goals area, or other usable areas without it, is warm (the station
+  //       knows something, not yet what they want). goalsStale = grounded aims on file, all past the recency window.
+  //   (b) ACTIVITY (NS-2) — a recent user run is its own grounding: it directly evidences the work the Commander is
+  //       doing. opts.activityCount (a count the caller derives from the context pack's user-run evidence) drives it;
+  //       0/absent → this path contributes nothing (pure dossier). On a tie it names ACTIVITY as the grounding source,
+  //       which opens every archetype to the veto (eligibleArchetypes) — a run is fresher evidence than a dossier area.
   //   dossierSummary — DossierStore.summary() shape: { known:[dim], familiarity:0..1, ... }
   //   beliefsByDim   — fn(dim)->[belief] OR a { dim:[belief] } map (each belief carries updatedAt/createdAt)
   //   opts.activityCount — count of recent user-initiated runs (grounding evidence); default 0
@@ -96,23 +107,28 @@
       const fresh = !newest || !Number.isFinite(now) || (now - newest) <= staleMs;
       (fresh ? usableDims : staleDims).push(dim);
     }
-    const goalsUsable = usableDims.indexOf(REQUIRE_DIM) >= 0;
+    // ONLY CONFIRMED BELIEFS CROSS THE ACTING LINE: the keystone counts from its non-seed beliefs alone, fresh by
+    // their own stamps (a fresh seed beside stale real aims must not make those aims look current).
+    const goalBeliefs = known.indexOf(REQUIRE_DIM) >= 0 ? get(REQUIRE_DIM).filter(b => b && b.weight !== 'seed') : [];
+    const goalsNewest = newestStamp(goalBeliefs);
+    const goalsUsable = goalBeliefs.length > 0 && (!goalsNewest || !Number.isFinite(now) || (now - goalsNewest) <= staleMs);
+    const goalsStale = goalBeliefs.length > 0 && !goalsUsable;
     let dossierTier = 'cold';
     if (goalsUsable && usableDims.length >= HOT_MIN) dossierTier = 'hot';
-    else if (goalsUsable && usableDims.length >= WARM_MIN) dossierTier = 'warm';
+    else if (usableDims.length >= WARM_MIN) dossierTier = 'warm';
 
-    // the ACTIVITY path (NS-2): a conservative tier derived purely from recent user-run count.
+    // the ACTIVITY path (NS-2): a tier derived purely from the recent user-run count.
     const activityCount = Math.max(0, Math.floor(Number(opts.activityCount) || 0));
-    let activityTier = 'cold';
-    if (activityCount >= ACTIVITY_HOT_MIN) activityTier = 'hot';
-    else if (activityCount >= ACTIVITY_WARM_MIN) activityTier = 'warm';
+    const activityTier = activityCount >= ACTIVITY_HOT_MIN ? 'hot' : 'cold';
 
     // take the HIGHER of the two (either grounding suffices); name which one licensed acting, for honest telemetry.
+    // A tie with real activity names activity (see (b) above), so a goals-only dossier beside a recent run keeps
+    // every archetype the run can ground, exactly as before the bars dropped.
     const rank = { cold: 0, warm: 1, hot: 2 };
     const tier = rank[activityTier] > rank[dossierTier] ? activityTier : dossierTier;
-    const groundedBy = tier === 'cold' ? null : (rank[activityTier] > rank[dossierTier] ? 'activity' : 'dossier');
+    const groundedBy = tier === 'cold' ? null : (activityTier !== 'cold' && rank[activityTier] >= rank[dossierTier] ? 'activity' : 'dossier');
     return {
-      tier, dossierTier, activityTier, groundedBy, activityCount, goalsUsable, usableDims, staleDims,
+      tier, dossierTier, activityTier, groundedBy, activityCount, goalsUsable, goalsStale, usableDims, staleDims,
       familiarity: Number.isFinite(sum.familiarity) ? sum.familiarity : 0
     };
   }
@@ -288,6 +304,31 @@
     for (const p of list.slice(0, 6)) lines.push('- ' + String(p).replace(/\s+/g, ' ').trim().slice(0, 160));
     return true;
   }
+  // PRIOR BUILDS (2026-10-05 audit item 1): what earlier NIGHTS already built/drafted for this focus (last ~14 days,
+  // each with its status + where its files live — server: priorwork.promptLines). Without it the same prototype was
+  // rebuilt night after night. The host ALSO vetoes near-duplicates (priorwork.veto); this block is the courtesy that
+  // lets the model propose the continuation itself. Returns whether anything was rendered.
+  function pushPriorBuilds(lines, prior) {
+    const list = Array.isArray(prior) ? prior.filter(Boolean) : [];
+    if (!list.length) return false;
+    lines.push('ALREADY BUILT ON EARLIER NIGHTS (last 14 days) — continue or improve these, do NOT rebuild them:');
+    for (const p of list.slice(0, 12)) lines.push('- ' + String(p).replace(/\s+/g, ' ').trim().slice(0, 220));
+    return true;
+  }
+  // the CONTINUE block for a do directive: the selected job iterates on an earlier build instead of starting over.
+  //   cont: { title, where, files:[path], summary, seeded }  (seeded = the host already copied its files into dir)
+  function pushContinueBlock(lines, cont, dir) {
+    if (!cont || !String(cont.title || '').trim()) return false;
+    const files = (Array.isArray(cont.files) ? cont.files : []).filter(Boolean).slice(0, 20);
+    // seeded: name only the NEW dir (one unambiguous place to work); otherwise point at where the old files live.
+    lines.push('CONTINUE, DO NOT RESTART: this job builds on your earlier build "' + String(cont.title).trim().slice(0, 120) + '"'
+      + (!(cont.seeded && dir) && cont.where ? ' (' + String(cont.where).trim() + ')' : '') + '.'
+      + (cont.seeded && dir ? ' Its files are ALREADY COPIED into "' + dir + '/" — open them, keep what works, and improve them in place.'
+        : (cont.where && cont.where !== 'desk draft' ? ' Read its files there first, then write the improved, complete version.' : ' Extend and improve that earlier draft rather than starting a new one.')));
+    if (files.length) lines.push('- its files: ' + files.join(', '));
+    if (String(cont.summary || '').trim()) lines.push('- what it was: ' + String(cont.summary).replace(/\s+/g, ' ').trim().slice(0, 240));
+    return true;
+  }
 
   // THE CANDIDATE DIRECTIVE — the reason-only task that asks the model for a few grounded, achievable-now job ideas
   // (it carries the dossier in its live system prompt; this hands the beliefs + the recent activity + the eligible
@@ -307,12 +348,14 @@
     const hasActivity = pushActivityBlock(lines, ctx.activity);
     pushSnapshotBlock(lines, ctx.projectSnapshot);
     pushPriorTonight(lines, ctx.priorTonight);
+    const hasPrior = pushPriorBuilds(lines, ctx.priorBuilds);
     const dimLine = (key, label) => { const arr = Array.isArray(beliefs[key]) ? beliefs[key].filter(Boolean) : []; if (arr.length) lines.push('- ' + label + ': ' + arr.join(' | ')); };
     lines.push('What you know about them:');
     dimLine('goals', 'Goals'); dimLine('pain', 'Pain points'); dimLine('ambition', 'Ambitions'); dimLine('stack', 'Stack & tools'); dimLine('standing_orders', 'Standing orders'); dimLine('style', 'Working style'); dimLine('people', 'People & audience (who the work is for)'); dimLine('schedule', 'Schedule & cadence (when work should land)');
     lines.push('Each job must be ONE of these kinds: ' + eligible.map(a => a.id + ' (' + a.blurb + ')').join(', ') + '.');
     lines.push('Hard rules:');
     if (hasFocus) lines.push('- STAY ON FOCUS: the single best job MUST advance TONIGHT\'S FOCUS above. A job that wanders off it is worse than a smaller job that moves it.');
+    if (hasPrior) lines.push('- NO REBUILDS: never propose a job that re-makes one of the ALREADY BUILT items above. To work on one, title the job "Continue: <its title>" and say in SPEC what you will improve. Prefer continuing the newest UNDECIDED build over starting something new.');
     if (hasThreads) lines.push('- PREFER AN OPEN THREAD: if any thread above fits, propose it and cite its tag in GROUNDS (e.g. GROUNDS: [t1] ...). A grounded open thread beats a fresh idea. If none fit, improvise a grounded idea as below.');
     if (hasActivity) lines.push('- CONTINUE THEIR WORK: prefer a job that directly advances, unblocks, or extends something in "What they worked on recently" above — that beats a generic idea. But stay HONEST: only cite work that is actually listed; never invent activity.');
     lines.push('- GROUNDED: every job must aim at a SPECIFIC thing above (an open thread / a real recent job / goal / pain / etc). Quote the exact thing in GROUNDS. If you cannot ground it in something you actually know or they actually did, do not propose it.');
@@ -327,12 +370,71 @@
     return lines.join('\n');
   }
 
+  /* ---- THE FOCUS-ADVANCEMENT VETO (2026-10-05 audit item 3) ----
+     A declared night focus used to be PROMPT-ONLY: the directive said "everything must advance TONIGHT'S FOCUS", but
+     nothing checked, so a candidate about something else entirely was selected and built under the focus banner.
+     When a focus is declared, a candidate now survives only if its text (title + grounds + spec) shares at least one
+     significant token with the focus's own evidence — its label, its ref's name, its cited why-lines, plus any extra
+     evidence the host hands in (the harness-read project snapshot for a project focus). Deliberately LENIENT: one
+     shared word is enough, and a candidate citing the focus thread's own id always passes. The words the resolver's
+     why-line TEMPLATES are made of ("you worked in … last touched today", "an open thread you raised …") are not
+     evidence and are excluded, otherwise every candidate mentioning "repo" or "today" would pass for free. */
+  const FOCUS_STOP = {};
+  ('the and for with that this from into onto your you yours are was were has have had not can will just than then '
+    + 'them they their there what when where which while who how why its our out over also only very more most '
+    + 'worked work working last touched today yesterday ago git repo read patch recent run runs point points open thread '
+    + 'threads raised never acted quest quests beat advance slate active goal arc done next step confirmed north star '
+    + 'asked ask focus outranks picked pick tonight night times time separate day days workflow keep keeps seen '
+    + 'commander because would could should about every other thing things stuff really around').split(/\s+/).forEach(w => { if (w) FOCUS_STOP[w] = 1; });
+  function focusStem(w) { return (w.length > 4 && w.endsWith('s') && !w.endsWith('ss')) ? w.slice(0, -1) : w; }
+  function focusTokens(s) {
+    const out = {};
+    for (const w of String(s == null ? '' : s).toLowerCase().match(/[a-z0-9]+/g) || []) {
+      if (w.length < 3 || FOCUS_STOP[w] || STOPWORDS[w] || /^\d+$/.test(w)) continue;
+      out[focusStem(w)] = 1;
+    }
+    return out;
+  }
+  function focusRefName(focus) {
+    const ref = String((focus && focus.ref) || '');
+    if (!focus || focus.kind !== 'project') return '';
+    const t = ref.replace(/[\\/]+$/, '');
+    const i = Math.max(t.lastIndexOf('/'), t.lastIndexOf('\\'));
+    return i >= 0 ? t.slice(i + 1) : t;
+  }
+  // the focus's evidence texts (label, ref name, why lines) + host extras. Pure.
+  function focusEvidenceTexts(focus, extra) {
+    const out = [];
+    if (focus && typeof focus === 'object') {
+      if (focus.label) out.push(String(focus.label));
+      const rn = focusRefName(focus); if (rn) out.push(rn);
+      for (const w of (Array.isArray(focus.why) ? focus.why : [])) if (w) out.push(String(w));
+    }
+    for (const e of (Array.isArray(extra) ? extra : [])) if (e) out.push(String(e));
+    return out;
+  }
+  // does candidate `cand` advance `focus`? true when no focus is declared (nothing to check against).
+  function advancesFocus(cand, focus, extraEvidence) {
+    if (!focus || typeof focus !== 'object' || !(focus.label || focus.ref)) return true;
+    const c = cand || {};
+    if (focus.kind === 'thread' && c.threadId && String(c.threadId) === String(focus.ref || focus.threadId || '')) return true;
+    const text = [c.title, c.grounds, c.spec].filter(Boolean).join(' ');
+    const lower = text.toLowerCase();
+    const label = String(focus.label || '').toLowerCase().trim();
+    if (label.length >= 3 && lower.indexOf(label) >= 0) return true;
+    const cTok = focusTokens(text);
+    const fTok = focusTokens(focusEvidenceTexts(focus, extraEvidence).join(' . '));
+    for (const w in cTok) if (fTok[w]) return true;
+    return false;
+  }
+
   // parse the candidate reply, tolerantly + with the GROUNDING VETO. Keeps a candidate only with a title, an
   // eligible KIND, a non-empty SPEC, and GROUNDS that is actually anchored in the provided EVIDENCE (structure
   // overrules the model). NS-2 widens the evidence pool: a candidate's GROUNDS may cite a static dossier BELIEF OR a
   // recent-ACTIVITY line (a real run/chat/goal/landed-work line from the context pack) — the token-overlap mechanics
   // are unchanged, so invented grounding (zero overlap with EITHER pool) still dies. opts: { eligible:[archetype],
-  // beliefs (map|array), activity:[line], requireGrounding:true }
+  // beliefs (map|array), activity:[line], requireGrounding:true, focus?:{kind,ref,label,why}, focusEvidence?:[line],
+  // onDrop?:(cand, reason) }. With `focus`, the FOCUS veto (advancesFocus) also applies.
   function parseCandidates(text, opts) {
     opts = opts || {};
     const eligibleIds = {};
@@ -366,6 +468,11 @@
       if (conf !== 'high' && conf !== 'medium' && conf !== 'low') conf = 'medium';
       const cand = { title: title.slice(0, 80), archetype: kind, grounds, confidence: conf, spec };
       if (threadId) cand.threadId = threadId;
+      // the FOCUS veto (host-enforced, not prompt-only): with a declared focus, an off-focus candidate never survives.
+      if (opts.focus && !advancesFocus(cand, opts.focus, opts.focusEvidence)) {
+        if (typeof opts.onDrop === 'function') { try { opts.onDrop(cand, 'off-focus'); } catch (_) {} }
+        continue;
+      }
       out.push(cand);
     }
     return out;
@@ -403,6 +510,7 @@
     const lines = [];
     lines.push('INTERNAL — SELF-DIRECTED WORK. The Commander is away. Do not run any tools. Reason only, then reply in the exact format below.');
     pushFocusBlock(lines, ctx.focusHeader);
+    pushContinueBlock(lines, ctx.continueFrom, '');
     lines.push('Do this ONE job now and leave a finished draft on their desk:');
     lines.push('- JOB: ' + String(selected.title || '').trim());
     if (selected.grounds) lines.push('- WHY IT MATTERS TO THEM: ' + String(selected.grounds).trim());
@@ -454,12 +562,14 @@
     const hasActivity = pushActivityBlock(lines, ctx.activity);
     const hasSnapshot = pushSnapshotBlock(lines, ctx.projectSnapshot);
     pushPriorTonight(lines, ctx.priorTonight);
+    const hasPrior = pushPriorBuilds(lines, ctx.priorBuilds);
     const dimLine = (key, label) => { const arr = Array.isArray(beliefs[key]) ? beliefs[key].filter(Boolean) : []; if (arr.length) lines.push('- ' + label + ': ' + arr.join(' | ')); };
     lines.push('What you know about them:');
     dimLine('goals', 'Goals'); dimLine('pain', 'Pain points'); dimLine('ambition', 'Ambitions'); dimLine('stack', 'Stack & tools'); dimLine('standing_orders', 'Standing orders'); dimLine('style', 'Working style'); dimLine('people', 'People & audience (who the work is for)'); dimLine('schedule', 'Schedule & cadence (when work should land)');
     lines.push('Each job must be ONE of these kinds: ' + eligible.map(a => a.id + ' (' + a.blurb + ')').join(', ') + '.');
     lines.push('Hard rules:');
     if (hasFocus) lines.push('- STAY ON FOCUS: the single best job MUST advance TONIGHT\'S FOCUS above.');
+    if (hasPrior) lines.push('- NO REBUILDS: never propose a job that re-makes one of the ALREADY BUILT items above. To work on one, title the job "Continue: <its title>" and say in SPEC what you will improve. Prefer continuing the newest UNDECIDED build over starting something new.');
     if (hasSnapshot) lines.push('- PATCH THE REAL PROJECT: base your change on the PROJECT SNAPSHOT above. Your artifact for a code change is a UNIFIED-DIFF .patch file (git-apply-able from the repo root) plus a one-line "howToUse" — the Commander applies it to a new branch on Keep. Set the manifest "kind":"patch" and include "targetRoot":"<the project root path shown in the snapshot header>".');
     if (hasThreads) lines.push('- PREFER AN OPEN THREAD: if any thread above fits, build it and cite its tag in GROUNDS (e.g. GROUNDS: [t1] ...). A grounded open thread beats a fresh idea. If none fit, improvise a grounded idea as below.');
     if (hasActivity) lines.push('- CONTINUE THEIR WORK: prefer a job that directly advances, unblocks, or extends something in "What they worked on recently" above — that beats a generic idea. But stay HONEST: only cite work that is actually listed; never invent activity.');
@@ -526,6 +636,7 @@
     lines.push('- JOB: ' + String(selected.title || '').trim());
     if (selected.grounds) lines.push('- WHY IT MATTERS TO THEM: ' + String(selected.grounds).trim());
     if (selected.spec) lines.push('- DONE WHEN: ' + String(selected.spec).trim());
+    pushContinueBlock(lines, ctx.continueFrom, dir);
     const hasSnap = pushSnapshotBlock(lines, ctx.projectSnapshot);
     lines.push('RULES:');
     if (hasSnap && String(ctx.targetRoot || '').trim()) {
@@ -535,7 +646,9 @@
     lines.push('- MATCH THE FORMAT TO THE ASK — build the SIMPLEST thing that fully serves it, never the most impressive: a question/research ask -> a short findings doc (answer first, sources after); a draft ask -> the draft file itself; a comparison/decision -> a short ranked write-up, recommendation on top. ONLY build an interactive SINGLE-FILE HTML tool (all CSS/JS inline, no build step, named index.html) when the ask genuinely needs interaction the Commander will use repeatedly — NEVER default to a dashboard unless the ask is literally to watch several changing numbers in one place.');
     lines.push('- Whatever the format: ZERO SETUP on their end — self-contained, one-click openable, no external files or build step; a script ships with its single run note in "howToUse".');
     lines.push('- Do the real work with your tools (web read/search, files). Ground factual claims in what the tools return. Write every file for this deliverable UNDER "' + dir + '/" (use paths like "' + dir + '/<file>").');
-    lines.push('- LOCAL ONLY: never send, publish, spend, or message. You cannot run commands or tests, so do not claim anything was tested — list what a human still needs to verify.');
+    // token-burn audit 2026-10-17: this used to say "You cannot run commands or tests" while shell_exec was wired, so the
+    // act wrote its report first and verify-on-stop then bought a second pass to check it (16 of 29 real shifts, ~18M tokens).
+    lines.push('- LOCAL ONLY: never send, publish, spend, or message. If you have a shell, CHECK the work BEFORE you write the manifest (a patch: `git apply --check` from the repo root; code: a syntax check or its test) and claim only what that check proved; list what a human still needs to verify.');
     lines.push('- When finished, write a manifest to "' + dir + '/deliverable.json" with EXACTLY this shape:');
     lines.push('  { "v": 1, "runId": "' + String(ctx.runId || '') + '", "agentId": "<your id>", "backlogId": "' + backlogId + '",');
     // 'patch' MUST be listed here: the PROJECT PATCH rule above tells the agent to set it, and the apply path
@@ -670,13 +783,13 @@
   return {
     idleFor, readiness, decide, newestStamp,
     eligibleArchetypes, grounded, sigTokens, flattenBeliefs, pushActivityBlock,
-    pushThreadsBlock, citedThreadId, threadRef, pushFocusBlock, pushSnapshotBlock, pushPriorTonight,
-    buildCandidateDirective, parseCandidates, scoreAndSelect, buildDoDirective, parseDeliverable,
+    pushThreadsBlock, citedThreadId, threadRef, pushFocusBlock, pushSnapshotBlock, pushPriorTonight, pushPriorBuilds, pushContinueBlock,
+    buildCandidateDirective, parseCandidates, scoreAndSelect, advancesFocus, focusTokens, focusEvidenceTexts, buildDoDirective, parseDeliverable,
     buildCandidateDirectiveV2, buildDoDirectiveV2, planRuleFor, planOnlyFieldFor, finishRuleFor, learnFold, learnWeightsFrom,
     buildCritiqueDirective, parseCritique, digestLines, digestSummary, digestHeadline,
     writePath, canWrite, fileBody,
     DEFAULT_IDLE_MS, DEFAULT_TICK_MS, REQUIRE_DIM, WARM_MIN, HOT_MIN, STALE_MS,
     ARCHETYPES, CANDIDATE_MAX, MIN_ACT_SCORE, CONFIDENCE_RANK,
-    ACTIVITY_WARM_MIN, ACTIVITY_HOT_MIN
+    ACTIVITY_HOT_MIN
   };
 });

@@ -32,6 +32,33 @@
     return out;
   }
 
+  // "Today is Wednesday, September 30, 2026 (station clock; trust it over your own sense of the date)." or '' —
+  // kept short: it rides every run's system prompt, which has a hard byte budget (test/payload.budget.test.js)
+  function todayLine(now) {
+    const t = Number(now);
+    if (!Number.isFinite(t) || t <= 0) return '';
+    try { return 'Today is ' + new Date(t).toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }) + ' (station clock; trust it over your own sense of the date).'; } catch (_) { return ''; }
+  }
+
+  /* SHELL (#128, 2026-10-17): which shell shell.exec ACTUALLY runs for this agent. The tool description is one static
+     string shared by every agent and machine, so it cannot know; models on Linux read its old "On Windows this uses
+     cmd.exe; wrap PowerShell cmdlets…" as the rule, tried powershell first and burned a call on `powershell: not found`.
+     The truth is per agent: the EFFECTIVE execution backend (execution-router.js backendIdFor — Full Power forces
+     local, Safe Cell is Docker, Remote SSH is ssh), then the host OS only for the local backend. Docker runs `sh -lc`
+     in the agent's container and SSH feeds `sh -s` on the remote host (environment.js), whatever this host is. Stable
+     per agent + machine, and it rides the per-run [RUNTIME] block, never the cached tool schema. */
+  function shellLine(o) {
+    o = o || {};
+    const backend = String(o.backend || '');
+    const posix = ': POSIX sh syntax, not cmd.exe or PowerShell.';
+    if (backend === 'docker') return 'Shell: shell.exec runs sh inside this agent\'s Docker container' + posix;
+    if (backend === 'ssh') return 'Shell: shell.exec runs sh on this agent\'s remote SSH host' + posix;
+    if (backend !== 'local') return '';
+    if (o.platform === 'win32') return 'Shell: shell.exec runs Windows cmd.exe on this computer; wrap PowerShell cmdlets with `powershell -NoProfile -NonInteractive -Command "..."`.';
+    const os = /^[a-z0-9]{2,16}$/.test(String(o.platform || '')) ? ' (' + o.platform + ')' : '';
+    return 'Shell: shell.exec runs /bin/sh on this computer' + os + posix;
+  }
+
   function runtimeIdentityBlock(o) {
     o = o || {};
     const provider = oneLine(o.provider, 'unknown', 80);
@@ -55,9 +82,15 @@
       'Trigger: ' + trigger
     ];
     if (fallbacks.length) lines.push('Possible fallback models: ' + fallbacks.join(', '));
+    const shell = o.shell ? shellLine(o.shell) : '';   // only when shell.exec is on this run's wire
+    if (shell) lines.push(shell);
+    // TODAY (2026-09-30): a model's own sense of the date is its training era — asked for "today's news" it searched a
+    // year-old month. The station's clock is the truth; `now` is injected by the caller (this file never reads a clock).
+    const today = todayLine(o.now);
+    if (today) lines.push(today);
     lines.push('If the Commander asks what StarNet build, model, provider, run, surface, or session you are using, answer from this block. For mutable harness state such as scheduler health, routines, connectors, or errors, call station.inspect. Do not guess or invent a CLI command.');
     return '\n\n' + lines.join('\n');
   }
 
-  return { oneLine, runtimeIdentityBlock };
+  return { oneLine, runtimeIdentityBlock, todayLine, shellLine };
 });

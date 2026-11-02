@@ -1,89 +1,80 @@
-/* node test/autonomystore.test.js — the thin browser wiring around the pure autonomy engine
-   (frontend/app/autonomystore.js). autonomystore.js is glue: hydrate / persist / new-hero reset, all logic in the
-   pure autonomy.js (tested separately). This fakes localStorage with the REAL engine wired in, and locks:
-     - init() hydrates from its OWN key, clamped to a valid posture (corrupt/old → the safe floor)
-     - the writers (applyPreset / setInitiative / setReach / setLeash) commit AND persist
-     - summary() / describe() delegate to the engine
-     - the posture round-trips through localStorage (survives reload); reset() clears the key + re-arms the floor
-     - it NEVER emits on U.bus (read-only citizen) */
 'use strict';
-const A = require('./_assert.js');
-
-global.Autonomy = require('../frontend/app/autonomy.js');   // real pure engine (we want the integration)
-
+const { readSidecarSource } = require('./helpers/source');
+const assert = require('node:assert/strict');
+const {AutonomyStore: S} = require('../frontend/app/autonomystore.js');
+global.Autonomy = require('../frontend/app/autonomy.js');
 const mem = {};
-global.localStorage = {
-  getItem: k => (Object.prototype.hasOwnProperty.call(mem, k) ? mem[k] : null),
-  setItem: (k, v) => { mem[k] = String(v); },
-  removeItem: k => { delete mem[k]; }
+global.localStorage = {getItem:k=>mem[k]||null,setItem:(k,v)=>{mem[k]=v;},removeItem:k=>{delete mem[k];}};
+const key='starnet.autonomy.v1';
+let server=Autonomy.fresh(), fail=false, malformed=false, hold=null;
+const calls=[];
+global.fetch=async(url,opts)=>{
+  const body=opts.body?JSON.parse(opts.body):null;calls.push(body);
+  if(body&&hold)await hold;
+  if(body&&fail)return {ok:false,json:async()=>({ok:false,error:'disk full'})};
+  if(body&&malformed)return {ok:true,json:async()=>({})};
+  if(body)server=Autonomy.normalize(body.posture);
+  return {ok:true,json:async()=>({ok:true,summary:Autonomy.summary(server)})};
 };
-const KEY = 'starnet.autonomy.v1';
-const posturePosts = [];
-global.fetch = (_path, opts) => { posturePosts.push(JSON.parse(opts.body)); return Promise.resolve({ ok: true }); };
-
-const { AutonomyStore } = require('../frontend/app/autonomystore.js');
-
-/* ---------- init: empty store → the safe floor ---------- */
-AutonomyStore.init();
-A.eq(AutonomyStore.get(), { v: 1, initiative: 'wait', reach: 'sandbox', leashPerDay: 3 }, 'a fresh store hydrates to the safe floor (fully wait-for-me, Sandbox ceiling)');
-A.eq(AutonomyStore.summary().enabled, false, 'the floor does nothing unattended');
-A.eq(posturePosts[posturePosts.length - 1].resumeHalt, false, 'boot posture mirror is not consent to lift E-STOP');
-
-/* ---------- applyPreset: commits + persists ---------- */
-AutonomyStore.applyPreset('build');
-A.eq(AutonomyStore.get().initiative, 'leash', "applyPreset('build') sets leash initiative");
-A.eq(AutonomyStore.get().reach, 'sandbox', "applyPreset('build') sets sandbox reach");
-A.ok(mem[KEY] && JSON.parse(mem[KEY]).initiative === 'leash', 'the posture persists to its own localStorage key');
-A.eq(posturePosts[posturePosts.length - 1].resumeHalt, true, 'a deliberate dial writer carries explicit resume consent');
-
-// even the most autonomous preset keeps reach at sandbox (the safety rule, end-to-end through the store)
-AutonomyStore.applyPreset('free');
-A.eq([AutonomyStore.summary().actsUnattended, AutonomyStore.summary().reachesOut], [true, false], "'free' acts unattended but never reaches out (sandbox-capped)");
-
-/* ---------- single-axis writers ---------- */
-AutonomyStore.setReach('reach');
-A.eq(AutonomyStore.summary().reachesOut, true, 'setReach(reach) raises the ceiling to reach-out (a deliberate opt-in)');
-AutonomyStore.setInitiative('wait');
-A.eq(AutonomyStore.summary().enabled, false, 'setInitiative(wait) turns autonomy fully off');
-AutonomyStore.setLeash(7);
-A.eq(AutonomyStore.get().leashPerDay, 7, 'setLeash persists a clamped allowance');
-A.ok(mem[KEY] && JSON.parse(mem[KEY]).leashPerDay === 7, 'the leash change persisted');
-
-/* ---------- describe() delegates + stays honest ---------- */
-AutonomyStore.applyPreset('free');
-A.ok(/freely toward your goals/i.test(AutonomyStore.describe()), 'describe() reflects the live posture (free)');
-A.ok(AutonomyStore.describe().indexOf('see everything it did') >= 0, 'describe() always promises legibility');
-
-/* ---------- persistence round-trip: survives a reload ---------- */
-AutonomyStore.applyPreset('build'); AutonomyStore.setReach('observe');
-AutonomyStore.init();   // simulate a page reload (re-hydrate from the key)
-A.eq(AutonomyStore.get(), { v: 1, initiative: 'leash', reach: 'observe', leashPerDay: 7 }, 'a posture survives reload (re-hydrated from its own key)');
-A.eq(posturePosts[posturePosts.length - 1].resumeHalt, false, 'reload mirror cannot impersonate a deliberate dial write');
-
-/* ---------- station backup import: restores posture without lifting E-STOP ---------- */
-AutonomyStore.importState({ v: 1, initiative: 'leash', reach: 'sandbox', leashPerDay: 4 });
-A.eq(AutonomyStore.get(), { v: 1, initiative: 'leash', reach: 'sandbox', leashPerDay: 4 }, 'station backup import restores the posture');
-A.eq(posturePosts[posturePosts.length - 1].resumeHalt, false, 'station backup import is not consent to lift E-STOP');
-
-/* ---------- corrupt / old key → the safe floor, never a crash ---------- */
-mem[KEY] = '{not valid json';
-AutonomyStore.init();
-A.eq(AutonomyStore.get().initiative, 'wait', 'an unparseable key degrades to the floor, never throws');
-mem[KEY] = JSON.stringify({ initiative: 'bogus', reach: 'orbit', leashPerDay: 999 });
-AutonomyStore.init();
-A.eq(AutonomyStore.get(), { v: 1, initiative: 'wait', reach: 'sandbox', leashPerDay: 12 }, 'out-of-enum fields clamp to the floor; leash clamps to the max');
-
-/* ---------- reset: a brand-new hero re-arms the floor + drops the key ---------- */
-AutonomyStore.applyPreset('free');
-AutonomyStore.reset();
-A.eq(mem[KEY], undefined, 'reset() removes the persisted key');
-A.eq(AutonomyStore.get(), { v: 1, initiative: 'wait', reach: 'sandbox', leashPerDay: 3 }, 'after reset the posture is the safe floor again');
-
-/* ---------- read-only: the store never emits on U.bus ---------- */
-let emitted = 0;
-global.U = { bus: { emit: () => { emitted++; }, on: () => {} } };
-const { AutonomyStore: Fresh } = (() => { delete require.cache[require.resolve('../frontend/app/autonomystore.js')]; return require('../frontend/app/autonomystore.js'); })();
-Fresh.init(); Fresh.applyPreset('free'); Fresh.setReach('reach'); Fresh.reset();
-A.eq(emitted, 0, 'AutonomyStore never emits on U.bus (read-only citizen; lint-emits stays green)');
-
-A.report('autonomystore.test');
+(async()=>{
+  mem[key]=JSON.stringify({initiative:'free',reach:'reach',leashPerDay:12});
+  await S.init();assert.equal(S.get().initiative,'propose','a new station reads the server default: propose, never act');assert.ok(calls.every(x=>x===null),'boot is read-only');
+  assert.equal((await S.applyPreset('build')).ok,true);assert.equal(S.get().initiative,'leash');assert.equal(calls.at(-1).resumeHalt,true);
+  assert.equal(JSON.parse(mem[key]).initiative,'leash');
+  fail=true;assert.equal((await S.setInitiative('wait')).ok,false);assert.equal(S.get().initiative,'leash');assert.match(S.status().error,/disk full/);
+  fail=false;malformed=true;assert.equal((await S.setReach('reach')).ok,false);assert.equal(S.get().reach,'sandbox');malformed=false;
+  let release;hold=new Promise(r=>release=r);
+  const first=S.setReach('observe'),second=S.setLeash(7);
+  await new Promise(r=>setImmediate(r));assert.equal(S.status().pending,true);assert.equal(S.get().reach,'sandbox','pending value is not current');
+  release();await Promise.all([first,second]);hold=null;
+  assert.equal(server.reach,'observe');assert.equal(server.leashPerDay,7);assert.equal(S.status().pending,false);
+  const original=global.fetch;
+  global.fetch=async(url,opts)=>{if(opts.body){server=Autonomy.normalize(JSON.parse(opts.body).posture);throw new Error('ack lost');}return original(url,opts);};
+  assert.equal((await S.setInitiative('free')).ok,false);assert.equal(S.get().initiative,'free','lost ack reconciles committed state');
+  global.fetch=original;
+  await S.importState({initiative:'wait',reach:'sandbox',leashPerDay:4});assert.equal(calls.at(-1).resumeHalt,false);
+  server={initiative:'leash',reach:'observe',leashPerDay:6};mem[key]='broken';await S.init();assert.equal(S.get().leashPerDay,6,'reload uses server despite missing cache');
+  global.fetch=async()=>{throw new Error('offline');};await S.refresh();assert.equal(S.status().loaded,false);assert.match(S.status().error,/offline/);
+  global.fetch=original;await S.refresh();assert.equal(S.status().loaded,true);assert.equal(S.status().error,'');
+  let emitted=0;global.U={bus:{emit:()=>emitted++}};await S.setLeash(12);assert.equal(emitted,0);
+  fail=true;assert.equal((await S.reset()).ok,false);assert.equal(S.get().initiative,server.initiative);
+  fail=false;await S.reset();assert.equal(mem[key],undefined);assert.equal(S.get().initiative,'propose');assert.equal(server.initiative,'propose','reset returns to the new-station default');assert.equal(calls.at(-1).resumeHalt,false);
+  // org P06: REACH and PACE never lift an E-STOP halt (resumeHalt:false); the ON ITS OWN rungs (setInitiative /
+  // applyPreset) still do. A write the route says LIFTED a halt (haltLifted) tells the Commander; one that lifted
+  // nothing says nothing — the notice keys on the route's proof, never on the request.
+  await S.setReach('reach');assert.equal(calls.at(-1).resumeHalt,false,'REACH never lifts a halt');
+  await S.setLeash(5);assert.equal(calls.at(-1).resumeHalt,false,'PACE never lifts a halt');
+  await S.setInitiative('leash');assert.equal(calls.at(-1).resumeHalt,true,'an ON ITS OWN rung is still a stated lift');
+  const notes=[];global.StationUI={notify:(m,k)=>notes.push([m,k])};
+  const plain=global.fetch;let lifted=false;
+  // the route's halt picture AFTER the write (org P06 wiring): haltStatus() + cronArmed; default = everything lifted, scheduler armed
+  const picture=(o={})=>({halted:!!(o.cron||o.nightshift||o.loops),subsystems:{cron:{halted:!!o.cron},nightshift:{halted:!!o.nightshift},loops:{halted:!!o.loops},overseer:{halted:!!o.loops,error:''}}});
+  let after={halt:picture(),cronArmed:true};
+  global.fetch=async(url,opts)=>{const r=await plain(url,opts);if(!opts.body||!lifted)return r;const j=await r.json();return {ok:true,json:async()=>Object.assign({},j,{haltLifted:true},after)};};
+  let res=await S.setInitiative('free');assert.equal(res.haltLifted,false);assert.equal(notes.length,0,'no halt lifted → no notice');
+  lifted=true;res=await S.applyPreset('build');assert.equal(res.haltLifted,true);
+  assert.deepEqual(notes,[['AUTOMATION RESUMED: schedules and away work will run again','good']],'a lifted halt says Automation resumed');
+  // a lift that saved a rung where nothing acts unattended (WAIT / SUGGEST) never promises away work (P06 review)
+  global.StationUI.initiativeLabel=id=>({wait:'WAIT',propose:'SUGGEST'})[id]||id;
+  notes.length=0;await S.setInitiative('wait');await S.applyPreset('suggest');
+  assert.deepEqual(notes,[['E-STOP LIFTED: schedules can run again; away work stays off while ON ITS OWN is WAIT','good'],['E-STOP LIFTED: schedules can run again; away work stays off while ON ITS OWN is SUGGEST','good']],'a lift at WAIT or SUGGEST is headed by what the route proved (the E-STOP lifted), never RESUMED over away work that stays off');
+  // org P06 wiring: the dial lifts only cron + night shift; goal loops stay E-STOPped until RESUME AUTOMATION. A lift that
+  // left loops halted never says RESUMED / LIFTED, and names where the rest lifts.
+  global.StationUI.initiativeLabel=id=>({wait:'WAIT',propose:'SUGGEST',leash:'SMALL JOBS',free:'FREE'})[id]||id;
+  notes.length=0;after={halt:picture({loops:true}),cronArmed:true};await S.setInitiative('leash');await S.setInitiative('wait');
+  assert.deepEqual(notes,[['E-STOP PARTLY LIFTED: schedules can run again; away work can run again; goal loops stay paused — RESUME AUTOMATION in the top bar','good'],['E-STOP PARTLY LIFTED: schedules can run again; away work stays off while ON ITS OWN is WAIT; goal loops stay paused — RESUME AUTOMATION in the top bar','good']],'loops still halted → PARTLY LIFTED + the top-bar door, never AUTOMATION RESUMED');
+  // a cleared cron halt flag is not an armed scheduler: with scheduling switched off the receipt never promises schedules
+  notes.length=0;after={halt:picture(),cronArmed:false};await S.setInitiative('free');await S.setInitiative('propose');
+  assert.deepEqual(notes,[['AUTOMATION RESUMED: away work can run again','good'],['E-STOP LIFTED: away work stays off while ON ITS OWN is SUGGEST','good']],'cron unarmed → no "schedules can run" claim');
+  // no halt picture (read-back failed) → claim nothing beyond the saved lift
+  notes.length=0;after={halt:null,cronArmed:true};await S.setInitiative('free');
+  assert.deepEqual(notes,[['E-STOP LIFT SAVED: the rest of the pause could not be checked — see RESUME AUTOMATION in the top bar','good']],'unknown halt picture → no RESUMED headline');
+  global.fetch=plain;delete global.StationUI;
+  // the route's haltLifted is TRUE only when this write cleared a standing halt (nightshift halted, or liftCronHalt() lifted one)
+  const idx=readSidecarSource();
+  assert.match(idx,/if \(resumeRequested && nightshift\.isHalted\(nightshiftState\)\) \{ saveNightshiftState\(nightshift\.clearHalt\(nightshiftState, Date\.now\(\)\)\); haltLifted = true; \}/,'nightshift lift sets haltLifted after the save');
+  assert.match(idx,/if \(resumeRequested && liftCronHalt\(\)\) haltLifted = true;/,'cron lift sets haltLifted only when liftCronHalt lifted one');
+  assert.match(idx,/resumeRequested: resumeRequested, haltLifted: haltLifted, halt: haltAfter, cronArmed: !!cronArmed,/,'the posture route reports haltLifted + the halt picture after the write + cronArmed (additive)');
+  assert.match(idx,/try \{ haltAfter = haltStatus\(\); \}/,'the halt picture is the same haltStatus() GET /api/halt serves');
+  console.log('autonomystore.test: PASS (confirmed writes, failures, serialization, lost ack, reload, recovery, halt-lift receipt)');
+})().catch(e=>{console.error(e);process.exitCode=1;});

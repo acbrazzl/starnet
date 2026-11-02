@@ -20,6 +20,7 @@ const os = require('os');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const { bootToken } = require('./_httpToken.js');
+const { allocatePort, BIND_REFUSED } = require('./helpers/ports.js');
 
 const HOST = '127.0.0.1';
 const INDEX = path.resolve(__dirname, '..', 'sidecar', 'index.js');
@@ -69,8 +70,8 @@ function boot(port, env, attemptsLeft) {
     const onData = d => {
       out += d.toString();
       if (!settled && out.indexOf('http://' + HOST + ':' + port) >= 0) { settled = true; resolve({ child, port }); }
-      else if (!settled && /already in use/i.test(out)) { settled = true; try { child.kill(); } catch (_) {}
-        if (attemptsLeft > 0) resolve(boot(port + 1, env, attemptsLeft - 1)); else reject(new Error('no free port')); }
+      else if (!settled && BIND_REFUSED.test(out)) { settled = true; try { child.kill(); } catch (_) {}
+        if (attemptsLeft > 0) resolve(allocatePort().then(next => boot(next, env, attemptsLeft - 1))); else reject(new Error('no free port')); }
     };
     child.stdout.on('data', onData); child.stderr.on('data', onData);
     child.on('error', e => { if (!settled) { settled = true; reject(e); } });
@@ -89,7 +90,7 @@ async function readNdjson(res) {
 function attachSse(B, token) {
   const ac = new AbortController();
   const events = [];
-  const done = fetch(B + '/api/channels/events?token=' + encodeURIComponent(token), { signal: ac.signal })
+  const done = fetch(B + '/api/channels/events?' + require('./_httpToken.js').sseQuery(token), { signal: ac.signal })
     .then(async (res) => {
       const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
       try {
@@ -123,7 +124,7 @@ function hotBeliefs(now) {
   const mock = await startMockOpenRouter();
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'sk-nsvis-e2e-'));
   const env = { SKYNET_WORKSPACES: ws, SKYNET_DEV: '1', SKYNET_OPENROUTER_BASE: mock.base, SKYNET_OPENROUTER_KEY: 'sk-or-v1-nsvis-fake', SKYNET_DEFAULT_MODEL: 'test/model' };
-  const { child, port } = await boot(8960 + (process.pid % 30), env, 20);
+  const { child, port } = await boot(await allocatePort(), env, 20);
   const B = 'http://' + HOST + ':' + port;
   let sse = null;
   try {
@@ -154,8 +155,8 @@ function hotBeliefs(now) {
 
     // ── 2. the crate rode WHILE the work ran: workitem.placed (night-shift preview) arrives BEFORE the last
     //      nightshift run.end (the DO/critique runs execute after placement — pending work is visible live).
-    const placedIdx = ev.findIndex(e => e.name === 'workitem.placed' && e.payload && /night-shift/.test(String(e.payload.preview || '')));
-    A.ok(placedIdx >= 0, 'a night-shift work-item crate was placed on the conveyor');
+    const placedIdx = ev.findIndex(e => e.name === 'workitem.placed' && e.payload && /^✦ autonomy: /.test(String(e.payload.preview || '')));
+    A.ok(placedIdx >= 0, 'an autonomy work-item crate was placed on the conveyor');
     A.ok(ev[placedIdx].payload.kind === 'cron' && ev[placedIdx].payload.agentId === 'agent', 'the crate is agent-bound autonomous work (kind cron, agentId agent)');
     let lastEndIdx = -1;
     for (let i = 0; i < ev.length; i++) if (ev[i].name === 'agent.run.end') lastEndIdx = i;

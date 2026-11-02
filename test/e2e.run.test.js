@@ -5,12 +5,14 @@
    deltas, a reconciled agent.cost, and exactly one agent.run.end{reason:'done'} — no real key, no network. */
 'use strict';
 const A = require('./_assert.js');
+const { runContextOf, userWords } = require('./helpers/host-notes.js');
 const http = require('http');
 const path = require('path');
 const os = require('os');
 const { bootToken } = require('./_httpToken.js');
 const fs = require('fs');
 const { spawn } = require('child_process');
+const { allocatePort, BIND_REFUSED } = require('./helpers/ports.js');
 const HOST = '127.0.0.1';
 const INDEX = path.resolve(__dirname, '..', 'sidecar', 'index.js');
 
@@ -118,7 +120,7 @@ function startMockOpenRouter() {
   });
 }
 
-// spawn the real sidecar; resolve once it logs its listen URL. Retries the next port on EADDRINUSE.
+// spawn the real sidecar; resolve once it logs its listen URL. Retries a refused bind (BIND_REFUSED) on a fresh allocatePort().
 function boot(port, env, attemptsLeft) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [INDEX], {
@@ -128,8 +130,8 @@ function boot(port, env, attemptsLeft) {
     const onData = d => {
       out += d.toString();
       if (!settled && out.indexOf('http://' + HOST + ':' + port) >= 0) { settled = true; resolve({ child, port }); }
-      else if (!settled && /already in use/i.test(out)) { settled = true; try { child.kill(); } catch (_) {}
-        if (attemptsLeft > 0) resolve(boot(port + 1, env, attemptsLeft - 1)); else reject(new Error('no free port')); }
+      else if (!settled && BIND_REFUSED.test(out)) { settled = true; try { child.kill(); } catch (_) {}
+        if (attemptsLeft > 0) resolve(allocatePort().then(next => boot(next, env, attemptsLeft - 1))); else reject(new Error('no free port')); }
     };
     child.stdout.on('data', onData); child.stderr.on('data', onData);
     child.on('error', e => { if (!settled) { settled = true; reject(e); } });
@@ -141,7 +143,7 @@ function boot(port, env, attemptsLeft) {
   const mock = await startMockOpenRouter();
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'sk-e2e-'));
   const env = { SKYNET_WORKSPACES: ws, SKYNET_OPENROUTER_BASE: mock.base, SKYNET_STREAM_KA_MS: '40' };   // fast heartbeat so the KA test observes it in ms, not 20s
-  const { child, port } = await boot(8840 + (process.pid % 50), env, 20);
+  const { child, port } = await boot(await allocatePort(), env, 20);
   const B = 'http://' + HOST + ':' + port;
   try {
     // a bootstrapped API token is required for privileged /api routes (api-hardening).
@@ -179,8 +181,11 @@ function boot(port, env, attemptsLeft) {
     A.eq(ends.length, 1, 'exactly one agent.run.end');
     A.eq(ends[0].payload.reason, 'done', 'the run completes with reason done');
     const firstReq = mock.requests[0] || {};
-    const firstSystem = (((firstReq.messages || [])[0] || {}).content) || '';
-    A.ok(firstSystem.indexOf('[RUNTIME]') >= 0, 'runtime identity block reaches the provider system prompt');
+    // lean-prompt (2026-10-12): [RUNTIME] rides the per-run <run_context> note placed with the newest user turn (on this
+    // non-Claude chat wire, as that turn's fenced leading text), so the system prompt (messages[0]) stays byte-identical
+    const firstSystem = runContextOf(firstReq.messages || []);
+    A.ok(String((((firstReq.messages || [])[0] || {}).content) || '').indexOf('[RUNTIME]') < 0, 'the system prompt itself carries no per-run block');
+    A.ok(firstSystem.indexOf('[RUNTIME]') >= 0, 'runtime identity block reaches the provider (run-context note)');
     A.ok(firstSystem.indexOf('Provider: openrouter') >= 0, 'runtime block names the selected provider');
     A.ok(firstSystem.indexOf('Requested model at run start: test/model') >= 0, 'runtime block names the requested model');
     A.ok(firstSystem.indexOf('If the Commander asks what StarNet build, model, provider') >= 0, 'runtime block tells the agent to answer build/model/provider questions from host state');
@@ -220,7 +225,9 @@ function boot(port, env, attemptsLeft) {
       const raw = await r.text();
       const evs = raw.split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch (_) { return null; } }).filter(Boolean);
       A.ok(evs.some(e => e.name === 'agent.run.end' && e.payload.reason === 'done'), 'compatible route recovers malformed tool history through the real sidecar');
-      const wire = mock.requests.slice(before).find(q => (q.messages || []).some(m => m.role === 'user' && m.content === 'PAIRRECOVERY compatible route'));
+      // the run-context note leads the Commander's own message (provider.js noteCarrier), not the recovered-result turn;
+      // on a chat wire the recovered text then joins that turn (projectRoles 'chat': two user turns in a row are one)
+      const wire = mock.requests.slice(before).find(q => (q.messages || []).some(m => m.role === 'user' && userWords(m).indexOf('PAIRRECOVERY compatible route') === 0));
       A.ok(wire && wire.messages.some(m => m.role === 'user' && String(m.content).includes('[recovered tool result') && String(m.content).includes('evidence survives')), 'compatible wire retains orphan evidence as labeled recovery text');
       A.ok(evs.some(e => e.name === 'agent.cost' && e.payload.reconciled === true), 'compatible recovery still emits reconciled cost');
     }
@@ -255,8 +262,27 @@ function boot(port, env, attemptsLeft) {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'X-StarNet-Token': token, Origin: B },
         body: JSON.stringify({ key: 'sk-or-v1-e2e-fake', model: 'test/model', agentId: 'code-e2e', isTask: true, messages: [{ role: 'user', content: 'CODEMODE compose a read' }] })
       });
-      const raw = await r.text();
-      const evs = raw.split('\n').map(l => l.trim()).filter(Boolean).map(l => { try { return JSON.parse(l); } catch (_) { return null; } }).filter(Boolean);
+      // code.run is consent-gated (2026-09-23 security stopgap): stream the run and approve its prompt once,
+      // over the SAME POST /api/consent the browser's consent card uses.
+      const evs = [];
+      {
+        const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = '', runId = '';
+        while (true) {
+          const { value, done } = await reader.read(); if (done) break;
+          buf += dec.decode(value, { stream: true }); let nl;
+          while ((nl = buf.indexOf('\n')) >= 0) {
+            const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1); if (!line) continue;
+            let ev = null; try { ev = JSON.parse(line); } catch (_) { continue; }
+            evs.push(ev);
+            if (ev.name === 'agent.run.start') runId = ev.payload.runId;
+            if (ev.name === 'permission.prompt') {
+              fetch(B + '/api/consent', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-StarNet-Token': token, Origin: B },
+                body: JSON.stringify({ runId, promptId: ev.payload.promptId, decision: 'once' }) }).catch(() => {});
+            }
+          }
+        }
+      }
+      A.ok(evs.some(e => e.name === 'permission.prompt' && ['code.run', 'code_run'].indexOf(e.payload.tool) >= 0),'code.run asked the Commander before running model code');
       const called = evs.filter(e => e.name === 'agent.tool_call').map(e => e.payload.name);
       A.ok(called.indexOf('code_run') >= 0, 'real sidecar executed model-facing code.run through its provider-safe wire name');
       A.ok(called.indexOf('tool.search') >= 0, 'the child nested read re-entered parent tool telemetry');
@@ -288,6 +314,7 @@ function boot(port, env, attemptsLeft) {
       const firstDomainReq = domainMain[0];
       const offered = ((firstDomainReq && firstDomainReq.tools) || []).map(t => t && t.function && t.function.name);
       A.ok(offered.indexOf('team_dispatch') < 0 && offered.indexOf('web_search') < 0, 'lead is not offered delegation or expansive search for a single-host check');
+      A.ok(offered.indexOf('browser_navigate') >= 0, 'the placed DISH keeps the browser on a single-host check (saw: ' + offered.join(', ') + ')');
       const runId = ((evs.find(e => e.name === 'agent.run.start') || {}).payload || {}).runId;
       const runs = await (await fetch(B + '/api/runs?agent=e2e-domain&runId=' + encodeURIComponent(runId), { headers: { 'X-StarNet-Token': token, Origin: B } })).json();
       const row = (runs.runs || [])[0];
@@ -408,7 +435,7 @@ function boot(port, env, attemptsLeft) {
 
   // reboot the sidecar on the SAME workspace: the persisted diag tail must come back.
   {
-    const boot2 = await boot(8890 + (process.pid % 50), env, 20);
+    const boot2 = await boot(await allocatePort(), env, 20);
     const B2 = 'http://' + HOST + ':' + boot2.port;
     try {
       const token2 = await bootToken(B2, B2);

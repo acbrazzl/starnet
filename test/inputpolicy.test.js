@@ -7,7 +7,7 @@ const { makeRegistry } = require('../sidecar/tools/registry.js');
 const { makeConsentBroker } = require('../sidecar/permissions.js');
 const { makeComputerTools } = require('../sidecar/tools/builtin/computer.js');
 const { makeDesktopTools } = require('../sidecar/tools/builtin/desktop.js');
-const { enforceSyntheticOnly, enforceRunAuthority, enforceEnabledToolsets, runInputContext, impactOfTool, makeRunAuthority, IMPACTS, backgroundOwnsLoopbackUrl, backgroundOwnsLocalUrl, makeLoopbackListenerProbe, normalizeUnattendedGrants, isConnectorTool } = require('../sidecar/inputpolicy.js');
+const { enforceSyntheticOnly, enforceRunAuthority, enforceEnabledToolsets, TOOLSET_FREEBIES, runInputContext, impactOfTool, makeRunAuthority, IMPACTS, backgroundOwnsLoopbackUrl, backgroundOwnsLocalUrl, makeLoopbackListenerProbe, normalizeUnattendedGrants, isConnectorTool } = require('../sidecar/inputpolicy.js');
 
 const station = {
   agents: { ag: { id: 'ag', room: 'r' } },
@@ -57,6 +57,29 @@ A.ok(legacyRaw.tools.includes('computer.use') && legacyRaw.tools.includes('deskt
   A.ok(onlyWeb.tools.includes('quest.update') && onlyWeb.tools.includes('tool.search'), 'non-toggleable computer freebies remain available');
   A.eq(onlyWeb.approvalRules['shell.exec'], undefined, 'parallel approval map is attenuated with tool names');
   A.eq(enforceEnabledToolsets(projected, { get: n => defs[n] }, null), projected, 'null keeps legacy station grants unchanged');
+  // The computer freebies no switch can turn off survive a restriction too (a routine keeps its own notepad).
+  const FREEBIE_TOOLS = ['quest.update', 'tool.search', 'todo', 'deliverable_note', 'station.inspect', 'station.show', 'manual.read', 'routine.notepad'];   // station.show: the same stationinfo grant as station.inspect (read, no consent; it refuses any run nobody is watching)
+  for (const t of FREEBIE_TOOLS) {
+    A.ok(safe.tools.includes(t), 'fixture: the computer grants ' + t);
+    A.ok(onlyWeb.tools.includes(t), 'a restriction-only toolset list keeps the computer freebie ' + t);
+  }
+  A.ok(safe.tools.includes('code.run') && !onlyWeb.tools.includes('code.run'), 'code.run (execute + consent) is NOT a freebie: a restriction strips it');
+  const appTools = (safe.tools || []).concat(safe.deferred || []).filter(n => n.indexOf('app.') === 0);
+  A.ok(appTools.length > 0, 'fixture: the computer grants the apps family');
+  for (const t of appTools) A.ok(!onlyWeb.tools.includes(t) && !(onlyWeb.deferred || []).includes(t), 'apps (' + t + ') is NOT a freebie: a restriction strips it');
+  A.eq(onlyWeb.approvalRules['todo'], projected.approvalRules['todo'], 'a kept freebie carries its approval rule');
+  A.eq(onlyWeb.approvalRules['code.run'], undefined, 'a stripped code.run carries no approval rule');
+  const none = enforceEnabledToolsets(projected, { get: n => defs[n] }, []);
+  A.eq(none.tools.slice().sort().join(','), FREEBIE_TOOLS.slice().sort().join(','), 'an empty restriction keeps exactly the freebies');
+  // Drift lock: every non-toggleable computer family is classified on purpose — a future freebie is never dropped silently.
+  const { CAP_REGISTRY } = require('../sidecar/capability/registry.js');
+  const { toggleableCaps } = require('../sidecar/capability/toolsets.js');
+  const toggleable = new Set(toggleableCaps(CAP_REGISTRY));
+  const STRIPPED = new Set(['code', 'apps']);
+  for (const g of CAP_REGISTRY.computer) {
+    if (g.capId === 'compute' || toggleable.has(g.capId)) continue;
+    A.ok(TOOLSET_FREEBIES.has(g.capId) || STRIPPED.has(g.capId), 'computer family "' + g.capId + '" is classified as a toolset freebie or as deliberately stripped');
+  }
 }
 
 for (const [surface, isTask] of [['interactive', true], ['autonomous', true], ['test', false]]) {
@@ -199,6 +222,25 @@ A.eq(backgroundOwnsLoopbackUrl({ running: true, tail: 'Local: https://[::1]:4443
   await unknownRegistry.dispatch({ id: 'u2', name: 'future.magic', args: {} }, unknownCtx);
   A.eq(exactPrompts, 2, 'an unclassifiable tool re-asks every call — "full" is deliberately NOT recorded for it');
   A.eq(unknownRuns, 2, 'each confirmed unclassifiable call executes exactly once');
+  // an UNANSWERED prompt (consentwait resolves 'timeout') is not a refusal: the model must not hear "denied" and tell
+  // the Commander they declined. An actual deny still says denied. (review threads-backend-06)
+  const askWith = (decision) => makeRunAuthority({ surface: 'interactive', isTask: true, environment: { supports: { hostileCodeSandbox: false } }, confirm: async () => decision })
+    .authorize({ id: 'u3', name: 'future.magic', args: {} }, unknownRegistry.get('future.magic'));
+  const timedOut = await askWith('timeout');
+  A.eq(timedOut.ok, false, 'a timed-out exact confirmation still does not run the call');
+  A.ok(/timed out/.test(timedOut.reason) && /not a refusal/.test(timedOut.reason) && !/denied/.test(timedOut.reason), 'and says nobody answered, never "denied": ' + timedOut.reason);
+  const denied = await askWith('deny');
+  A.ok(denied.ok === false && /was denied/.test(denied.reason), 'an actual deny still reads as denied');
+  // ...and what the MODEL reads through dispatch carries the consent path's guidance: it was not run, it was not a
+  // refusal, tell the Commander it timed out, do not retry it alone (review follow-up on threads-backend-06)
+  const runsBeforeTimeout = unknownRuns;
+  const timedOutAuthority = makeRunAuthority({ surface: 'interactive', isTask: true, environment: { supports: { hostileCodeSandbox: false } }, confirm: async () => 'timeout' });
+  const timedOutDispatch = await unknownRegistry.dispatch({ id: 'u4', name: 'future.magic', args: {} }, { authorize: timedOutAuthority.authorize, consent: async () => ({ allow: true }) });
+  A.eq(unknownRuns, runsBeforeTimeout, 'a timed-out exact confirmation never runs the call');
+  A.ok(timedOutDispatch.isError === true && /timed out/.test(timedOutDispatch.content) && /not a refusal/.test(timedOutDispatch.content)
+    && /NOT run/.test(timedOutDispatch.content) && /Do NOT retry it yourself/.test(timedOutDispatch.content),
+  'the dispatched result says it timed out, was not run, was not a refusal, and not to retry alone: ' + timedOutDispatch.content);
+  A.ok(!/denied/i.test(timedOutDispatch.content), 'a timed-out exact confirmation never reads as denied: ' + timedOutDispatch.content);
 
   /* THE CONNECTOR TOOL (capability 'mcp:<id>') — a server the Commander deliberately connected. It routes to
      the consent BROKER instead, so the grade they pick is recorded and the next call is answered from cache.
@@ -323,5 +365,55 @@ A.eq(backgroundOwnsLoopbackUrl({ running: true, tail: 'Local: https://[::1]:4443
   const unattended = makeRunAuthority({ surface: 'autonomous' });
   const unattendedChild = makeRunAuthority({ connectorAuthority: unattended });
   A.eq(unattendedChild.project(mcp), false, 'an ungranted unattended lead cannot mint a connector grant');
+  // NAMING the work and the run's own checklist have no outward effect: they must never read as external-unknown
+  // (2026-09-30: after web research, a build stopped on an approval card just to call deliverable_note)
+  const { makeDeliverableTool } = require('../sidecar/tools/builtin/deliverable.js');
+  const delivTools = []; makeDeliverableTool({ notes: new Map() }).register({ register: (t) => delivTools.push(t) });
+  A.eq(impactOfTool(delivTools.find((t) => t.name === 'deliverable_note')), IMPACTS.NONE, 'deliverable_note is impact none (it labels work already done)');
+  const todoSrc = require('fs').readFileSync(require('path').join(__dirname, '../sidecar/tools/builtin/todo.js'), 'utf8');
+  A.ok(/name: 'todo', capability: 'taskplan'[^\n]*impact: 'none'/.test(todoSrc), 'todo is impact none (the run\'s own checklist)');
+  // A ROUTINE'S OWN NOTEPAD survives unattended ASK (#155): undeclared it read as external-unknown and was stripped from the
+  // only runs it works in, while the routine still reported ok. The impact is the HOST def's, never the 'routinescratch' cap's.
+  {
+    const { makeRoutineTools } = require('../sidecar/tools/builtin/routines.js');
+    const notes = new Map();
+    const notepadDeps = { getRoutineNotepad: async id => notes.get(id) || '', setRoutineNotepad: async (id, text) => { notes.set(id, text); return true; } };
+    const reg = makeRegistry();
+    makeRoutineTools(notepadDeps).register(reg);
+    let impostorRuns = 0;
+    reg.register({ name: 'routine.ledger', capability: 'routinescratch', scope: 'write', requiresConsent: false, run: async () => { impostorRuns++; return { content: 'ran', summary: 'ran' }; } });
+    const askRoutine = makeRunAuthority({ surface: 'autonomous', isTask: true });
+    const withImpostor = Object.assign({}, safe, {
+      tools: safe.tools.concat('routine.ledger'),
+      grants: safe.grants.concat({ capId: 'routinescratch', tool: 'routine.ledger', scope: 'write', requiresConsent: false, network: false }),
+      approvalRules: Object.assign({}, safe.approvalRules, { 'routine.ledger': { requiresConsent: false, scope: 'write', network: false } })
+    });
+    A.ok(withImpostor.tools.includes('routine.notepad'), 'fixture: the computer grants routine.notepad');
+    A.eq(impactOfTool(reg.get('routine.notepad')), IMPACTS.NONE, 'the host-registered routine.notepad is impact none');
+    A.eq(impactOfTool(reg.get('routine.ledger')), IMPACTS.EXTERNAL_UNKNOWN, 'an undeclared tool of the same routinescratch capability still fails closed');
+    const askProjected = enforceRunAuthority(withImpostor, reg, askRoutine);
+    A.ok(askProjected.tools.includes('routine.notepad'), 'an unattended ASK routine is offered its own notepad');
+    A.ok(askProjected.grants.some(g => g && g.tool === 'routine.notepad'), 'the notepad grant survives the unattended projection');
+    A.ok(!askProjected.tools.includes('routine.ledger'), 'the same-capability unknown tool is filtered from the unattended run');
+    const routineCtx = Object.assign(makeCapCtx(askProjected), { authorize: askRoutine.authorize, consent: async () => ({ allow: false, reason: 'unattended' }), surface: 'autonomous', isTask: true, cronJobId: 'job_155' });
+    const wrote = await reg.dispatch({ id: 'n1', name: 'routine.notepad', args: { action: 'write', text: 'seen: a, b' } }, routineCtx);
+    A.eq(wrote.summary, 'routine notepad saved', 'the unattended ASK routine writes its notepad');
+    A.eq(notes.get('job_155'), 'seen: a, b', 'the write lands on the host-minted routine id');
+    const reread = await reg.dispatch({ id: 'n2', name: 'routine.notepad', args: { action: 'read' } }, routineCtx);
+    A.eq(reread.content, 'seen: a, b', 'the unattended ASK routine reads its notepad back');
+    const ledger = await reg.dispatch({ id: 'n3', name: 'routine.ledger', args: {} }, Object.assign({}, routineCtx, makeCapCtx(withImpostor)));
+    A.eq(ledger.summary, 'user-control-denied', 'a forced call to the unknown same-capability tool is refused at the authority gate');
+    A.eq(impostorRuns, 0, 'the unknown same-capability tool never runs');
+    // a connector/plugin re-registering the name replaces the whole entry: it does not inherit the host def's impact
+    const replaced = makeRegistry();
+    makeRoutineTools(notepadDeps).register(replaced);
+    replaced.register({ name: 'routine.notepad', capability: 'routinescratch', scope: 'write', requiresConsent: false, run: async () => { impostorRuns++; return { content: 'ran', summary: 'ran' }; } }, { provenance: 'connector' });
+    A.eq(replaced.get('routine.notepad').provenance, 'connector', 'fixture: the connector registration replaced the host entry');
+    A.eq(impactOfTool(replaced.get('routine.notepad')), IMPACTS.EXTERNAL_UNKNOWN, 'a connector re-registration of routine.notepad keeps the fail-closed class');
+    A.ok(!enforceRunAuthority(safe, replaced, askRoutine).tools.includes('routine.notepad'), 'a replaced routine.notepad is filtered from the unattended run');
+    const forged = await replaced.dispatch({ id: 'n4', name: 'routine.notepad', args: { action: 'read' } }, Object.assign({}, routineCtx, makeCapCtx(safe)));
+    A.eq(forged.summary, 'user-control-denied', 'a forced call to the replaced routine.notepad is refused');
+    A.eq(impostorRuns, 0, 'the replacement never runs unattended');
+  }
   A.report('inputpolicy.test');
 })().catch(e => { console.error(e); process.exit(1); });

@@ -6,8 +6,9 @@
      - the greeting carries NO operator manual, NO skill recipes, NO [ORCHESTRATION] briefing (it has no tools
        on the wire, so those blocks described capabilities it did not have and cost ~25KB of prefill);
      - the task turn still carries all of them (the diet must never starve real work);
-     - both carry the [RUNTIME] block, and on the task turn it rides AFTER the byte-stable blocks so a
-       provider's prefix cache survives the per-run 'Run id:' line.
+     - both carry the [RUNTIME] block — since lean-prompt (2026-10-12) in the per-run <run_context> note placed
+       with the newest user turn, never in the system prompt, so a provider's prefix cache survives the per-run
+       'Run id:' line across messages.
    Zero real network, zero spend. */
 'use strict';
 const A = require('./_assert.js');
@@ -17,6 +18,8 @@ const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 const { bootToken } = require('./_httpToken.js');
+const { runContextOf, userWords } = require('./helpers/host-notes.js');
+const { allocatePort, BIND_REFUSED } = require('./helpers/ports.js');
 
 const HOST = '127.0.0.1';
 const INDEX = path.resolve(__dirname, '..', 'sidecar', 'index.js');
@@ -36,8 +39,8 @@ function startMockOpenRouter() {
           const request = JSON.parse(body);
           requests.push(request);
           const latestUser = (request.messages || []).filter(m => m.role === 'user').at(-1);
-          const cappedChat = latestUser && latestUser.content === 'hello cap regression';
-          const cappedTask = latestUser && latestUser.content === 'write cap regression'
+          const cappedChat = latestUser && userWords(latestUser) === 'hello cap regression';
+          const cappedTask = latestUser && userWords(latestUser) === 'write cap regression'
             && !(request.messages || []).some(m => String(m.content).includes('<output_continuation>'));
           res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
           res.write('data: ' + JSON.stringify({ choices: [{ delta: { content: 'ok' } }] }) + '\n\n');
@@ -62,9 +65,9 @@ function boot(port, env, attemptsLeft) {
     const onData = d => {
       out += d.toString();
       if (!settled && out.indexOf('http://' + HOST + ':' + port) >= 0) { settled = true; resolve({ child, port }); }
-      else if (!settled && /already in use/i.test(out)) {
+      else if (!settled && BIND_REFUSED.test(out)) {
         settled = true; try { child.kill(); } catch (_) {}
-        if (attemptsLeft > 0) resolve(boot(port + 1, env, attemptsLeft - 1)); else reject(new Error('no free port'));
+        if (attemptsLeft > 0) resolve(allocatePort().then(next => boot(next, env, attemptsLeft - 1))); else reject(new Error('no free port'));
       }
     };
     child.stdout.on('data', onData); child.stderr.on('data', onData);
@@ -76,7 +79,7 @@ function boot(port, env, attemptsLeft) {
 (async () => {
   const mock = await startMockOpenRouter();
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'sk-chat-diet-'));
-  const { child, port } = await boot(9040 + (process.pid % 25), { SKYNET_WORKSPACES: ws, SKYNET_OPENROUTER_BASE: mock.base }, 20);
+  const { child, port } = await boot(await allocatePort(), { SKYNET_WORKSPACES: ws, SKYNET_OPENROUTER_BASE: mock.base }, 20);
   const B = 'http://' + HOST + ':' + port;
   try {
     const token = await bootToken(B, B);
@@ -99,7 +102,11 @@ function boot(port, env, attemptsLeft) {
       // the run's own request is the longest system prompt in the window (aux passes are shorter or absent)
       const system = systems.sort((a, b) => b.length - a.length)[0] || '';
       const tools = reqs.map(q => (q && Array.isArray(q.tools)) ? q.tools.length : 0);
-      return { system, events, requests: reqs, tools: Math.max.apply(null, tools.concat([0])) };
+      // the per-run <run_context> note (lean-prompt 2026-10-12) of that same request: on this non-Claude chat wire, the fenced
+      // leading text of its newest user turn (provider.js userSideHostNotes)
+      const main = reqs.find(q => (((q || {}).messages || [])[0] || {}).content === system) || { messages: [] };
+      const note = runContextOf(main.messages);
+      return { system, note, events, requests: reqs, tools: Math.max.apply(null, tools.concat([0])) };
     };
 
     const chat = await run(false, 'hello');
@@ -115,7 +122,10 @@ function boot(port, env, attemptsLeft) {
     A.ok(skillHeads.length >= 1, 'the task turn carries at least one skill recipe (default-on library skills)');
     A.ok(skillHeads.every(h => chat.system.indexOf(h) < 0), 'greeting: none of those skill recipes ship');
     A.ok(chat.system.indexOf('<capabilities_ground_truth>') >= 0, 'greeting: the capabilities ground truth STAYS (truthful telemetry)');
-    A.ok(chat.system.indexOf('[RUNTIME]') >= 0 && chat.system.indexOf('Run id:') >= 0, 'greeting: the runtime identity block STAYS');
+    // ...but it never says "You CAN" on a turn with no tools attached: it states the station grant and that this reply has none
+    A.ok(chat.system.indexOf('NONE of these tools are attached to THIS reply') >= 0 && !/- You CAN: (?!think and reply)/.test(chat.system), 'greeting: the ground truth says no tools are attached to this reply');
+    A.ok(task.system.indexOf('NONE of these tools are attached to THIS reply') < 0 && task.system.indexOf('- You CAN: ') >= 0, 'task: the ground truth still says what it CAN do');
+    A.ok(chat.note.indexOf('[RUNTIME]') >= 0 && chat.note.indexOf('Run id:') >= 0, 'greeting: the runtime identity block STAYS (in the per-run note)');
     A.ok(chat.system.length < task.system.length * 0.4, 'greeting prompt is under 40% of the task prompt (' + chat.system.length + ' vs ' + task.system.length + ' chars)');
 
     /* ---- real work is never starved ---- */
@@ -125,13 +135,13 @@ function boot(port, env, attemptsLeft) {
     A.ok(task.system.indexOf('[HARNESS]') >= 0, 'task: tool note present');
     A.ok(task.system.indexOf('<capabilities_ground_truth>') >= 0, 'task: capabilities ground truth present');
 
-    /* ---- prefix-cache order: the per-run line rides after the byte-stable blocks ---- */
-    const iRuntime = task.system.indexOf('[RUNTIME]');
-    A.ok(iRuntime > task.system.indexOf('[ORCHESTRATION]'), 'task: [RUNTIME] comes after the [ORCHESTRATION] briefing');
-    A.ok(iRuntime > task.system.indexOf('<starnet_operator_manual>'), 'task: [RUNTIME] comes after the manual');
-    A.ok(iRuntime > task.system.indexOf('<capabilities_ground_truth>'), 'task: [RUNTIME] comes after the capabilities block');
-    A.ok(iRuntime > task.system.lastIndexOf('### '), 'task: [RUNTIME] comes after the last skill recipe');
-    A.eq((task.system.match(/Run id: /g) || []).length, 1, 'task: exactly one run id line');
+    /* ---- prefix-cache order: the per-run line rides after the byte-stable blocks ----
+       lean-prompt (2026-10-12): it used to close the system prompt (after [ORCHESTRATION], the manual, the capabilities
+       block and the skill recipes). It now rides the <run_context> note placed with the newest user turn, so the
+       system prompt carries no per-run bytes at all — strictly stronger than "after the stable blocks". */
+    A.ok(task.system.indexOf('[RUNTIME]') < 0 && task.system.indexOf('Run id:') < 0, 'task: no per-run line anywhere in the system prompt');
+    A.ok(chat.system.indexOf('Run id:') < 0, 'greeting: no per-run line in the system prompt either');
+    A.eq((task.note.match(/Run id: /g) || []).length, 1, 'task: exactly one run id line (in the per-run note)');
 
     // A per-request ceiling must not trigger four more generations of a greeting. Real tasks still
     // need semantic continuation to finish an answer or reissue a cut-off tool call.

@@ -27,6 +27,8 @@ durable structure rather than a one-time task.
 - **EXECUTION_BACKENDS.md** — how workbench tools execute through a single environment boundary
   (local vs sandbox modes).
 - **CLAUDE_CREW.md** — opt-in: your own Claude Code CLI sessions as floor crew (Remote Control links, your Claude login) + `STARNET_REMOTE_HOSTS` phone access over Tailscale
+- **CLAUDE_CLI_PROVIDER.md** — the `claude-cli` brain: how the local Claude Code CLI runs a turn with its own
+  tools off, how Stop/timeouts work, and how its cost is booked.
 - **MEMORY_AND_CONTEXT_PLAN.md** — the layered design of Cortex, the agent memory + context
   engine (plan, but the reference for how memory is shaped).
 - **v7-subsystem-analysis.md** — auto-generated audit of the v7 codebase to decide what to

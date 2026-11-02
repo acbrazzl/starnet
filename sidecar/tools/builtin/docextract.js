@@ -11,7 +11,7 @@
    charts and comments are dropped. A caller that needs fidelity should open the file, not read it.
 
    makeDocExtract({ inflateRaw }) -> { sniff, extract, _internals }
-     inflateRaw(buf) -> Buffer     // zlib.inflateRawSync, injected so this module stays pure + testable
+     inflateRaw(buf, { maxOutputLength }) -> Buffer   // zlib.inflateRawSync, injected so this module stays pure + testable
      sniff(nameOrPath, buf?) -> 'docx' | 'xlsx' | 'ipynb' | null
      extract(buf, kind, opts?) -> string        // throws on a malformed container; the caller falls back */
 'use strict';
@@ -25,6 +25,12 @@
   const DEFAULT_MAX_CHARS = 200000;
   const MAX_SHEET_ROWS = 5000;      // a spreadsheet can be a million rows; the prompt cannot
   const MAX_ROW_CELLS = 256;
+  // ZIP-BOMB CEILING. The declared sizes in a ZIP header are attacker-controlled and deflate reaches ~1000:1, so a
+  // 1 MB .docx/.xlsx an agent downloaded could inflate to a gigabyte — synchronously, freezing the whole sidecar
+  // (UI, API, every run) or exhausting memory. Each entry and the whole document share a hard output budget; past
+  // it extract() throws and fs.read falls back to the plain read. Real documents are nowhere near these numbers.
+  const MAX_ENTRY_INFLATE = 32 * 1024 * 1024;
+  const MAX_TOTAL_INFLATE = 64 * 1024 * 1024;
 
   const EOCD_SIG = 0x06054b50, CEN_SIG = 0x02014b50, LOC_SIG = 0x04034b50;
 
@@ -135,27 +141,53 @@
       .sort((a, b) => (parseInt(/(\d+)\.xml$/.exec(a)[1], 10) - parseInt(/(\d+)\.xml$/.exec(b)[1], 10)));
     if (!sheets.length) throw new Error('not an Excel workbook (no xl/worksheets/sheet*.xml)');
     const out = [];
+    // `open` is the cell's own start tag: the type lives THERE. Read from the whole cell, a formula's
+    // <f t="shared"> counted as the cell type.
+    function cellValue(c, open) {
+      const type = (/\st="([^"]*)"/.exec(open) || [])[1] || 'n';
+      if (type === 'inlineStr') {
+        const runs = c.match(/<t\b[^>]*>([\s\S]*?)<\/t>/g) || [];
+        return runs.map(t => unescapeXml(t.replace(/^<t\b[^>]*>/, '').replace(/<\/t>$/, ''))).join('');
+      }
+      const v = /<v>([\s\S]*?)<\/v>/.exec(c);
+      if (!v) return '';
+      if (type === 's') { const i = parseInt(v[1], 10); return (i >= 0 && i < shared.length) ? shared[i] : ''; }
+      return unescapeXml(v[1]);   // numbers, dates-as-serials, booleans, cached formula results
+    }
+    // "C2" / "$AB$7" -> 0-based column index; -1 when there is no usable ref
+    function colIndex(ref) {
+      const m = /^\$?([A-Za-z]{1,3})\$?\d*$/.exec(String(ref || ''));
+      if (!m) return -1;
+      let n = 0;
+      for (const ch of m[1].toUpperCase()) n = n * 26 + (ch.charCodeAt(0) - 64);
+      return n - 1;
+    }
     sheets.forEach((sheetName, si) => {
       const xml = readText(buf, entries, sheetName, inflateRaw) || '';
-      const rows = xml.match(/<row\b[\s\S]*?<\/row>|<row\b[^>]*\/>/g) || [];
+      // self-closing FIRST: tried second, an empty <row/> or <c .../> matched up to the NEXT element's close tag
+      const rows = xml.match(/<row\b[^>]*\/>|<row\b[^>]*>[\s\S]*?<\/row>/g) || [];
       const lines = [];
+      let colsCut = false;
       for (const row of rows.slice(0, MAX_SHEET_ROWS)) {
-        const cells = (row.match(/<c\b[\s\S]*?<\/c>|<c\b[^>]*\/>/g) || []).slice(0, MAX_ROW_CELLS).map(c => {
-          const type = (/\bt="([^"]*)"/.exec(c) || [])[1] || 'n';
-          if (type === 'inlineStr') {
-            const runs = c.match(/<t\b[^>]*>([\s\S]*?)<\/t>/g) || [];
-            return runs.map(t => unescapeXml(t.replace(/^<t\b[^>]*>/, '').replace(/<\/t>$/, ''))).join('');
-          }
-          const v = /<v>([\s\S]*?)<\/v>/.exec(c);
-          if (!v) return '';
-          if (type === 's') { const i = parseInt(v[1], 10); return (i >= 0 && i < shared.length) ? shared[i] : ''; }
-          return unescapeXml(v[1]);   // numbers, dates-as-serials, booleans, cached formula results
-        });
+        /* SPARSE ROWS (2026-10-20). Excel omits blank cells, so a row is often A2, D2. Cells were placed by match
+           order, and 900 in D2 landed under column B: every sheet with a blank cell read with numbers under the
+           wrong header. Each cell now goes to the column its r="..." names; a missing or out-of-order ref falls
+           back to the next column (the historic order). */
+        const cells = [];
+        for (const c of (row.match(/<c\b[^>]*\/>|<c\b[^>]*>[\s\S]*?<\/c>/g) || [])) {
+          const open = /^<c\b[^>]*>/.exec(c)[0];
+          let col = colIndex((/\sr="([^"]*)"/.exec(open) || [])[1]);
+          if (col < cells.length) col = cells.length;
+          if (col >= MAX_ROW_CELLS) { colsCut = true; break; }
+          while (cells.length < col) cells.push('');
+          cells.push(cellValue(c, open));
+        }
         // A row that is entirely empty carries nothing a reader would see.
         if (cells.some(c => c !== '')) lines.push(cells.join('\t'));
       }
       const label = names[si] || ('sheet' + (si + 1));
-      out.push('### ' + label + (rows.length > MAX_SHEET_ROWS ? ' (first ' + MAX_SHEET_ROWS + ' of ' + rows.length + ' rows)' : '') + '\n' + lines.join('\n'));
+      out.push('### ' + label + (rows.length > MAX_SHEET_ROWS ? ' (first ' + MAX_SHEET_ROWS + ' of ' + rows.length + ' rows)' : '')
+        + (colsCut ? ' (columns past ' + MAX_ROW_CELLS + ' not shown)' : '') + '\n' + lines.join('\n'));
     });
     return out.join('\n\n').trim();
   }
@@ -201,13 +233,21 @@
       if (kind === 'ipynb') text = ipynbText(buf);
       else {
         const entries = readEntries(buf);
-        text = kind === 'docx' ? docxText(buf, entries, inflateRaw) : xlsxText(buf, entries, inflateRaw);
+        let budget = MAX_TOTAL_INFLATE;
+        const bounded = raw => {
+          if (budget <= 0) throw new Error('document expands past the extraction budget');
+          // zlib honours maxOutputLength and throws ERR_BUFFER_TOO_LARGE instead of allocating past it.
+          const out = inflateRaw(raw, { maxOutputLength: Math.min(MAX_ENTRY_INFLATE, budget) });
+          budget -= out.length;
+          return out;
+        };
+        text = kind === 'docx' ? docxText(buf, entries, bounded) : xlsxText(buf, entries, bounded);
       }
       if (text.length > maxChars) return text.slice(0, maxChars) + '\n…[truncated]';
       return text;
     }
 
-    return { sniff, extract, _internals: { readEntries, entryBytes, unescapeXml, stripTags, docxText, xlsxText, ipynbText, findEocd } };
+    return { sniff, extract, _internals: { MAX_ENTRY_INFLATE, MAX_TOTAL_INFLATE, readEntries, entryBytes, unescapeXml, stripTags, docxText, xlsxText, ipynbText, findEocd } };
   }
 
   return { makeDocExtract, sniff, _internals: { unescapeXml, stripTags, findEocd } };

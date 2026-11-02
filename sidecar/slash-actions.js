@@ -70,7 +70,10 @@ function makeSlashActions(deps) {
   function armedNote() {
     if (typeof cron.halted === 'function' && cron.halted()) return " Routines are STOPPED by the Commander's E-STOP, so nothing will fire — /cron on to resume them.";
     if (typeof cron.armed !== 'function') return '';
-    return cron.armed() ? '' : ' Routines are NOT armed right now, so nothing will fire — /cron on to arm them.';
+    if (cron.armed()) return '';
+    // the Commander turned scheduling OFF (org wire AUTO-P16-1): a save keeps it off — said as their choice, never as a fault
+    if (typeof cron.offByChoice === 'function' && cron.offByChoice()) return ' Scheduling is off (you turned it off), so nothing will fire — /cron on to turn it on.';
+    return ' Routines are NOT armed right now, so nothing will fire — /cron on to arm them.';
   }
 
   async function routineAction(args, ctx) {
@@ -127,7 +130,14 @@ function makeSlashActions(deps) {
       if (!schedule) return fail('That routine has no schedule — /routine add <schedule> | <task>.');
       if (!task) return fail('That routine has no task — say what it should do after the pipe.');
       if (typeof cron.create !== 'function') return fail('Creating routines is not wired on this station.');
-      const r = await cron.create({ name: task.slice(0, 60), prompt: task, schedule: schedule, agentId: me });
+      /* WHERE ITS RESULTS GO (bug 3b958e41). Typed in a messaging chat, the routine reports back to THAT chat — the
+         same default the routine.create tool takes from the run's deliveryOrigin, so the two doors make one kind of
+         routine. Typed on the desktop there is no origin and the spec is exactly what it always was. */
+      const dOrigin = (ctx && ctx.deliveryOrigin && ctx.deliveryOrigin.channel && ctx.deliveryOrigin.chatId) ? ctx.deliveryOrigin : null;
+      const spec = { name: task.slice(0, 60), prompt: task, schedule: schedule, agentId: me };
+      if (dOrigin) { spec.deliver = 'origin'; spec.origin = { channel: String(dOrigin.channel), chatId: String(dOrigin.chatId), threadId: dOrigin.threadId != null && dOrigin.threadId !== '' ? String(dOrigin.threadId) : null }; }
+      const toChat = dOrigin ? ' Results will come back to this chat.' : '';
+      const r = await cron.create(spec);
       if (!r || r.ok === false) {
         // The mint ledger's decline is STICKY and has no un-decline API, so "you deleted this before" is a dead
         // end unless we name the way out. Names normalize to lowercase-alphanumeric (mint-ledger normName), so a
@@ -150,8 +160,10 @@ function makeSlashActions(deps) {
         try { const p = cron.preview(schedule); if (p && p.ok !== false && p.localNext && p.localNext.length) local = p.localNext[0]; } catch (_) {}
         first = ', first fire ' + (local || j.nextRunAt);
       }
+      // ONE ARM RULE (org wire AUTO-P16-1): the host's save turned a never-set switch on — said as it happened
+      const nowOn = !!(r.scheduler && r.scheduler.armedNow);
       return say('Routine created: "' + (j.name || task.slice(0, 60)) + '" — ' + (j.scheduleDisplay || schedule)
-        + first + '.' + armedNote());
+        + first + '.' + (j.deliver === 'origin' ? toChat : '') + (nowOn ? ' Scheduling is now on.' : '') + armedNote());
     }
 
     // NOTE: no `run` verb. Firing a routine on demand streams NDJSON through handleCronRun, which is welded to
@@ -202,7 +214,7 @@ function makeSlashActions(deps) {
   // beginner is a dead end: true, but unactionable. Translate the known ones and name the next step; an
   // unrecognized code still passes through verbatim rather than being swallowed or guessed at.
   const SHIFT_REASONS = {
-    'no-capability': 'this agent has no model credential it can build with yet — add a key in SETTINGS → PROVIDERS',
+    'no-capability': 'this agent has no model credential it can build with yet — add a key in SETTINGS → AI & MODELS',
     'empty-backlog': 'there is nothing queued to build — /away <what to build> adds one',
     'not-granted': '"build while away" is off for this agent — /away on to turn it on',
     'bad-agent': 'that agent id is not one of your station agents',
@@ -228,17 +240,19 @@ function makeSlashActions(deps) {
       const st = await workshop.state(agentId);
       if (!st || st.ok === false) return fail('Could not read the away workshop: ' + String((st && st.error) || 'no answer') + '.');
       const items = (st.backlog || []).slice(0, MAX_LIST);
-      // Mark a row "waiting in OUTBOX" ONLY when its manifest still validates on disk — the same proof the
+      // A built item waits in the LIBRARY under NEEDS A DECISION (KEEP IT / DISCARD; deliverableRows' status 'pending'), never in
+      // TO REVIEW: that is the rating list for away runs and workflow jobs, with no keep/discard (org P12 wiring, 10-14).
+      // Mark a row "waiting" ONLY when its manifest still validates on disk — the same proof the
       // OUTBOX panel demands. Keying off builtRunId alone made the rows contradict this card's own count
       // (two rows claiming to wait, above a line saying one is waiting).
       const ready = Array.isArray(st.pendingIds) ? st.pendingIds.map(String) : null;
       const isReady = (it) => it && it.builtRunId && (ready ? ready.indexOf(String(it.builtRunId)) !== -1 : false);
       const lines = items.map((it, i) => (i + 1) + '. ' + String((it && (it.title || it.detail)) || '(untitled)').slice(0, 120)
-        + (isReady(it) ? '  [built — waiting in OUTBOX]'
+        + (isReady(it) ? '  [built — waiting in DELIVERABLES › NEEDS A DECISION]'
           : (it && it.builtRunId ? '  [was built, but its files are gone]' : '')));
       if (!items.length) lines.push('(nothing queued — /away <what to build> adds one)');
       if ((st.backlog || []).length > items.length) lines.push('… and ' + ((st.backlog || []).length - items.length) + ' more.');
-      if (st.pending) lines.push('' + st.pending + ' finished build' + (st.pending === 1 ? '' : 's') + ' waiting for your keep/discard — open OUTBOX.');
+      if (st.pending) lines.push('' + st.pending + ' finished build' + (st.pending === 1 ? '' : 's') + ' waiting for your KEEP IT or DISCARD — open MY WORK › DELIVERABLES (NEEDS A DECISION).');
       lines.push('Build while away: ' + (st.granted ? 'ON' : 'OFF') + '.');
       return card('Away workshop — ' + (st.backlog || []).length + ' queued', lines);
     }
@@ -266,7 +280,7 @@ function makeSlashActions(deps) {
           + (r.parked ? '. That item is now parked and will NOT be retried — /away <the same idea> to queue it again.' : '.'));
       }
       const title = (r.manifest && r.manifest.title) ? String(r.manifest.title).slice(0, 80) : '';
-      return say('Away shift built' + (title ? ' "' + title + '"' : ' a deliverable') + '. It waits in OUTBOX for keep or discard.');
+      return say('Away shift built' + (title ? ' "' + title + '"' : ' a deliverable') + '. It waits in MY WORK › DELIVERABLES (NEEDS A DECISION) for KEEP IT or DISCARD.');
     }
 
     // Anything else is the thing to build.
@@ -306,7 +320,7 @@ function makeSlashActions(deps) {
     }
     // "compute" is the gate to spend a model turn at all, not a callable tool — say so rather than listing it.
     lines.push('Every agent can also think and reply (the compute grant); that is not a callable tool.');
-    if (!live.length && !off.length) return say('This agent has no tools yet — place props in REFIT to grant them. ' + lines[lines.length - 2 >= 0 ? lines.length - 2 : 0]);
+    if (!live.length && !off.length) return say('This agent has no tools yet — place props in BUILD MODE to grant them. ' + lines[lines.length - 2 >= 0 ? lines.length - 2 : 0]);
     return card('Tools for this agent (' + live.length + ' active)', lines);
   }
 
@@ -326,7 +340,7 @@ function makeSlashActions(deps) {
     const agentId = String((ctx && ctx.agentId) || 'agent');
     let s;
     try { s = await budget.snapshot(agentId); } catch (e) { return fail('Could not read the spend ledger: ' + ((e && e.message) || e)); }
-    if (!s || s.ok === false) return fail('Could not read the spend ledger: ' + String((s && s.error) || 'no answer') + '.');
+    if (!s || s.ok === false) return fail('Could not read the spend ledger: ' + String((s && s.error) || 'no answer').replace(/[.\s]+$/, '') + '.');
     const caps = s.caps || {};
     const lines = [];
     const dayCap = Number(caps.perDay) > 0 ? (' of ' + usd(caps.perDay) + ' daily cap') : '';
@@ -338,7 +352,15 @@ function makeSlashActions(deps) {
     if (Number(caps.perRun) > 0) capBits.push('per run ' + usd(caps.perRun));
     if (Number(caps.perDay) > 0) capBits.push('per day ' + usd(caps.perDay));
     if (Number(caps.global) > 0) capBits.push('total ' + usd(caps.global));
-    lines.push(capBits.length ? ('Caps: ' + capBits.join(' · ') + '.') : 'No spend caps are set — SETTINGS → BUDGET.');
+    lines.push(capBits.length ? ('Caps: ' + capBits.join(' · ') + '.') : 'No spend caps are set — SETTINGS › SPENDING LIMITS.');
+    // runs counted above whose dollars nobody can prove: an unpriced model's (no published rate) and a subscription's
+    const unpriced = Number(s.unpricedRuns) || 0, unmetered = Number(s.unmeteredRuns) || 0;
+    const plural = n => n + ' run' + (n === 1 ? '' : 's');
+    const outside = [unpriced ? plural(unpriced) + ' on models with no published price' : '', unmetered ? plural(unmetered) + ' on a subscription' : ''].filter(Boolean);
+    if (outside.length) lines.push(outside.join(' and ') + ' — their cost is not in these dollars.');
+    // runs stopped mid-answer: the provider bills the call that was cut off, but its usage never arrived (80de2a75)
+    const cut = Number(s.usageMissingRuns) || 0;
+    if (cut) lines.push(plural(cut) + ' stopped mid-answer before the provider reported usage — the dollars above are at least what was spent.');
     // The point of moving this server-side: say WHOSE numbers these are, so the figure is not read as
     // "what I watched happen in this window".
     lines.push('From the station ledger — includes routines, away shifts and messaging runs, not just this window.');

@@ -24,13 +24,21 @@
     if (key) h['x-goog-api-key'] = key;
     return h;
   }
-  function modelPath(id) {
+  // GitHub #98: 'google/<model>' is the OpenRouter spelling of a Gemini model, which a station keeps after switching to
+  // the native GEMINI provider. It names the native model 'models/<model>', never a 'google/…' resource (Google 404s).
+  // A routed id's OpenRouter variant suffix (':free', ':thinking', …) is a routing option, never part of a native model
+  // name — left on, the native URL would read it as its ':method' half.
+  function routedToNative(id) {
     const s = String(id || '').trim();
+    return /^google\//i.test(s) ? s.replace(/^google\//i, '').replace(/:[a-z][a-z0-9-]*$/i, '') : s;
+  }
+  function modelPath(id) {
+    const s = routedToNative(id);
     if (!s) return 'models/gemini-pro';
     return s.indexOf('/') >= 0 ? s.replace(/^\/+/, '') : ('models/' + s);
   }
   function stripModelPrefix(id) {
-    return String(id || '').replace(/^models\//, '');
+    return routedToNative(id).replace(/^models\//, '');
   }
   function safeJson(value, fallback) {
     if (value && typeof value === 'object') return value;
@@ -101,7 +109,7 @@
     let i = 0;
     for (; i < (messages || []).length; i++) {
       const msg = messages[i];
-      if (!msg || msg.role !== 'system') break;
+      if (!msg || msg.role !== 'system' || provider.isRunContextNote(msg)) break;   // the run-context note rides the user side (provider.js)
       const text = textFromContent(msg.content).trim();
       if (text) system.push({ text });
     }
@@ -170,7 +178,9 @@
       // on EVERY turn, so one zod-authored connector would take out every Gemini run. Prune to the
       // documented field set here, at the wire seam that owns the constraint.
       const decl = { name, description: fn.description || '' };
-      const params = toolschema.forGemini(fn.parameters || {});
+      // sanitizeKeys first: property names every wire accepts; the model's args are mapped back to the declared
+      // names on the way in (see stream()).
+      const params = toolschema.forGemini(toolschema.sanitizeKeys(fn.parameters || {}));
       if (!toolschema.isEmptyObjectSchema(params)) decl.parameters = params;
       declarations.push(decl);
     }
@@ -263,8 +273,22 @@
     let catalogPromise = null;
     let catalogRewarmAt = 0;
     let rewarmKicked = false;
+    // SHARED CATALOG (providers/catalog-cache.js, attached by the factory): the list this key last loaded from this
+    // endpoint (any instance) answers this one synchronously, so a run is sized from inputTokenLimit (1M on 2.x/3.x)
+    // instead of a cold 131072, and a fresh adapter no longer re-fetches every /models page. Absent = as before.
+    const shared = (opts.catalogCache && typeof opts.catalogCache.bind === 'function')
+      ? opts.catalogCache.bind({ scope: opts.catalogScope, endpoint: baseUrl, fetchList: sharedList }) : null;
+    let adoptedVersion = 0;
+    function adoptShared() {
+      if (!shared || !shared.shared) return;
+      const hit = shared.peek();
+      if (!hit || hit.version === adoptedVersion) return;
+      adoptedVersion = hit.version;
+      catalog = hit.models.slice();
+    }
 
     function maybeRewarmCatalog() {
+      if (shared && shared.shared) { adoptShared(); shared.ensure(); return; }
       if (catalog && catalog.length) return;
       if (catalogPromise) return;
       if (clock) {
@@ -311,7 +335,11 @@
       body.generationConfig = Object.assign({}, body.generationConfig, { thinkingConfig: cfg });
     }
     function buildBody(req) {
-      const converted = messagesToGemini(req.messages || []);
+      // ONE pre-send normalization (provider.js prepareWireMessages): a functionCall left unanswered mid-history (a
+      // run that died at the tool boundary) gets its functionResponse before the next turn, instead of being
+      // followed straight by user text. Gemini's wire carries no call ids (it pairs by position), so no id rewrite.
+      // Then the ONE role projection (provider.js projectRoles 'native'): later system messages are user turns.
+      const converted = messagesToGemini(provider.projectRoles(provider.prepareWireMessages(req.messages || [], 'gemini'), 'native'));
       const body = { contents: converted.contents };
       if (converted.systemInstruction) body.systemInstruction = converted.systemInstruction;
       const tools = toGeminiTools(req.tools);
@@ -320,14 +348,18 @@
       return body;
     }
 
-    async function* stream(req) {
+    // A tool advertised under sanitized property keys gets its args mapped back to the declared names before
+    // the loop sees them; with no such tool this is the raw stream itself.
+    function stream(req) { return toolschema.withRestoredArgKeys(wireStream(req), req && req.tools); }
+
+    async function* wireStream(req) {
       req = req || {};
       maybeRewarmCatalog();
       const body = buildBody(req);
       let res;
-      try { res = await requestWithRetry(req.model, body, req.signal); }
+      try { res = await requestWithRetry(req.model, body, req.signal, provider.runtime.preStreamRetries(req, RETRY_DELAYS.length)); }
       catch (e) { if (isAbort(e, req.signal)) return; throw e; }
-      const reader = timeouts.idleGuardedReader(res.body.getReader(), { signal: req.signal });
+      const reader = timeouts.idleGuardedReader(res.body.getReader(), { signal: req.signal, url: res.url || baseUrl });
       const dec = new TextDecoder();
       let buf = '';
       const toolIndexOf = new Map();
@@ -347,7 +379,12 @@
       }
       function* emitFrom(j) {
         if (!j || typeof j !== 'object') return;
-        if (j.error) throw new Error('gemini stream error: ' + ((j.error && (j.error.message || j.error.status || j.error.code)) || 'unknown'));
+        if (j.error) {
+          const err = new Error('gemini stream error: ' + ((j.error && (j.error.message || j.error.status || j.error.code)) || 'unknown'));
+          err.body = j;   // {error:{code, status:'RESOURCE_EXHAUSTED'|…}} — errorClass reads the status code
+          err.ownMessage = true;
+          throw err;
+        }
         const candidates = Array.isArray(j.candidates) ? j.candidates : [];
         let usageEmittedForFrame = false;   // usage rides the done-carrying frame; emit it exactly once, BEFORE done
         for (let ci = 0; ci < candidates.length; ci++) {
@@ -444,7 +481,11 @@
       }
     }
 
-    async function requestWithRetry(model, body, signal) {
+    async function requestWithRetry(model, body, signal, maxRetries) {
+      // maxRetries: the loop may LOWER this ladder (req.preStreamRetries = 0 once it owns the pacing — provider.js).
+      // `waited` is the backoff actually spent; the exhaustion marker reports it so the loop counts it, not repeats it.
+      const retries = (maxRetries == null) ? RETRY_DELAYS.length : maxRetries;
+      let waited = 0;
       for (let attempt = 0; ; attempt++) {
         if (signal && signal.aborted) throw abortError();
         let res;
@@ -460,22 +501,37 @@
           });
         } catch (e) {
           if (isAbort(e, signal)) throw e;
-          if (attempt < RETRY_DELAYS.length) { await delay(RETRY_DELAYS[attempt], signal); continue; }
-          throw provider.runtime.markPreStreamRetriesExhausted(e);
+          provider.runtime.stampRequestHost(e, baseUrl);   // a TLS/socket cause names no host: say which one we dialled
+          // a TLS rejection or a crash in our own request code cannot heal by re-sending: fail fast, unmarked
+          const failure = classifyApiError(e, { model });   // unreachable: one retry (its retryBudget), then name the host
+          if (!failure.retryable) throw e;
+          if (attempt < provider.runtime.retryLimit(failure, retries)) { const wait = provider.runtime.retryDelay(failure, attempt, RETRY_DELAYS); waited += wait; await delay(wait, signal); continue; }
+          throw provider.runtime.markPreStreamRetriesExhausted(e, { attempts: attempt + 1, waitedMs: waited });
         } finally {
           guard.disarm();
         }
         if (res.ok && res.body) return res;
-        let detail = res.statusText || '';
-        try { const j = await res.json(); detail = (j && j.error && (j.error.message || j.error.status || j.error.code)) || JSON.stringify(j); }
-        catch (_) { try { detail = (await res.text()).slice(0, 300); } catch (_) {} }
+        // The body is read ONCE, as text, through the idle watchdog and the caller's Stop (provider.runtime.readErrorBody):
+        // a stalled error body ignored Stop for up to 300 s. Only a JSON error's own words are quoted. A non-JSON page (a
+        // proxy's 503 "... reset reason: connection reset") keeps the status text: the browser's error copy reads
+        // transport and policy words before the status (friendlyerror kindFromRaw), so its prose would be told as a
+        // dropped connection or a content block the harness cannot prove.
+        const eb = await provider.runtime.readErrorBody(res, { signal, url: baseUrl, tag: 'providers.gemini' });
+        const errBody = eb.parsed ? eb.data : null;
+        let detail = eb.parsed ? ((errBody && errBody.error && (errBody.error.message || errBody.error.status || errBody.error.code)) || JSON.stringify(errBody)) : (res.statusText || '');
+        if (eb.stalled) detail += ' (error body did not finish)';
         const err = new Error('gemini http ' + res.status + ' - ' + detail);
         err.status = res.status;
         err.headers = res.headers;
+        /* KEEP THE PROVIDER'S ERROR BODY (same law as codex.js). The message above keeps only error.message, but the
+           classifier's decisive signal can be the canonical status ({error:{status:'RESOURCE_EXHAUSTED'}}); dropping
+           the body left errorClass reading prose. The message stays the adapter's own sentence (label + status —
+           what the UI routes on; err.ownMessage tells errorClass so); the body rides alongside for its code. */
+        if (errBody && typeof errBody === 'object') { err.body = errBody; err.ownMessage = true; }
         const cls = classifyApiError(err, { model });
         err.transient = cls.retryable;
-        if (cls.retryable && attempt < RETRY_DELAYS.length) { await delay(Math.min(60000, Math.max(RETRY_DELAYS[attempt], cls.retryAfterMs || 0)), signal); continue; }
-        throw cls.retryable ? provider.runtime.markPreStreamRetriesExhausted(err) : err;
+        if (cls.retryable && attempt < retries) { const wait = Math.min(60000, Math.max(RETRY_DELAYS[attempt], cls.retryAfterMs || 0)); waited += wait; await delay(wait, signal); continue; }
+        throw cls.retryable ? provider.runtime.markPreStreamRetriesExhausted(err, { attempts: attempt + 1, waitedMs: waited }) : err;
       }
     }
 
@@ -488,52 +544,85 @@
       if (catalog && catalog.length) return catalog;
       if (!catalogPromise) {
         catalogPromise = (async () => {
-          try {
-            const models = new Map(), seenTokens = new Set();
-            let pageToken = '';
-            // The API defaults to 50 models per page. Never cache a successful
-            // first page as the full catalog when a later page failed.
-            for (let page = 0; page < 100; page++) {
-              const url = baseUrl + '/models' + (pageToken ? '?pageToken=' + encodeURIComponent(pageToken) : '');
-              const res = await doFetch(url, { headers: headerBag(key, 'application/json') });
-              if (!res.ok) return [];
-              const j = await res.json();
-              const raw = Array.isArray(j.models) ? j.models : (Array.isArray(j.data) ? j.data : []);
-              for (const item of raw) {
-                const model = normalizeModel(item);
-                if (model) models.set(model.id, model);
-              }
-              const next = j.nextPageToken;
-              if (!next) return Array.from(models.values());
-              if (typeof next !== 'string' || seenTokens.has(next)) return [];
-              seenTokens.add(next);
-              pageToken = next;
-            }
-            return []; // a broken endpoint cannot paginate forever or poison the cache
-          } catch (_) { return []; }
+          const list = await fetchList();
+          const version = shared ? shared.share(list) : 0;   // a live list: kept for this key, its windows noted
+          if (version) adoptedVersion = version;
+          return list;
         })();
       }
       catalog = await catalogPromise;
       if (!catalog.length) catalogPromise = null;
       return catalog;
     }
+    // Every /models page, read live. [] on any failure.
+    async function fetchList() {
+      try {
+        const models = new Map(), seenTokens = new Set();
+        let pageToken = '';
+        // The API defaults to 50 models per page. Never cache a successful
+        // first page as the full catalog when a later page failed.
+        for (let page = 0; page < 100; page++) {
+          const url = baseUrl + '/models' + (pageToken ? '?pageToken=' + encodeURIComponent(pageToken) : '');
+          const res = await doFetch(url, { headers: headerBag(key, 'application/json') });
+          if (!res.ok) return [];
+          const j = await res.json();
+          const raw = Array.isArray(j.models) ? j.models : (Array.isArray(j.data) ? j.data : []);
+          for (const item of raw) {
+            const model = normalizeModel(item);
+            if (model) models.set(model.id, model);
+          }
+          const next = j.nextPageToken;
+          if (!next) return Array.from(models.values());
+          if (typeof next !== 'string' || seenTokens.has(next)) return [];
+          seenTokens.add(next);
+          pageToken = next;
+        }
+        return []; // a broken endpoint cannot paginate forever or poison the cache
+      } catch (_) { return []; }
+    }
+    function sharedList() { return fetchList(); }   // the cache's background load
     async function listModels() { return (await loadCatalog()).map(m => Object.assign({}, m)); }
     function findModel(id) {
+      adoptShared();
       const clean = stripModelPrefix(id);
-      return catalog ? catalog.find(m => m.id === clean || m.id === id) : null;
+      const m = catalog ? catalog.find(x => x.id === clean || x.id === id) : null;
+      // a warm list without this id (a model released after it loaded): one throttled refresh can find it
+      if (!m && id && shared && catalog && catalog.length) shared.ensure({ miss: true });
+      return m;
     }
-    function contextLimit(id) { const m = findModel(id); return (m && m.context_length) || defaultContext; }
+    // Learn the window before a run is built (catalog-cache.js runWindow bounds the wait): this key's shared list, else
+    // ONE deduped load of it (none while the endpoint is in its failure back-off). Resolves to the catalog it has.
+    async function warmCatalog() {
+      adoptShared();
+      if (catalog && catalog.length) { maybeRewarmCatalog(); return catalog; }
+      if (shared && shared.shared) {
+        if (shared.inBackoff()) return catalog || [];
+        await shared.load();
+        adoptShared();
+        return catalog || [];
+      }
+      return loadCatalog();
+    }
+    // First known source wins, none invented: the catalog row, what this endpoint reported to any instance, an explicit
+    // default, 0 (unknown).
+    function contextLimit(id) {
+      const m = findModel(id);
+      if (m && m.context_length) return m.context_length;
+      return (shared && shared.windowFact(stripModelPrefix(id))) || defaultContext;
+    }
     // Gemini's API never reports a price, and returning null here left spentUsd at 0.00 for the whole run —
     // which silently disabled the per-run spend ceiling and the day/global pools (loop.js only stops when
     // spentUsd crosses the cap). Resolved off the dated list-rate table, independent of catalog warm state so
     // the cap works from the first turn; an unrecognized model still returns null and stays 'unpriced'.
-    function priceOf(id) { return prices.priceOf('gemini', id); }
+    function priceOf(id) { return prices.priceOf('gemini', routedToNative(id)); }
+    // the catalog's max output for this model (provider.js outputLimit: outputTokenLimit); 0 = not known yet
+    function outputLimit(id) { const m = findModel(id); return (m && Number(m.max_completion_tokens)) || 0; }
     function supportsTools(id) { const m = findModel(id); return m ? m.supportsTools : true; }
     // Resolved from the model NAME: /v1beta/models publishes no capability data, and the dock asks before a
     // catalog fetch has necessarily landed.
     function reasoningEfforts(id) { return geminiEffortsFor(id); }
 
-    return { stream, listModels, contextLimit, priceOf, supportsTools, reasoningEfforts };
+    return { stream, listModels, warmCatalog, contextLimit, outputLimit, priceOf, supportsTools, reasoningEfforts };
   }
 
   return { makeGeminiProvider, _internals: { messagesToGemini, toGeminiTools, normalizeUsage, normalizeModel, modelPath, cleanBaseUrl, finishFor } };

@@ -12,6 +12,7 @@
    surface knows every id. Add a new authType:'oauth_device_code' profile and this test fails on every file
    that hasn't caught up — the failure list IS the checklist. */
 'use strict';
+const { readSidecarSource } = require('./helpers/source');
 const A = require('./_assert.js');
 const fs = require('fs');
 const path = require('path');
@@ -25,7 +26,7 @@ A.ok(OAUTH_IDS.includes('codex') && OAUTH_IDS.includes('grok') && OAUTH_IDS.incl
   'sanity: the registry ships the known device-OAuth trio (codex/grok/kimi)');
 
 const read = f => fs.readFileSync(path.join(__dirname, '..', f), 'utf8');
-const sidecarSrc = read('sidecar/index.js');
+const sidecarSrc = readSidecarSource();
 const appSrc = read('frontend/app/app.js');
 const harnessSrc = read('frontend/app/harness.js');
 const dockSrc = read('frontend/app/modeldock.js');
@@ -146,6 +147,22 @@ for (const p of OAUTH) {
       if (line) A.ok(line[0].includes("return '" + p.id + "'"),
         file + " alias '" + alias + "' resolves to '" + p.id + "' (never another provider)");
     }
+  }
+}
+
+// Anthropic picks + offline fallback name only SERVED models: claude-opus-4-1 retired 2026-08-05 and Haiku 3.5 is
+// retired, so a chip or fallback naming either 404s on the first send (2026-10-07 report).
+{
+  const picks = (appSrc.match(/const MODEL_PICKS = Object\.freeze\(\{[\s\S]*?\n  \}\);/) || [''])[0];
+  const fallback = (appSrc.match(/const FALLBACK_MODELS = Object\.freeze\(\{[\s\S]*?\n  \}\);/) || [''])[0];
+  const anthPicks = (picks.match(/\n    anthropic: \[[\s\S]*?\n    \],/) || [''])[0];
+  const anthFallback = (fallback.match(/\n    anthropic: \[[^\]]*\]/) || [''])[0];
+  A.ok(anthPicks && anthFallback, 'app.js still declares the Anthropic picks + fallback');
+  for (const dead of ['claude-opus-4-1', 'claude-3-5-haiku']) {
+    A.ok(!anthPicks.includes(dead) && !anthFallback.includes(dead), 'no retired Anthropic id (' + dead + ') in the picks or fallback');
+  }
+  for (const id of (anthPicks.match(/id: '([^']+)'/g) || []).map(s => s.slice(5, -1))) {
+    A.ok(anthFallback.includes("'" + id + "'"), 'Anthropic pick ' + id + ' is also in the offline fallback list');
   }
 }
 

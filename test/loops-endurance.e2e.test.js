@@ -15,6 +15,7 @@
 const A = require('./_assert.js');
 const http = require('node:http');
 const { SidecarFixture } = require('./helpers/sidecar-fixture.js');
+const { userWords } = require('./helpers/host-notes.js');   // the user's own words: the run-context note leads the newest user message on this wire
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
@@ -110,7 +111,7 @@ async function until(fixture, predicate, label, timeoutMs) {
     const cancelObjective = 'inspect then wait for cancellation';
     const loopCalls = objective => provider.state.calls.filter(call => {
       const users = call.messages.filter(message => message && message.role === 'user');
-      return users.length > 0 && String(users[0].content || '').indexOf(objective) === 0;
+      return users.length > 0 && userWords(users[0]).indexOf(objective) === 0;
     }).length;
     const created = await fixture.json('POST', '/api/loops', {
       name: 'endurance restart fixture',
@@ -147,7 +148,9 @@ async function until(fixture, predicate, label, timeoutMs) {
     A.eq(journal.body.recoveries[0].uncertain.length, 0, 'no side effect is falsely labelled uncertain');
 
     const runsAfterCrash = await fixture.json('GET', '/api/runs?agent=agent&limit=20');
-    A.eq(runsAfterCrash.body.runs.length, 0, 'the interrupted pass is not falsely recorded as completed');
+    // Run history now lists a run the process died inside as reason 'interrupted' (Step 2 journal lane) — honest, and
+    // never a completion. The invariant is that nothing claims the pass finished.
+    A.eq(runsAfterCrash.body.runs.filter(run => run.reason !== 'interrupted').length, 0, 'the interrupted pass is not falsely recorded as completed');
 
     provider.state.mode = 'complete';
     const resume = await fixture.json('POST', '/api/loops/control', { id: loopId, action: 'resume' });
@@ -158,9 +161,13 @@ async function until(fixture, predicate, label, timeoutMs) {
     A.eq(loopCalls(restartObjective), callsAtResume + 1, 'RESUME launches exactly one replacement provider pass');
     const replacementPrompt = provider.state.calls.filter(call => {
       const users = call.messages.filter(message => message && message.role === 'user');
-      return users.length && String(users[0].content || '').indexOf(restartObjective) === 0;
+      return users.length && userWords(users[0]).indexOf(restartObjective) === 0;
     }).slice(-1)[0];
-    const replacementText = String(replacementPrompt && replacementPrompt.messages.find(message => message.role === 'user').content || '');
+    // The transcript is written per turn now (Step 2), so the interrupted pass's own directive + paired tool turn are
+    // real history the replacement is seeded with. The fence belongs to the replacement's OWN directive: the last
+    // user turn of that call.
+    const replacementUsers = replacementPrompt ? replacementPrompt.messages.filter(message => message && message.role === 'user') : [];
+    const replacementText = String((replacementUsers[replacementUsers.length - 1] || {}).content || '');
     A.ok(/INTERRUPTED PASSES/.test(replacementText) && /inspect and verify current state/i.test(replacementText),
       'the replacement prompt carries the durable lost-context/duplicate-effect fence');
     A.eq(resumed.loops[0].recent.filter(row => row.outcome === 'running').length, 0, 'no abandoned RUNNING row survives');

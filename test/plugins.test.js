@@ -214,6 +214,178 @@ async function writePlugin(id, source, manifest) {
       A.eq(Object.keys(JSON.parse(await fsp.readFile(ALLOW, 'utf8'))).length, 0, 'and it left no orphan approval behind');
       A.eq(await loader.destroy('auditor'), false, 'destroying what is gone is an honest false');
     }
+
+    // ---- HELPER FILES ARE PART OF WHAT WAS APPROVED (audit 2026-09-25 #17) ----
+    {
+      await fsp.rm(ALLOW, { force: true });
+      for (const d of await fsp.readdir(PLUGINS)) await fsp.rm(path.join(PLUGINS, d), { recursive: true, force: true });
+      const base = path.join(PLUGINS, 'helpered');
+      await writePlugin('helpered', `
+        module.exports = { register(api) {
+          api.on('post_tool_call', () => { global.__helperSays = require('./lib/helper.js')(); });
+        } };
+      `);
+      await fsp.mkdir(path.join(base, 'lib'), { recursive: true });
+      const helperFile = path.join(base, 'lib', 'helper.js');
+      await fsp.writeFile(helperFile, "module.exports = () => 'approved-helper';", 'utf8');
+      let t = 1000;
+      const clock = { now: () => t };
+      const reqFresh = (p) => { for (const k of Object.keys(require.cache)) if (k.indexOf(base) === 0) delete require.cache[k]; return require(p); };
+      const loader = mk({ clock, requireModule: reqFresh });
+      const d0 = (await loader.discover()).plugins[0];
+      await loader.allow(d0.id, d0.digest);
+
+      // a changed helper (main untouched) goes back to pending at the next load
+      await fsp.writeFile(helperFile, "module.exports = () => 'TAMPERED';", 'utf8');
+      const d1 = (await loader.discover()).plugins[0];
+      A.ok(d1.digest !== d0.digest, 'editing a helper file changes the approval digest (main is unchanged)');
+      let r = await loader.load(makeHooks());
+      A.eq(r.loaded.length, 0, 'a plugin whose helper changed does not load on its old approval');
+      A.eq(r.pending.map(p => p.id), ['helpered'], 'it is pending re-approval');
+      // a new file dropped into the folder also re-asks
+      await fsp.writeFile(helperFile, "module.exports = () => 'approved-helper';", 'utf8');
+      A.eq((await loader.discover()).plugins[0].digest, d0.digest, 'restoring the helper restores the approved digest');
+      await fsp.writeFile(path.join(base, 'extra.js'), '1', 'utf8');
+      A.eq((await loader.listPending()).length, 1, 'an added file re-asks too');
+      await fsp.rm(path.join(base, 'extra.js'));
+
+      // exec-time: a helper changed AFTER load is caught before the handler runs, and disables the plugin
+      const errs = [];
+      const loader2 = mk({ clock, requireModule: reqFresh, onError: (e) => errs.push(e) });
+      const spine = makeHooks();
+      r = await loader2.load(spine);
+      A.eq(r.loaded.length, 1, 'the approved plugin loads');
+      global.__helperSays = null;
+      await spine.invoke('post_tool_call', { tool_name: 'x' });
+      A.eq(global.__helperSays, 'approved-helper', 'its handler runs the approved helper');
+      await fsp.writeFile(helperFile, "module.exports = () => 'TAMPERED';", 'utf8');
+      t += 5000;   // past the re-hash window
+      global.__helperSays = null;
+      await spine.invoke('post_tool_call', { tool_name: 'x' });
+      A.eq(global.__helperSays, null, 'after a helper edit the handler does NOT run the changed code');
+      A.ok(errs.some(e => e.plugin === 'helpered' && /changed since approval/.test(e.error)), 'the drift is reported by name');
+      await fsp.writeFile(helperFile, "module.exports = () => 'approved-helper';", 'utf8');
+      t += 5000;
+      await spine.invoke('post_tool_call', { tool_name: 'x' });
+      A.eq(global.__helperSays, null, 'a disabled plugin stays off until it is re-approved and re-loaded');
+
+      // no injected clock => no rate limit: a drift is caught on the VERY NEXT call (never fails open for want of a clock)
+      {
+        const errs3 = [];
+        const loader3 = mk({ clock: undefined, requireModule: reqFresh, onError: (e) => errs3.push(e) });
+        const spine3 = makeHooks();
+        const r3 = await loader3.load(spine3);
+        A.eq(r3.loaded.length, 1, 'clockless loader: the approved plugin loads');
+        global.__helperSays = null;
+        await spine3.invoke('post_tool_call', { tool_name: 'x' });
+        A.eq(global.__helperSays, 'approved-helper', 'clockless loader: the approved helper runs');
+        await fsp.writeFile(helperFile, "module.exports = () => 'TAMPERED';", 'utf8');
+        global.__helperSays = null;
+        await spine3.invoke('post_tool_call', { tool_name: 'x' });
+        A.eq(global.__helperSays, null, 'clockless loader: a helper edit is caught on the next call with no time passing');
+        await fsp.writeFile(helperFile, "module.exports = () => 'approved-helper';", 'utf8');
+      }
+
+      // guard findings cover helpers, not only main
+      const seen = [];
+      await mk({ guard: { scanText: (f) => { seen.push(f); return []; } } }).discover();
+      A.ok(seen.indexOf('lib/helper.js') >= 0, 'the guard scans helper files for the approval prompt');
+
+      // a link inside the folder is refused (it would approve code the plugin does not own)
+      const outside = path.join(DIR, 'outside.js');
+      await fsp.writeFile(outside, "module.exports = () => 'outside';", 'utf8');
+      let linked = true;
+      try { await fsp.symlink(outside, path.join(base, 'lib', 'linked.js'), 'file'); }
+      catch (_) {
+        const jt = path.join(DIR, 'junction-target'); await fsp.mkdir(jt, { recursive: true }); try { await fsp.symlink(jt, path.join(base, 'lib', 'linkdir'), 'junction'); } catch (__) { linked = false; }
+      }
+      if (linked) {
+        const found = await loader.discover();
+        A.eq(found.plugins.length, 0, 'a plugin folder containing a link is not offered for approval');
+        A.ok(found.errors.some(e => /helpered: .*link/.test(e)), 'and the refusal names the link');
+      } else A.ok(true, 'symlinks unavailable here (no privilege) — link refusal covered on other hosts');
+      for (const n of ['linked.js', 'linkdir']) { try { await fsp.rm(path.join(base, 'lib', n), { force: true }); } catch (_) { /* absent */ } }
+
+      delete global.__helperSays;
+    }
+
+    // ---- QUICK RE-VERIFY for the background job timer (2026-10-19, idle-CPU piece 2) ----
+    // The 10 s job timer used to re-read, sha256 and guard-scan the whole approved folder on every tick. A quick check
+    // trusts the cached approval only while a stat stamp of the folder is unchanged (and re-hashes at least every
+    // STAMP_TRUST_MS); any edit, add or revoke must still be caught on the very next tick.
+    {
+      await fsp.rm(ALLOW, { force: true });
+      for (const d of await fsp.readdir(PLUGINS)) await fsp.rm(path.join(PLUGINS, d), { recursive: true, force: true });
+      const base = path.join(PLUGINS, 'jobber');
+      await writePlugin('jobber', "module.exports = { register(api) {} };");
+      await fsp.mkdir(path.join(base, 'lib'), { recursive: true });
+      const helper = path.join(base, 'lib', 'helper.js');
+      await fsp.writeFile(helper, "module.exports = () => 'aaaa';", 'utf8');
+      let t = Date.now() + 60000, reads = 0, hashes = 0, scans = 0;   // real time + 1 min: the files are past the racy window
+      const countingFsp = Object.assign({}, fsp, { readFile: (...a) => { reads++; return fsp.readFile(...a); } });
+      const loader = mk({ fsp: countingFsp, clock: { now: () => t }, hash: (s) => { hashes++; return sha(s); },
+        guard: { scanText: () => { scans++; return []; } } });
+      const d0 = (await loader.discover()).plugins[0];
+      await loader.allow(d0.id, d0.digest);
+      A.ok((await loader.approvedRecord('jobber', { quick: true })) !== null, 'quick: the first check hashes and approves');
+
+      const tick = async () => { t += 10000; reads = 0; hashes = 0; scans = 0; return loader.approvedRecord('jobber', { quick: true }); };
+      let r = await tick();
+      A.ok(r && r.digest === d0.digest, 'quick: an untouched folder is still approved 10 s later');
+      A.eq(hashes, 0, 'quick: …without hashing a single file');
+      A.eq(scans, 0, '…without a guard scan');
+      A.eq(reads, 1, '…and reading only the allowlist (a revoke must still win at once)');
+
+      // a SAME-SIZE rewrite (the classic stat-cache blind spot) moves the stamp: caught on the very next tick
+      await fsp.writeFile(helper, "module.exports = () => 'bbbb';", 'utf8');
+      r = await tick();
+      A.eq(r, null, 'quick: a same-size edit to a helper is caught on the next tick (the approval no longer covers it)');
+      await fsp.writeFile(helper, "module.exports = () => 'aaaa';", 'utf8');
+      A.ok((await tick()) !== null, 'restoring the approved bytes restores the approval (full re-hash)');
+      A.ok(hashes > 0, '…which really re-hashed');
+
+      // an ADDED file moves the stamp too
+      await fsp.writeFile(path.join(base, 'lib', 'extra.js'), '1', 'utf8');
+      A.eq(await tick(), null, 'quick: a file dropped into the folder is caught on the next tick');
+      await fsp.rm(path.join(base, 'lib', 'extra.js'));
+      A.ok((await tick()) !== null, 'removing it restores the approval');
+
+      // a REVOKE wins at once, whatever the stamp says
+      await loader.revoke('jobber');
+      A.eq(await tick(), null, 'quick: a revoked plugin is refused on the next tick');
+      await loader.allow(d0.id, d0.digest);
+      A.ok((await tick()) !== null, 're-approved: approved again');
+
+      // the safety interval: an unchanged stamp is trusted for at most 5 min since the last real hash
+      let rehashedAt = -1;
+      for (let i = 1; i <= 31 && rehashedAt < 0; i++) { await tick(); if (hashes > 0) rehashedAt = i; }
+      A.ok(rehashedAt > 0 && rehashedAt <= 30, 'quick: an unchanged folder is still fully re-hashed within 5 min of 10 s ticks (tick ' + rehashedAt + ')');
+
+      // every NON-quick caller keeps the exact old rule: past the 2 s window it re-hashes, stamp or not
+      t += 3000; hashes = 0;
+      A.ok((await loader.approvedRecord('jobber')) !== null, 'full: still approved');
+      A.ok(hashes > 0, 'full: a non-quick caller past the 2 s window always re-hashes');
+
+      // RACY-CLEAN: a folder touched within 2 s of its hash is never stamp-trusted (a coarse filesystem could hide a
+      // same-size rewrite in that tick), so the next quick check re-hashes
+      {
+        let t2 = 0, h2 = 0;
+        const racy = mk({ clock: { now: () => t2 }, hash: (s) => { h2++; return sha(s); } });
+        await fsp.writeFile(helper, "module.exports = () => 'aaaa';", 'utf8');   // the approved bytes, a fresh mtime
+        t2 = Date.now();
+        A.ok((await racy.approvedRecord('jobber', { quick: true })) !== null, 'racy: approved');
+        t2 += 10000; h2 = 0;
+        A.ok((await racy.approvedRecord('jobber', { quick: true })) !== null, 'racy: still approved on the next tick');
+        A.ok(h2 > 0, 'racy: a folder touched within 2 s of its hash is re-hashed on the next quick tick, not stamp-trusted');
+      }
+
+      // no clock → no quick path (never fails open for want of a clock)
+      const clockless = mk({ clock: undefined, hash: (s) => { hashes++; return sha(s); } });
+      await clockless.approvedRecord('jobber', { quick: true });
+      hashes = 0;
+      await clockless.approvedRecord('jobber', { quick: true });
+      A.ok(hashes > 0, 'clockless: every quick check re-hashes');
+    }
   } finally {
     await fsp.rm(DIR, { recursive: true, force: true });
     delete global.__auditLog; delete global.__apiKeys; delete global.__spineReachable;

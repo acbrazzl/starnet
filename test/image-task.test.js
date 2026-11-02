@@ -1,5 +1,6 @@
 /* Offline regressions for image-task admission, credential routing, and truthful completion. */
 'use strict';
+const { readSidecarSource } = require('./helpers/source');
 const A = require('./_assert.js');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -71,8 +72,19 @@ const borrowedOpenAI = ImageTask.resolveRoute({ providerId: 'gemini', runKey: 'g
 A.eq(borrowedOpenAI.provider, 'openai', 'a text run can use a separately connected OpenAI key for STUDIO generation');
 A.eq(borrowedOpenAI.protocol, 'openai-images', 'the station OpenAI route selects the dedicated Images API');
 
+// The ChatGPT sign-in is a keyless STUDIO route: first for a run on the plan, last resort for any other text run,
+// never for a StarNet-credits run.
+const planRoute = { ok: true, provider: 'codex', protocol: 'codex-responses', key: '', baseUrl: '', keySource: 'plan' };
+A.eq(ImageTask.resolveRoute({ providerId: 'codex', codexSignedIn: true }), planRoute, 'a Codex run renders on its own ChatGPT plan');
+A.eq(ImageTask.resolveRoute({ ...managedInput, providerId: 'codex', codexSignedIn: true }).provider, 'codex', 'a Codex run uses the plan before spending linked credits');
+A.eq(ImageTask.resolveRoute({ providerId: 'anthropic', runKey: 'k', stationOpenRouterKey: 'or', codexSignedIn: true }).provider, 'openrouter', 'a connected OpenRouter key still wins for a non-Codex run');
+A.eq(ImageTask.resolveRoute({ providerId: 'anthropic', runKey: 'k', codexSignedIn: true }), planRoute, 'a keyless non-Codex run falls back to the ChatGPT sign-in');
+A.eq(ImageTask.resolveRoute({ providerId: 'starnet', codexSignedIn: true }).ok, false, 'a StarNet-credits run never moves onto the ChatGPT account');
+A.eq(ImageTask.resolveRoute({ providerId: 'codex', codexSignedIn: false }).code, 'media-route-required', 'a dead or missing sign-in is no route');
+A.ok(/sign in to ChatGPT/.test(ImageTask.admissionBlocker({ hasStudio: true, studioEnabled: true, route: { ok: false }, providerId: 'codex', model: 'gpt-5.5' })), 'the blocker names the ChatGPT sign-in as a fix');
+
 const noGear = ImageTask.admissionBlocker({ hasStudio: false, studioEnabled: false, route: direct, providerId: 'openrouter', model: 'x' });
-A.ok(/Open REFIT, place a STUDIO/.test(noGear), 'missing gear names the exact REFIT action');
+A.ok(/Open BUILD MODE, place a STUDIO/.test(noGear), 'missing gear names the exact BUILD MODE action');
 const disabled = ImageTask.admissionBlocker({ hasStudio: true, studioEnabled: false, route: direct });
 A.ok(/MEDIA STUDIO is disabled/.test(disabled) && /ABILITIES > TOOLSETS/.test(disabled), 'disabled STUDIO names the exact toolset action instead of asking for another prop');
 const noRoute = ImageTask.admissionBlocker({ hasStudio: true, studioEnabled: true, route: impossible, providerId: 'gemini', model: 'gemini-2.5-pro' });
@@ -97,12 +109,18 @@ A.eq(alreadyFailed.reason, 'budget', 'existing failure reason is preserved');
 
 // Composition-root lock: the pure policy must guard the real run host, including the
 // terminal event that consumers use as completion truth.
-const indexSource = fs.readFileSync(path.join(__dirname, '..', 'sidecar', 'index.js'), 'utf8');
+const indexSource = readSidecarSource();
 const runHost = indexSource.slice(indexSource.indexOf('async function runOnce(o)'));
 const admissionAt = runHost.indexOf('ImageTask.admissionBlocker');
 const loopAt = runHost.indexOf('result = await runAgentLoop');
 A.ok(admissionAt >= 0 && loopAt > admissionAt, 'the STUDIO blocker runs before the configured model/fallback loop');
 A.ok(/makeImageTools\(\{ openrouter: studioRoute\.ok \? \{ apiKey: studioRoute\.key, model, baseUrl: studioRoute\.baseUrl, provider: studioRoute\.provider, protocol: studioRoute\.protocol/.test(runHost), 'the image tool receives only the compatible resolved key and protocol route');
+// #118: the plan image host's live list is read through the SAME primary sign-in image.js posts with (never an extra
+// account's list), only on the plan route, and the run's own model is offered only for a Codex run.
+const hostListAt = runHost.indexOf('const codexHostModels = codexMemoLiveModelIds(');
+A.ok(hostListAt > 0 && hostListAt < runHost.indexOf('const imageTools = makeImageTools('), 'the image-host list is built before the image tools');
+A.ok(/const codexHostModels = codexMemoLiveModelIds\(async \(\) => selectProvider\(\{ provider: 'codex', fetch: globalThis\.fetch, token: await ensureCodexAccessToken\(\), renewToken: forceRefreshCodexAccessToken, baseUrl: studioRoute\.baseUrl \|\| '' \}\)\.listModels\(\)\);/.test(runHost), 'the image-host list is the image sign-in\'s LIVE catalog through the per-run memo (offline fallback excluded there, unit-proven in provider.codex.test.js)');
+A.ok(/codexHostModels: studioRoute\.protocol === 'codex-responses' \? codexHostModels : undefined, codexRunModel: \(\) => \(usingCodex \? model : ''\)/.test(runHost), 'image.js gets the host list on the plan route and the run model only for a Codex run');
 A.ok(/const agentModelBlocker = ImageTask\.agentModelBlocker[\s\S]*const imageRoomId/.test(runHost), 'image-only models are rejected before STUDIO admission or a provider request');
 A.ok(/provider: activeProviderId/.test(runHost) && /provider = provider \|\| \(recent && recent\.provider\)/.test(indexSource), 'run history and diagnostics keep the actual provider beside the actual model');
 A.ok(/\(taskBrief \|\| imageTask\).*agent\.run\.end/.test(runHost), 'a provisional image-task done event is buffered until artifact settlement');

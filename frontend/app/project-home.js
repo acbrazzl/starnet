@@ -10,7 +10,7 @@ const ProjectHome = (() => {
     try {
       const response = await fetch(url, { signal: controller.signal, cache: 'no-store', ...(body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {}) });
       const data = await response.json();
-      if (!response.ok || data.ok === false) throw new Error(data.error || data.reason || 'Request could not be completed.');
+      if (!response.ok || data.ok === false) throw Object.assign(new Error(data.error || data.reason || 'Request could not be completed.'), { status: response.status });
       return data;
     } finally { clearTimeout(timeout); }
   }
@@ -47,7 +47,9 @@ const ProjectHome = (() => {
   function close() {
     ++epoch; clearTimeout(timer); root = homeId = '';
     if (panel) { showView(''); actions.hidden = true; updates.remove(); }
-    document.getElementById('comms-title').textContent = '▮ COMMS';
+    // ORG P26: the project home hands the title back — the open session's name, never a bare 'COMMS'
+    const title = document.getElementById('comms-title'); title.removeAttribute('data-session');
+    if (typeof Chat !== 'undefined' && Chat.paintTitle) Chat.paintTitle(); else title.textContent = 'COMMS';
     document.getElementById('comms-idbar').classList.remove('ph-project');
   }
   async function open(projectRoot) {
@@ -76,7 +78,8 @@ const ProjectHome = (() => {
     const log = document.getElementById('chat-log');
     if (updates.parentNode !== log) log.appendChild(updates);
     notice(data.project.blessed ? '' : 'Folder access is revoked. Re-add this folder before starting new work.');
-    document.getElementById('comms-title').textContent = data.project.name || root.split(/[\\/]/).pop();
+    const title = document.getElementById('comms-title'); title.removeAttribute('data-session'); title.removeAttribute('data-tip');
+    title.textContent = data.project.name || root.split(/[\\/]/).pop();
     const crewList = panel.querySelector('.ph-crew-list');
     const signature = JSON.stringify(data.crew.map(a => [a.id, a.name]));
     if (!crewDirty && crewList.dataset.signature !== signature + JSON.stringify(data.project.preferredAgents)) {
@@ -156,9 +159,15 @@ const ProjectHome = (() => {
       if (token !== epoch) return;
       if (homeId && Workstreams.activeId() !== homeId) { close(); return; }
       try { const data = await request('/api/projects/workspace?root=' + encodeURIComponent(root)); if (token !== epoch) return; render(data); }
-      catch (_) { if (token === epoch) notice('Activity could not refresh. Showing the last confirmed state; reconnecting…'); }
+      catch (error) {
+        // 404 is the station's answer, not an outage: the project was forgotten under this open home (PROJECTS › Forget).
+        // Hand COMMS back instead of polling forever under a "reconnecting…" the station already answered.
+        if (token === epoch && error && error.status === 404) { close(); return; }
+        if (token === epoch) notice('Activity could not refresh. Showing the last confirmed state; reconnecting…');
+      }
       if (token === epoch) poll(token);
     }, 2500);
   }
-  return { open, close, onSession: id => { if (root && id !== homeId) close(); } };
+  // owns(): the project home names the COMMS title while it is shown (Chat.paintTitle steps aside)
+  return { open, close, owns: () => !!root, onSession: id => { if (root && id !== homeId) close(); } };
 })();

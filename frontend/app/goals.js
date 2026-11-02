@@ -48,6 +48,13 @@
   const TRANSIENT = /^(the user (said|asked|wanted)|we (discussed|talked|covered)|in this (run|task|session)|this (run|task|session)|today (i|we))\b/i;
   // lines the model sometimes emits as framing, not steps — dropped (a header is not a milestone).
   const FRAMING = /^(here('| i)s|the (path|plan|breakdown|milestones?|steps?)( i see)?|milestones?|steps?|plan)\s*[:\-—]?\s*$/i;
+  // "## The roadmap" — a markdown header line, never a step. A NUMBERED heading ("### 1. Ship the CLI MVP", "## Step 2: …") is a
+  // step written as a heading: its #'s drop and it parses like any other line (review 10-14 — it was dropped, and a path of
+  // heading-styled steps fell under MIN_MILESTONES).
+  const HEADING = /^\s{0,3}#{1,6}\s+(.*)$/;
+  const HEADED_STEP = /^(?:\d{1,2}[.)\]:-]?\s+|(?:step|milestone|phase)\s*\d{1,2}\b)/i;
+  // a milestone that opens on a comparison ("> 100 paying users") keeps it — the plain line would read it as a quote mark
+  const COMPARE = /^(?:>=?|≥)\s*(?=[\d$€£])/;
 
   // a self-contained secret scrubber (the default redact) — the decomposition model text is authored client-side
   // (unlike study proposals, which the sidecar redacts before they reach the browser), so a milestone line must be
@@ -80,7 +87,9 @@
     if (FRAMING.test(c)) return true;
     return false;
   }
-  const clip = (s, n) => { s = String(s == null ? '' : s).trim(); return s.length > n ? s.slice(0, n) : s; };
+  // a cap counts UTF-16 units (bounded storage) but never ends on half an emoji: a lone high surrogate renders as a
+  // broken glyph and was written into the goal store and the station's journey (qa/bugs/d1d77332 sibling, 2026-10-21)
+  const clip = (s, n) => { s = String(s == null ? '' : s).trim(); return (s.length > n ? s.slice(0, n) : s).replace(/[\uD800-\uDBFF]$/, ''); };
 
   /* THE DECOMPOSITION DIRECTIVE — the self-assigned task the agent runs to break a goal into a path. The agent
      already carries the COMMANDER dossier block in its system prompt, so this tells it to USE what it knows, not
@@ -114,12 +123,19 @@
     // milestone line is never stored with an obvious key shape even when no redact is injected.
     const inject = typeof opts.redact === 'function' ? opts.redact : (x => x);
     const redact = s => scrubSecrets(inject(s));
+    // a milestone is read as plain words (walk 10-14: the confirm panel typed '**Item one:**' and '`code`' at the Commander, and
+    // Confirm would have stored them so) — opts.plain is the host's markdown → one plain line (Deliverables.plainLine)
+    const plain = typeof opts.plain === 'function' ? opts.plain : (x => x);
     const out = [];
     const seen = new Set();
-    for (const ln of String(modelText == null ? '' : modelText).split('\n')) {
+    for (const raw of String(modelText == null ? '' : modelText).split('\n')) {
+      const h = HEADING.exec(raw);
+      if (h && !HEADED_STEP.test(h[1])) continue;   // a markdown heading is a header, not a milestone
+      const ln = h ? h[1] : raw;
       const m = LINE.exec(ln);
       if (!m) continue;
-      let text = redact(String(m[1])).trim();
+      const cmp = COMPARE.exec(m[1]);
+      let text = redact((cmp ? cmp[0] : '') + String(plain(cmp ? m[1].slice(cmp[0].length) : m[1]))).trim();
       if (!text) continue;
       if (lowValue(text)) continue;
       text = clip(text, TEXT_CHARS);

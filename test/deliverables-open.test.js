@@ -53,8 +53,10 @@ function clickFor(row, preview) {
       __STARNET_API__: 'http://127.0.0.1:61661',
       __STARNET_API_TOKEN__: 'launch-token',
       __TAURI__: { core: { invoke: async (name, args) => { calls.push({ name, args }); } } },
-      getSelection: () => ''
+      getSelection: () => '',
+      crypto: require('node:crypto').webcrypto
     };
+    global.ApiTicket = require('../frontend/app/apiticket.js');   // the page loads app/apiticket.js first
 
     const run = clickFor({
       id: 'run:agent:run-1', agentId: 'agent', runId: 'run-1', source: 'run',
@@ -79,6 +81,29 @@ function clickFor(row, preview) {
     A.eq(calls[0] && calls[0].args.path, 'workshop/run-2/brief.md',
       'Workshop OPEN preserves the backend-proven jailed path instead of guessing from the display name');
 
+    /* P24 wiring: a keyless TO REVIEW FILES row whose desktop OPEN fails points at "the library below" ONLY while a library card
+       for its run is really drawn there. TO REVIEW lists cleared runs too (includeCleared=1), and those have no library card. */
+    {
+      const failing = { invoke: async () => { throw new Error('host refused'); } };
+      global.window.__TAURI__ = { core: failing };
+      const reviewClick = (cards, inLib) => {
+        const li = { querySelector: () => null };   // TO REVIEW's file row: no .dlv-floc key slot
+        const dlv = { querySelectorAll: sel => sel === 'article.dlv-card[data-run]' ? cards.map(id => ({ getAttribute: a => a === 'data-run' ? id : null })) : [] };
+        const c = clickFor({ id: 'run:agent:rv', agentId: 'agent', runId: 'run-rv', source: 'run',
+          files: [{ path: 'out.md', preview: 'markdown', sandboxed: false, openUrl: '/api/file?agent=agent&path=out.md' }] }, { innerHTML: '' });
+        const base = c.event.target.closest;
+        c.event.target.closest = sel => sel === 'li' ? li : sel === '.dlv' ? (inLib ? dlv : null) : base(sel);
+        return c;
+      };
+      const said = async c => { const out = []; await D.handleOpenClick(c.event, c.rows, {}, t => out.push(t)); return out.join(' '); };
+      A.ok(/open its run in the library below/.test(await said(reviewClick(['other', 'run-rv'], true))), 'a run whose library card is drawn below: the toast points at it');
+      const cleared = await said(reviewClick(['other'], true));
+      A.ok(!/library below/.test(cleared) && /session or workspace folder/.test(cleared), 'a CLEARED run (no library card) never points at a row that is not there: ' + cleared);
+      A.ok(!/library below/.test(await said(reviewClick(['run-rv'], false))), 'no library around the link: no "below" claim');
+      global.window.__TAURI__ = { core: { invoke: async (name, args) => { calls.push({ name, args }); } } };
+    }
+    A.ok(/'<article class="dlv-card" data-i="' \+ i \+ '"' \+ \(r\.runId \? ' data-run="' \+ esc\(r\.runId\) \+ '"' : ''\)/.test(frontendSource), 'every library card carries its run id (what TO REVIEW\'s fallback looks for)');
+
     delete global.window.__TAURI__;
     let fetched = '';
     global.fetch = async url => {
@@ -94,8 +119,32 @@ function clickFor(row, preview) {
     await D.handleOpenClick(browser.event, browser.rows);
     A.ok(browserPreview.innerHTML.indexOf('SAFE PREVIEW') >= 0 && browserPreview.innerHTML.indexOf('Visible beside this row') >= 0,
       'browser preview paints inside the clicked card');
-    A.ok(fetched.indexOf('http://127.0.0.1:61661/api/file?') === 0 && fetched.indexOf('token=launch-token') >= 0,
-      'browser preview uses the real desktop API base and launch token');
+    A.ok(fetched.indexOf('http://127.0.0.1:61661/api/file?') === 0 && /[?&]ticket=st1\./.test(fetched) && fetched.indexOf('launch-token') < 0,
+      'browser preview uses the real desktop API base and a scoped ticket — never the launch token in the URL');
+    const state = {};
+    let releaseOld;
+    global.fetch = () => new Promise(resolve => { releaseOld = resolve; });
+    const stale = D.handleOpenClick(browser.event, browser.rows, state);
+    global.fetch = async () => ({ ok: true, text: async () => 'Newest selection' });
+    await D.handleOpenClick(browser.event, browser.rows, state);
+    releaseOld({ ok: true, text: async () => 'Obsolete selection' }); await stale;
+    A.ok(browserPreview.innerHTML.includes('Newest selection') && !browserPreview.innerHTML.includes('Obsolete'), 'a late response cannot replace the newest preview');
+    let releaseBody;
+    global.fetch = async () => ({ ok: true, text: () => new Promise(resolve => { releaseBody = resolve; }) });
+    const staleBody = D.handleOpenClick(browser.event, browser.rows, state);
+    await new Promise(resolve => setImmediate(resolve));
+    global.fetch = async () => ({ ok: true, text: async () => 'Latest body' });
+    await D.handleOpenClick(browser.event, browser.rows, state);
+    releaseBody('Obsolete body'); await staleBody;
+    A.ok(browserPreview.innerHTML.includes('Latest body') && !browserPreview.innerHTML.includes('Obsolete'), 'the race guard covers response bodies too');
+    let failOld; const notices = [];
+    global.fetch = () => new Promise((_, reject) => { failOld = reject; });
+    const failedOld = D.handleOpenClick(browser.event, browser.rows, state, text => notices.push(text));
+    global.fetch = async () => ({ ok: true, text: async () => 'Still current' });
+    await D.handleOpenClick(browser.event, browser.rows, state);
+    failOld(new Error('old outage')); await failedOld;
+    A.eq(notices, [], 'stale failures do not clear the current preview or display unrelated errors');
+    A.ok(browserPreview.innerHTML.includes('Still current'), 'latest preview survives stale failure');
   } finally {
     global.window = oldWindow;
     global.fetch = oldFetch;

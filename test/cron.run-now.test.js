@@ -6,12 +6,13 @@
    must also place a cron work item and mirror lifecycle over SSE so the floor
    moves immediately when the user presses Run Now. */
 'use strict';
+const { readSidecarSource } = require('./helpers/source');
 
 const A = require('./_assert.js');
 const fs = require('fs');
 const path = require('path');
 
-const src = fs.readFileSync(path.resolve(__dirname, '..', 'sidecar', 'index.js'), 'utf8');
+const src = readSidecarSource();
 
 function sliceBetween(text, startPattern, endPattern) {
   const start = text.search(startPattern);
@@ -27,7 +28,7 @@ const runOnceBlock = sliceBetween(src, /async function runOnce\(/, /\/\/ ---- co
 
 A.ok(/function placeCronWorkitem\s*\(/.test(src), 'shared cron workitem helper exists');
 A.ok(/placeWorkitem:\s*placeCronWorkitem/.test(driverBlock), 'scheduled cron uses the shared workitem helper');
-A.ok(/placeCronWorkitem\s*\(\s*job\.agentId\s*,\s*job\.prompt\s*,\s*runId\s*\)/.test(runNowBlock), 'manual Run Now places a cron workitem');
+A.ok(/placeCronWorkitem\s*\(\s*job\.agentId\s*,\s*job\.prompt\s*,\s*runId\s*(,\s*job\.dockId\s*)?\)/.test(runNowBlock), 'manual Run Now places a cron workitem');
 A.ok(/broadcast:\s*true/.test(runNowBlock), 'manual Run Now opts into SSE lifecycle broadcast');
 A.ok(/manual[\s/]+Run Now[\s/]+opts into broadcast/i.test(runOnceBlock), 'runOnce comment documents manual cron broadcast reason');
 
@@ -73,8 +74,29 @@ A.ok(/entryUsd:\s*state\.usd/.test(runNowBlock), "Run Now seeds the chain ceilin
 
 /* THE ROUTINE'S RECORDED SPEND IS THE WHOLE LINE'S (2026-08-22): a Run Now line that cost real money showed
    `lastUsd 0` — the hop-only chain spend was dropped and markRun never received usd at all. Both fire paths must
-   add line.usd to the entry spend and hand it to markRun. */
-A.ok(/state\.usd \+= line\.usd/.test(runNowBlock), "Run Now adds the line's hop spend to the entry run's spend");
-A.ok(/cronStore\.markRun\([^;]*usd:\s*state\.usd/.test(runNowBlock), "Run Now records the line total on the routine (markRun usd)");
+   add line.usd to the entry spend and hand it to markRun. Since quick win 25 both paths fold the line through ONE helper
+   (routing/line-fire.js foldLineIntoFire — its spend fold is behaviour-tested in cron.chain.test.js). */
+A.ok(/foldLineIntoFire\(state, line\)/.test(runNowBlock), "Run Now adds the line's hop spend to the entry run's spend (foldLineIntoFire)");
+A.ok(/cronDriver\.settleRun\(job\.id, runId, state, null\)/.test(runNowBlock), "Run Now passes the line's full state into the shared durable settlement path");
+
+/* SAME TOOLS AS THE SCHEDULED FIRE (B5 per-bay isolation). Run Now's stage one passed no `station`, so runOnce fell
+   back to the broad autonomous default office (dish, cabinet, notebook, studio…) while the scheduled fire runs in the
+   routine's bay room only — "test it now" showed web tools the 9:00 fire did not have (or the reverse). Lock stage
+   one to the exact resolveStation expression the driver uses, and the driver to its side of it. */
+const runNowStageOne = sliceBetween(runNowBlock, /await runOnce\(\{/, /chainRunner\.advance\(/);
+A.ok(/station:\s*\(\s*job\.dockId\s*\?\s*router\.stationFor\(job\.agentId,\s*job\.dockId\)\s*:\s*router\.stationFor\(job\.agentId\)\s*\)\s*\|\|\s*undefined/.test(runNowStageOne), "Run Now stage one runs in the routine's bay room, exactly like the scheduled fire (B5)");
+const driverSrc = fs.readFileSync(path.resolve(__dirname, '..', 'sidecar', 'cron-driver.js'), 'utf8');
+A.ok(/job\.dockId \? resolveStation\(job\.agentId, job\.dockId\) : resolveStation\(job\.agentId\)/.test(driverSrc), 'the scheduled fire resolves the same bay station (cron-driver.js)');
+A.ok(/resolveStation:\s*\(agentId, dockId\)\s*=>\s*router\.stationFor\(agentId, dockId\)/.test(driverBlock), "the driver's resolveStation is router.stationFor — the seam Run Now calls directly");
+
+/* threads-backend-03: a run whose model went silent AFTER its tools ran must never be reported as "nothing was done"
+   (a file was written; "continue" may redo it). Run Now counts the tool calls it streams and hands the count to the
+   stop sentence (StopReason.incompleteRunMessage's extra.toolsRan). */
+A.ok(/name === 'agent\.tool_call'\) \{ state\.buf = ''; state\.toolsRan\+\+; \}/.test(runNowBlock), 'Run Now counts each tool call it streams');
+A.ok(/StopReason\.incompleteRunMessage\(terminalReason, \{ toolsRan: state\.toolsRan \|\| 0 \}\)/.test(runNowBlock), 'and its incomplete-run sentence knows whether tools ran');
+{
+  const StopReason = require('../sidecar/stop-reason.js');
+  A.ok(!/nothing was done/.test(StopReason.incompleteRunMessage('empty', { toolsRan: 2 })), 'an empty reply after tools never says nothing was done');
+}
 
 if (require.main === module) A.report('cron.run-now.test');

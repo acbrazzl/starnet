@@ -62,6 +62,45 @@ const fresh = fs => makeJourneyStore({ fs: fs || memFs(), path, workspaces: '/ws
   A.ok(s.snapshot().receipts.filter(r => r.agentId === 'builder').every(r => r.dismissedAt === 300), 'suppression is visible on its receipts');
   await s.setSuppressed('builder', 'building', false, 301);
   A.ok(/building: 7 verified outcomes/.test(s.adaptationBlock('builder')), 'Commander can resume the corrected track');
+  // LEAN PROMPT (2026-10-12): the block rides the cache-stable system prompt, so that form carries the TIER only — a count
+  // changes with every verified outcome and would re-write the cached prefix behind it mid-conversation
+  {
+    const t = fresh();
+    for (let n = 1; n <= 7; n++) await t.recordQuest(quest(n), null, 100 + n);
+    const tierOnly = t.adaptationBlock('builder', { counts: false });
+    A.ok(/\n- building \(proven\)\. Reuse established patterns\. State uncertainty outside this track\.\n/.test(tierOnly), 'tier-only block: domain, tier and its instruction');
+    A.ok(!/verified outcomes? \(/.test(tierOnly) && !/: \d+ /.test(tierOnly), 'tier-only block: no outcome count');
+    await t.recordQuest(quest(8), null, 108);
+    A.eq(t.snapshot().mastery.find(m => m.agentId === 'builder' && m.domain === 'building').count, 8, 'setup: an eighth verified outcome lands (still proven)');
+    A.eq(t.adaptationBlock('builder', { counts: false }), tierOnly, 'tier-only block is byte-identical across a verified outcome that crosses no tier');
+    A.ok(/building: 8 verified outcomes/.test(t.adaptationBlock('builder')), 'the default (counted) block still reports the live count');
+  }
+  // the tier-only form keeps the agent's MOST-practised five (review 2026-10-12): six practiced domains, the most-practised
+  // one sorting last by name — picking by tier then name used to drop it
+  {
+    const t2 = fresh();
+    const plan = { building: 3, creative: 3, growth: 3, operations: 3, planning: 3, writing: 6 };
+    let k = 0;
+    for (const [domain, n] of Object.entries(plan)) for (let i = 0; i < n; i++) {
+      k++;
+      await t2.recordQuest({ id: 'q:w' + k, status: 'done', title: 'Job ' + k, domain, completedBy: 'writer', goalId: 'goal:w',
+        contract: { type: 'artifact', key: 'w-' + k + '.md' }, completedAt: 500 + k }, null, 500 + k);
+    }
+    const lean = t2.adaptationBlock('writer', { counts: false });
+    const named = lean.split('\n').filter(l => l.startsWith('- ')).map(l => l.slice(2).split(' (')[0]);
+    A.eq(named, ['building', 'creative', 'growth', 'operations', 'writing'], 'tier-only block: the five most-practised domains, rendered by tier then name');
+    const counted = t2.adaptationBlock('writer').split('\n').filter(l => l.startsWith('- ')).map(l => l.slice(2).split(':')[0]);
+    A.eq(counted.slice().sort(), named.slice().sort(), 'tier-only and counted blocks name the same five domains');
+  }
+  // PROTOTYPE POLLUTION (security audit 2026-09-25): '__proto__' passes the agent-id regex, and
+  // rec.suppressed['__proto__'] is Object.prototype — one /api/journey call used to set Object.prototype.building.
+  for (const bad of ['__proto__', 'constructor', 'prototype']) {
+    const r = await s.setSuppressed(bad, 'building', true, 310);
+    A.ok(r.ok === false, 'setSuppressed refuses object-model key ' + bad + ' as an agent id');
+  }
+  A.ok(!Object.prototype.hasOwnProperty('building') && ({}).building === undefined, 'Object.prototype was not polluted');
+  A.ok(typeof Object.building === 'undefined', 'the Object constructor was not written to');
+  A.eq(Object.keys(normalize({ suppressed: JSON.parse('{"__proto__":{"building":1},"builder":{"research":2}}') }).suppressed), ['builder'], 'a __proto__ row on disk is dropped on load');
 
   const milestone = { goalId: 'goal:game', milestoneId: 'm:launch', milestoneText: 'Launch the playable game', evidence: 'Release build linked in the task', agentId: 'builder', domain: 'building', goalDone: true };
   A.ok((await s.recordMilestone(milestone, 400)).ok, 'a final work milestone records the completed action');
@@ -150,6 +189,8 @@ const fresh = fs => makeJourneyStore({ fs: fs || memFs(), path, workspaces: '/ws
     attest: { confirmed: true, evidence: 'I attended my first piano lesson' } };
   await realWorld.recordQuest(realQuest, null, 2);
   A.eq(realWorld.snapshot().progression.points, 10, 'a goal-linked Commander-confirmed quest advances Commander progression');
+  A.eq(JSON.stringify(realWorld.snapshot().progression.activity), JSON.stringify([{ at: 2, kind: 'quest', points: 10, goalId: 'practice', step: true }]),
+    'the battle pass reads each award as {at, kind, points, goalId, step} — a step finished through its quest is flagged');
   A.eq(realWorld.snapshot().mastery, [], 'a self-reported quest without an agent never awards agent mastery');
   await realWorld.recordQuest(Object.assign({}, realQuest, { id: 'assigned-user-action', agentId: 'builder', attest: { source: 'commander', confirmed: true, evidence: 'I attended the lesson myself' } }), null, 2);
   A.eq(realWorld.snapshot().mastery, [], 'a direct user report never credits the assigned agent with doing the action');

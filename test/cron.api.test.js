@@ -18,6 +18,7 @@ const path = require('path');
 const os = require('os');
 const { bootToken } = require('./_httpToken.js');
 const { makeRunJournal } = require('../sidecar/run-journal.js');
+const { allocatePort, BIND_REFUSED } = require('./helpers/ports.js');
 
 const HOST = '127.0.0.1';
 const INDEX = path.resolve(__dirname, '..', 'sidecar', 'index.js');
@@ -42,15 +43,15 @@ function boot(port, workspaces, attemptsLeft) {
     const onData = d => {
       out += d.toString();
       if (!settled && out.indexOf('http://' + HOST + ':' + port) >= 0) { settled = true; resolve({ child, port }); }
-      if (!settled && /already in use/i.test(out)) {
+      if (!settled && BIND_REFUSED.test(out)) {
         settled = true; try { child.kill(); } catch (_) {}
-        if (attemptsLeft > 0) resolve(boot(port + 1, workspaces, attemptsLeft - 1));
+        if (attemptsLeft > 0) resolve(allocatePort().then(next => boot(next, workspaces, attemptsLeft - 1)));
         else reject(new Error('no free port'));
       }
     };
     child.stdout.on('data', onData); child.stderr.on('data', onData);
     child.on('error', e => { if (!settled) { settled = true; reject(e); } });
-    setTimeout(() => { if (!settled) { settled = true; try { child.kill(); } catch (_) {} reject(new Error('boot timeout; output:\n' + out)); } }, 9000);
+    setTimeout(() => { if (!settled) { settled = true; try { child.kill(); } catch (_) {} reject(new Error('boot timeout; output:\n' + out)); } }, 30000);
   });
 }
 
@@ -58,7 +59,7 @@ function boot(port, workspaces, attemptsLeft) {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'sk-cron-'));
   fs.mkdirSync(path.join(ws, 'channels'), { recursive: true });
   fs.writeFileSync(path.join(ws, 'channels', 'chatmap.json'), JSON.stringify({ version: 1, chats: { dev_target: { chatId: 'cron-dev', channel: 'dev', agentId: 'cron_brief' } } }), 'utf8');
-  let booted = await boot(8890 + (process.pid % 60), ws, 20);
+  let booted = await boot(await allocatePort(), ws, 20);
   let child = booted.child, port = booted.port;
   const B = () => 'http://' + HOST + ':' + port;
   let apiToken = '';
@@ -109,6 +110,28 @@ function boot(port, workspaces, attemptsLeft) {
     // remove the tz job so the persistence/removal counts below (which pin an exact job total) stay stable.
     await j('POST', '/api/cron/remove', { id: tzCreate.body.job.id });
 
+    // ---- create: enabledToolsets is normalized to real family ids, never silently emptied (#58 class) ----
+    // A console label, a tool name and a wrong case all mean the family; a typo is REFUSED by name (it used to be
+    // dropped/kept as an unknown family and the routine fired with no web tools); [] means no restriction.
+    const toolsetCases = [
+      [['Web & Browser'], ['web'], 'Label mapping', 'the TOOLSETS console label maps to its family'],
+      [['web_request'], ['web'], 'Tool name family', 'a tool name maps to its family'],
+      [['Web'], ['web'], 'Casefold check', 'a family id in any case is that family'],
+      [['web', 'cabinet'], ['web', 'cabinet'], 'Two families kept', 'valid family ids are stored unchanged'],
+      [['web', 'todo'], ['web'], 'Freebie entry', 'a computer freebie (always kept) adds nothing'],
+      [[], null, 'Empty restriction', 'an empty list is NO restriction, never "restrict to nothing"']
+    ];
+    for (let i = 0; i < toolsetCases.length; i++) {
+      const [input, want, name, why] = toolsetCases[i];
+      const made = await j('POST', '/api/cron', { name: name, prompt: 'p', schedule: 'every 1h', agentId: 'cron_brief', enabledToolsets: input });
+      A.eq(made.status, 200, 'toolsets ' + JSON.stringify(input) + ' -> 200');
+      A.eq(JSON.stringify(made.body.job && made.body.job.enabledToolsets), JSON.stringify(want), why);
+      if (made.body.job) await j('POST', '/api/cron/remove', { id: made.body.job.id });
+    }
+    const badToolset = await j('POST', '/api/cron', { name: 'Toolset typo', prompt: 'p', schedule: 'every 1h', agentId: 'cron_brief', enabledToolsets: ['nonsense'] });
+    A.eq(badToolset.status, 400, 'an unknown toolset is refused (400), never dropped');
+    A.ok(/unknown toolset "nonsense"/.test(String(badToolset.body && badToolset.body.error)) && /\bweb\b/.test(String(badToolset.body && badToolset.body.error)), 'the refusal names the bad entry and the valid ids');
+
     // ---- create: bad inputs are refused (not silently stored as un-fireable) ----
     const badSched = await j('POST', '/api/cron', { name: 'x', prompt: 'y', schedule: 'whenever i feel like it' });
     A.eq(badSched.status, 400, 'unparseable schedule -> 400');
@@ -116,6 +139,15 @@ function boot(port, workspaces, attemptsLeft) {
     A.eq(badCronExpr.status, 400, 'invalid cron expr -> 400');
     const badAgent = await j('POST', '/api/cron', { name: 'x', prompt: 'y', schedule: 'every 1h', agentId: '../escape' });
     A.eq(badAgent.status, 400, 'malformed routine agentId -> 400');
+    // A ONE-SHOT WHOSE TIME HAS PASSED (sweep/autonomy 2026-10-20): it was stored and FIRED on the very next tick — a
+    // model a day/year off on the date ran the task immediately while saying "scheduled for <that date>", and the
+    // preview listed the past instant as the next fire. Refused at the one parse seam create/update/preview share.
+    const pastIso = new Date(Date.now() - 86400000).toISOString();
+    const pastOnce = await j('POST', '/api/cron', { name: 'past once', prompt: 'send the report', schedule: pastIso, agentId: 'cron_brief' });
+    A.eq(pastOnce.status, 400, 'a one-shot at a time that already passed -> 400, never stored to fire at once');
+    A.ok(/already passed/.test(String(pastOnce.body && pastOnce.body.error)), 'and it says the time already passed: ' + (pastOnce.body && pastOnce.body.error));
+    const pvPast = await j('POST', '/api/cron/preview', { schedule: pastIso });
+    A.eq(pvPast.status, 400, 'the preview never lists a past instant as the next fire');
 
     // ---- list: the snapshot the panel renders; enabled:false because SKYNET_CRON_ENABLED is unset ----
     const list = await j('GET', '/api/cron');
@@ -167,6 +199,14 @@ function boot(port, workspaces, attemptsLeft) {
     A.eq(updBadAgent.status, 400, 'update rejects a malformed agentId');
     const updBadProvider = await j('POST', '/api/cron/update', { id, patch: { provider: 'bad-provider' } });
     A.eq(updBadProvider.status, 400, 'update rejects an unknown provider');
+    const updBadToolset = await j('POST', '/api/cron/update', { id, patch: { enabledToolsets: ['bogus'] } });
+    A.eq(updBadToolset.status, 400, 'update refuses an unknown toolset');
+    const afterBad = (await j('GET', '/api/cron')).body.jobs.find(x => x.id === id);
+    A.eq(afterBad && afterBad.enabledToolsets, null, 'a refused toolset update leaves the routine unchanged');
+    const updToolset = await j('POST', '/api/cron/update', { id, patch: { enabledToolsets: ['WEB & BROWSER'] } });
+    A.eq(JSON.stringify(updToolset.body.job && updToolset.body.job.enabledToolsets), '["web"]', 'update normalizes a console label to its family');
+    const updToolsetClear = await j('POST', '/api/cron/update', { id, patch: { enabledToolsets: [] } });
+    A.eq(updToolsetClear.body.job && updToolsetClear.body.job.enabledToolsets, null, 'update with [] clears the restriction');
 
     // ---- run-now: guarded (no provider credentials -> 400; unknown id -> 404) — zero spend ----
     const runNoKey = await j('POST', '/api/cron/run', { id });
@@ -209,7 +249,7 @@ function boot(port, workspaces, attemptsLeft) {
     interrupted.checkpoint('uncertain-cron-run', { phase: 'assistant', turn: 1, messages: [{ role: 'assistant', content: 'about to update the external system' }] });
     interrupted.toolIntent('uncertain-cron-run', { callId: 'mutating-call-1', name: 'connector.update', mutating: true });
     try { child.kill(); } catch (_) {} await sleep(200);
-    booted = await boot(port + 100, ws, 20); child = booted.child; port = booted.port;
+    booted = await boot(await allocatePort(), ws, 20); child = booted.child; port = booted.port;
     await refreshToken();
     const after = await j('GET', '/api/cron');
     A.eq(after.body.jobs.length, 2, 'the routines persisted across a restart');
@@ -277,7 +317,7 @@ function boot(port, workspaces, attemptsLeft) {
     A.ok(bakJobs.length >= 1, 'cron.jobs.json.bak contains routine jobs, not an empty snapshot');
     try { child.kill(); } catch (_) {} await sleep(200);
     fs.writeFileSync(cronPath, '');   // simulate a hard kill/torn write that left the protected main empty
-    booted = await boot(port + 200, ws, 20); child = booted.child; port = booted.port;
+    booted = await boot(await allocatePort(), ws, 20); child = booted.child; port = booted.port;
     await refreshToken();
     const recovered = await j('GET', '/api/cron');
     A.eq(recovered.body.jobs.length, 3, 'torn cron.jobs.json recovered from .bak on boot');
@@ -288,6 +328,16 @@ function boot(port, workspaces, attemptsLeft) {
     A.eq(durableResolution.status, 'resolved', 'the operator resolution survives a second host boot');
     A.eq(durableResolution.resolution.note, 'verified in destination audit log', 'the audit note survives restart');
     A.eq(durableResolution.canResolve, false, 'a resolved journal cannot be decided again after restart');
+
+    // A live foreign lock remains authoritative after the CRUD wait budget.
+    const lockPath = path.join(ws, 'cron.lock');
+    const beforeContention = fs.readFileSync(path.join(ws, 'cron.jobs.json'), 'utf8');
+    fs.writeFileSync(lockPath, process.pid + ':audit-holder');
+    try {
+      const busy = await j('POST', '/api/cron/update', { id, patch: { name: 'must not commit outside lock' } });
+      A.eq(busy.status, 500, 'contended CRUD reports failure instead of bypassing the lock');
+      A.eq(fs.readFileSync(path.join(ws, 'cron.jobs.json'), 'utf8'), beforeContention, 'contended write cannot modify the durable store');
+    } finally { fs.unlinkSync(lockPath); }
 
     // ---- remove: delete then confirm gone ----
     const rm = await j('POST', '/api/cron/remove', { id });

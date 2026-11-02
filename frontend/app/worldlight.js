@@ -170,10 +170,11 @@ const WorldLight = (() => {
     return light;
   }
 
-  function lightAt(x, y, lights, segments) {
+  // trans (optional): the caller's remembered visibilityFraction for these segments — same value, fewer rays
+  function lightAt(x, y, lights, segments, trans) {
     const rgb = [0, 0, 0]; let strongest = null, strength = 0, energy = 0, dx = 0, dy = 0;
     for (const l of lights) {
-      const transmission = visibilityFraction(l, x, y, segments); if (!transmission) continue;
+      const transmission = trans ? trans(l, x, y) : visibilityFraction(l, x, y, segments); if (!transmission) continue;
       const v = l.a * falloff(Math.hypot(x - l.x, y - l.y) / l.r) * transmission;
       for (let i = 0; i < 3; i++) rgb[i] += l.c[i] * v;
       const o = originOf(l), d = Math.hypot(o.x - x, o.y - y);
@@ -207,22 +208,157 @@ const WorldLight = (() => {
   function create(options) {
     options = options || {};
     let quality = QUALITY[options.quality] ? options.quality : 'high';
+    // key/keyProps/keyReach/shadeCool drive the KEY buffer: an overlay-composited
+    // light map (neutral .5 = unchanged, above = gain up to 2x). The dark film can
+    // only remove darkness; this is the one pass that puts light ON a surface.
     let config = Object.assign({ ambient: 0.82, wallAmbient: 0.28, fixtureTint: 0.17,
-      emission: 1, propLift: 0.65, propTint: 1, atmosphere: 0.25, shafts: 1, sampleCacheLimit: 512 }, options);
+      emission: 1, propLift: 0.65, propTint: 1, atmosphere: 0.25, shafts: 1, sampleCacheLimit: 512,
+      key: 0, keyProps: 1, keyReach: 0.62, keyPropReach: 1.2, shadeCool: 0, cut: 1 }, options);
     let geo = null, geometryOptions = {}, segments = [], width = 1, height = 1, ratio = 1;
     let interiorPath = null, interiorMask = null, surfaceMask = null, surfaceChunks = [];
-    let baseDark = null, baseGlow = null, frameDark = null, frameGlow = null;
-    let fixtureKey = '', frameKey = '', fixtureLights = [], currentLights = [], stampPixels = 0, disposed = false;
+    let baseDark = null, baseGlow = null, frameDark = null, frameGlow = null, baseKey = null, frameLift = null;
+    let fixtureLights = [], currentLights = [], stampPixels = 0, disposed = false;
     let preparedFrame = null, preparedLights = [], preparedConfigRevision = -1;
     const stamps = new Map(), canvasWatches = new Map(), lostCanvases = new Set(), samples = new Map();
-    let sampleKey = null;
+    /* NUMERIC LIGHT KEYS (2026-10-20, "eats my PC's resources"). The composed maps and the sample cache were keyed on
+       strings rebuilt every frame (~12 KB of them on Andrew's station), and the map key rounded each alpha to a byte, so
+       a screen's ±1.5% flicker kept crossing a byte boundary and re-blitting the station-sized maps several times a
+       second. Each light now packs into a reused Float64Array, LIGHT_SLOTS numbers a light:
+         x y r c0 c1 c2 originX originY softness · beam? bx by bdx bdy blength bwidth bstrength · alpha
+       Geometry and config compare exactly. The MAPS hold each alpha inside a MAP_ALPHA_BAND (1.5 LSB) band around the
+       alpha they were built with: a wiggle that small is below what the map can show, while switching a light on, off
+       or to work moves far past it and rebuilds that very frame. The SAMPLE key keeps exact alpha (band 0): sprites and
+       shadows still follow sub-byte changes. */
+    const LIGHT_SLOTS = 18, ALPHA_SLOT = 17, MAP_ALPHA_BAND = 1.5;
+    const lightKey = () => ({ keys: new Float64Array(LIGHT_SLOTS * 16), n: -1 });   // n < 0: nothing recorded yet
+    const fixtureMap = lightKey(), propMap = lightKey(), fixtureSample = lightKey(), propSample = lightKey();
+    const STATIC_CONFIG = ['ambient', 'ambientLift', 'wallAmbient', 'fixtureTint', 'shafts', 'key', 'keyReach', 'shadeCool', 'cut'];
+    const staticConfig = new Array(STATIC_CONFIG.length), dynamicConfig = new Float64Array(4);
+    let sampleGeometry = -1, sampleConfig = -1, sampleQuality = '', sampleAmbient;   // what the cached samples were taken under
     let resourcesDirty = false, retryResourcesAt = 0;
     const metrics = { geometryRevision: 0, staticBuilds: 0, dynamicBuilds: 0, visibilityBuilds: 0,
       frames: 0, preparations: 0, beamBuilds: 0, lastBuildMs: 0, droppedSources: 0, supported: true, contextLosses: 0, contextRecoveries: 0,
-      configRevision: 0, sampleCacheHits: 0, sampleCacheMisses: 0, sampleCacheEvictions: 0, sampleCacheInvalidations: 0 };
+      configRevision: 0, groundClipBuilds: 0, sampleCacheHits: 0, sampleCacheMisses: 0, sampleSourcesWalked: 0, sampleCacheEvictions: 0, sampleCacheInvalidations: 0 };
     const sampleLimit = () => clamp(Math.floor(finite(config.sampleCacheLimit, 512)), 0, 2048);
+    /* GEOMETRY-SCOPED VISIBILITY (2026-10-07, a 207-source station drew at ~22ms): an emitter's area origins, and
+       the wall-occlusion fraction a point sees from them, depend only on the walls (segments) and the emitter's
+       physical origin + softness — never on its brightness. prepare() re-normalizes every source each frame and a
+       working screen changes some alpha every frame, which (correctly) clears the sample cache: so every sample
+       re-ran 5 origins × every wall for every source in reach, and every source re-derived its origins (~100k ray
+       tests a frame). Both are now remembered for the current wall set; brightness still reaches every sample
+       exactly, and a new wall set (setGeometry, a quality change) starts both caches over. */
+    const ORIGIN_LIMIT = 4096, TRANS_LIMIT = 32768;
+    let visFor = null; const originCache = new Map(), transCache = new Map();
+    function visScope() { if (visFor !== segments) { visFor = segments; originCache.clear(); transCache.clear(); nearSegCache.clear(); } }
+    const originKey = (l, count) => finite(l.originX, l.x) + ',' + finite(l.originY, l.y) + ',' + l.softness + ',' + count;
+    function originsOf(l, count) {
+      visScope();
+      const k = originKey(l, count); let o = originCache.get(k);
+      if (!o) {
+        o = emitterOrigins(l, segments, count);
+        if (originCache.size >= ORIGIN_LIMIT) originCache.delete(originCache.keys().next().value);
+        originCache.set(k, o);
+      }
+      l.originKey = k; return o;
+    }
+    /* (2026-10-10) the walls a source can be blocked by: a ray from any of its area origins to a point in its reach lies
+       inside the box around those origins and its reach, so a wall wholly outside that box can never stop it. A walking
+       body's fresh sample traced 5 origins × EVERY wall of the station; it now traces the walls near the source. */
+    const nearSegCache = new Map();
+    function segsNear(l) {
+      visScope();
+      const k = l.originKey + '|' + l.x + ',' + l.y + ',' + l.r; let near = nearSegCache.get(k);
+      if (!near) {
+        const os = l.origins || [originOf(l)], pad = 1;
+        let x0 = l.x - l.r, x1 = l.x + l.r, y0 = l.y - l.r, y1 = l.y + l.r;
+        for (const o of os) { x0 = Math.min(x0, o.x); x1 = Math.max(x1, o.x); y0 = Math.min(y0, o.y); y1 = Math.max(y1, o.y); }
+        x0 -= pad; x1 += pad; y0 -= pad; y1 += pad;
+        near = segments.filter(s => Math.max(s.x1, s.x2) >= x0 && Math.min(s.x1, s.x2) <= x1 && Math.max(s.y1, s.y2) >= y0 && Math.min(s.y1, s.y2) <= y1);
+        if (nearSegCache.size >= ORIGIN_LIMIT) nearSegCache.delete(nearSegCache.keys().next().value);
+        nearSegCache.set(k, near);
+      }
+      return near;
+    }
+    // === visibilityFraction(l, x, y, segments): in reach the fraction is a function of l.origins and the walls
+    // alone (visibleFrom's own reach test is the same test, already passed), so it is looked up by both
+    function transmissionOf(l, x, y) {
+      if (Math.hypot(x - l.x, y - l.y) > l.r) return 0;
+      if (!l.originKey) return visibilityFraction(l, x, y, segments);
+      visScope();
+      const k = l.originKey + '|' + x + ',' + y; let v = transCache.get(k);
+      if (v === undefined) {
+        v = visibilityFraction(l, x, y, l.segsNear || segments);
+        if (transCache.size >= TRANS_LIMIT) transCache.delete(transCache.keys().next().value);
+        transCache.set(k, v);
+      }
+      return v;
+    }
     function invalidateSamples() {
-      samples.clear(); sampleKey = null; metrics.sampleCacheInvalidations++;
+      samples.clear(); fixtureSample.n = -1; metrics.sampleCacheInvalidations++;
+    }
+    /* LIGHT GRID + KERNELS (2026-10-10, "slower since the new textures"). A station with ~270 emitters re-samples every
+       prop and body each frame (a flickering screen changes an alpha, which correctly clears the sample cache), and
+       every sample walked EVERY source with a string-keyed transmission lookup per source in reach — the hottest
+       function on the floor. Two remembered halves now, both scoped to the light GEOMETRY (every source's position,
+       reach and emitter origins, and the walls), never to brightness:
+         · grid — each cell lists the sources whose reach box covers it, in currentLights order;
+         · kernel — per exact sample point, each covering source's falloff, wall transmission and unit direction.
+       A sample is then the kernel weighted by this frame's alpha and colour: the same terms lightAt computes, summed in
+       the same order, so the descriptor is identical. A moving body's new point builds its kernel the old way. */
+    const GRID_CELL = 64, KERNEL_LIMIT = 4096;
+    let gridGeom = null, gridKeys = null, gridSegs = null, gridFor = null;
+    const gridIdx = new Map(), kernels = new Map();
+    function syncGrid() {
+      if (gridFor === currentLights && gridSegs === segments) return;
+      gridFor = currentLights;
+      let same = gridSegs === segments && !!gridGeom && gridGeom.length === currentLights.length * 3;
+      for (let i = 0; same && i < currentLights.length; i++) {
+        const l = currentLights[i];
+        same = gridGeom[i * 3] === l.x && gridGeom[i * 3 + 1] === l.y && gridGeom[i * 3 + 2] === l.r && gridKeys[i] === l.originKey;
+      }
+      if (same) return;
+      gridSegs = segments; gridGeom = new Float64Array(currentLights.length * 3); gridKeys = new Array(currentLights.length);
+      gridIdx.clear(); kernels.clear();
+      currentLights.forEach((l, i) => {
+        gridGeom[i * 3] = l.x; gridGeom[i * 3 + 1] = l.y; gridGeom[i * 3 + 2] = l.r; gridKeys[i] = l.originKey;
+        const x0 = Math.floor((l.x - l.r) / GRID_CELL), x1 = Math.floor((l.x + l.r) / GRID_CELL);
+        const y0 = Math.floor((l.y - l.r) / GRID_CELL), y1 = Math.floor((l.y + l.r) / GRID_CELL);
+        for (let gy = y0; gy <= y1; gy++) for (let gx = x0; gx <= x1; gx++) {
+          const k = gx + ',' + gy; let a = gridIdx.get(k); if (!a) gridIdx.set(k, a = []); a.push(i);
+        }
+      });
+    }
+    // the geometry half of lightAt for one point: [index, falloff, transmission, ux, uy] per contributing source
+    function kernelAt(x, y, key) {
+      let k = kernels.get(key);
+      if (k) return k;
+      k = [];
+      const idx = gridIdx.get(Math.floor(x / GRID_CELL) + ',' + Math.floor(y / GRID_CELL)) || [];
+      metrics.sampleSourcesWalked += idx.length;
+      for (const i of idx) {
+        const l = currentLights[i], transmission = transmissionOf(l, x, y); if (!transmission) continue;
+        const o = originOf(l), d = Math.hypot(o.x - x, o.y - y);
+        k.push(i, falloff(Math.hypot(x - l.x, y - l.y) / l.r), transmission, d > EPS ? (o.x - x) / d : NaN, d > EPS ? (o.y - y) / d : NaN);
+      }
+      if (kernels.size >= KERNEL_LIMIT) kernels.delete(kernels.keys().next().value);
+      kernels.set(key, k);
+      return k;
+    }
+    // lightAt's sum over a kernel, with this frame's alpha and colour (same terms, same order)
+    function lightFromKernel(k) {
+      const rgb = [0, 0, 0]; let strongest = null, strength = 0, energy = 0, dx = 0, dy = 0;
+      for (let j = 0; j < k.length; j += 5) {
+        const l = currentLights[k[j]], v = l.a * k[j + 1] * k[j + 2];
+        for (let i = 0; i < 3; i++) rgb[i] += l.c[i] * v;
+        if (k[j + 3] === k[j + 3]) { dx += k[j + 3] * v; dy += k[j + 4] * v; }
+        energy += v;
+        if (v > strength) { strength = v; strongest = l; }
+      }
+      const direction = Math.hypot(dx, dy);
+      return { rgb: rgb.map(v => Math.round(clamp(v, 0, 255))), strength, source: strongest,
+        color: rgb.map(v => energy > EPS ? Math.round(clamp(v / energy, 0, 255)) : 0),
+        dx: direction > EPS ? dx / direction : 0, dy: direction > EPS ? dy / direction : 0,
+        energy, coherence: energy > EPS ? clamp(direction / energy, 0, 1) : 0 };
     }
     function sample(x, y) {
       x = +x; y = +y;
@@ -234,7 +370,8 @@ const WorldLight = (() => {
         samples.delete(key); samples.set(key, cached); metrics.sampleCacheHits++; return cached;
       }
       metrics.sampleCacheMisses++;
-      const hit = lightAt(x, y, currentLights, segments), limit = sampleLimit();
+      syncGrid();
+      const hit = lightFromKernel(kernelAt(x, y, key)), limit = sampleLimit();
       // Descriptors are read-only so a sprite's tint adjustment cannot poison the
       // next furniture/crew draw sharing this exact physical position.
       Object.freeze(hit.rgb); Object.freeze(hit.color); Object.freeze(hit);
@@ -285,10 +422,11 @@ const WorldLight = (() => {
       interiorMask = geometryOptions.interiorMask || null;
       surfaceChunks = Array.isArray(geometryOptions.surfaceChunks) ? geometryOptions.surfaceChunks : [];
       segments = buildSegments(geo, geometryOptions.tileSize);
-      for (const c of [baseDark, baseGlow, frameDark, frameGlow]) release(c);
+      for (const c of [baseDark, baseGlow, frameDark, frameGlow, baseKey, frameLift]) release(c);
+      baseKey = null; frameLift = null;
       const w = Math.max(1, Math.ceil(width * ratio)), h = Math.max(1, Math.ceil(height * ratio));
       baseDark = makeCanvas(w, h); baseGlow = makeCanvas(w, h); frameDark = makeCanvas(w, h); frameGlow = makeCanvas(w, h);
-      clearStamps(); fixtureKey = ''; frameKey = ''; fixtureLights = []; currentLights = [];
+      clearStamps(); fixtureMap.n = -1; propMap.n = -1; fixtureLights = []; currentLights = [];
       preparedFrame = null; preparedLights = [];
       invalidateSamples();
       resourcesDirty = false; retryResourcesAt = 0; metrics.geometryRevision++; return metrics.supported;
@@ -345,7 +483,7 @@ const WorldLight = (() => {
         const g = c.getContext('2d');
         if (g && typeof g.isContextLost === 'function' && g.isContextLost()) lost(c);
       };
-      for (const c of [baseDark, baseGlow, frameDark, frameGlow]) inspect(c);
+      for (const c of [baseDark, baseGlow, frameDark, frameGlow, baseKey, frameLift]) inspect(c);
       for (const s of stamps.values()) inspect(s.canvas);
       if (resourcesDirty) {
         if (clock() < retryResourcesAt) return false;
@@ -360,7 +498,41 @@ const WorldLight = (() => {
 
     const keyOf = l => l.x + ',' + l.y + ',' + l.r + ',' + l.c.join(',') + ',' + finite(l.originX, l.x) + ',' + finite(l.originY, l.y) + ',' + l.softness;
     const beamKey = l => l.beam ? Object.values(l.beam).join(',') : '';
-    const signature = lights => lights.map(l => keyOf(l) + ',' + Math.round(l.a * 255) + ',' + beamKey(l)).join(';');
+    // true when `lights` differ from what `k` recorded: the count or any geometry exactly, an alpha by `band` LSB or more
+    // (band 0: any change at all). The slot order is LIGHT_SLOTS' above; a light without a shaft records zeros past its flag.
+    function lightsStale(k, lights, band) {
+      if (k.n !== lights.length) return true;
+      const a = k.keys;
+      for (let i = 0, o = 0; i < lights.length; i++, o += LIGHT_SLOTS) {
+        const l = lights[i], b = l.beam;
+        if (a[o] !== l.x || a[o + 1] !== l.y || a[o + 2] !== l.r || a[o + 3] !== l.c[0] || a[o + 4] !== l.c[1] || a[o + 5] !== l.c[2] ||
+          a[o + 6] !== finite(l.originX, l.x) || a[o + 7] !== finite(l.originY, l.y) || a[o + 8] !== l.softness || a[o + 9] !== (b ? 1 : 0)) return true;
+        if (b && (a[o + 10] !== b.x || a[o + 11] !== b.y || a[o + 12] !== b.dx || a[o + 13] !== b.dy ||
+          a[o + 14] !== b.length || a[o + 15] !== b.width || a[o + 16] !== b.strength)) return true;
+        if (band ? Math.abs(l.a - a[o + ALPHA_SLOT]) * 255 >= band : a[o + ALPHA_SLOT] !== l.a) return true;
+      }
+      return false;
+    }
+    function recordLights(k, lights) {
+      const need = lights.length * LIGHT_SLOTS;
+      if (k.keys.length < need) k.keys = new Float64Array(Math.max(need, k.keys.length * 2));
+      const a = k.keys;
+      for (let i = 0, o = 0; i < lights.length; i++, o += LIGHT_SLOTS) {
+        const l = lights[i], b = l.beam;
+        a[o] = l.x; a[o + 1] = l.y; a[o + 2] = l.r; a[o + 3] = l.c[0]; a[o + 4] = l.c[1]; a[o + 5] = l.c[2];
+        a[o + 6] = finite(l.originX, l.x); a[o + 7] = finite(l.originY, l.y); a[o + 8] = l.softness; a[o + 9] = b ? 1 : 0;
+        a[o + 10] = b ? b.x : 0; a[o + 11] = b ? b.y : 0; a[o + 12] = b ? b.dx : 0; a[o + 13] = b ? b.dy : 0;
+        a[o + 14] = b ? b.length : 0; a[o + 15] = b ? b.width : 0; a[o + 16] = b ? b.strength : 0;
+        a[o + ALPHA_SLOT] = l.a;
+      }
+      k.n = lights.length;
+    }
+    // a config value compares by value; NaN matches NaN, as it did inside the old string key
+    const sameValue = (a, b) => a === b || (a !== a && b !== b);
+    function staticConfigStale() {
+      for (let i = 0; i < STATIC_CONFIG.length; i++) if (!sameValue(staticConfig[i], config[STATIC_CONFIG[i]])) return true;
+      return false;
+    }
     function stamp(light, beamOnly) {
       if (beamOnly && (!light.beam || !(light.beam.strength > 0))) return null;
       const key = (beamOnly ? 'beam:' + beamKey(light) + ':' : '') + keyOf(light);
@@ -435,6 +607,41 @@ const WorldLight = (() => {
       g.globalAlpha = 1; g.globalCompositeOperation = 'source-over';
     }
 
+    const keyOn = () => finite(config.key, 0) > 0 || finite(config.shadeCool, 0) > 0;
+    // The key is tighter than the cut that made room for it: a highlight film at the
+    // cut's full radius overlaps its neighbours into a haze that lifts the whole room.
+    // Screens and beacons are small emitters: they keep (or exceed) their own reach.
+    function paintKey(g, lights, amount, reach) {
+      reach = clamp(finite(reach, 0.62), 0.2, 2);
+      g.globalCompositeOperation = 'lighter';
+      for (const l of lights) {
+        const a = clamp(l.a * amount, 0, 1); if (!(a > 0)) continue;
+        const s = stamp(Object.assign({}, l, { r: Math.max(1, l.r * reach), beam: null })); if (!s) continue;
+        g.globalAlpha = a; g.drawImage(s.canvas, s.x, s.y, s.size, s.size);
+      }
+      g.globalAlpha = 1; g.globalCompositeOperation = 'source-over';
+    }
+    // Neutral grey over the station silhouette only (space stays untouched): a
+    // faint blue-over-red split, so unlit deck reads cool and the lamp pools warm.
+    function rebuildKey(lights) {
+      if (!keyOn()) { release(baseKey); release(frameLift); baseKey = null; frameLift = null; return; }
+      const w = baseDark.width, h = baseDark.height;
+      if (!baseKey) baseKey = makeCanvas(w, h);
+      if (!frameLift) frameLift = makeCanvas(w, h);
+      if (!baseKey || !frameLift) return;
+      const k = reset(baseKey), cool = clamp(finite(config.shadeCool, 0), 0, 0.3);
+      if (hasSurface()) {
+        if (surfaceMask) k.drawImage(surfaceMask, 0, 0, width, height);
+        else for (const c of surfaceChunks) if (c.baseCv) drawChunk(k, c, c.baseCv);
+        k.globalCompositeOperation = 'source-in';
+      }
+      k.fillStyle = 'rgb(' + Math.round(128 * (1 - cool)) + ',' + Math.round(128 * (1 - cool * 0.35)) + ',' + Math.round(128 * (1 + cool * 0.45)) + ')';
+      if (hasSurface()) k.fillRect(0, 0, width, height);
+      else { k.save(); clipDeckFootprint(k); clipFloor(k); k.fillRect(0, 0, width, height); k.restore(); }
+      k.globalCompositeOperation = 'source-over';
+      paintKey(k, lights, 0.5 * clamp(finite(config.key, 0), 0, 2), config.keyReach);
+    }
+
     function rebuildStatic(lights) {
       const d = reset(baseDark), glow = reset(baseGlow), wall = clamp(finite(config.wallAmbient, 0.28), 0, 0.8);
       // Existing LOW/MEDIUM/HIGH room settings are .82/.72/.62. Their ordering
@@ -463,9 +670,12 @@ const WorldLight = (() => {
         d.save(); clipDeckFootprint(d); clipFloor(d); d.fillStyle = 'rgba(5,9,22,' + inside + ')';
         d.fillRect(0, 0, width, height); d.restore();
       }
-      paint(d, lights, 1, 'destination-out');
+      // cut > 1 opens a pool further; fill lamps arrive at ~.42 and left a third of
+      // the ambient film standing directly under the fixture.
+      paint(d, lights, clamp(finite(config.cut, 1), 0, 3), 'destination-out');
       paint(glow, lights, finite(config.fixtureTint, 0.17), 'screen');
       if (config.shafts > 0) paint(glow, lights, clamp(config.shafts, 0, 2), 'screen', true);
+      rebuildKey(lights);
       metrics.staticBuilds++;
     }
 
@@ -477,13 +687,15 @@ const WorldLight = (() => {
       fixtureLights = sourceFixtures.map(s => normalizeLight(s, true, finite(frame.fixtureGain, 1))).filter(Boolean).slice(0, q.maxSources);
       preparedLights = sourceProps.map(s => normalizeLight(s, false, finite(frame.emission, config.emission))).filter(Boolean).slice(0, q.maxSources);
       currentLights = fixtureLights.concat(preparedLights); preparedFrame = frame;
-      for (const light of currentLights) light.origins = emitterOrigins(light, segments, q.areaSamples);
+      for (const light of currentLights) { light.origins = originsOf(light, q.areaSamples); light.segsNear = segsNear(light); }
       // Sample energy must respond to even sub-byte changes. Raster map keys may
       // quantize alpha for reuse; this key deliberately retains its exact value.
-      const exact = lights => lights.map(l => keyOf(l) + ',' + l.a + ',' + beamKey(l)).join(';');
-      const nextSampleKey = metrics.geometryRevision + '/' + metrics.configRevision + '/' + quality + '/' + config.ambient +
-        '|fixtures:' + exact(fixtureLights) + '|props:' + exact(preparedLights);
-      if (nextSampleKey !== sampleKey) { invalidateSamples(); sampleKey = nextSampleKey; }
+      if (sampleGeometry !== metrics.geometryRevision || sampleConfig !== metrics.configRevision || sampleQuality !== quality ||
+        !sameValue(sampleAmbient, config.ambient) || lightsStale(fixtureSample, fixtureLights, 0) || lightsStale(propSample, preparedLights, 0)) {
+        invalidateSamples();
+        recordLights(fixtureSample, fixtureLights); recordLights(propSample, preparedLights);
+        sampleGeometry = metrics.geometryRevision; sampleConfig = metrics.configRevision; sampleQuality = quality; sampleAmbient = config.ambient;
+      }
       metrics.droppedSources = Math.max(0, sourceFixtures.length - fixtureLights.length) + Math.max(0, sourceProps.length - preparedLights.length);
       preparedConfigRevision = metrics.configRevision;
       metrics.preparations++; return true;
@@ -500,31 +712,65 @@ const WorldLight = (() => {
       // clears preparedFrame; explicit frames and config changes still refresh.
       if(frame !== undefined || !preparedFrame || preparedConfigRevision !== metrics.configRevision)prepare(nextFrame);
       const fixtures = fixtureLights, lights = preparedLights;
-      const fk = signature(fixtures) + '|' + config.ambient + ',' + config.ambientLift + ',' + config.wallAmbient + ',' + config.fixtureTint + ',' + config.shafts;
-      if (fk !== fixtureKey) { rebuildStatic(fixtures); fixtureKey = fk; frameKey = ''; }
-      const dk = signature(lights) + '|' + finite(config.propLift, 0.65) + '|' + finite(config.propTint, 1);
-      if (dk !== frameKey) {
+      if (staticConfigStale() || lightsStale(fixtureMap, fixtures, MAP_ALPHA_BAND)) {
+        rebuildStatic(fixtures); recordLights(fixtureMap, fixtures);
+        for (let i = 0; i < STATIC_CONFIG.length; i++) staticConfig[i] = config[STATIC_CONFIG[i]];
+        propMap.n = -1;   // the frame maps start from the static ones
+      }
+      const lift = finite(config.propLift, 0.65), tint = finite(config.propTint, 1), keyProps = finite(config.keyProps, 1), keyPropReach = finite(config.keyPropReach, 1.2);
+      if (dynamicConfig[0] !== lift || dynamicConfig[1] !== tint || dynamicConfig[2] !== keyProps || dynamicConfig[3] !== keyPropReach ||
+        lightsStale(propMap, lights, MAP_ALPHA_BAND)) {
         const d = reset(frameDark), glow = reset(frameGlow);
         d.drawImage(baseDark, 0, 0, width, height); glow.drawImage(baseGlow, 0, 0, width, height);
-        paint(d, lights, finite(config.propLift, 0.65), 'destination-out'); paint(glow, lights, clamp(finite(config.propTint, 1), 0, 1), 'screen');
-        frameKey = dk; metrics.dynamicBuilds++;
+        paint(d, lights, lift, 'destination-out'); paint(glow, lights, clamp(tint, 0, 1), 'screen');
+        if (baseKey && frameLift) {
+          const k = reset(frameLift); k.drawImage(baseKey, 0, 0, width, height);
+          paintKey(k, lights, 0.5 * clamp(finite(config.key, 0), 0, 2) * clamp(keyProps, 0, 4), config.keyPropReach);
+        }
+        recordLights(propMap, lights); dynamicConfig[0] = lift; dynamicConfig[1] = tint; dynamicConfig[2] = keyProps; dynamicConfig[3] = keyPropReach;
+        metrics.dynamicBuilds++;
       }
       ctx.save();
       ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.imageSmoothingEnabled = ratio < 1;
-      ctx.drawImage(frameDark, 0, 0, width, height); ctx.globalCompositeOperation = 'screen';
+      ctx.drawImage(frameDark, 0, 0, width, height);
+      if (baseKey && frameLift) { ctx.globalCompositeOperation = 'overlay'; ctx.drawImage(frameLift, 0, 0, width, height); }
+      ctx.globalCompositeOperation = 'screen';
       ctx.drawImage(frameGlow, 0, 0, width, height); ctx.restore();
       metrics.frames++; metrics.lastBuildMs = +(clock() - started).toFixed(3); return true;
     }
 
+    /* (2026-10-10) a body's wall clip is a 24-ray cast against every wall, and a 49-body crew paid it for every body,
+       on-screen or not, every frame (~15% of a floor draw). The polygon depends only on the foot, the reach and the
+       walls, so a body standing still reuses it; off-canvas bodies skip the pass (everything here is clipped to it). */
+    const GROUND_POLY_LIMIT = 512; let groundPolyFor = null; const groundPolys = new Map();
+    function groundPolygon(x, y, r) {
+      if (groundPolyFor !== segments) { groundPolyFor = segments; groundPolys.clear(); }
+      const k = x + ',' + y + ',' + r; let p = groundPolys.get(k);
+      if (!p) {
+        p = visibilityPolygon({ x, y, r }, segments, 24); metrics.groundClipBuilds++;
+        if (groundPolys.size >= GROUND_POLY_LIMIT) groundPolys.delete(groundPolys.keys().next().value);
+        groundPolys.set(k, p);
+      }
+      return p;
+    }
     function drawGrounding(ctx, bodies) {
       if (disposed || !ctx || !geo) return;
+      const m = typeof ctx.getTransform === 'function' ? ctx.getTransform() : null, cv = ctx.canvas;
+      const cull = m && cv && cv.width > 0 && !m.b && !m.c && m.a > 0 && m.d > 0;
       ctx.save(); clipFloor(ctx); ctx.globalCompositeOperation = 'multiply';
       for (const body of (bodies || [])) {
-        const s = shadowFor(body, currentLights, segments,
-          sample(finite(body.x, body.px), finite(body.y, body.py))); if (!s) continue;
+        const bx = finite(body.x, body.px), by = finite(body.y, body.py);
+        if (cull && Number.isFinite(bx) && Number.isFinite(by)) {   // no shadow reaches past its body's height + width
+          const reach = (clamp(finite(body.height, 18), 2, 90) + clamp(finite(body.width, 8), 2, 140) + 6) * Math.max(m.a, m.d);
+          const sx = bx * m.a + m.e, sy = by * m.d + m.f;
+          if (sx + reach < 0 || sy + reach < 0 || sx - reach > cv.width || sy - reach > cv.height) continue;
+        }
+        const s = shadowFor(body, currentLights, segments, sample(bx, by)); if (!s) continue;
         ctx.save();
-        // The silhouette can spread around a foot, but never through a bulkhead.
-        const polygon = visibilityPolygon({ x: s.x, y: s.y, r: s.length + s.width }, segments, 24);
+        // The silhouette can spread around a foot, but never through a bulkhead. The clip is keyed on the body's MAXIMUM reach
+        // (shadowFor caps length at height * 0.7), not this frame's length: a flickering screen nearby moves the length every
+        // frame, and must not re-cast the 24 wall rays for a body standing still. Walls still bound the larger clip.
+        const polygon = groundPolygon(s.x, s.y, clamp(finite(body.height, 18), 2, 90) * 0.7 + s.width);
         ctx.beginPath(); polygon.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)); ctx.closePath(); ctx.clip();
         const ex = s.x + s.dx * s.length, ey = s.y + s.dy * s.length;
         // Nested low-opacity silhouettes form a bounded penumbra without a blur
@@ -576,11 +822,11 @@ const WorldLight = (() => {
       config = Object.assign({}, config, next);
       metrics.configRevision++; invalidateSamples();
       if (QUALITY[next.quality] && next.quality !== quality) { quality = next.quality; if (geo) setGeometry(geo, geometryOptions); }
-      else { fixtureKey = ''; frameKey = ''; }
+      else { fixtureMap.n = -1; propMap.n = -1; }
     }
     function dispose() {
-      disposed = true; for (const c of [baseDark, baseGlow, frameDark, frameGlow]) release(c);
-      baseDark = null; baseGlow = null; frameDark = null; frameGlow = null;
+      disposed = true; for (const c of [baseDark, baseGlow, frameDark, frameGlow, baseKey, frameLift]) release(c);
+      baseKey = null; frameLift = null; baseDark = null; baseGlow = null; frameDark = null; frameGlow = null;
       clearStamps(); currentLights = []; fixtureLights = []; geo = null; surfaceMask = null; interiorPath = null;
       preparedFrame = null; preparedLights = [];
       invalidateSamples();
@@ -592,7 +838,8 @@ const WorldLight = (() => {
         sampleCacheSize: samples.size, sampleCacheLimit: sampleLimit(),
         shafts: fixtureLights.filter(l => l.beam && l.beam.strength > 0 && config.shafts > 0).length,
         ambient: clamp(0.208 + finite(config.ambient, 0.82) * 0.6 - clamp(finite(config.ambientLift, 0), 0, .2), 0, 0.9),
-        cacheBytes: 4 * stampPixels + (baseDark ? baseDark.width * baseDark.height * 16 : 0), disposed }) };
+        cacheBytes: 4 * stampPixels + (baseDark ? baseDark.width * baseDark.height * (baseKey ? 24 : 16) : 0),
+        key: !!baseKey, disposed }) };
   }
   return { create, buildSegments, visibilityPolygon, visibleAt, visibilityFraction, emitterOrigins,
     rayDistance, falloff, normalizeLight, lightAt, shadowFor, QUALITY };

@@ -7,7 +7,8 @@
     crew: '<path d="M5 2h5v5H5zM3 14v-4h9v4M12 3h2v4M14 10h1v4"/>',
     work: '<path d="M3 2h10v12H3zM6 5h4M6 8h4M6 11h2"/>',
     build: '<path d="M2 2h8l4 3-2 2-3-2H2zM6 5v9h3V5"/>',
-    system: '<path d="M4 4h8v8H4zM6 6h4v4H6zM6 1v3M10 1v3M6 12v3M10 12v3M1 6h3M1 10h3M12 6h3M12 10h3"/>'
+    system: '<path d="M4 4h8v8H4zM6 6h4v4H6zM6 1v3M10 1v3M6 12v3M10 12v3M1 6h3M1 10h3M12 6h3M12 10h3"/>',
+    apps: '<path d="M2 2h5v5H2zM9 2h5v5H9zM2 9h5v5H2zM9 9h5v5H9z"/>'
   };
   Object.entries(dockIcons).forEach(([group, paths]) => {
     const icon = document.querySelector('#bottombar [data-group="'+group+'"] > .bb-grp .bb-gi');
@@ -35,16 +36,19 @@
     recipes:'M3 2h10v12H3zM6 5h4M6 8h4M6 11h2',
     automation:'M3 6V3h10v4M11 5l2 2 2-2M13 10v3H3V9M1 11l2-2 2 2',
     quests:'M4 14V2h8l-2 3 2 3H4',
+    workflows:'M1 6h3v4H1zM6.5 6h3v4h-3zM12 6h3v4h-3zM4 8h2.5M9.5 8H12',
     refit:'M2 3h12v10H2zM7 3v10M7 8h7',
     connectors:'M3 2v4M7 2v4M2 6h6v4H2zM5 10v3h8V9',
     messaging:'M2 3h12v9H7l-3 2v-2H2zM5 6h6M5 9h4',
     manual:'M8 4L2 2v10l6 2 6-2V2zM8 4v10',
     settings:'M2 4h12M2 8h12M2 12h12M5 2v4M11 6v4M7 10v4',
     updates:'M8 12V2M4 6l4-4 4 4M2 11v3h12v-3',
-    notifs:'M5 3h6v7l2 2H3l2-2zM7 14h2'
+    notifs:'M5 3h6v7l2 2H3l2-2zM7 14h2',
+    apps:'M2 2h5v5H2zM9 2h5v5H9zM2 9h5v5H2zM9 9h5v5H9z',
+    newapp:'M2 2h12v12H2zM8 5v6M5 8h6'
   };
   document.querySelectorAll('#bottombar .bb-menu .bb').forEach(button=>{
-    const key=button.dataset.term || ({'bb-recruit':'recruit','bb-missions':'recipes','bb-build':'refit'})[button.id];
+    const key=button.dataset.term || ({'bb-recruit':'recruit','bb-missions':'recipes','bb-build':'refit','bb-newapp':'newapp','bb-newapp-build':'newapp','bb-mywork':'tasks','bb-automate':'automation','bb-connect':'connectors'})[button.id];
     const icon=button.querySelector('.bb-i');
     if(icon && menuPaths[key]){icon.setAttribute('aria-hidden','true');icon.innerHTML=svgIcon(menuPaths[key]);}
   });
@@ -65,7 +69,9 @@
     s.exiting = !showing;
     w.inert = !showing;
     if (showing) seat(w,s);
-    if (reducedMotion.matches) { done(); return; }
+    // a ONE MENU tab switch (stationui switchFamilyTab) swaps windows in place: no sheet travel either way
+    const famSwitch = typeof document !== 'undefined' && !!document.body && document.body.hasAttribute('data-fam-switch');
+    if (reducedMotion.matches || famSwitch) { done(); return; }
     const style = getComputedStyle(w);
     const duration = parseFloat(style.getPropertyValue('--t-med')) || 220;
     w.style.willChange = 'translate, opacity';
@@ -87,8 +93,13 @@
   });
   const zoom = () => Number.parseFloat(getComputedStyle(document.body).zoom) || 1;
   const rect = el => el && el.getBoundingClientRect();
+  // A bar that is not on screen (HUD mode hides #topbar/#bottombar) measures as a zero rect; seating
+  // against it put sheets at a negative top, off-screen. A hidden bar is no bar; in the HUD the deck is the top edge.
+  const shown = r => (r && r.width > 0 && r.height > 0 ? r : null);
   function band() {
-    const z = zoom(), top = rect(document.querySelector('#topbar')), bottom = rect(document.querySelector('#bottombar'));
+    const z = zoom();
+    const top = shown(rect(document.querySelector('#topbar'))) || shown(rect(document.querySelector('#hud-deck')));
+    const bottom = shown(rect(document.querySelector('#bottombar')));
     const left = rect(document.querySelector('#left')), right = rect(document.querySelector('#chat-panel'));
     let x = left && left.width ? left.right + 10 : 12;
     let end = right && right.width ? right.left - 10 : innerWidth - 12;
@@ -101,7 +112,20 @@
     // Catalogs need room below their search/category controls on first open.
     // An explicit drag/keyboard height still wins, exactly as for every other sheet.
     const catalog = w.classList.contains('mkt-window') && w.querySelector('.mkt-stage');
-    const preferred = catalog ? Math.max(available * .75, w.offsetHeight - catalog.offsetHeight + 260) : available * .56;
+    // The BROWSER window shows a whole web page: at 56% of the band the page is a letterbox strip.
+    const page = w.classList.contains('browser-win');
+    // The WORKFLOWS window is a work surface: the job, the step working on it and the whole result want the room (2026-09-30).
+    const work = w.classList.contains('wfw-win');
+    // The ADD AGENTS picker is a roster you pick from: at 56% its add list showed one agent and a half (walk 10-14 #9).
+    // Its two lists keep floors (two agents to add, one member); on a short screen 80% is under them, so it opens as tall as
+    // its own overflow says they need (review 10-14: DONE sat 18px under the fold at 1366x768) — still capped by the band.
+    const roster = w.classList.contains('gc-picker-win'), rosterBody = roster && w.querySelector('.term-body');
+    const rosterNeed = rosterBody ? w.offsetHeight - rosterBody.clientHeight + rosterBody.scrollHeight : 0;
+    // The rail windows (CONNECT, SETTINGS, the dossiers, MY WORK, AUTOMATE …) are pages you read and pick from: at 56% a
+    // newcomer met a ~470px porthole onto thousands of px, and CONNECT showed its intro but not one service (UX night 10-25).
+    // NOTIFICATIONS stays a short sheet: it is a log you glance at.
+    const reading = w.classList.contains('console') && !w.classList.contains('notifs-win');
+    const preferred = catalog ? Math.max(available * .75, w.offsetHeight - catalog.offsetHeight + 260) : page ? available * .82 : work ? available * .8 : roster ? Math.max(available * .8, rosterNeed) : reading ? available * .8 : available * .56;
     const h = s.expanded ? available : Math.min(available, Math.max(220, s.height || preferred));
     w.style.animation = 'none'; w.style.transform = 'none';
     const geometry = {left:b.x+'px',top:(b.bottom-h)+'px',width:b.width+'px',height:h+'px',maxWidth:b.width+'px',maxHeight:available+'px'};
@@ -120,6 +144,12 @@
     const remember = () => { if (w._saveDockState) w._saveDockState(s); };
     w.classList.add('gd-sheet');
     w._fitDockedSheet = () => { if (!s.docked) return false; seat(w,s); return true; };
+    // a tab swap that carried another window's docked height in AFTER this sheet mounted: take it and re-seat
+    w._reseatDock = () => {
+      const d = w._readDockState ? w._readDockState() : {};
+      s.docked = true; s.expanded = d.expanded === true; s.height = Number.isFinite(d.height) && d.height > 0 ? d.height : null;
+      seat(w,s);
+    };
     w._animateSheet = (phase, done) => moveSheet(w,s,phase === 'restore',done);
     const controls = document.createElement('span'); controls.className = 'gd-controls';
     const button = (label, action) => {
@@ -193,6 +223,9 @@
     seat(w,s,true);
   }
   const host=document.querySelector('#terms'); if(!host)return;
+  // stationui seats a new window through this the moment its empty frame mounts, before the builder fills it (one full layout
+  // of the content, at the docked width); the observer below still catches any window added some other way
+  host._seatSheet = w => { if (!states.has(w)) attach(w); };
   const update=()=>{
     states.forEach((s,w)=>{if(!w.isConnected){cancelMotion(w,s);states.delete(w);}});
     host.querySelectorAll('.term').forEach(w=>{if(!states.has(w))attach(w);});

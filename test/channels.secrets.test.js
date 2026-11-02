@@ -10,6 +10,7 @@
        and exposes a token-gated /api/channels/token push that never echoes the token.
      • the Rust shell injects SKYNET_<ID>_TOKEN from the keychain, migrates plaintext, and gates the command. */
 'use strict';
+const { readSidecarSource } = require('./helpers/source');
 const A = require('./_assert.js');
 const fs = require('fs');
 const path = require('path');
@@ -180,6 +181,34 @@ const root = path.resolve(__dirname, '..');
   }
 }
 
+// ---- E4. Slack + Matrix are keychain channels too; Signal carries no secret (config only) ----
+//   The shell's keychain table now covers every channel credential. The sidecar side of the split must treat the
+//   Slack pair and the Matrix access token exactly like the Telegram/Discord tokens: stripped only with proof,
+//   kept as the last copy without it, and never touching the non-secret endpoint/account config.
+{
+  const secrets = {
+    slack: { token: 'xoxb-1 xapp-1', key: 'sk-s', model: 'm', enabled: true },
+    matrix: { token: 'syt_2', key: 'sk-m', endpoint: 'https://matrix.example', model: 'm' },
+    signal: { endpoint: 'http://127.0.0.1:8080', account: '+15550001111', key: 'sk-g', model: 'm' }
+  };
+  const failed = S.migratePlaintext(secrets, { keychainMode: true, hasChannelToken: () => false });
+  A.eq(failed.config.slack.token, 'xoxb-1 xapp-1', 'keychain write failed: the Slack pair stays on disk (last copy)');
+  A.eq(failed.config.matrix.token, 'syt_2', 'keychain write failed: the Matrix token stays on disk (last copy)');
+  A.eq(failed.imports.map(i => i.id).sort(), ['matrix', 'slack'], 'Slack + Matrix are reported for keychain adoption; Signal is not');
+  A.eq(failed.config.signal, { endpoint: 'http://127.0.0.1:8080', account: '+15550001111', model: 'm' }, 'Signal keeps its endpoint/account config, loses only the provider key');
+
+  const proven = S.migratePlaintext(secrets, { keychainMode: true, hasChannelToken: (id, tok) => (id === 'slack' && tok === 'xoxb-1 xapp-1') || (id === 'matrix' && tok === 'syt_2') });
+  A.ok(!('token' in proven.config.slack) && !('token' in proven.config.matrix), 'keychain read-back proven: Slack + Matrix plaintext stripped');
+  A.eq(proven.config.matrix.endpoint, 'https://matrix.example', 'the Matrix homeserver (non-secret) survives the strip');
+
+  const stale = S.migratePlaintext(secrets, { keychainMode: true, hasChannelToken: (id, tok) => id === 'matrix' && tok === 'syt_OLD' });
+  A.eq(stale.config.matrix.token, 'syt_2', 'a keychain holding a DIFFERENT Matrix token cannot prove this one durable');
+
+  const persisted = S.stripTokens(secrets, (id) => id === 'slack');
+  A.ok(!('token' in persisted.slack), 'desktop persist: durable Slack pair stripped');
+  A.eq(persisted.matrix.token, 'syt_2', 'desktop persist: non-durable Matrix token kept');
+}
+
 // ---- F. migratePlaintext: a secret-free desktop config is a no-op (no needless rewrite) ----
 {
   const secrets = { telegram: { model: 'm', enabled: false }, notifyAutonomous: true };
@@ -210,7 +239,8 @@ const root = path.resolve(__dirname, '..');
 
 // ---- G. sidecar host wiring (static guard on index.js) ----
 {
-  const src = fs.readFileSync(path.join(root, 'sidecar', 'index.js'), 'utf8');
+  // the host wherever it lives — but not the modules that DEFINE what it wires (secrets.js, child-env.js, registry.js)
+  const src = readSidecarSource({ except: ['sidecar/channels/secrets.js', 'sidecar/child-env.js', 'sidecar/channels/registry.js'] });
   A.ok(/require\(['"]\.\/channels\/secrets\.js['"]\)/.test(src), 'index.js requires the secrets module');
   A.ok(/DESKTOP_SHELL\s*=\s*\/\^\(1\|true\|yes\|on\)/.test(src), 'index.js derives DESKTOP_SHELL from the shell env');
   A.ok(/channelTokenRuntime/.test(src), 'index.js has a runtime channel-token layer');
@@ -219,7 +249,7 @@ const root = path.resolve(__dirname, '..');
   A.ok(/SKYNET_TELEGRAM_TOKEN|TELEGRAM_TOKEN/.test(src) && /DISCORD_TOKEN/.test(src), 'index.js seeds tokens from env');
   A.ok(/DESKTOP_SHELL\s*\?\s*channelSecretsMod\.stripTokens\(obj,\s*isChannelTokenDurable\)/.test(src), 'saveChannelSecrets strips secrets DURABILITY-AWARE under the desktop shell (never the last copy)');
   A.ok(/migratePlaintext/.test(src), 'index.js runs the boot migration');
-  A.ok(/'\/api\/channels\/token'/.test(src) && /handleSetChannelToken/.test(src), 'index.js wires the token-push route');
+  A.ok(/exact: '\/api\/channels\/token', h: handleSetChannelToken \}/.test(src), 'index.js wires the token-push route');
   // DURABILITY LEDGER (Andrew's invariant): a ledger exists, spawn-env seeds it durable, and a body-token stays non-durable.
   A.ok(/channelTokenDurable/.test(src), 'index.js tracks per-channel token durability');
   A.ok(/function isChannelTokenDurable/.test(src), 'index.js exposes isChannelTokenDurable(id)');
@@ -229,7 +259,7 @@ const root = path.resolve(__dirname, '..');
   A.ok(/if\s*\(savedRecord\s*&&\s*savedRecord\.token\)\s*return String\(savedRecord\.token\)/.test(src), 'channelToken() allows the plaintext-record fallback (desktop included)');
   A.ok(!/!DESKTOP_SHELL\s*&&\s*savedRecord\s*&&\s*savedRecord\.token/.test(src), 'channelToken() no longer blocks the plaintext fallback on desktop');
   // /status exposes a truthful `durable` flag (keychain/env OR plaintext-on-disk).
-  A.ok(/durable:\s*durable/.test(src), '/status endpoints report a truthful durable flag');
+  A.ok(/configured: configured, durable: durable/.test(src), '/status endpoints report a truthful durable flag');
   A.ok(/handleChannelSync[\s\S]*?channelToken\(['"]telegram['"],\s*['"]['"],\s*t\)/.test(src), 'Telegram identity sync resolves a keychain/runtime token instead of requiring a plaintext copy');
   A.ok(/channelTokenDurable\[channel\]\s*=\s*tok/.test(src), 'a /api/channels/token push records the exact keychain-backed value as durable');
   // P1 key hygiene: the boot migration also sweeps the .bak, and the provider key is resolved from the runtime
@@ -308,6 +338,15 @@ const root = path.resolve(__dirname, '..');
   A.ok(/mod credentials;/.test(mainRs), 'main.rs owns one focused native credential module');
   A.ok(/SIDECAR_CHANNEL_TOKEN_ENVS/.test(credentialsRs), 'credentials.rs declares the channel-token env table');
   A.ok(/"telegram",\s*"SKYNET_TELEGRAM_TOKEN"/.test(credentialsRs) && /"discord",\s*"SKYNET_DISCORD_TOKEN"/.test(credentialsRs), 'credentials.rs maps both channels to their spawn env vars');
+  A.ok(/"slack",\s*"SKYNET_SLACK_TOKEN"/.test(credentialsRs) && /"matrix",\s*"SKYNET_MATRIX_TOKEN"/.test(credentialsRs), 'credentials.rs keychains the Slack pair and the Matrix access token too');
+  // the Rust env names and the sidecar's CHANNEL_TOKEN_ENV must agree for every keychained channel
+  const idx = readSidecarSource();
+  const envTable = /const CHANNEL_TOKEN_ENV = \{([^}]*)\}/.exec(idx);
+  A.ok(!!envTable, 'index.js declares CHANNEL_TOKEN_ENV');
+  for (const m of credentialsRs.matchAll(/\("([a-z]+)",\s*"SKYNET_([A-Z_]+)"\)/g)) {
+    if (!/_TOKEN$/.test(m[2])) continue;
+    A.ok(new RegExp('\\b' + m[1] + ":\\s*'" + m[2] + "'").test(envTable ? envTable[1] : ''), 'sidecar reads the ' + m[1] + ' keychain env (' + m[2] + ')');
+  }
   A.ok(/format!\("channel:\{channel\}"\)/.test(credentialsRs), 'credentials.rs uses the channel:<id> keychain account');
   A.ok(/read_channel_token\(channel\)/.test(nativeRs) && /set_sidecar_branded_env\(&mut cmd, env_name, token\)/.test(mainRs), 'main.rs injects module-owned keychain tokens into both branded sidecar env aliases at spawn');
   A.ok(/fn read_telegram_bot_tokens/.test(credentialsRs) && /SKYNET_TELEGRAM_BOT_TOKENS/.test(mainRs), 'the shell injects saved agent-bot keychain tokens at every sidecar spawn');
@@ -319,7 +358,9 @@ const root = path.resolve(__dirname, '..');
   A.ok(/fn harness_store_channel_token[\s\S]*?set_password[\s\S]*?push_channel_token/.test(mainRs), 'store command writes the keychain then pushes to the sidecar');
   // DURABILITY (Andrew's invariant): the plaintext-token migration only strips the file token AFTER a keychain
   // read-back confirms the keychain actually holds it — a failed set_password must leave the plaintext copy intact.
-  A.ok(/fn migrate_channel_tokens_from_plaintext[\s\S]*?read_channel_token\(channel\)[\s\S]*?keychain_has_it[\s\S]*?\.remove\("token"\)/.test(credentialsRs), 'migrate strips the plaintext token only after a keychain read-back confirms it (never destroys the last copy)');
+  A.ok(/fn migrate_channel_tokens_from_plaintext[\s\S]*?migrate_channel_tokens_with\(&KeyringChannelStore/.test(credentialsRs), 'the boot migration writes through the real keychain store');
+  A.ok(/fn migrate_channel_tokens_with[\s\S]*?store\s*\.read\(channel\)[\s\S]*?keychain_has_it[\s\S]*?\.remove\("token"\)/.test(credentialsRs), 'migrate strips the plaintext token only after a keychain read-back confirms it (never destroys the last copy)');
+  A.ok(/fn failed_keychain_writes_leave_the_plaintext_file_byte_identical/.test(credentialsRs), 'a Rust unit test proves the write-failure path keeps the plaintext file intact');
 }
 
 // ---- J. frontend routes the token through the keychain on desktop, POST-body on browser ----
@@ -403,7 +444,7 @@ const root = path.resolve(__dirname, '..');
   // 6) host wiring static guards: index.js persists through the verified factory, RETURNS the ok bit, and the
   //    routes surface it (notify 500s, disconnect never claims `purged` on an unproven write).
   {
-    const idx = fs.readFileSync(path.join(root, 'sidecar', 'index.js'), 'utf8');
+    const idx = readSidecarSource();
     A.ok(/persistChannelSecretsVerified = channelSecretsMod\.makeVerifiedPersist\(\{/.test(idx), 'saveChannelSecrets rides makeVerifiedPersist (read-back-proven)');
     A.ok(/const r = persistChannelSecretsVerified\(obj\);[\s\S]{0,400}?return r\.ok;/.test(idx), 'saveChannelSecrets returns the proven ok bit');
     A.ok(/if \(!saveChannelSecrets\(channelSecrets\)\) \{ res\.writeHead\(500/.test(idx), 'the notify route surfaces a failed persist as 500 (the old guard was unreachable)');

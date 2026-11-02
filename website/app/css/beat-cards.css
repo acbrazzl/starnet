@@ -31,7 +31,7 @@ body #chat-panel .cmsg:is(.turnin,.nudge,.consent) :is(.turnin-text,.ws-line,.ws
 body #chat-panel .cmsg:is(.turnin,.nudge,.consent) :is(.ws-k,.ws-fhead,.turnin-kind,.ws-kindchip,.turnin-queue) {
   font-size: var(--sn-type-meta) !important; line-height: 1.35; letter-spacing: .65px;
 }
-body #chat-panel .cmsg:is(.turnin,.nudge,.consent) :is(.turnin-evidence,.work-rate-hint,.work-rate-reference,.consent-result,.ws-verline,.ws-vcmd,.ws-vexit,.tq-reason,.tq-hint) {
+body #chat-panel .cmsg:is(.turnin,.nudge,.consent) :is(.turnin-evidence,.work-rate-hint,.work-rate-reference,.consent-result,.consent-hint,.ws-verline,.ws-vcmd,.ws-vexit,.tq-reason,.tq-hint) {
   font-size: var(--sn-type-control) !important; line-height: 1.45;
   color: var(--text); opacity: 1; letter-spacing: .15px;
 }
@@ -51,9 +51,9 @@ body #chat-panel .cmsg :is(.turnin-kind,.ws-kindchip,.turnin-queue) {
 }
 body #chat-panel .cmsg .turnin-queue { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
 /* Actions wrap as units. Narrow COMMS must grow vertically, never shrink its text. */
-body #chat-panel :is(.cmsg.turnin,.cmsg.nudge,.cmsg.consent) .consent-btns,
+body #chat-panel :is(.cmsg.turnin,.cmsg.nudge,.cmsg.consent,.dg-inspect) .consent-btns,
 body #chat-panel .turnin-rate { display: flex; flex-wrap: wrap; gap: 8px; }
-body #chat-panel :is(.cmsg.turnin,.cmsg.nudge,.cmsg.consent) .consent-btn,
+body #chat-panel :is(.cmsg.turnin,.cmsg.nudge,.cmsg.consent,.dg-inspect) .consent-btn,
 body #chat-panel .choice-row .choice {
   min-width: 0; min-height: 34px; max-width: 100%; padding: 7px 11px;
   font-family: inherit; font-size: var(--sn-type-control) !important; line-height: 1.3;
@@ -63,22 +63,22 @@ body #chat-panel .choice-row .choice {
   box-shadow: inset 0 1px 0 var(--beat-light); text-shadow: none;
   transition: background-color var(--t-fast) var(--ease-soft), border-color var(--t-fast) var(--ease-soft);
 }
-body #chat-panel :is(.cmsg.turnin,.cmsg.nudge,.cmsg.consent) .consent-btn:hover,
+body #chat-panel :is(.cmsg.turnin,.cmsg.nudge,.cmsg.consent,.dg-inspect) .consent-btn:hover,
 body #chat-panel .choice-row .choice:hover {
   background: var(--beat-hover); border-color: var(--ph-dim); text-shadow: none;
 }
-body #chat-panel :is(.cmsg.turnin,.cmsg.nudge,.cmsg.consent) .consent-btn:is(.primary,.ws-openit,.ws-primary,.consent-confirm),
+body #chat-panel :is(.cmsg.turnin,.cmsg.nudge,.cmsg.consent,.dg-inspect) .consent-btn:is(.primary,.ws-openit,.ws-primary,.consent-confirm),
 body #chat-panel .choice-row .choice:is(.suggested,.confirm) {
   border-color: rgba(var(--gold-rgb),.5); color: var(--ph-bright);
   background: linear-gradient(140deg,rgba(var(--gold-rgb),.15),rgba(var(--ph-rgb),.04));
 }
-body #chat-panel :is(.cmsg.turnin,.cmsg.nudge,.cmsg.consent) .consent-btn.deny {
+body #chat-panel :is(.cmsg.turnin,.cmsg.nudge,.cmsg.consent,.dg-inspect) .consent-btn.deny {
   color: var(--bad); border-color: color-mix(in srgb,var(--bad) 35%,transparent);
   background: color-mix(in srgb,var(--bad) 4%,transparent);
 }
-body #chat-panel :is(.cmsg.turnin,.cmsg.nudge,.cmsg.consent) .consent-btn.quiet,
+body #chat-panel :is(.cmsg.turnin,.cmsg.nudge,.cmsg.consent,.dg-inspect) .consent-btn.quiet,
 body #chat-panel .choice-row .choice.quiet { color: var(--text); opacity: 1; }
-body #chat-panel :is(.cmsg.turnin,.cmsg.nudge,.cmsg.consent) .consent-btn:disabled {
+body #chat-panel :is(.cmsg.turnin,.cmsg.nudge,.cmsg.consent,.dg-inspect) .consent-btn:disabled {
   color: var(--text); opacity: .55; cursor: default; background: transparent; box-shadow: none;
 }
 body #chat-panel :is(.cmsg.turnin,.cmsg.nudge,.cmsg.consent,.choice-row) :is(button,input,textarea):focus-visible {
@@ -135,8 +135,11 @@ body #chat-panel .workshop-return .ws-plan {
   body #chat-panel .choice-row .choice { transition: none; }
 }
 /* Preserve the meaning of host-owned approval and multi-select states. */
-body #chat-panel :is(.cmsg.turnin,.cmsg.nudge,.cmsg.consent) .consent-btn.danger {
-  color: var(--warn); border-color: rgba(var(--gold-rgb),.5);
+/* Full access warns in its words and colour only: a gold edge made it look like the suggested key (2026-10-13 review) */
+body #chat-panel :is(.cmsg.turnin,.cmsg.nudge,.cmsg.consent) .consent-btn.danger { color: var(--warn); }
+/* the key just pressed stays lit while its answer is on its way */
+body #chat-panel :is(.cmsg.turnin,.cmsg.nudge,.cmsg.consent) .consent-btn.sel:disabled {
+  opacity: 1; color: var(--ph-bright); border-color: var(--ph); background: rgba(var(--ph-rgb),.2);
 }
 body #chat-panel :is(.cmsg.turnin,.cmsg.nudge,.cmsg.consent) .consent-btn.sel,
 body #chat-panel .choice-row .choice.sel {
@@ -256,7 +259,59 @@ body .task-conversation :is(.tc-caption,.tc-dimension,.tc-answer-label,.tc-hint)
   font-size: var(--sn-type-meta) !important; line-height: 1.45; letter-spacing: .45px; color: var(--text);
 }
 body .task-conversation :is(.tc-caption,.tc-dimension) { color: var(--ph); }
-body .task-conversation .tc-question { font-size: var(--sn-type-title) !important; line-height: 1.4; }
+body .task-conversation .tc-question { font-size: var(--sn-type-prose) !important; line-height: 1.45; }   /* the question at the same 18px as every other card */
+/* the one-on-one choice question (chat.js clarifyRow): who asks, the question at reading size, a plain hint, the reason
+   folded — the same reading order as the group question card */
+body #chat-panel .cmsg.consent[data-clarify-prompt] .cq-who {
+  font-size: var(--sn-type-meta) !important; line-height: 1.3; letter-spacing: 1.2px; text-transform: uppercase; color: var(--gold);
+}
+body #chat-panel .cmsg.consent[data-clarify-prompt] .cq-text {
+  margin: 6px 0 4px; font-size: var(--sn-type-prose) !important; line-height: 1.45; color: var(--ph-bright); white-space: pre-wrap;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden;
+}
+/* a long question shows three lines; the whole of it is one tap away (chat.js / taskconversation.js measure it) */
+body #chat-panel .cmsg.consent[data-clarify-prompt].cq-open .cq-text,
+body .task-conversation.tc-open .tc-question { display: block; -webkit-line-clamp: unset; overflow: visible; }
+body .task-conversation .tc-question { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; white-space: pre-wrap; }
+body #chat-panel .cmsg.consent[data-clarify-prompt] .cq-whole,
+body .task-conversation .tc-whole {
+  display: block; margin: 0 0 6px; padding: 3px 0; min-height: 0; font: inherit; font-size: var(--sn-type-meta) !important;
+  letter-spacing: .3px; color: var(--ph); background: none; border: 0; box-shadow: none; text-shadow: none; cursor: pointer;
+}
+body #chat-panel .cmsg.consent[data-clarify-prompt] .cq-whole[hidden], body .task-conversation .tc-whole[hidden] { display: none; }
+body #chat-panel .cmsg.consent[data-clarify-prompt] .cq-whole:focus-visible { outline: 2px solid var(--ph); outline-offset: 2px; }
+body #chat-panel .cmsg.consent[data-clarify-prompt] .consent-btns { margin: 8px 0 0; flex-direction: column; align-items: stretch; gap: 6px; }
+body #chat-panel .cmsg.consent[data-clarify-prompt] .consent-btn { text-align: left; }
+body #chat-panel .cmsg.consent[data-clarify-prompt] .consent-btn.quiet { background: transparent; box-shadow: none; }   /* full width like the answers, quieter */
+body #chat-panel .cmsg.consent[data-clarify-prompt] .cq-why { margin: 6px 0 0; }
+body #chat-panel .cmsg.consent[data-clarify-prompt] .cq-why > summary {
+  cursor: pointer; padding: 3px 0; font-size: var(--sn-type-meta) !important; letter-spacing: .3px; color: var(--ph);
+}
+body #chat-panel .cmsg.consent[data-clarify-prompt] .cq-why > summary:focus-visible { outline: 2px solid var(--ph); outline-offset: 2px; }
+body #chat-panel .cmsg.consent[data-clarify-prompt] .cq-why > p {
+  margin: 6px 0 2px; font-size: var(--sn-type-control) !important; line-height: 1.5; color: var(--text);
+}
+body #chat-panel .cmsg.consent[data-clarify-prompt] .cq-hint {
+  margin: 8px 0 0; font-size: var(--sn-type-meta) !important; line-height: 1.4; color: var(--text); opacity: .85;
+}
+/* a starting point that is in the answer shows it (✓ + the pressed face) */
+body .task-conversation .consent-btn.tc-shortcut[aria-pressed=true] { color: var(--ph-bright); border-color: var(--ph); background: rgba(var(--ph-rgb),.2); }
+/* the pixel face draws "fi" as a broken ligature ("frst", "defned"): COMMS reads letter by letter */
+body #chat-panel { font-variant-ligatures: none; }
+/* ONE disclosure marker on every card: the folds draw the same ▸ / ▾ the "Show the whole question" key does */
+body #chat-panel :is(.cq-why, .tc-why, .tc-draft, .tc-understanding, .tc-receipt, .consent-payload) > summary { list-style: none; text-wrap: pretty; }
+body #chat-panel :is(.cq-why, .tc-why, .tc-draft, .tc-understanding, .tc-receipt, .consent-payload) > summary::-webkit-details-marker { display: none; }
+body #chat-panel :is(.cq-why, .tc-why, .tc-draft, .tc-understanding, .tc-receipt, .consent-payload) > summary::before { content: '▸ '; }
+body #chat-panel :is(.cq-why, .tc-why, .tc-draft, .tc-understanding, .tc-receipt, .consent-payload)[open] > summary::before { content: '▾ '; }
+/* no orphan word on its own line under a hint or a question */
+body #chat-panel :is(.cq-hint, .tc-hint, .cq-text, .tc-question) { text-wrap: pretty; }
+/* the reason and the draft fold under labelled lines: the question and the answer box lead the card */
+body .task-conversation :is(.tc-why,.tc-draft) { margin: 8px 0; }
+body .task-conversation :is(.tc-why,.tc-draft) > summary {
+  cursor: pointer; padding: 4px 0; font-size: var(--sn-type-meta) !important; letter-spacing: .3px; color: var(--ph);
+}
+body .task-conversation :is(.tc-why,.tc-draft) > summary:focus-visible { outline: 2px solid var(--ph); outline-offset: 2px; }
+body .task-conversation .tc-why .tc-reason { margin: 6px 0 2px; }
 body .task-conversation :is(.tc-reason,.tc-understanding,.tc-sample-text,.tc-answer-sent) {
   font-size: var(--sn-type-prose) !important; line-height: 1.5; color: var(--text);
 }
@@ -269,9 +324,11 @@ body .task-conversation .tc-answer { font-size: var(--sn-type-control) !importan
 body .task-conversation .tc-answer::placeholder { font-size: inherit; color: var(--text); opacity: .8; }
 body .task-conversation .consent-btn {
   min-height: 34px; max-width: 100%; padding: 7px 11px; font-size: var(--sn-type-control) !important;
-  line-height: 1.4; white-space: normal; border: 1px solid var(--beat-edge); border-radius: 6px;
+  line-height: 1.4; white-space: normal; border: 1px solid var(--beat-edge); border-radius: 5px;
   background: rgba(var(--ph-rgb),.04); color: var(--ph-bright); text-shadow: none;
 }
+/* the skip key reads as the quieter choice beside Send answer (the dim rule in app.css lost to the key colour above) */
+body .task-conversation .consent-btn.tc-skip { color: var(--text); }
 body .task-conversation .consent-btn.primary { border-color: rgba(var(--gold-rgb),.5); background: rgba(var(--gold-rgb),.12); }
 body .task-conversation .consent-btn:enabled:hover { background: var(--beat-hover); }
 body .task-conversation .consent-btn:disabled { opacity: .45; cursor: default; }
@@ -304,4 +361,159 @@ body .toast .toast-lamp { font-size: var(--sn-type-meta); }
   body #chat-panel .receipts .turnin-kind { justify-self: start; }
   body #chat-panel .receipts .receipt-text { grid-column: 1; }
   body #chat-panel .receipts .receipt-veto { grid-column: 2; grid-row: 1 / span 2; }
+}
+
+/* ============================================================
+   DELEGATED WORK (2026-10-10, delegated.js). The decision-card material (--beat-*): a dispatch is the same kind of
+   object as an approval or a turn-in, a live status you can act on. Andrew 10-10 on the first calm pass (a bare rule,
+   14-15px type, underlined "stop" / "back to" links): "ugly like the old version of starnet, cheap looking". One card
+   per dispatch: a head that says who has the work and where it stands, then (while it runs, or on a click) one row
+   per worker with ONE real key, Stop while it runs, Open after. Matte: state is a lamp / edge / fill, never a glow.
+   ============================================================ */
+body #chat-panel #chat-log > .dg-line {
+  min-width: 0; margin: 10px 0 12px; overflow: hidden;
+  border: 1px solid var(--beat-edge); border-left: 2px solid rgba(var(--ph-rgb), .55); border-radius: 10px;
+  background: var(--beat-face); box-shadow: inset 0 1px 0 var(--beat-light), 0 4px 16px rgba(0,0,0,.18);
+  color: var(--text); text-shadow: none;
+}
+body #chat-panel #chat-log > .dg-line:has(.dg-line-sum.waiting) { border-left-color: rgba(var(--gold-rgb), .75); }
+body #chat-panel #chat-log > .dg-line .dg-line-head {
+  display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0; min-height: 46px; padding: 10px 14px;
+  font: inherit; font-size: var(--sn-type-control) !important; line-height: 1.3; letter-spacing: .2px; text-align: left; color: var(--text);
+  background: transparent; border: 0; border-radius: 0; box-shadow: none; text-shadow: none; cursor: pointer;
+  transition: background-color var(--t-fast) var(--ease-soft);
+}
+body #chat-panel #chat-log > .dg-line .dg-line-head:hover { background: var(--beat-hover); }
+body #chat-panel #chat-log > .dg-line .dg-line-head:focus-visible { outline: 2px solid var(--ph); outline-offset: -2px; }
+body #chat-panel #chat-log > .dg-line .dg-line-text { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+body #chat-panel #chat-log > .dg-line .dg-line-text b { font-weight: normal; color: var(--ph-bright); letter-spacing: .6px; }
+body #chat-panel #chat-log > .dg-line .dg-line-sum { flex: none; font-size: var(--sn-type-compact) !important; color: var(--text); }
+body #chat-panel #chat-log > .dg-line .dg-line-sum.working { color: var(--ph-bright); }
+body #chat-panel #chat-log > .dg-line .dg-line-sum.waiting { color: var(--gold); }
+body #chat-panel #chat-log > .dg-line .dg-line-sum.failed { color: var(--bad); }
+/* a drawn chevron (never a fallback-font glyph): right when folded, down when the rows show */
+body #chat-panel #chat-log > .dg-line .dg-caret {
+  flex: none; width: 8px; height: 8px; margin: 0 3px; border-right: 2px solid var(--ph); border-bottom: 2px solid var(--ph);
+  transform: rotate(-45deg); transition: transform var(--t-fast) var(--ease-soft);
+}
+body #chat-panel #chat-log > .dg-line .dg-line-head[aria-expanded="true"] .dg-caret { transform: translateY(-2px) rotate(45deg); }
+/* the housed lamp (Workflow panel / crew lamp recipe): a lit square in a dark ring with a top light */
+body #chat-panel #chat-log > .dg-line .dg-lamp {
+  flex: none; width: 10px; height: 10px; border-radius: 2px; background: rgba(var(--ph-rgb), .22);
+  box-shadow: 0 0 0 1px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.3);
+}
+body #chat-panel #chat-log > .dg-line .dg-lamp.working { background: var(--ph); animation: dg-breathe 1.6s steps(8, jump-none) infinite; }
+body #chat-panel #chat-log > .dg-line .dg-lamp.queued { background: rgba(var(--ph-rgb), .45); }
+body #chat-panel #chat-log > .dg-line .dg-lamp.waiting { background: var(--gold); }
+body #chat-panel #chat-log > .dg-line .dg-lamp.done { background: var(--ok); }
+/* delivered, completion unknown (a pre-0.13.3 thread): the phosphor lamp, neither done-green nor failed-red */
+body #chat-panel #chat-log > .dg-line .dg-lamp.recorded { background: rgba(var(--ph-rgb), .7); }
+body #chat-panel #chat-log > .dg-line .dg-lamp:is(.failed, .stopped) { background: var(--bad); }
+@keyframes dg-breathe { 50% { opacity: .5; } }
+@media (prefers-reduced-motion: reduce) { body #chat-panel #chat-log > .dg-line .dg-lamp { animation: none !important; } }
+/* one row per worker: who + task, then where it stands under the task; its one key spans both lines */
+/* the rows share ONE set of columns (subgrid), so every task starts at the same x whatever the worker's name */
+body #chat-panel #chat-log > .dg-line .dg-line-list {
+  display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto; column-gap: 10px; border-top: 1px solid var(--beat-edge);
+}
+body #chat-panel #chat-log > .dg-line .dg-li {
+  grid-column: 1 / -1; display: grid; grid-template-columns: 10px auto minmax(0, 1fr) auto; grid-template-columns: subgrid;
+  align-items: center; column-gap: 10px; row-gap: 2px;
+  padding: 9px 12px 9px 14px;
+}
+body #chat-panel #chat-log > .dg-line .dg-li + .dg-li { border-top: 1px solid rgba(var(--ph-rgb), .08); }
+body #chat-panel #chat-log > .dg-line .dg-li > .dg-lamp { grid-column: 1; grid-row: 1; }
+body #chat-panel #chat-log > .dg-line .dg-li-who { grid-column: 2; grid-row: 1; font-size: var(--sn-type-control) !important; letter-spacing: 1px; color: var(--ph); }
+body #chat-panel #chat-log > .dg-line .dg-li-task {
+  grid-column: 3; grid-row: 1; min-width: 0; font-size: var(--sn-type-control) !important; color: var(--ph-bright);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+body #chat-panel #chat-log > .dg-line .dg-li-st {
+  grid-column: 3; grid-row: 2; min-width: 0; font-size: var(--sn-type-meta) !important; color: var(--text); opacity: .8;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+body #chat-panel #chat-log > .dg-line .dg-li.waiting .dg-li-st { color: var(--gold); opacity: 1; }
+body #chat-panel #chat-log > .dg-line .dg-li:is(.failed, .stopped) .dg-li-st { color: var(--bad); opacity: 1; }
+body #chat-panel #chat-log > .dg-line .dg-li > :is(.dg-key, .dg-keys) { grid-column: 4; grid-row: 1 / span 2; margin-left: 4px; }
+body #chat-panel #chat-log > .dg-line .dg-keys { display: flex; gap: 6px; }
+/* A WORKER WAITING ON YOU (rc walk 10-14: "Needs you · change taglin…" — its two answer keys took the width its ask needed):
+   the task and the ask take the whole row and the ask wraps rather than cut the path it names; the keys sit under them. */
+body #chat-panel #chat-log > .dg-line .dg-li.waiting .dg-li-task { grid-column: 3 / -1; }
+body #chat-panel #chat-log > .dg-line .dg-li.waiting .dg-li-st { grid-column: 3 / -1; white-space: normal; overflow-wrap: anywhere; }
+body #chat-panel #chat-log > .dg-line .dg-li.waiting > :is(.dg-key, .dg-keys) { grid-column: 3 / -1; grid-row: 3; justify-self: start; margin: 4px 0 0; }
+/* the key: the Build Library / Workflow panel glass key, at COMMS's 34px */
+body #chat-panel #chat-log .dg-line .dg-key {
+  min-height: 34px; padding: 6px 14px; font-family: inherit; font-size: var(--sn-type-control) !important; line-height: 1.15; letter-spacing: .4px;
+  color: var(--ph); border: 1px solid rgba(var(--ph-rgb), .2); border-radius: 8px; white-space: nowrap; cursor: pointer;
+  background: linear-gradient(125deg, rgba(var(--ph-bright-rgb), .09), rgba(var(--ph-rgb), .045) 48%, rgba(var(--ph-rgb), .015));
+  box-shadow: inset 0 1px 0 rgba(var(--ph-bright-rgb), .07); text-shadow: none;
+  transition: background-color var(--t-fast) var(--ease-soft), border-color var(--t-fast) var(--ease-soft), color var(--t-fast) var(--ease-soft);
+}
+body #chat-panel #chat-log .dg-line .dg-key:hover:not(:disabled) { color: var(--ph-bright); border-color: rgba(var(--ph-rgb), .45); background: rgba(var(--ph-rgb), .1); }
+body #chat-panel #chat-log .dg-line .dg-key:active:not(:disabled) { box-shadow: inset 0 2px 4px rgba(0,0,0,.35); }
+body #chat-panel #chat-log .dg-line .dg-key:focus-visible { outline: 2px solid var(--ph-bright); outline-offset: 2px; }
+body #chat-panel #chat-log .dg-line .dg-key.deny {
+  color: var(--bad); border-color: color-mix(in srgb, var(--bad) 35%, transparent); background: color-mix(in srgb, var(--bad) 5%, transparent);
+}
+body #chat-panel #chat-log .dg-line .dg-key.deny:hover:not(:disabled) { color: var(--bad); border-color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); }
+body #chat-panel #chat-log .dg-line .dg-key:disabled { opacity: .55; cursor: default; }
+/* the primary answer on a worker's ask: the consent card's lit key (gold edge), never a glow */
+body #chat-panel #chat-log .dg-line .dg-key.primary { color: var(--ph-bright); border-color: rgba(var(--gold-rgb), .55); background: linear-gradient(140deg, rgba(var(--gold-rgb), .15), rgba(var(--ph-rgb), .04)); }
+body #chat-panel #chat-log .dg-line .dg-key.primary:hover:not(:disabled) { border-color: var(--gold); background: rgba(var(--gold-rgb), .16); }
+/* SEE WORK (2026-10-11): a worker's own answer and "What MIRA did" receipt unfold in place under its row — the
+   conversation stays the one place. The receipt is a recessed well (matte), the answer reads at prose size. */
+body #chat-panel #chat-log > .dg-line .dg-line-list > .dg-work { grid-column: 1 / -1; padding: 2px 14px 14px 34px; border-top: 1px solid rgba(var(--ph-rgb), .08); }
+body #chat-panel #chat-log > .dg-line .dg-work-answer {
+  margin: 8px 0 10px; padding: 2px 0 2px 12px; border-left: 2px solid rgba(var(--ph-rgb), .35);
+  font-size: var(--sn-type-control) !important; line-height: 1.5; color: var(--text); overflow-wrap: anywhere;
+}
+/* a worker's report renders with the same report markdown as COMMS (Chat.renderProse): its headings are spans that are
+   block-level only under .cmsg .body, so here they ran inline into the text around them — "Here's what I found:3
+   Competitor Launch Emails — Desktop AI Agent SpaceI've sourced…" (live walkthrough 2026-10-13) */
+body #chat-panel #chat-log > .dg-line .dg-work-answer .md-p { display: block; white-space: pre-wrap; margin: .5em 0; }
+body #chat-panel #chat-log > .dg-line .dg-work-answer .md-h { display: block; margin: .65em 0 .3em; color: var(--ph-bright); letter-spacing: .5px; }
+body #chat-panel #chat-log > .dg-line .dg-work-answer > .md-h:first-child,
+body #chat-panel #chat-log > .dg-line .dg-work-answer > .md-p:first-child { margin-top: .2em; }
+body #chat-panel #chat-log > .dg-line .dg-work-answer .md-list { white-space: normal; margin: .4em 0; padding-left: 1.6em; }
+body #chat-panel #chat-log > .dg-line .dg-work-answer .md-quote { display: block; white-space: normal; margin: .5em 0; padding: .3em .7em; border-left: 2px solid var(--ph-faint); }
+body #chat-panel #chat-log > .dg-line .dg-work-note { margin: 8px 0; font-size: var(--sn-type-meta) !important; color: var(--text); opacity: .75; }
+body #chat-panel #chat-log > .dg-line .dg-work-note.bad { color: var(--bad); opacity: 1; }
+body #chat-panel #chat-log > .dg-line .dg-receipt {
+  padding: 10px 12px; border: 1px solid rgba(var(--ph-rgb), .16); border-radius: 8px;
+  background: rgba(0, 0, 0, .2); box-shadow: inset 0 1px 3px rgba(0, 0, 0, .18);
+}
+body #chat-panel #chat-log > .dg-line .dg-receipt-head {
+  display: flex; justify-content: space-between; gap: 10px; margin-bottom: 6px;
+  font-size: var(--sn-type-meta) !important; letter-spacing: 1.4px; text-transform: uppercase; color: var(--ph);
+}
+body #chat-panel #chat-log > .dg-line .dg-receipt-head > span:last-child { letter-spacing: .4px; text-transform: none; color: var(--text); }
+body #chat-panel #chat-log > .dg-line .dg-receipt-steps { margin: 0 0 6px; padding-left: 26px; font-size: var(--sn-type-compact) !important; line-height: 1.45; color: var(--text); }
+body #chat-panel #chat-log > .dg-line .dg-receipt-steps li { overflow-wrap: anywhere; }
+body #chat-panel #chat-log > .dg-line .dg-receipt-steps li::marker { color: rgba(var(--ph-rgb), .55); }
+body #chat-panel #chat-log > .dg-line .dg-receipt-steps li b { font-weight: normal; color: var(--ph-bright); }
+body #chat-panel #chat-log > .dg-line .dg-receipt-steps li.bad span { color: var(--bad); }
+body #chat-panel #chat-log > .dg-line .dg-receipt-row {
+  display: grid; grid-template-columns: 5.5em minmax(0, 1fr) auto; align-items: center; gap: 10px; min-height: 34px;
+  border-top: 1px solid rgba(var(--ph-rgb), .1); font-size: var(--sn-type-compact) !important; color: var(--text);
+}
+body #chat-panel #chat-log > .dg-line .dg-receipt-row .k { font-size: var(--sn-type-meta) !important; letter-spacing: 1.2px; text-transform: uppercase; color: var(--ph); }
+body #chat-panel #chat-log > .dg-line .dg-receipt-row .v { min-width: 0; overflow-wrap: anywhere; }
+
+/* Delegated details stay readable inside a resized COMMS panel, using the shared consent disclosure. */
+body #chat-panel #chat-log > .dg-line { container-type: inline-size; container-name: delegated; }
+body #chat-panel #chat-log > .dg-line .dg-inspect { grid-column: 1 / -1; min-width: 0; padding: 0 14px 8px 34px; }
+body #chat-panel #chat-log > .dg-line .dg-inspect:empty { display: none; }
+body #chat-panel #chat-log > .dg-line .dg-inspect summary { color: var(--gold); font-size: var(--sn-type-meta); overflow-wrap: anywhere; }
+body #chat-panel #chat-log > .dg-line .dg-inspect pre { max-height: 240px; padding: 10px; border: 1px solid var(--beat-edge); background: rgba(0,0,0,.2); font-size: var(--sn-type-meta); }
+body #chat-panel #chat-log > .dg-line .dg-inspect .consent-copy { min-height: 34px; }
+body #chat-panel #chat-log > .dg-line .dg-li { cursor: default; }
+@container delegated (max-width: 420px) {
+  body #chat-panel #chat-log > .dg-line .dg-line-head { flex-wrap: wrap; }
+  body #chat-panel #chat-log > .dg-line .dg-line-text { white-space: normal; }
+  body #chat-panel #chat-log > .dg-line .dg-line-sum { flex: 0 1 calc(100% - 20px); min-width: 0; margin-left: 20px; white-space: normal; overflow-wrap: anywhere; }
+  body #chat-panel #chat-log > .dg-line .dg-line-list { grid-template-columns: 10px auto minmax(0, 1fr); }
+  body #chat-panel #chat-log > .dg-line .dg-li { grid-template-columns: 10px auto minmax(0, 1fr); }
+  body #chat-panel #chat-log > .dg-line .dg-li-st { grid-column: 2 / -1; white-space: normal; overflow-wrap: anywhere; }
+  body #chat-panel #chat-log > .dg-line .dg-li > :is(.dg-key, .dg-keys) { grid-column: 2 / -1; grid-row: 3; margin: 4px 0 0; justify-self: start; }
+  body #chat-panel #chat-log > .dg-line .dg-work, body #chat-panel #chat-log > .dg-line .dg-inspect { padding-left: 14px; }
 }

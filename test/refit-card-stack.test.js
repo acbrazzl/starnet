@@ -27,6 +27,7 @@ const path = require('path');
 
 const src = f => fs.readFileSync(path.join(__dirname, '..', 'frontend', 'app', f), 'utf8');
 const build = src('build.js');
+const panel = src('workflowpanel.js');   // the docked Workflow panel (2026-09-22) — the step/flow cards' saves live here now
 /* The "must NOT appear" assertions below run against a COMMENT-STRIPPED slice: this file documents the
    bugs it prevents, and a comment naming markSeen()/removeChild() is not a call to them. */
 const strip = s => s.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/.*/g, ' ');
@@ -52,19 +53,25 @@ A.ok(/const dismiss = \(\) => \{ markSeen\(\);/.test(guideBlock), 'the first-run
 A.ok(/cardRegister\(g, dismiss\)/.test(guideBlock), '…and registers THAT as its close path, so ESC on it does the same thing');
 
 /* ---------- 2. the cards that SAVE something close through the save ---------- */
-const stepBlock = build.slice(build.indexOf('function openStepCard'), build.indexOf('function openWorkstationPicker'));
-A.ok(/const closeP = \(\) => \{ saveBrief\(\);/.test(stepBlock), "the step card's close path saves the job brief");
-A.ok(/cardRegister\(g, closeP\)/.test(stepBlock), '…and it is registered, so ESC saves the brief instead of discarding it');
+/* THE STEP + FLOW CARDS BECAME THE DOCKED WORKFLOW PANEL (2026-09-22). The saves they were held to moved
+   with them: the panel's ONE close path saves every open field (brief + hand-off, line name, LINE BUDGET,
+   gate config) — and every way out (✕, ✓ DONE, ESC, REFIT close) goes through it. */
+const stepBlock = build.slice(build.indexOf('function openStepCard'), build.indexOf('function openWorkflowPanel'));
 A.ok(/cardCloseAll\(\)/.test(stepBlock), 'opening the step card REPLACES whatever card was up (FINISH ① CREW / the world nag)');
-A.ok(!/querySelector\('\.refit-step-card'\)\) return/.test(stepBlock), '…and never silently no-ops on an already-open card');
-
+A.ok(/openWorkflowPanel\(bayId\)/.test(stepBlock), '…and opens the docked panel on that BAY (never silently no-ops)');
 const flowBlock = build.slice(build.indexOf('function openFlowCard'), build.indexOf('function openBeltCard'));
-A.ok(/const closeP = \(\) => \{ saveName\(\);/.test(flowBlock), "the flow card's close path saves the line name");
-A.ok(/cardRegister\(g, closeP\)/.test(flowBlock), '…and it is registered too');
+A.ok(/openWorkflowPanel\(propId\)/.test(flowBlock), 'the INBOX / gate door opens the same panel');
+const pClose = panel.slice(panel.indexOf('  function close() {'), panel.indexOf('  const isOpen'));
+A.ok(/saveOpenFields\(\);/.test(pClose), "the panel's close path saves its open fields first");
+const pSave = panel.slice(panel.indexOf('  function saveOpenFields() {'), panel.indexOf('/* ===== BAY'));
+for (const k of ['_saveName', '_saveBay', '_saveLimits', '_saveGate']) A.ok(pSave.indexOf(k) > 0, 'saveOpenFields saves ' + k);
+A.ok(/WorkflowPanel\.isOpen\(\)\) \{ WorkflowPanel\.close\(\); return; \}/.test(build), 'ESC closes the docked panel THROUGH its close path (saving) before it leaves REFIT');
+A.ok(/if \(typeof WorkflowPanel !== 'undefined' && WorkflowPanel\.isOpen\(\)\) WorkflowPanel\.close\(\);/.test(build.slice(build.indexOf('  function close() {'), build.indexOf('  const toggle'))), 'closing REFIT closes the panel through its save path while the station is still ours');
 
-const roomBlock = build.slice(build.indexOf('function openRoomCard'), build.indexOf('function doDeleteRoom'));
-A.ok(/const closeC = \(\) => \{ saveName\(\);/.test(roomBlock), "the room card's close path saves the rename");
-A.ok(/cardRegister\(g, closeC\)/.test(roomBlock), '…and it is registered');
+// the ROOM card docks above the library now (2026-10-01 build-mode upgrade, phase 2): its rename saves on Enter or on leaving the field
+const roomBlock = build.slice(build.indexOf('function renderRoomCard'), build.indexOf('function renderGroupCard'));
+A.ok(/nameEl\.onblur = saveName;/.test(roomBlock), "the room card saves the rename when the field is left");
+A.ok(/if \(e\.key === 'Enter'\) \{ e\.preventDefault\(\); nameEl\.blur\(\); \}/.test(roomBlock), '…and on Enter');
 
 // EVERY card opener replaces rather than bailing out
 for (const fn of ['openStepCard', 'openWorkstationPicker', 'openFlowCard', 'openBeltCard',
@@ -73,9 +80,9 @@ for (const fn of ['openStepCard', 'openWorkstationPicker', 'openFlowCard', 'open
   A.ok(i > 0, fn + ' is still a card opener');
   A.ok(build.slice(i, i + 700).indexOf('cardCloseAll()') > 0, fn + ' replaces the open card instead of no-opping');
 }
-// …and every card registers SOME close path (8 cards; a new one that forgets is the bug this counts)
-A.ok((build.match(/cardRegister\(g, /g) || []).length >= 9,
-  'every mounted card registers its close path (first-run + eight editors)');
+// …and every card registers SOME close path (7 cards; a new one that forgets is the bug this counts)
+A.ok((build.match(/cardRegister\(g, /g) || []).length >= 7,
+  'every mounted card registers its close path (first-run + the modal editors; the step/flow cards are the docked panel now; the desk picker is the selection card since 2026-10-07)');
 
 /* ---------- 3. a mounted card owns the keyboard ---------- */
 const keyBlock = build.slice(build.indexOf('function onKey(ev)'), build.indexOf('function onKeyUp(ev)'));
@@ -97,7 +104,7 @@ A.ok(/function onCancel\(\) \{[^}]*releaseDrag\(\)/.test(build), 'pointercancel 
 const blur = build.slice(build.indexOf('function onBlur()'), build.indexOf('function onBlur()') + 200);
 A.ok(/releaseDrag\(\)/.test(blur), 'window blur releases the capture');
 A.ok(!/drag\.mode === 'pan'/.test(blur), 'and blur cancels EVERY drag, not just a pan (no frozen ghost after alt-tab)');
-A.ok(/if \(drag \|\| connectFrom \|\| dupe\) \{ selectTool\('select'\); return; \}/.test(escCode)
+A.ok(/if \(drag \|\| connectFrom \|\| connectTo \|\| dupe\) \{ selectTool\('select'\); return; \}/.test(escCode)   // (connectTo: JOIN A LINE's armed destination, 2026-10-09)
   && /if \(drag \|\| dragPid != null\) releaseDrag\(\)/.test(build), 'ESC cancels the gesture and tool through the capture-release path');
 
 /* ---------- 5. completed Build actions leave truthful controls and status ---------- */
@@ -142,8 +149,14 @@ const lockBlock = build.slice(build.indexOf('if (protectedSpawn) {'), build.inde
 A.ok(/voiceSay\('hover'/.test(lockBlock), 'the lock badge speaks through the one-voice arbiter, not a bare fillText');
 
 /* ---------- 8. delivery bookkeeping resolves against the LIVE station ---------- */
-const noteBlock = build.slice(build.indexOf('function noteLineDelivered'), build.indexOf('function noteLineDelivered') + 900);
-A.ok(/opts\.getStation\(\)[\s\S]*const st = live \|\| station;/.test(noteBlock),
-  'noteLineDelivered prefers the live station over the module-level one close() never nulls');
+// (the crate-at-a-chute hook noteLineDelivered is gone — a crate books nothing, 2026-10-12; the shipment bookkeeping that replaced
+// it — noteLineShipped, and finLiveStation behind lineShipSpent / markLineShipped — keeps the same live-station rule)
+for (const fn of ['function noteLineShipped', 'function finLiveStation']) {
+  const noteBlock = build.slice(build.indexOf(fn), build.indexOf(fn) + 900);
+  A.ok(build.indexOf(fn) > 0 && /opts\.getStation\(\)[\s\S]*const st = live \|\| station;/.test(noteBlock),
+    fn.slice(9) + ' prefers the live station over the module-level one close() never nulls');
+}
+A.ok(/function lineShipSpent\(lineId\) \{\s*const st = finLiveStation\(\);/.test(build) && /function markLineShipped\(lineId\) \{\s*const st = finLiveStation\(\);/.test(build),
+  '…and lineShipSpent / markLineShipped resolve through it');
 
 A.report('refit-card-stack');

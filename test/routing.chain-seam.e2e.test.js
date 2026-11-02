@@ -13,6 +13,7 @@ const os = require('os');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const { bootToken } = require('./_httpToken.js');
+const { allocatePort, BIND_REFUSED } = require('./helpers/ports.js');
 
 const HOST = '127.0.0.1';
 const INDEX = path.resolve(__dirname, '..', 'sidecar', 'index.js');
@@ -29,9 +30,9 @@ function boot(port, env, attemptsLeft) {
     const onData = d => {
       out += d.toString();
       if (!settled && out.indexOf('http://' + HOST + ':' + port) >= 0) { settled = true; resolve({ child, port }); }
-      else if (!settled && /already in use/i.test(out)) {
+      else if (!settled && BIND_REFUSED.test(out)) {
         settled = true; try { child.kill(); } catch (_) {}
-        if (attemptsLeft > 0) resolve(boot(port + 1, env, attemptsLeft - 1));
+        if (attemptsLeft > 0) resolve(allocatePort().then(next => boot(next, env, attemptsLeft - 1)));
         else reject(new Error('no free port'));
       }
     };
@@ -45,7 +46,7 @@ function boot(port, env, attemptsLeft) {
 (async () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'sk-chain-seam-'));
   const env = { SKYNET_WORKSPACES: ws, STARNET_WORKSPACES: ws };
-  const { child, port } = await boot(9110 + (process.pid % 50), env, 20);
+  const { child, port } = await boot(await allocatePort(), env, 20);
   const B = 'http://' + HOST + ':' + port;
   try {
     const token = await bootToken(B, B);
@@ -92,6 +93,10 @@ function boot(port, env, attemptsLeft) {
     const hop = await chainAsk('research-agent', '', lineId);
     A.eq(hop.next, 'writer-agent', 'chained dock -> the downstream agent');
     A.eq(hop.brief, 'Draft the result in press style.', 'and the RECEIVING dock\'s standing brief rides the answer');
+    // sweep 2026-10-01: the rest of hopTurn's turn — the writer's reply LEAVES the line, so the COMMS work line tells it so
+    A.eq([hop.last, hop.verdict], [true, null], 'the answer says the next stage is the LAST (its reply is the result), with no verdict gate');
+    const Chat = require('fs').readFileSync(require('path').join(__dirname, '..', 'frontend', 'app', 'chat.js'), 'utf8');
+    A.ok(/Pipeline\.handoffPrompt\(seed\.originalText, cur, out\.text, hop, nxr\.brief, nxr\.verdict, nxr\.last\)/.test(Chat), 'the COMMS work line composes the same 7-part turn the sidecar chain runner does');
     A.eq(await chainOf('writer-agent', '', lineId), null, 'terminal dock -> null');
     A.eq(await chainOf('no-such-agent', '', lineId), null, 'unknown agent -> null');
 

@@ -55,12 +55,14 @@ import { mkdirSync, writeFileSync, rmSync, readFileSync, readdirSync } from 'nod
 import { createServer } from 'node:http';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 import { sleep, launchChrome, connectCDP, evalJS, capture, collectDiagnostics } from '../lib/cdp.mjs';
 import { materializeSeedWorkspace, bootSeededSidecar, isUp, waitUp, waitDevReady, DEFAULT_MODEL } from '../lib/seed.mjs';
-import { closeOnly, openSel } from '../lib/states.mjs';
-import { messageContentText } from '../lib/message-content.mjs';
+import { closeOnly, openSel, openTermFallback } from '../lib/states.mjs';
 import { makeLedger, fingerprintOf } from './ledger.mjs';
+// the run's opening prompt on every route (a Claude route carries the host notes as their own user turns before it)
+const { firstUserWords } = createRequire(import.meta.url)('../../test/helpers/host-notes.js');
 
 /* ── Dismissed/known journey gate (mirror of golden.mjs's per-frame review-clean) ──────────────
  * A journey assertion can be TRIAGED-and-DISMISSED in the QA ledger (e.g. J2b/panel-close's busy-
@@ -112,6 +114,14 @@ const WIN = process.env.SKYNET_SHOT_SIZE || '1440,900';
 const KEEP = process.argv.includes('--keep');
 const SCRATCH = join(OUT_DIR, '_seed-workspace');
 const PROFILE = join(OUT_DIR, '_profile');
+// A FRESH BROWSER PER RUN (2026-09-23): the end-of-run wipe below fails silently while Chrome still holds
+// the profile, and a surviving profile carries a dirty `starnet.save` that cloudsave.reconcile() pushes over
+// the fresh seed (the audit gate inherited a placed prop every Guardian hour). Wipe before launch; fail loud.
+function freshProfile(dir) {
+  rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 });
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
 const ONLY = (() => {
   const i = process.argv.indexOf('--only');
   return i >= 0 && process.argv[i + 1] ? new Set(process.argv[i + 1].split(',').map(s => s.trim().toUpperCase())) : null;
@@ -191,9 +201,11 @@ function startControllableMock(model) {
           // '[WORKSHOP_SHIFT]' marker — for those we emit the file-writing tool calls that BUILD the deliverable
           // (mirrors test/workshop.e2e.test.js's mock), so /workshop-run has real bytes to serve. All OTHER runs
           // (the interactive chat directives J1-J3 fire) use the hold/quick behavior.
+          // The marker is matched on the run's OWN opening words (test/helpers/host-notes.js firstUserWords): the
+          // <run_context> note and recall ride the user side of the wire — on this Claude model as their own user
+          // turns BEFORE the shift prompt — so "the first user message" is a host note, never the shift (J4 red, 10-15).
           let msgs = []; try { msgs = (JSON.parse(body).messages) || []; } catch (_) {}
-          const userMsg = msgs.find(m => m && m.role === 'user');
-          const prompt = messageContentText(userMsg && userMsg.content);
+          const prompt = firstUserWords(msgs);
           const isWorkshop = prompt.indexOf('[WORKSHOP_SHIFT]') === 0;
           const tool = (id, name, args) => {
             res.write('data: ' + JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id, type: 'function', function: { name, arguments: JSON.stringify(args) } }] } }] }) + '\n\n');
@@ -266,7 +278,8 @@ function makeAsserter() {
 }
 
 /* ─────────────────────────── CDP driving helpers ─────────────────────────── */
-const clickSel = (cdp, sel) => evalJS(cdp, `(() => { const el = document.querySelector(${J(sel)}); if (!el) return 'NOTFOUND'; el.click(); return 'clicked'; })()`).catch((e) => 'ERR:' + e.message);
+// a [data-term] key front doors folded into a menu tab opens its window the way the tab does (openTermFallback)
+const clickSel = (cdp, sel) => evalJS(cdp, `(() => { const el = document.querySelector(${J(sel)}); if (!el) return ${openTermFallback(sel)} ? 'opened-via-menu' : 'NOTFOUND'; el.click(); return 'clicked'; })()`).catch((e) => 'ERR:' + e.message);
 async function waitSel(cdp, sel, tries = 30) {
   for (let i = 0; i < tries; i++) { const ok = await evalJS(cdp, `!!document.querySelector(${J(sel)})`).catch(() => false); if (ok) return true; await sleep(200); }
   return false;
@@ -431,10 +444,26 @@ const PARITY_PROBE = `(() => {
   return out;
 })()`;
 
-async function parityCheck(cdp, A, step) {
-  const res = await evalJS(cdp, PARITY_PROBE).catch((e) => ({ checks: [{ name: 'parity/probe', ok: false, detail: 'threw: ' + e.message }], snap: {} }));
+// Keep a failed CDP read separate from the state it was meant to observe.
+async function observeJS(cdp, expression) {
+  const started = performance.now();
+  try {
+    const value = await evalJS(cdp, expression);
+    return { ok: true, value, elapsedMs: Math.round(performance.now() - started) };
+  } catch (error) {
+    return { ok: false, error: String(error && error.message || error), elapsedMs: Math.round(performance.now() - started) };
+  }
+}
+function observationFailure(observation) {
+  return `observation failed after ${observation.elapsedMs}ms: ${observation.error}`;
+}
+
+async function parityCheck(cdp, A, step, { observation, detailPrefix = '' } = {}) {
+  const res = observation
+    ? (observation.ok ? observation.value : { checks: [{ name: 'parity/probe', ok: false, detail: observationFailure(observation) }], snap: {} })
+    : await evalJS(cdp, PARITY_PROBE).catch((e) => ({ checks: [{ name: 'parity/probe', ok: false, detail: 'threw: ' + e.message }], snap: {} }));
   const checks = (res && Array.isArray(res.checks)) ? res.checks : [{ name: 'parity/probe', ok: false, detail: 'no checks returned' }];
-  for (const c of checks) A.ok(`${step}::${c.name}`, c.ok, c.detail);
+  for (const c of checks) A.ok(`${step}::${c.name}`, c.ok, detailPrefix ? detailPrefix + '; ' + c.detail : c.detail);
   return res;
 }
 
@@ -484,7 +513,8 @@ async function journeyTaskLifecycle(cdp, A, mock) {
   A.ok('J1/run-in-flight', !!busyId, busyId ? 'busy on ' + busyId : 'no run went in-flight (mock/provider?)');
   await waitCrewBusyProjection(cdp);
   await parityCheck(cdp, A, 'J1.2-run-live');
-  // Internal lane identity stays `active`; the customer-facing heading is IN PROGRESS / REVIEW.
+  // Internal lane identity stays `active`; the customer-facing heading is IN PROGRESS (org P11 dropped
+  // the old " / REVIEW" suffix, so a heading that still carries REVIEW fails here).
   // Check both authorities so a wording correction cannot conceal a misplaced or idle card.
   const activeLane = await evalJS(cdp, `(() => {
     const c=document.querySelector('.kb-card[data-id="${tid}"]');
@@ -493,7 +523,8 @@ async function journeyTaskLifecycle(cdp, A, mock) {
     return { lane:task&&task.lane, heading:h&&h.textContent.trim(), running:!!(c&&c.querySelector('.kb-state.running')), busy:!!Channels.isBusy(${J(tid)}) };
   })()`).catch(() => null);
   A.ok('J1/assigned-card-active', !!activeLane && activeLane.lane === 'active' &&
-    /^IN PROGRESS \/ REVIEW\b/.test(String(activeLane.heading)) && activeLane.running && activeLane.busy,
+    /^IN PROGRESS\b/.test(String(activeLane.heading)) && !/REVIEW/.test(String(activeLane.heading)) &&
+    activeLane.running && activeLane.busy,
     'assigned card state = ' + J(activeLane));
 
   // step 2b: A LIVE RUN OUTRANKS THE LANE (regression guard, 2026-08-14). ↩ QUEUE (and ✓ SHIP, and a
@@ -652,14 +683,14 @@ async function journeyInterruptReload(cdp, A, mock) {
   const testReady = ready && await evalJS(cdp, '!!(window.__SKYNET_TEST__ && window.__SKYNET_TEST__.ready())').catch(() => false);
   A.ok('J2/reload/floor-back', !!testReady, testReady ? 'floor + testapi ready after reload' : 'never came back in-game after reload');
   if (!testReady) return;
-  const anyBusy = await evalJS(cdp, "(typeof Channels!=='undefined' && Channels.anyBusy && Channels.anyBusy())").catch(() => true);
-  A.ok('J2/reload/nothing-busy-after-reload', !anyBusy, anyBusy ? 'a channel is busy after a fresh reload (impossible truthfully)' : 'no transient run survived the reload');
+  const anyBusy = await observeJS(cdp, "(typeof Channels!=='undefined' && Channels.anyBusy && Channels.anyBusy())");
+  A.ok('J2/reload/nothing-busy-after-reload', anyBusy.ok && !anyBusy.value, anyBusy.ok ? (anyBusy.value ? 'a channel is busy after a fresh reload (impossible truthfully)' : 'no transient run survived the reload') : observationFailure(anyBusy));
   await openBoard(cdp);
   await parityCheck(cdp, A, 'J2.reload-after');
   // the task the run was on persisted (Workstreams IS persisted), but its card must NOT claim RUNNING.
   if (tid && tid.indexOf && tid.indexOf('ws_') === 0) {
-    const running = await evalJS(cdp, `!!document.querySelector('.kb-card[data-id="${tid}"] .kb-state.running')`).catch(() => false);
-    A.ok('J2/reload/no-running-chip-after-reload', !running, running ? 'card still shows RUNNING after reload' : 'reloaded card shows an honest (non-running) state');
+    const running = await observeJS(cdp, `!!document.querySelector('.kb-card[data-id="${tid}"] .kb-state.running')`);
+    A.ok('J2/reload/no-running-chip-after-reload', running.ok && !running.value, running.ok ? (running.value ? 'card still shows RUNNING after reload' : 'reloaded card shows an honest (non-running) state') : observationFailure(running));
   }
 }
 
@@ -691,11 +722,12 @@ async function journeyDoubleSend(cdp, A, mock, diag) {
   A.ok('J3/no-duplicate-board-rows', dupCount === 0, dupCount ? dupCount + ' duplicate card id(s): ' + boardIds.join(',') : boardIds.length + ' unique card(s)');
 
   // let both runs finish, then assert no stuck RUNNING + still no dupes.
-  await waitIdle(cdp, 60);
+  const idle = await waitIdle(cdp, 60);
+  const idleDetail = 'waitIdle=' + idle + (idle ? ' (idle observed)' : ' (idle not observed within polling window)');
   await openBoard(cdp);
-  await parityCheck(cdp, A, 'J3.settled');
-  const stuck = await evalJS(cdp, "Array.from(document.querySelectorAll('.kb-card .kb-state.running')).length").catch(() => -1);
-  A.ok('J3/no-stuck-running', stuck === 0, stuck + ' card(s) still RUNNING after both runs settled');
+  await parityCheck(cdp, A, 'J3.settled', { observation: await observeJS(cdp, PARITY_PROBE), detailPrefix: idleDetail });
+  const stuck = await observeJS(cdp, "Array.from(document.querySelectorAll('.kb-card .kb-state.running')).length");
+  A.ok('J3/no-stuck-running', stuck.ok && stuck.value === 0, idleDetail + '; ' + (stuck.ok ? stuck.value + ' card(s) RUNNING' : observationFailure(stuck)));
 
   // exactly two NEW workstreams were created (no phantom extra rows from the rapid fire).
   const afterIds = await evalJS(cdp, "(typeof Workstreams!=='undefined') ? Workstreams.all().map(w=>w.id) : []").catch(() => []);
@@ -708,7 +740,7 @@ async function journeyDoubleSend(cdp, A, mock, diag) {
 
 /* ═══════════════════════════ J4 — summon → assign → deliverable → OPEN ═══════════════════════════
  * A deliverable's Open action is only truthful if the /workshop-run jail actually SERVES a runnable page.
- * The frontend Open action navigates a new tab to /workshop-run/<agent>/<run>/index.html?token= — an
+ * The frontend Open action navigates a new tab to /workshop-run/~t/<ticket>/<agent>/<run>/index.html (run-scoped ticket) — an
  * interactive nav a headless CDP page can't meaningfully follow. So we assert the SERVE CONTRACT directly
  * over HTTP (the exact bytes+headers the Open action depends on): a real workshop deliverable, built through
  * the granted fs-jail, is served 200 as runnable text/html under an opaque-origin sandbox CSP. This is the
@@ -750,7 +782,10 @@ async function journeyDeliverableOpen(cdp, A, base, token, mock) {
   if (!runId || !hasHtml) return;
 
   // THE OPEN CONTRACT: the served page is 200 runnable text/html, script intact, opaque-origin sandbox CSP.
-  const runUrl = base + '/workshop-run/' + agentId + '/' + runId + '/index.html?token=' + encodeURIComponent(token);
+  // a tab open carries a RUN-SCOPED ticket in the path (sidecar/apitickets.js) — the master token in a URL is refused
+  const apitickets = createRequire(import.meta.url)('../../sidecar/apitickets.js');
+  const runTicket = apitickets.mint(token, 'run', apitickets.scopeRun(agentId, runId), { now: Date.now() });
+  const runUrl = base + '/workshop-run/~t/' + runTicket + '/' + agentId + '/' + runId + '/index.html';
   const pageRes = await fetch(runUrl).catch(e => ({ status: 0, _err: String(e) }));
   A.ok('J4/workshop-run-200', pageRes && pageRes.status === 200, 'GET /workshop-run/.../index.html → ' + (pageRes && pageRes.status) + (pageRes && pageRes._err ? ' ' + pageRes._err : ''));
   if (pageRes && pageRes.status === 200) {
@@ -815,14 +850,28 @@ async function journeyBayIdleLife(cdp, A) {
   await evalJS(cdp, closeOnly).catch(() => {});
   const bodyOf = `(() => { try { const b=(window.__SKYNET_TEST__.bodies()||[]).find(x=>x.id===${J(PROBE)}); return b||null; } catch(e){ return null; } })()`;
 
-  // 1) inject a belt + a bay bound to the probe agent → rederive → syncCrewFromPlan spawns a NON-summoned body.
+  /* 1) inject a bay bound to the probe agent and CONNECT an INBOX to it → rederive → syncCrewFromPlan spawns a
+     NON-summoned body. Since conveyor links phase B a bay joins a line only through a LINK — a loose belt beside it
+     joins nothing (the plan's decision 1; the old single setBelt tile no longer hooked the bay, and J6 went red) —
+     so the belt is laid the way the BELT tool lays it: connectBelt, which makes the link. The INBOX takes the first
+     clear spot west, north, south or east of the bay. */
   const inj = await evalJS(cdp, `(() => { try {
     if (typeof Build==='undefined' || !Build.__test__ || !Build.__test__.station) return 'NO_BUILD_TEST';
     const st = Build.__test__.station();
-    const okBelt = st.setBelt(6,5,'E'); const okBay = st.addProp({ t:'bay', x:7, y:5, w:1, h:1, agentId:${J(PROBE)} });
-    return JSON.stringify({ belt: !!(okBelt&&okBelt.ok), bay: !!(okBay&&okBay.ok!==false) });
+    const bay = st.addProp({ t:'bay', x:7, y:5, w:1, h:1, agentId:${J(PROBE)} });
+    if (!bay || bay.ok === false) return JSON.stringify({ bay: false, why: bay && bay.error });
+    let link = null;
+    for (const [x, y] of [[4,5],[7,2],[7,8],[10,5]]) {
+      if (!st.canPlaceProp('intake', x, y, 1, 1).ok) continue;
+      const inbox = st.addProp({ t:'intake', x, y, w:1, h:1 });
+      if (!inbox || inbox.ok === false) continue;
+      link = st.connectBelt(inbox.id, bay.id);
+      if (link && link.ok) break;
+      st.removeProp(inbox.id);
+    }
+    return JSON.stringify({ bay: true, link: !!(link && link.ok), why: link && !link.ok ? link.error : undefined });
   } catch(e){ return 'ERR:'+e.message; } })()`).catch(e => 'ERR:' + e.message);
-  A.ok('J6/bay-injected', typeof inj === 'string' && inj.indexOf('ERR') < 0 && inj.indexOf('NO_BUILD') < 0, 'inject → ' + inj);
+  A.ok('J6/bay-injected', typeof inj === 'string' && /"bay":true/.test(inj) && /"link":true/.test(inj), 'inject → ' + inj);
 
   // 2) the plan body appears (proves it's a real bay-bound, non-summoned body — the exact class that froze).
   let born = false;
@@ -868,8 +917,14 @@ async function journeyBayIdleLife(cdp, A) {
   const caged = await evalJS(cdp, bodyOf).catch(() => null);
   A.ok('J6/stays-in-own-zone', !caged || caged.inOwnZone !== false, caged ? ('inOwnZone=' + caged.inOwnZone + ' tile=' + caged.tile.x + ',' + caged.tile.y) : 'no body');
 
-  // cleanup: remove the injected bay + belt so a shared-app follow-on sees the original floor.
-  await evalJS(cdp, `(() => { try { const st=Build.__test__.station(); const p=(st.propsByAgent?st.propsByAgent(${J(PROBE)}):[]).find(pp=>pp.t==='bay'); if (p) st.removeProp(p.id); if (st.setBelt) st.setBelt(6,5,''); return 'cleaned'; } catch(e){ return 'ERR:'+e.message; } })()`).catch(() => {});
+  // cleanup: remove the injected INBOX, bay and the belt that joined them so a shared-app follow-on sees the original floor.
+  await evalJS(cdp, `(() => { try { const st=Build.__test__.station();
+    const bay=(st.propsByAgent?st.propsByAgent(${J(PROBE)}):[]).find(pp=>pp.t==='bay'); if (!bay) return 'no bay';
+    const mine=(st.links()||[]).filter(l=>l.to.prop===bay.id||l.from.prop===bay.id);
+    const tiles=[]; for (const l of mine) for (const t of (l.path||[])) tiles.push([t.x,t.y]);
+    if (tiles.length && st.removeBelts) st.removeBelts(tiles);
+    for (const l of mine) st.removeProp(l.from.prop===bay.id ? l.to.prop : l.from.prop);
+    st.removeProp(bay.id); return 'cleaned'; } catch(e){ return 'ERR:'+e.message; } })()`).catch(() => {});
 }
 
 /* ═══════════════════════════ J7 — slash INPUT-path truth (the 2026-07-05 ARGS-bug seam) ═══════════════════════════
@@ -1052,7 +1107,7 @@ async function main() {
     JOURNEY_API_TOKEN = token;
   } catch (_) {}
 
-  const { proc: chromeProc, chrome } = launchChrome({ cdpPort: CDP_PORT, win: WIN, profileDir: PROFILE });
+  const { proc: chromeProc, chrome } = launchChrome({ cdpPort: CDP_PORT, win: WIN, profileDir: freshProfile(PROFILE) });
   proc = chromeProc;
   proc.on('error', (e) => { console.error('chrome spawn error', e); });
   console.log(`chrome: ${chrome}\ntarget: ${APP_URL}`);

@@ -81,9 +81,42 @@
       agentId: str, runId: str, objective: str, deliverable: str, audience: str, success: str,
       assumptions: { type: 'array' }
     }),
+    /* ADDITIVE (2026-10-26, summon-lines fix for 0.14.1, orchestrator-approved): a delegated WORKER's tool step,
+       forwarded onto its LEAD's stream under its OWN name. Forwarding it as agent.tool_call/tool_result made every
+       lead-side sink (CLI tracker, /api/observe, Telegram/routine reply buffers, phone, ACP) take it for the lead's
+       own step. A sink that does not know this name ignores it; the page translates it back for the floor. */
+    'crew.tool_step': obj(['agentId', 'runId', 'parentRunId', 'callId', 'name', 'phase'], {
+      agentId: str, runId: str, parentRunId: str, callId: str, name: str, phase: { enum: ['call', 'result'] },
+      argsSummary: str, ok: bool, isError: bool, ms: num
+    }),
     'provider.fallback': obj(['agentId', 'runId', 'fromModel', 'toModel', 'reason'], {
       agentId: str, runId: str, fromModel: str, toModel: str, reason: str,
       fromProvider: str, toProvider: str, rotate: bool
+    }),
+    /* ADDITIVE (2026-09-23, live-events lane, Andrew-approved): the retry ladder (~105 s of backoff) and the
+       provider idle watchdog (up to 300 s per silent attempt) used to run SILENT — the Commander saw run start
+       and then nothing until the end or the error. Two new events, nothing renamed or removed:
+       provider.retry — the loop is about to re-send the SAME model turn after a transient failure; emitted
+       BEFORE the backoff. `attempt` uses the numbering of the run's recorded recovery attempts (the ladder rung,
+       counting retries an adapter already spent pre-stream); `delayMs` is the wait the loop will ACTUALLY sleep
+       (0 when no sleep is wired); `maxAttempts` is this retry class's budget (ladder rungs, or the single
+       truncation retry). stage: pre_stream = the failed attempt received no stream event, mid_stream = it had.
+       retryAfterMs = a server-stated wait; waitedMs / patienceMs = local backoff spent before this rung / the
+       ladder's total local patience. */
+    'provider.retry': obj(['agentId', 'runId', 'attempt', 'reason', 'delayMs'], {
+      agentId: str, runId: str, attempt: int, reason: str, delayMs: num,
+      maxAttempts: int, model: str, stage: { enum: ['pre_stream', 'mid_stream'] },
+      retryAfterMs: num, waitedMs: num, patienceMs: num
+    }),
+    /* agent.waiting — a liveness HEARTBEAT (host-injected ticker, ~15 s) while a model call has produced no
+       token or tool event. phase: first_byte = the request is out and no stream event has arrived; streaming =
+       the stream is open but carries no visible output yet (e.g. reasoning); retry_backoff = sleeping between
+       ladder rungs after a provider.retry; connect = reserved for an adapter that can tell headers-pending
+       apart. sinceMs = how long this wait has lasted (since the model call went out, or since the backoff
+       began). It proves the run is alive and waiting — never that the task advanced. */
+    'agent.waiting': obj(['agentId', 'runId', 'phase', 'sinceMs'], {
+      agentId: str, runId: str, phase: { enum: ['connect', 'first_byte', 'streaming', 'retry_backoff'] },
+      sinceMs: num, model: str
     }),
     // a no-op turn (no tool call + no NEW assistant content — an empty stream or a re-emitted prior turn, e.g. a
     // wasted failover/compaction retry) was REFUNDED from the iteration budget instead of counting against maxIters.
@@ -235,6 +268,16 @@
        that only the page can do — open a session, switch agent, delegate. `id` correlates the page's reply on
        POST /api/station/ack. Carries no result: this is the REQUEST half only. */
     'station.command': obj(['id', 'verb'], { id: str, verb: str, args: any }),
+    // ADDITIVE (STEP-IN, 2026-09-29): a browser HANDOFF changed state — the agent paused on a login/2FA/CAPTCHA and
+    // asked the Commander to take its live browser (sidecar/browser-handoff.js). State-carrying and replayable: the
+    // station renders exactly this record. `id` is the handoff's OWN id (never a consent promptId). `where` is
+    // host + path only (no query string). Rides the station SSE bridge, not the /api/run socket.
+    'browser.handoff': obj(['id', 'agentId', 'runId', 'state'], {
+      id: str, agentId: str, runId: str,
+      state: { enum: ['waiting', 'taken', 'returned', 'cancelled', 'expired', 'aborted'] },
+      reason: { enum: ['login', '2fa', 'captcha', 'payment', 'other'] }, note: str, host: str, where: str, title: str,
+      remembered: bool, requestedAt: num, takenAt: any, endedAt: any, expiresAt: num
+    }),
 
     // ---- reserved (P3 mutation API) ----
     'worldChange': obj(['seq'], { seq: int, dirtyTiles: { type: 'array' } }),

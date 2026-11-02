@@ -45,6 +45,11 @@ async function tokenFromIndex(base) {
     const tauriGet = await fetch(B + '/api/budget/status', { headers: { Origin: tauriOrigin, 'X-StarNet-Token': browserToken } });
     A.eq(tauriGet.status, 200, 'Tauri trusted origin with boot token authorizes sensitive GET');
     A.eq(tauriGet.headers.get('access-control-allow-origin'), tauriOrigin, 'Tauri CORS still mirrors the app origin');
+    // the desktop page is cross-origin: without an expose list it cannot read which engine spoke a clip, so every
+    // built-in voice resolved as the keyed recipe (machine shell, browser re-pacing on top of Kokoro's own)
+    const exposed = String(tauriGet.headers.get('access-control-expose-headers') || '').toLowerCase().split(/\s*,\s*/);
+    A.ok(exposed.includes('x-voice-provider'), 'Tauri CORS exposes X-Voice-Provider to the app page');
+    A.ok(exposed.includes('x-voice-cache'), 'Tauri CORS exposes X-Voice-Cache to the app page');
 
     fs.mkdirSync(path.join(ws, 'agent', 'reports'), { recursive: true });
     fs.writeFileSync(path.join(ws, 'agent', 'reports', 'active.html'), '<script>fetch("/api/session",{method:"POST"})</script>');
@@ -73,6 +78,50 @@ async function tokenFromIndex(base) {
     A.ok(dsSys.j.exists === false && dsSys.j.isDir === false && dsSys.j.reason === 'outside-allowed-roots', 'dirstat REFUSES an absolute system path outside HOME/WORKSPACES (no filesystem probe)');
     const dsRel = await dirstat('not/absolute');
     A.ok(dsRel.j.exists === false && dsRel.j.reason === 'not-absolute', 'dirstat rejects a non-absolute path');
+
+    /* 2026-09-23 audit: the Host pin guards EVERY path, not just /api/*. `/` inlines the API token, so a
+       DNS-rebound page (Host: attacker name) must not be able to read it. fetch() cannot forge Host, so this
+       speaks raw http with the rebinding Host header a browser would send after the rebind. */
+    const rawGet = (p, host) => new Promise((resolve, reject) => {
+      const u = new URL(B);
+      const req = require('http').request({ host: u.hostname, port: u.port, path: p, method: 'GET', headers: { Host: host } }, (res) => {
+        let body = ''; res.on('data', d => { body += d; }); res.on('end', () => resolve({ status: res.statusCode, body, headers: res.headers }));
+      });
+      req.on('error', reject); req.end();
+    });
+    const port = new URL(B).port;
+    const rebound = await rawGet('/', 'rebind.evil.example:' + port);
+    A.eq(rebound.status, 403, 'a rebound Host cannot load the index page');
+    A.ok(rebound.body.indexOf(browserToken) < 0 && !/__STARNET_API_TOKEN__/.test(rebound.body), 'the rebound response carries no API token');
+    const reboundRun = await rawGet('/workshop-run/agent/x/index.html?token=' + browserToken, 'rebind.evil.example:' + port);
+    A.eq(reboundRun.status, 403, 'workshop-run is behind the same Host floor');
+    const localIndex = await rawGet('/', '127.0.0.1:' + port);
+    A.eq(localIndex.status, 200, 'the loopback Host still loads the app');
+    A.eq(localIndex.headers['x-frame-options'], 'SAMEORIGIN', 'the app refuses cross-site framing (X-Frame-Options)');
+    A.ok(/frame-ancestors 'self'/.test(localIndex.headers['content-security-policy'] || ''), 'the app refuses cross-site framing (CSP frame-ancestors)');
+    // APPS / plugin windows: a sandboxed page the station frames must never be able to navigate ITSELF to the web
+    // (that is how a poisoned app page would leak what it shows) — the station page only frames its own origin.
+    A.ok(/frame-src 'self' http:\/\/127\.0\.0\.1:\d+ http:\/\/localhost:\d+(;|$)/.test(localIndex.headers['content-security-policy'] || ''), 'the station page frames only its own origin (CSP frame-src)');
+    // 2026-10-10: the token page carries a SCRIPT policy — same-origin files + its one nonce'd boot script only
+    const pageCsp = localIndex.headers['content-security-policy'] || '';
+    const nonce = (/script-src 'self' 'nonce-([A-Za-z0-9+/=]{16,})'/.exec(pageCsp) || [])[1] || '';
+    A.ok(!!nonce, 'the app page CSP allows scripts from its own origin plus a per-response nonce only — got: ' + pageCsp);
+    A.ok(/object-src 'none'/.test(pageCsp) && /base-uri 'none'/.test(pageCsp), 'no plugins and no <base> hijack on the app page');
+    A.ok(localIndex.body.indexOf('<script nonce="' + nonce + '">window.__STARNET_API_TOKEN__=') >= 0, 'the boot script carries that nonce (and this same-user client receives the token)');
+    const again = await rawGet('/', '127.0.0.1:' + port);
+    A.ok(((/'nonce-([^']+)'/.exec(again.headers['content-security-policy'] || '') || [])[1] || '') !== nonce, 'the nonce is fresh per response');
+    A.eq((await rawGet('/', 'localhost:' + port)).status, 200, 'localhost Host is loopback too');
+    // The ONE exemption: a line-trigger webhook may arrive through the Commander's own tunnel carrying its public
+    // Host. It must reach the trigger's secret check (here: an unknown trigger), never the Host floor.
+    const tunnelHook = await new Promise((resolve, reject) => {
+      const req = require('http').request({ host: '127.0.0.1', port, path: '/api/hooks/trg_nosuchtrigger01', method: 'POST', headers: { Host: 'abc.trycloudflare.com', 'Content-Type': 'application/json' } }, (res) => {
+        let body = ''; res.on('data', d => { body += d; }); res.on('end', () => resolve({ status: res.statusCode, body }));
+      });
+      req.on('error', reject); req.end('{}');
+    });
+    A.ok(tunnelHook.status !== 403 || !/forbidden host/.test(tunnelHook.body), 'a tunnelled trigger webhook reaches its own secret check, not the Host floor');
+    A.ok(tunnelHook.body.indexOf(browserToken) < 0, 'the trigger webhook answer carries no API token');
+    A.eq((await rawGet('/api/hooks/trg_nosuchtrigger01', 'abc.trycloudflare.com')).status, 403, 'a non-POST on the hook path still meets the Host floor');
   } finally {
     await fixture.dispose();
   }

@@ -71,7 +71,19 @@
 
     const name = o.name || 'channel';
     const MAX_MESSAGE_LENGTH = o.maxMessageLength || 4096;
-    const allowed = normalizeAllowed(o.allowedChats);
+    /* allowedChats is a fixed list/Set, OR a function of chatId read on EVERY message. The function is the
+       composition root's form: the owner admits a group with /allow and the hub writes that onto the chat's own
+       record, so the very next message from that group must see it. A fixed list captured here would need a
+       reconnect, and for the whole of 2026-07..10 the root passed nothing at all — every group was dropped on
+       every platform while the unit tests, which pass a list by hand, stayed green. Fails CLOSED: a store
+       hiccup must never open a room. */
+    const allowedFn = (typeof o.allowedChats === 'function') ? o.allowedChats : null;
+    const allowed = allowedFn ? new Set() : normalizeAllowed(o.allowedChats);
+    function chatAllowed(chatId) {
+      const id = String(chatId == null ? '' : chatId);
+      if (!allowedFn) return allowed.has(id);
+      try { return allowedFn(id) === true; } catch (_) { return false; }
+    }
     const onInbound = typeof o.onInbound === 'function' ? o.onInbound : function () {};
     const onCallback = typeof o.onCallback === 'function' ? o.onCallback : null;   // C6: inline-keyboard taps
     const onStatus = typeof o.onStatus === 'function' ? o.onStatus : null;         // channel.connect telemetry
@@ -222,9 +234,11 @@
       // a reply to one of OUR messages is an address, and it is how a thread of follow-ups stays natural
       if (m.replyTo && String(m.replyTo.userName || '').trim().toLowerCase() === botUsername) return true;
       // a slash command with NO @suffix is aimed at whatever bot is listening; with a suffix it is aimed by name
-      // (and that name landed in `mentions` above, so a command for a DIFFERENT bot has already failed the check)
+      // (and that name landed in `mentions` above, so a command for a DIFFERENT bot has already failed the check).
+      // '-' is allowed because the Commander's own command names may carry one (/disk-usage); without it a group
+      // dropped such a command before the hub could recognise it (2026-10-18).
       const t = String(m.text == null ? '' : m.text);
-      if (/^\/[A-Za-z0-9_]+(\s|$)/.test(t)) return true;
+      if (/^\/[A-Za-z0-9_-]+(\s|$)/.test(t)) return true;
       return false;
     }
 
@@ -246,19 +260,87 @@
     const wasOurs = (chatId, messageId) =>
       messageId != null && messageId !== '' && sentIds.has(String(chatId) + '|' + String(messageId));
 
-    /* THREE verdicts, not two. 'drop' is silence, 'run' is a real turn, and 'observe' is the middle ground the
-       mention gate created a need for: heard and remembered, but never dispatched. Kept as one function so the
-       order of the gates can only be read one way — an echo, a bot and a non-allowlisted chat are refused before
-       anything is stored, so observing can never become a way around admission. */
+    /* ADMISSION COMMANDS. A group is closed until the paired owner admits it, and the owner admits it FROM the
+       group: "/allow" (or "/allow@thisbot", which is what Telegram's "/" menu sends in a group). That is the one
+       thing a not-yet-admitted group may say to us, so it gets its own verdict, 'admit' — never 'run', because
+       relay-admission.js admits a relayed group message only on 'run' and a signed relay body can CLAIM the
+       owner's id. Only a live message from an identified person counts: a forward is a third party's words, a
+       broadcast post has no sender to check, and an edit of an old "/allow" is history, not a request. A bare
+       command is aimed at whatever bot is listening (the same rule as every other slash command); an @-suffixed
+       one must name US, and while our own name is still unknown it cannot, so it is refused rather than guessed. */
+    const ADMISSION_CMD = /^\/(allow|deny)(?:@([A-Za-z0-9_]+))?(?:\s|$)/i;
+    function admissionCommand(m) {
+      if (!m || m.forwarded || m.channelPost || m.edited) return false;
+      if (!String(m.userId == null ? '' : m.userId)) return false;
+      const text = String(m.text == null ? '' : m.text).trim();
+      const hit = ADMISSION_CMD.exec(text);
+      if (!hit) return false;
+      const suffix = String(hit[2] || '').toLowerCase();
+      // a bare command with ARGUMENTS ("/allow @newmember") is another bot's — a moderation bot's — never an admission:
+      // ours takes none unless it names us. Taken as ours it admitted the owner's station to a room nobody meant to open.
+      if (!suffix) return !text.slice(hit[0].length).trim() || admissionArgNamesUs(text);
+      const me = botUsernameNow();
+      return !!me && suffix === me;
+    }
+    /* "/allow @thisbot" / "/deny @thisbot": the argument is OUR name and nothing else — the same address as the
+       "/allow@thisbot" form, and the natural one in a room with several bots. Read from the text, so it holds before
+       any platform's mention entities do; while our own name is unknown nothing can name us. */
+    function admissionArgNamesUs(text) {
+      const t = String(text == null ? '' : text).trim();
+      const hit = ADMISSION_CMD.exec(t);
+      if (!hit || hit[2]) return false;
+      const me = botUsernameNow();
+      return !!me && t.slice(hit[0].length).trim().toLowerCase() === '@' + me;
+    }
+    /* A non-owner's /allow in a group we do not answer in gets ONE line saying why, straight through the
+       transport like the offline notice: never the hub, so a stranger's group never reaches the durable inbox
+       or outbox (a flood there would back up the owner's own replies), and at most once a minute per chat, so a
+       room spamming the command cannot turn the bot into an amplifier. Best-effort by design. */
+    const ADMISSION_REFUSAL = '⚠ I don\'t answer in this chat — only the owner who paired me can turn me on here.';
+    const REFUSAL_EVERY_MS = 60000;
+    const MAX_REFUSED_CHATS = 200;
+    const refusedAt = new Map();   // chatId -> clock.now() of the last refusal
+    function refuseAdmission(m) {
+      const id = String(m.chatId);
+      const t = Number(clock.now()) || 0;
+      const last = refusedAt.get(id);
+      if (last != null && t - last < REFUSAL_EVERY_MS) return;
+      refusedAt.delete(id); refusedAt.set(id, t);
+      while (refusedAt.size > MAX_REFUSED_CHATS) refusedAt.delete(refusedAt.keys().next().value);
+      const route = {};
+      if (m.threadId != null && m.threadId !== '') route.threadId = String(m.threadId);
+      if (m.messageId != null && m.messageId !== '') route.replyTo = String(m.messageId);
+      console.log('[' + name + '] refused /allow or /deny from a non-owner in chat ' + id);
+      Promise.resolve()
+        .then(() => transport.send(id, ADMISSION_REFUSAL, route))
+        .then(r => { if (r && r.ok) rememberSent(id, r.messageId); })
+        .catch(e => console.error('[' + name + '] admission refusal failed for chat ' + id + ':', (e && e.message) || e));
+    }
+
+    /* FOUR verdicts. 'drop' is silence, 'run' is a real turn, and 'observe' is the middle ground the mention
+       gate created a need for: heard and remembered, but never dispatched. 'admit' is an /allow or /deny aimed at
+       us from a group we do not answer in yet (see ADMISSION COMMANDS) — dispatch hands the owner's to the hub
+       and refuses anyone else's. Kept as one function so the order of the gates can only be read one way — an
+       echo, a bot and a non-allowlisted chat are refused before anything is stored, so observing can never
+       become a way around admission. */
     function admission(m) {
       if (wasOurs(m.chatId, m.messageId)) return 'drop';               // our own post, echoed back to us
       if (ignoreBots && m.fromBot) return 'drop';                      // never answer another bot, in any chat
       if (allowedUsers.size && !allowedUsers.has(String(m.userId == null ? '' : m.userId))) return 'drop';
       if (m.chatType === 'dm') return 'run';
-      if (!allowed.has(String(m.chatId))) return 'drop';
+      if (!chatAllowed(m.chatId)) return admissionCommand(m) ? 'admit' : 'drop';
+      // a command another bot is NAMED for is never ours, even in a room we answer in full: the hub's parse strips the
+      // @suffix, so with /mention off "/new@otherbot" wiped THIS bot's history and "/stop@otherbot" stopped our run (2026-10-20)
+      if (commandForAnotherBot(m)) return observeUnmentionedFor(m.chatId) ? 'observe' : 'drop';
       if (!requireMentionFor(m.chatId)) return 'run';
       if (addressesUs(m)) return 'run';
       return observeUnmentionedFor(m.chatId) ? 'observe' : 'drop';
+    }
+    function commandForAnotherBot(m) {
+      const hit = /^\/[A-Za-z0-9_-]+@([A-Za-z0-9_]+)(?:\s|$)/.exec(String(m.text == null ? '' : m.text).trim());
+      if (!hit) return false;
+      const me = botUsernameNow();
+      return !!me && hit[1].toLowerCase() !== me;   // our own name still unknown: cannot tell, keep the old behaviour
     }
     // DM-only first cut: a direct message is always admitted; a group/channel message only if whitelisted.
     function admitted(m) { return admission(m) === 'run'; }
@@ -307,6 +389,9 @@
         const m = n.message;
         const verdict = admission(m);
         if (verdict === 'drop') { acknowledge(); return; }
+        // Only the paired owner admits a chat. A group message never claims ownership, so an unpaired bot has
+        // no owner here and every /allow is refused.
+        if (verdict === 'admit' && !(owner && String(m.userId) === owner)) { refuseAdmission(m); acknowledge(); return; }
         let own = null;
         if (m.chatType === 'dm') {
           own = ownerDecision(m.userId, m);
@@ -315,7 +400,10 @@
           // the hub as a direct reply: it gets the same durable inbox/outbox guarantees as a model answer while the
           // pairing code stays out of transcript/history. A repeated /pair from the owner is consumed too, so a
           // crash after owner persistence but before acknowledgement can never leak the code into the model.
-          const pairCommand = /^\/pair(?:\s|$)/i.test(String(m.text || ''));
+          // Slack/Discord panels show the slash-less "pair XXXXX-XXXXX" (Slack intercepts "/pair"); consume only
+          // that exact code SHAPE so an ordinary "pair these two files" from the owner still reaches the agent.
+          const pairText = String(m.text || '');
+          const pairCommand = /^\/pair(?:\s|$)/i.test(pairText) || /^pair\s+[A-Za-z0-9]{5}-?[A-Za-z0-9]{5}\s*$/i.test(pairText);
           if ((own.claimed && own.consume) || pairCommand) {
             onInbound({
               channel: name, chatId: String(m.chatId), chatType: 'dm', userId: String(m.userId || ''),
@@ -362,9 +450,18 @@
         // this a broadcast post rather than a person talking. A platform that sets neither behaves as before.
         if (m.edited) im.edited = true;
         if (m.channelPost) im.channelPost = true;
+        // A FORWARD is a third party's words under the owner's id — the hub taints its run and never parses it as a
+        // command. This rebuild used to drop the flag, so a forwarded message ran as the owner's own order (2026-10-10).
+        if (m.forwarded) im.forwarded = true;
         // OBSERVE-ONLY: heard, to be remembered, never dispatched. The hub files it in the transcript and returns
         // before a single model call. Additive — a platform that never observes sends the exact old shape.
         if (verdict === 'observe') im.observeOnly = true;
+        // ADMISSION-ONLY: the owner's /allow or /deny from a chat that is not admitted yet. The hub acts on that
+        // command and nothing else — this message got past the allow-list only because of what it says.
+        if (verdict === 'admit') im.admissionOnly = true;
+        // an /allow or /deny whose only argument is our own @name: the hub reads it as ours, like "/deny@thisbot"
+        // (it cannot tell our name from a moderation bot's "/deny @spammer" on its own). Additive.
+        if (m.chatType !== 'dm' && admissionArgNamesUs(m.text)) im.argNamesUs = true;
         if (Array.isArray(m.mentions) && m.mentions.length) im.mentions = m.mentions.slice();
         onInbound(im);   // production hub durably claims synchronously; a failed claim throws before acknowledgement
         acknowledge();
@@ -397,21 +494,33 @@
     // the fetch hanging FAR past that (no bytes ever arrive). Race the poll against a hard wall-clock =
     // pollTimeoutSec*1000 + 15s slack so a stall aborts in seconds, not the ~5min default socket timeout. The
     // disconnect abort (ac.signal) still wins — we compose both so either fires; a deadline-fire is NOT a disconnect
-    // (we distinguish by ac.signal.aborted below) so it just backs off and re-polls. Degrades gracefully on old
-    // platforms without AbortSignal.any/timeout (then only ac.signal governs, as before).
+    // (we distinguish by ac.signal.aborted below) so it just backs off and re-polls.
+    // ONE SHORT-LIVED CONTROLLER PER POLL, released when the poll settles. `AbortSignal.any([ac.signal, timeout])`
+    // per poll leaked: the connection-lifetime ac.signal keeps every composite it ever fed reachable (~1.8 KB per
+    // poll retained after GC on Node 22.23 — ~225 MB/day for a ~1.25/s Discord/Slack poll, freed only on reconnect).
     const POLL_DEADLINE_MS = pollTimeoutSec * 1000 + 15000;
-    function pollSignal() {
-      if (typeof AbortSignal === 'undefined' || typeof AbortSignal.timeout !== 'function') return ac.signal;
-      const deadline = AbortSignal.timeout(POLL_DEADLINE_MS);
-      return (typeof AbortSignal.any === 'function') ? AbortSignal.any([ac.signal, deadline]) : deadline;
+    function pollScope() {
+      const parent = ac && ac.signal;
+      if (typeof AbortController === 'undefined' || !parent || typeof parent.addEventListener !== 'function') return { signal: parent, done: function () {} };
+      const pc = new AbortController();
+      const timer = setTimeout(function () {
+        // the same reason AbortSignal.timeout gave, so transports keep classifying a deadline the way they did
+        pc.abort(typeof DOMException === 'function' ? new DOMException('The operation was aborted due to timeout', 'TimeoutError') : undefined);
+      }, POLL_DEADLINE_MS);
+      if (timer && typeof timer.unref === 'function') timer.unref();
+      const forward = function () { pc.abort(parent.reason); };
+      if (parent.aborted) forward(); else parent.addEventListener('abort', forward, { once: true });
+      return { signal: pc.signal, done: function () { clearTimeout(timer); parent.removeEventListener('abort', forward); } };
     }
 
     async function loop() {
       let attempt = 0;
       while (!stopped) {
         let raw;
+        const poll = pollScope();
         try {
-          raw = await transport.getUpdates({ offset: offset, timeoutSec: pollTimeoutSec, signal: pollSignal() });
+          try { raw = await transport.getUpdates({ offset: offset, timeoutSec: pollTimeoutSec, signal: poll.signal }); }
+          finally { poll.done(); }
         } catch (e) {
           // Only a REAL disconnect (stopped / the disconnect signal aborted) exits the loop. A deadline-timeout
           // abort has stopped=false and ac.signal.aborted=false, so it falls through to backoff+retry (a stalled
@@ -636,10 +745,10 @@
       // minimal identity (the reference harness's chat-info lookup -> {name,type}); transports may override with a richer lookup.
       chatInfo(chatId) {
         if (typeof transport.chatInfo === 'function') return transport.chatInfo(String(chatId));
-        return { id: String(chatId), type: allowed.has(String(chatId)) ? 'group' : 'dm' };
+        return { id: String(chatId), type: chatAllowed(chatId) ? 'group' : 'dm' };
       },
 
-      _internals: { admitted, admission, ownerOk, ownerDecision, normalizeAllowed, dispatch, isFatal, isConflict, isAbort, DEFAULT_BACKOFF, DEFAULT_CONFLICT_RETRY_MS, rememberSent, wasOurs, sentIds, MAX_SENT_IDS, wakeWords, namedUs, MIN_WAKE_WORD, get offset() { return offset; }, get owner() { return owner; } }
+      _internals: { admitted, admission, chatAllowed, admissionCommand, refusedAt, ADMISSION_REFUSAL, REFUSAL_EVERY_MS, ownerOk, ownerDecision, normalizeAllowed, dispatch, isFatal, isConflict, isAbort, DEFAULT_BACKOFF, DEFAULT_CONFLICT_RETRY_MS, rememberSent, wasOurs, sentIds, MAX_SENT_IDS, wakeWords, namedUs, MIN_WAKE_WORD, get offset() { return offset; }, get owner() { return owner; } }
     };
   }
 

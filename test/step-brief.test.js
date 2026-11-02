@@ -43,7 +43,18 @@ const HDR = 'YOUR STANDING BRIEF FOR THIS STATION:';
   // line naming on the INTAKE
   const nm = s.setPropLabel(intake.id, '  PRESS DESK  ');
   A.ok(nm.ok && nm.label === 'PRESS DESK', 'setPropLabel trims and stores the line name');
-  A.ok(!s.setPropLabel(bay.id, 'x').ok, 'a non-intake refuses a label (BAD_TYPE)');
+  A.ok(s.setPropLabel(bay.id, 'Draft review').ok, 'a BAY accepts its own visible step name');
+  /* RESTORED (2026-10-12, M34): 14e87ed5c turned the only "a non-intake refuses a label" check into the BAY acceptance above, so
+     nothing covered setPropLabel's BAD_TYPE branch any more. Every other machine still refuses a name — checked on a separate
+     station so this fixture stays as it was. */
+  {
+    const s0 = WM.create(), z0 = s0.rooms()[0].rects[0];
+    const ob = s0.addProp({ t: 'outbox', x: z0.x1 + 1, y: z0.y1 + 1, w: 2, h: 2 }), mg = s0.addProp({ t: 'merger', x: z0.x1 + 5, y: z0.y1 + 1, w: 1, h: 1 });
+    A.ok(ob.ok && mg.ok, 'fixture: an OUTBOX and a junction place on the seed deck');
+    A.eq(s0.setPropLabel(ob.id, 'x').error, 'BAD_TYPE', 'an OUTBOX refuses a name (BAD_TYPE)');
+    A.eq(s0.setPropLabel(mg.id, 'x').error, 'BAD_TYPE', 'a junction refuses a name (BAD_TYPE)');
+    A.ok(!s0.propById(ob.id).label && !s0.propById(mg.id).label, 'a refused name is never stored');
+  }
   A.eq(s.setPropLabel(intake.id, 'y'.repeat(100)).label.length, 48, 'a label is bounded at 48 chars');
   s.setPropLabel(intake.id, 'PRESS DESK');
 
@@ -52,6 +63,7 @@ const HDR = 'YOUR STANDING BRIEF FOR THIS STATION:';
   const b2 = s2.props().find(p => p.t === 'bay');
   const i2 = s2.props().find(p => p.t === 'intake');
   A.eq(b2.brief, BRIEF, 'brief survives serialize -> migrate -> deserialize');
+  A.eq(b2.label, 'Draft review', 'the BAY name survives serialize -> migrate -> deserialize');
   A.eq(i2.label, 'PRESS DESK', 'label survives serialize -> migrate -> deserialize');
 
   // projectGeometry carries both (the compiler's input)
@@ -131,13 +143,16 @@ const lineGeo = withBriefs => ({
 
   // a plan with BLOCKING errors is refused for ROUTING but the brief — a fact about the PLACED floor —
   // still serves (same capsPlan precedence as stationFor: a broken belt graph must not strip the duty line).
+  // (the fixture used to be a duplicate-binding floor; one agent may crew many bays since 2026-09-22, so the
+  //  blocking error is now a belt CYCLE drawn beside the briefed dock)
   const dup = P.compileRoutingPlan({
     props: [{ id: 'i', t: 'intake', x: 0, y: 0, w: 1, h: 1 },
             { id: 'b1', t: 'bay', x: 3, y: 0, w: 1, h: 1, agentId: 'twin', brief: 'First twin duty.' },
             { id: 'b2', t: 'bay', x: 6, y: 0, w: 1, h: 1, agentId: 'twin' }],
-    belts: [belt(1, 0, 'E'), belt(2, 0, 'E'), belt(4, 0, 'E'), belt(5, 0, 'E')]
+    belts: [belt(1, 0, 'E'), belt(2, 0, 'E'), belt(4, 0, 'E'), belt(5, 0, 'E'),
+            belt(20, 0, 'E'), belt(21, 0, 'S'), belt(21, 1, 'W'), belt(20, 1, 'N')]
   });
-  A.ok(!P.ok(dup), 'fixture: the duplicate-binding floor has a blocking error');
+  A.ok(!P.ok(dup), 'fixture: the cyclic floor has a blocking error');
   const r2 = makeRouter();
   A.ok(!r2.setPlan(dup).ok, 'the router refuses it for routing');
   A.eq(r2.resolveTarget({ tag: 'general' }), null, 'and routes nothing from it');

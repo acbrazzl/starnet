@@ -231,17 +231,9 @@ a:hover{ color:var(--amber); }
 .bezel img{ width:100%; height:auto; display:block; image-rendering:auto; }
 .bezel canvas{ width:100%; height:auto; display:block; }
 .bezel figcaption{ padding:9px 4px 2px; font-size:14px; letter-spacing:1px; color:rgba(236,224,207,.35); }
-/* the live preview IS the app (website/app, a verbatim frontend copy booted from a seeded
-   save) — an iframe at the app's fixed 1380x900 layout, clipped to the station-camera panel
-   and scaled to the column. live-preview.js measures the current panel rectangle. */
-.bezel.live{ border:0; background:transparent; padding:0; box-shadow:none; }
-.app-clip{ position:relative; overflow:hidden; width:100%; aspect-ratio:var(--app-aspect,666 / 744); }
-.app-clip iframe{
-  position:absolute; left:0; top:0; width:1380px; height:900px; border:0;
-  pointer-events:none;                       /* a preview, not a control surface */
-  transform-origin:0 0;
-  transform:scale(var(--appk,1)) translate(var(--appx,-283px),var(--appy,-88px));
-}
+/* every page's nav rides above the CRT glass (z 60-62) and above the homepage's lifted #station (63,
+   home.css). Doubled class so it outranks the later .topbar z-index rules below. Deliberately SHARED. */
+.topbar.topbar{ z-index:70; }
 
 /* feature cards */
 .cards{ display:grid; grid-template-columns:repeat(3,1fr); gap:18px; }
@@ -712,4 +704,4 @@ a:hover{ color:var(--amber); }
 .site-doc-paths{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px}.site-doc-paths>a{display:flex;flex-direction:column;padding:28px;border:1px solid var(--line);background:var(--panel);text-decoration:none;border-radius:6px}.site-doc-paths>a:hover{border-color:var(--amber-d)}
 .eyebrow{font:10px/1.5 ui-monospace,monospace;letter-spacing:.14em;color:var(--amber-d)}.site-doc-paths h3{font:600 22px/1.3 system-ui,sans-serif;letter-spacing:-.03em;color:var(--ink);margin:22px 0 12px}.site-doc-paths p{font:14px/1.8 system-ui,sans-serif;color:#bfc1b6;margin:0 0 24px}.site-doc-paths>a>span:last-child{font:12px system-ui,sans-serif;margin-top:auto}
 .footer{border-top:1px solid var(--line);padding:36px 28px;text-shadow:none}.footer-line{font:12px/1.7 system-ui,sans-serif;letter-spacing:0;color:#a8ad9f}.footer-links{gap:18px;margin-top:20px}.footer-links a{font:10px/1.5 system-ui,sans-serif;letter-spacing:.035em;color:#a9b39c}.footer-fine{font:10px/1.7 system-ui,sans-serif;letter-spacing:0;color:#909b83}
-@media(max-width:760px){.topbar{display:grid;grid-template-columns:1fr auto;gap:14px 10px;padding:14px 20px;text-align:left}.brand img{width:144px}.topnav{grid-row:2;grid-column:1/-1;justify-content:flex-start;gap:22px}.topnav a{font-size:15px;letter-spacing:1px}.topbar-right{grid-column:2;grid-row:1;justify-content:flex-end;gap:10px;letter-spacing:1px}.topbar-right>a:first-child{display:none}.topbar-right .nav-download{padding:7px 10px;font-size:15px}.site-doc-paths{grid-template-columns:1fr}.feat{padding:24px}.site-doc-paths>a{padding:24px}.footer-links{gap:14px}}
+@media(max-width:760px){.topbar{display:grid;grid-template-columns:1fr auto;gap:14px 10px;padding:14px 20px;text-align:left}.brand img{width:144px}.topnav{grid-row:2;grid-column:1/-1;justify-content:flex-start;flex-wrap:wrap;gap:10px 16px}.topnav a{font-size:15px;letter-spacing:1px}.topbar-right{grid-column:2;grid-row:1;justify-content:flex-end;gap:10px;letter-spacing:1px}.topbar-right>a:first-child{display:none}.topbar-right .nav-download{padding:7px 10px;font-size:15px}.site-doc-paths{grid-template-columns:1fr}.feat{padding:24px}.site-doc-paths>a{padding:24px}.footer-links{gap:14px}}

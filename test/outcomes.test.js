@@ -8,6 +8,7 @@
      - lane derivation follows the workstream-prefix vocabulary; lane:interactive never rates FAILING
      - successPrior is Laplace-smoothed and absent under support (a caller's default must stay untouched) */
 'use strict';
+const { readSidecarSource } = require('./helpers/source');
 const A = require('./_assert.js');
 const O = require('../sidecar/outcomes.js');
 
@@ -129,17 +130,35 @@ A.eq(O.successPrior(null, 'x'), null, '…and leans nothing');
   // host seams (DOM/boot flow — source-locked like the sibling suites' wiring sections)
   const fs = require('fs');
   const path = require('path');
-  const idx = fs.readFileSync(path.join(__dirname, '..', 'sidecar', 'index.js'), 'utf8');
+  const idx = readSidecarSource();
   A.ok(/function stationTrackRecord\(\)/.test(idx) && /personalizationStore\.read\(\)\.enabled\) return null/.test(A.fnBody(idx, 'function stationTrackRecord()')),
     'the shared read exists and the personalization PAUSE returns null before any fold');
-  A.ok(/const trackRecord = stationTrackRecordLines\(\);/.test(A.fnBody(idx, 'function commanderEvidenceInputs()')),
+  A.ok(/const trackRecord = stationTrackRecordLines\(\);/.test(A.fnBody(idx, 'function commanderEvidenceInputs(evidence)')),
     'the evidence composer consumes the shared read (every evidence:true generator now sees the record)');
-  A.ok(/learn, trackRecord, redact \}, \{ now \}\);/.test(idx),
+  // (context-key-redact, 2026-10-28: the pack scrubs with its own default resolver now; `redact` rides only as the
+  // self-talk join's matchRedact)
+  A.ok(/learn, trackRecord, matchRedact: redact \}, \{ now \}\);/.test(idx),
     'the night-shift context pack consumes the SAME read');
   A.ok(/success: q\.contract && q\.contract\.type === 'attest' \? 0\.55 : \(autoPrior != null \? autoPrior : 0\.8\)/.test(idx),
     'the quest ranker\'s success feature reads the measured autonomous-lane prior, guess only under support');
   A.ok(/trackRecord = \{ decided: rec\.decided, windowMs: rec\.windowMs, patterns: Outcomes\.summary\(rec\), lines: Outcomes\.lines\(rec\) \}/.test(idx),
     'GET /api/insights serves the same record (the fold every prompt cites is inspectable over HTTP)');
+}
+
+/* ── the Commander's verdict outranks the harness: a finished run rated `miss` is a failure ── */
+{
+  const rows = [];
+  for (let i = 0; i < 5; i++) rows.push(run({ runId: 'radar-' + i, recipeId: 'radar', title: 'Stock Radar', ts: T - i * 1000 }));
+  const blind = O.fold(rows, { now: T });
+  A.eq(O.summary(blind)[0] && O.summary(blind)[0].verdict, 'proven', 'without verdicts, five finished runs read as proven');
+  const verdicts = { 'radar-0': 'miss', 'radar-1': 'miss', 'radar-2': 'miss', 'radar-3': 'miss', 'radar-4': 'great' };
+  const rated = O.fold(rows, { now: T, verdicts });
+  const k = rated.keys['recipe:radar'];
+  A.eq(k.n + '/' + k.ok + '/' + k.fail, '5/1/4', 'four runs the Commander rated missed count as failures');
+  A.eq(k.failReasons.rated_missed, 4, 'named as rated_missed');
+  const line = O.lines(rated).find(l => l.indexOf('Stock Radar') >= 0);
+  A.ok(line && line.indexOf('only 1 of 5 recent runs landed') >= 0 && line.indexOf('rated_missed ×4') >= 0, 'the line says it did not land, and why (' + line + ')');
+  A.eq(O.fold([run({ runId: 'x', reason: 'error' })], { now: T, verdicts: { x: 'great' } }).keys['lane:interactive'].ok, 0, 'praise never turns a harness failure into a success');
 }
 
 A.report('outcomes track record');

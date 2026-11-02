@@ -14,6 +14,7 @@
      3. SOURCE-LEVEL invariants for the browser-only summon path (app.js / build.js are IIFEs over live DOM, so —
         like kitout.test.js — we lock the honesty-critical wiring by reading the source): NO per-agent placement. */
 'use strict';
+const { readSidecarSource } = require('./helpers/source');
 const A = require('./_assert.js');
 const fs = require('fs');
 const path = require('path');
@@ -367,7 +368,7 @@ A.ok(tight.indexOf('P1') >= 0, 'under a tight budget the agent package composes 
 A.eq(tight.indexOf('G1'), -1, 'the global extra (G1) is the one truncated, not the class package');
 
 /* ---------- 2b. sidecar roster passthrough (source-level: additive fields carried + persisted) ---------- */
-const idx = fs.readFileSync(path.join(__dirname, '../sidecar/index.js'), 'utf8');
+const idx = readSidecarSource();
 const repl = idx.slice(idx.indexOf('function replaceAgentRoster('), idx.indexOf('function loadAgentRoster('));
 A.ok(/skills:\s*Array\.isArray\(a && a\.skills\)/.test(repl), 'replaceAgentRoster passes through per-agent skills[]');
 A.ok(/reasoningEffort:\s*\(a && a\.reasoningEffort\)/.test(repl), 'replaceAgentRoster passes through reasoningEffort');
@@ -406,7 +407,7 @@ A.ok(!/onAgentRoomAssigned/.test(build), 'build.js no longer fires a room-assign
 // MISSING (add it in REFIT), and never claims a kit "arrives" at a per-agent workstation.
 const summarySeg = app.slice(app.indexOf('function loadoutSummary('), app.indexOf('function loadoutSummary(') + 900);
 A.ok(/stationGearTypes\(\)/.test(summarySeg), 'loadoutSummary checks the class gear against the STATION (station-wide), not the agent room');
-A.ok(/add .* in REFIT/.test(summarySeg), 'loadoutSummary tells the Commander to add missing station gear in REFIT');
+A.ok(/add .* in BUILD MODE/.test(summarySeg), 'loadoutSummary tells the Commander to add missing station gear in BUILD MODE');
 A.ok(!/arrives when it gets a workstation/.test(app), 'the summon copy no longer promises a kit arrives at a workstation');
 // stationGearTypes reads the station-wide caps (the shared source the run\'s skill availability uses)
 A.ok(/function stationGearTypes\(\)[\s\S]{0,200}World\.stationCaps/.test(app), 'stationGearTypes reads World.stationCaps (station-wide shared gear)');
@@ -521,22 +522,28 @@ A.ok(/function hydrateSkillRows\(\)/.test(mkt) && /hydrateSkillRows\(\)/.test(mk
   'the dossier hydrates real skill names async once the catalog resolves');
 // CLEARANCE/EFFORT honesty moved onto the control that resolves them (modelHelpHTML), replacing a spec-grid row
 // whose value was the words "station default". The claim must still be advisory, never a promise summon can't keep.
-const mhh = mkt.slice(mkt.indexOf('function modelHelpHTML('), mkt.indexOf('function modelHelpHTML(') + 1200);
-A.ok(/orchestrator/.test(mhh) && /tuned for/.test(mhh),
-  'the MODEL helper is honest — an unpinned model INHERITS the orchestrator, the class tier is only a tuning note');
+const mhh = A.fnBody(mkt, 'function modelHelpHTML(');
+// org P22 (2026-10-14): "orchestrator" became "the agent on the line" — summonAgent copies the FOCUSED agent's model
+A.ok(/Copies the model of the agent on the line now/.test(mhh) && /tuned for/.test(mhh),
+  'the MODEL helper is honest — an unpinned model COPIES the agent on the line, the class tier is only a tuning note');
 A.ok(/overrides the class default/.test(mhh), 'a pinned model is labelled as overriding the class default');
 A.ok(/applied at summon/.test(mkt), 'the builder still labels reasoning effort as what summon APPLIES');
 
-/* ---------- S3b. CUSTOM BUILDER: kit/skills/effort round-trip into the saved custom spec ---------- */
-// the builder holds picked-loadout state and folds it into the spec passed to Specialties.saveCustom.
-A.ok(/let buildKit = \[\], buildSkills = \[\], buildEffort = null/.test(mkt), 'the custom builder tracks picked kit/skills/effort');
-A.ok(/function buildKitChipsHTML\(\)/.test(mkt), 'the builder renders kit picker chips');
-A.ok(/KIT_PICKABLE = \['dish', 'cabinet', 'notebook', 'workbench', 'studio'\]/.test(mkt),
-  'the gear picker offers the shareable station caps only (computer/connector are per-agent manual-bind, excluded)');
-A.ok(/Choose at least one tool this class will use/.test(mkt), 'the custom builder explains the tool picker in plain language');
-A.ok(/data-skill=/.test(mkt) && /loadSkillCatalog\(\)\.then/.test(mkt.slice(mkt.indexOf('function wireBuildForm'))),
-  'the skill picker is populated from the live skill catalog');
-A.ok(/data-effort=/.test(mkt), 'the builder has a reasoning-effort selector');
+/* ---------- S3b. CUSTOM BUILDER: tools + skills are BUILT IN; a carried loadout still round-trips ----------
+   Andrew 2026-10-04: the builder's tool/skill/model/effort pickers were "very confusing" — and they never decided
+   an agent's reach (tools resolve per turn from the station + power settings, skills are ADD-only over the enabled
+   set, model + effort are picked on the recruit card). The builder is now one page that says so. Lock BOTH halves:
+   no picker comes back, and a loadout carried in from a station draft / an edited class still survives the save. */
+const bfhAll = A.fnBody(mkt, 'function buildFormHTML(');
+const wbfAll = A.fnBody(mkt, 'function wireBuildForm(');
+A.ok(/let buildKit = \[\], buildSkills = \[\], buildEffort = null/.test(mkt), 'the custom builder still carries a draft/edited loadout (kit/skills/effort)');
+A.ok(!/function buildKitChipsHTML\(\)/.test(mkt) && !/KIT_PICKABLE/.test(mkt), 'the builder no longer renders a tool (kit) picker');
+A.ok(!/Choose at least one tool/.test(mkt), 'the builder never demands a tool pick (the pick changed nothing)');
+A.ok(!/data-skill=/.test(bfhAll + wbfAll) && !/loadSkillCatalog/.test(wbfAll), 'the builder no longer renders a skill picker');
+A.ok(!/data-effort=/.test(bfhAll) && !/data-model=/.test(bfhAll), 'the builder no longer renders model / effort pickers (the recruit card owns them)');
+A.ok(!/data-recipe-panel/.test(bfhAll), 'the builder is ONE page, not three tabs');
+A.ok(/Tools and skills are built in/.test(bfhAll), 'the builder says, plainly, that tools and skills come built in');
+A.ok(/Pick its model when you recruit/.test(bfhAll), 'the builder points model choice at the recruit card');
 // the CREATE handler passes kit/skills/effort into saveCustom (round-trip).
 const createSeg = mkt.slice(mkt.indexOf("const create = stage.querySelector('.mkt-do-build')"), mkt.indexOf("stage.querySelector('#mkt-b-name'); if (nameIn)"));
 A.ok(/kit:\s*buildKit\.slice\(\)/.test(createSeg), 'CREATE folds the picked kit into the saved spec');
@@ -604,7 +611,8 @@ A.ok(/Object\.assign\(\{\}, editing \|\| \{\}/.test(createSeg), 'editing starts 
 // the seam is now filled: resolveTierModel reads a persisted tier->model map (a pinned tier wins; else base model).
 A.ok(/TIER_MODELS_KEY = 'starnet\.tierModels\.v1'/.test(app), 'app.js defines the tier->model store key');
 const rtm = app.slice(app.indexOf('function resolveTierModel('), app.indexOf('function resolveTierModel(') + 400);
-A.ok(/tierModelMap\(\)\[tier\]/.test(rtm), 'resolveTierModel consults the persisted tier->model map (the S1 seam is filled)');
+// org P22 fix: the read moved into tierModelFor (shared with the Recruitment Bay's MODEL helper); resolveTierModel calls it
+A.ok(/tierModelFor\(tier\)/.test(rtm) && /tierModelMap\(\)\[tier\]/.test(A.fnBody(app, 'function tierModelFor(')), 'resolveTierModel consults the persisted tier->model map (the S1 seam is filled)');
 A.ok(/return baseModel \|\|/.test(rtm), 'an unpinned tier still falls back to the base/station-default model (default unchanged)');
 // the SETTINGS MODELS section adds the CLASS TIER MODELS mapping + wires it to the SAME localStorage key.
 A.ok(/CLASS TIER MODELS/.test(sui), 'SETTINGS surfaces a CLASS TIER MODELS mapping');

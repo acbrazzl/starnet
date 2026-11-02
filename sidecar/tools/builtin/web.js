@@ -1,9 +1,10 @@
 /* sidecar/tools/builtin/web.js — the WEB capability: web_search(query) and web_fetch(url).
-   Zero extra API keys for the MVP. Node 18+ (global fetch). No deps.
+   Zero extra API keys for the MVP. Node 18+. One runtime dep: undici (its fetch + a per-hop Agent that pins the
+   DNS-validated address — the rebinding guard; staged into the desktop bundle by scripts/stage-voice-deps.mjs).
 
    makeWebTools(deps?) -> { searchTool, fetchTool, register(registry),
                             webSearch(query,opts), webFetch(url,opts) }   // raw fns exported for reuse/testing
-     deps.fetchImpl  : (url, init) => Promise<Response>   // injectable for tests; defaults to global fetch
+     deps.fetchImpl  : (url, init) => Promise<Response>   // injectable for tests; defaults to undici.fetch
      deps.openrouter : { apiKey, model } | null           // enables the OpenRouter search/fetch FALLBACK
      deps.userAgent  : override UA string
 
@@ -37,6 +38,8 @@
   const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
                      '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
   const FETCH_MAX_CHARS   = 6000;   // web_fetch truncation
+  const net = require('node:net');
+  const responseProvenance = require('../response-provenance.js');
   /* RAW-BODY CEILING, applied BEFORE anything parses the response.
      htmlToText is a chain of lazy `[\s\S]*?` replaces — quadratic in the input — and the clamp to
      FETCH_MAX_CHARS ran AFTER it. Measured on a page of repeated "<script>": 64KB -> 55ms, 256KB -> 880ms,
@@ -46,12 +49,61 @@
      2MB leaves the extractor far more material than the 6k it will keep, while bounding the worst case to
      well under a second. */
   const RAW_BODY_MAX_CHARS = 2 * 1024 * 1024;
-  function readBodyBounded(r) {
-    return Promise.resolve(r.text()).then(t => {
+  /* THE CEILING IS ENFORCED WHILE READING, NOT AFTER (2026-10-20). The cut above ran on r.text(), which had
+     already pulled, decompressed and decoded the WHOLE body: a 32 MiB file pulled 33,554,432 bytes to keep
+     2 Mi characters (station RSS 61 -> 164 MB), an endless stream never finished, and a gzip/br bomb inflated
+     in full. Now the body streams in and the read stops at RAW_BODY_MAX_BYTES (3 bytes per UTF-16 unit, so the
+     kept text is still the full 2 Mi characters for any UTF-8) and cancels the rest. One TextDecoder pass over
+     the kept bytes decodes exactly as Response.text() does (BOM stripped, invalid bytes -> U+FFFD).
+     Content-Length is never trusted to refuse a body: under gzip it is the compressed wire size. A response
+     without a stream (test doubles that only implement text()) keeps the historic path. `truncated` lets a
+     caller say the body was cut instead of calling it whole; `downloadStopped` says the READ stopped at the
+     byte cap with more pending. They differ: a 2-6 MiB ASCII body is read whole and only its decoded text is
+     cut, so calling that "not downloaded" would be false. */
+  const RAW_BODY_MAX_BYTES = RAW_BODY_MAX_CHARS * 3;
+  const { note: failNote } = require('../../failopen');
+  async function readBodyInfo(r) {
+    const body = r && r.body;
+    if (!body || typeof body.getReader !== 'function') {
+      const t = await r.text();
       const s = String(t == null ? '' : t);
-      return s.length > RAW_BODY_MAX_CHARS ? s.slice(0, RAW_BODY_MAX_CHARS) : s;
-    });
+      return s.length > RAW_BODY_MAX_CHARS ? { text: s.slice(0, RAW_BODY_MAX_CHARS), truncated: true, downloadStopped: false } : { text: s, truncated: false, downloadStopped: false };
+    }
+    const reader = body.getReader();
+    const chunks = [];
+    let bytes = 0, truncated = false;
+    try {
+      for (;;) {
+        const step = await reader.read();
+        if (step.done) break;
+        const value = step.value instanceof Uint8Array ? step.value : new Uint8Array(step.value || []);
+        const room = RAW_BODY_MAX_BYTES - bytes;
+        if (value.byteLength >= room) {
+          chunks.push(value.subarray(0, room)); bytes += room;
+          truncated = value.byteLength > room;
+          break;
+        }
+        chunks.push(value); bytes += value.byteLength;
+      }
+      if (bytes >= RAW_BODY_MAX_BYTES && !truncated) truncated = !(await reader.read()).done;   // exactly at the cap: is there more?
+    } finally {
+      if (truncated) {
+        try { await reader.cancel(); } catch (e) { failNote('web.body.cancel', e); }
+      } else {
+        try { reader.releaseLock(); } catch (e) { failNote('web.body.release', e); }
+      }
+    }
+    const downloadStopped = truncated;   // the read stopped at the byte cap and cancelled the rest
+    let s = new TextDecoder('utf-8').decode(Buffer.concat(chunks.map(c => Buffer.from(c.buffer, c.byteOffset, c.byteLength))));
+    if (s.length > RAW_BODY_MAX_CHARS) { s = s.slice(0, RAW_BODY_MAX_CHARS); truncated = true; }
+    return { text: s, truncated, downloadStopped };
   }
+  function readBodyBounded(r) {
+    return readBodyInfo(r).then(info => info.text);
+  }
+  const RAW_BODY_MAX_LABEL = String(RAW_BODY_MAX_CHARS).replace(/\B(?=(\d{3})+(?!\d))/g, ',');   // "2,097,152"
+  const RAW_BODY_CUT_NOTE = 'response body cut at its first ' + RAW_BODY_MAX_LABEL + ' characters (raw-body ceiling); the rest was not kept';
+  const RAW_BODY_STOP_NOTE = RAW_BODY_CUT_NOTE + ', and the download stopped at ' + String(RAW_BODY_MAX_BYTES).replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' bytes';   // "6,291,456"
   const SNIPPET_MAX_CHARS = 320;
   const SEARCH_TIMEOUT_MS = 12000;
   const FETCH_TIMEOUT_MS  = 15000;
@@ -106,6 +158,45 @@
   }
   function stripTags(s) { return decodeEntities(String(s).replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim(); }
   function clamp(s, n) { s = String(s); return s.length > n ? s.slice(0, n).trimEnd() + ' …' : s; }
+  /* undici's whole message for ANY failed outbound fetch is "fetch failed"; the reason lives on .cause. Name its
+     code + host so a failure is diagnosable from the transcript instead of an unactionable slogan — the cause's
+     own host/IP first, else the host we DIALLED: a TLS-alert or socket cause (ERR_SSL_TLSV1_ALERT_DECODE_ERROR,
+     UND_ERR_SOCKET) carries no host at all, and "fetch failed (ERR_SSL_…)" left a customer unable to tell which
+     service broke (2026-10-07). Never the raw cause and never a URL: with auth.in:"query" the request URL carries
+     a key. Same shape as telegram.transport.js errOf. Returns e. */
+  function nameTransport(e, host) {
+    const c = e && e.cause;
+    // A response body can fail after headers arrived. Keep its distinct prefix;
+    // append only bounded machine metadata, never decoder text or cause URLs.
+    if (c && e instanceof Error && e.name !== 'AbortError' && e.message === 'terminated') {
+      const code = typeof c.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(c.code) ? c.code : '';
+      const h = typeof host === 'string' ? host : '';
+      const ip = h.startsWith('[') && h.endsWith(']') ? h.slice(1, -1) : h;
+      const hostname = h.length <= 253 && (/^[A-Za-z0-9.-]+$/.test(h) || net.isIP(ip)) ? h : '';
+      if (code) e.message += ' (' + [code, hostname].filter(Boolean).join(' ') + ')';
+      return e;
+    }
+    if (c && e instanceof Error && /^fetch failed$/.test(e.message)) {
+      const detail = [c.code || c.name || '', c.hostname || c.address || host || ''].filter(Boolean).join(' ');
+      if (detail) e.message = 'fetch failed (' + detail + ')';
+    }
+    return e;
+  }
+  /* Did this failure happen BEFORE any server answered? (no connection, DNS, TLS, reset, no reply in time.)
+     An HTTP status or a DDG anomaly page is the web ANSWERING; these are not. Codes are read the same way
+     softFetchAnswer reads them (e, e.errors[], e.cause, e.cause.errors[]). */
+  const TRANSPORT_CODE_RE = /^(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|EPIPE|UND_ERR_\w+|ERR_SSL_\w+|ERR_TLS_\w+|CERT_\w+|\w*_SIGNATURE\w*|UNABLE_TO_\w+|DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN)$/;
+  function isTransportFault(e) {
+    if (!e) return false;
+    if (e.__timeout) return true;
+    if (/^fetch failed/.test(String(e.message || ''))) return true;
+    const c = e.cause;
+    const codes = [e.code].concat(
+      (e.errors || []).map(x => x && x.code),
+      c ? [c.code].concat((c.errors || []).map(x => x && x.code)) : []
+    );
+    return codes.some(x => typeof x === 'string' && TRANSPORT_CODE_RE.test(x));
+  }
 
   function waitAbortable(ms, signal) {
     return new Promise((resolve, reject) => {
@@ -239,10 +330,17 @@
     else h = h.replace(/\.+$/, '');
     return h;
   }
+  // a refusal the HOST wrote: never taints the run, and its row says why (see browser.js hostRefusal)
+  function hostRefusal(msg, summary) { const e = new Error(msg); e.hostAuthored = true; if (summary) e.toolSummary = summary; return e; }
+  // ...but ONLY for the caller's own URL. A REDIRECT hop's refusal names a host the REMOTE server chose (its Location
+  // header, or a name whose DNS it runs), so its text is outside text: it must reach the run like a fetched byte and
+  // latch the taint, exactly as before the refusal was host-authored. Every redirect hop's guard error passes here.
+  function redirectRefusal(e) { if (e && e.hostAuthored) delete e.hostAuthored; return e; }
   function assertSafeUrl(raw) {
     let u;
-    try { u = new URL(raw); } catch (e) { throw new Error('invalid URL: ' + raw); }
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('only http(s) URLs are allowed');
+    try { u = new URL(raw); } catch (e) { throw hostRefusal('invalid URL: ' + raw, 'invalid URL'); }
+    if (u.protocol === 'file:') throw hostRefusal('only http(s) URLs are allowed. Files are read with fs_read — a worker\'s saved file at the exact path its dispatch row lists (artifacts[].abs).', 'not a web address (file://)');
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw hostRefusal('only http(s) URLs are allowed', 'not a web address');
     const h = hostOf(u);
     const blockedName =
       h === 'localhost' || h === '0.0.0.0' ||
@@ -252,14 +350,17 @@
     const numericHost = /^\d+$/.test(h) || /^0x[0-9a-f]+$/i.test(h);   // integer / hex IP encodings (e.g. http://2130706433/)
     const bareName = h.indexOf('.') < 0 && h.indexOf(':') < 0 && !numericHost;  // single-label intranet name
     if (blockedName || bareName || numericHost || isPrivateV4(h) || isPrivateV6(h))
-      throw new Error('refusing to fetch private/loopback/intranet host: ' + h);
+      throw hostRefusal('refusing to fetch private/loopback/intranet host: ' + h);
     return u;
   }
-  // DNS-rebinding guard: resolve a NAME and refuse if any address is private. Injectable + best-effort.
-  // A proven ENOTFOUND is preserved for web_fetch to report immediately; transient resolver failures are
-  // still left for fetch to surface because they are not proof that the domain is absent.
+  // Resolve every candidate and return the address that the connection must use.
+  // A DNS failure is not evidence that the destination is safe, so fail closed.
   function nodeLookup(host) { const dns = require('node:dns'); return dns.promises.lookup(host, { all: true }); }
   async function assertResolvedSafe(u, lookup) {
+    const addrs = await resolvedSafeAddrs(u, lookup);
+    return addrs && addrs[0];
+  }
+  async function resolvedSafeAddrs(u, lookup) {
     if (!lookup) return;
     const h = hostOf(u);
     if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h) || h.indexOf(':') >= 0) return;   // already a literal
@@ -273,15 +374,16 @@
       throw e;
     }
     let addrs;
-    try { addrs = await lookup(u.hostname); }
-    catch (e) {
-      if (e && e.code === 'ENOTFOUND') throw e;
-      return;
-    }
+    addrs = await lookup(u.hostname);
+    if (!Array.isArray(addrs) || !addrs.length) throw new Error('no verified DNS address for ' + h);
     for (const a of (addrs || [])) {
       const ip = (a && a.address) || '';
-      if (isPrivateV4(ip) || isPrivateV6(ip)) throw new Error('refusing: ' + u.hostname + ' resolves to private address ' + ip);
+      if (!net.isIP(ip)) throw new Error('resolver returned an invalid IP address for ' + h);
+      // host-authored like the static refusal above when the name is the caller's own; a redirect hop's name came
+      // from the remote server, and its caller strips the mark (redirectRefusal)
+      if (isPrivateV4(ip) || isPrivateV6(ip)) throw hostRefusal('refusing: ' + u.hostname + ' resolves to private address ' + ip);
     }
+    return addrs;
   }
 
   // ---------- HTML -> readable text (web_fetch fallback) ----------
@@ -420,7 +522,8 @@
 
   function makeWebTools(deps) {
     deps = deps || {};
-    const rawFetch = deps.fetchImpl || (typeof fetch !== 'undefined' ? fetch : null);
+    const undici = require('undici');
+    const rawFetch = deps.fetchImpl || undici.fetch;
     if (!rawFetch) throw new Error('web.js requires global fetch (Node 18+) or deps.fetchImpl');
     const politeness = deps.politeness || makePoliteScheduler({
       wait: deps.politeWait, minGapMs: deps.politeMinGapMs,
@@ -432,6 +535,37 @@
     const or = deps.openrouter || null;
     // DNS-rebinding guard resolver: default to real Node DNS; pass deps.lookup:null to disable (tests).
     const doLookup = ('lookup' in deps) ? deps.lookup : nodeLookup;
+    const makePinnedAgent = deps.agentFactory || (options => new undici.Agent(options));
+    // One dispatcher per requested hop: its socket lookup returns ONLY the
+    // address validated for this hop. The URL stays intact for Host and TLS SNI.
+    // Closing after the body is read prevents an old connection from carrying
+    // the next hop past its own DNS validation.
+    // Node 20+ connects with autoSelectFamily on, which asks the lookup for { all: true } and expects an ARRAY
+    // of {address, family}. Answering (address, family) there made Node read `undefined` as the list, so every
+    // pinned request died as "fetch failed" (cause ERR_INVALID_IP_ADDRESS) — web_request could reach nothing
+    // (user report, 0.12.5 + 0.13.0). The list holds every VALIDATED address, so a v6-less network still
+    // reaches v4; the single-address shape keeps the first one.
+    async function fetchPinned(u, init) {
+      const addrs = await resolvedSafeAddrs(u, doLookup);
+      const pinned = addrs ? addrs.map(a => ({ address: a.address, family: a.family || net.isIP(a.address) })) : null;
+      const dispatcher = pinned ? makePinnedAgent({ connect: {
+        lookup(hostname, options, callback) {
+          if (options && options.all) callback(null, pinned.map(a => Object.assign({}, a)));
+          else callback(null, pinned[0].address, pinned[0].family);
+        }
+      } }) : null;
+      try {
+        const r = await doFetch(u.href, dispatcher ? Object.assign({}, init, { dispatcher }) : init);
+        const info = await readBodyInfo(r);
+        return { status: r.status, ct: r.headers.get('content-type') || '', loc: r.headers.get('location') || '', body: info.text, bodyTruncated: info.truncated, bodyDownloadStopped: info.downloadStopped };
+      } catch (e) {
+        // name the cause code + host (nameTransport). Cause host/IP FIRST, the requested hostname only as the
+        // fallback — never reorder: the pinned-dispatcher test expects the IP when the cause carries one.
+        throw nameTransport(e, u.hostname);
+      } finally {
+        if (dispatcher) await dispatcher.close();
+      }
+    }
     // web_request needs the RUN's surface (host authority — never taken from tool args) and a resolver for
     // the Commander's stored keys. Default: no keys and the strict surface, so an unwired caller can only
     // make UNAUTHENTICATED requests rather than silently gaining credentials it was never handed.
@@ -441,6 +575,31 @@
     // behaves exactly as before. Availability is probed lazily per use (Chrome may not exist).
     const reader = deps.reader || null;
     const readerReady = () => { try { return !!(reader && reader.available().ok); } catch (_) { return false; } };
+    /* THE READER RUNG KEEPS TIME (live walk 10-14: a worker's search sat on "Searching …" for 80 s, then 185 s, while
+       Chromium failed to launch, and nobody was told). When a later rung can still answer (OpenRouter), the browser's
+       START gets READER_RUNG_MS; a browser not up by then is passed over, and while it is still starting no search
+       queues behind it. The budget bounds ONLY the start (review 10-14): once the browser has produced a page
+       (reader.search's onLaunched) the search waits for it as before, so a healthy-but-slow read never tips into the
+       PAID OpenRouter search. A browser that could not start is named in the answer (webreader holds it down a while). */
+    const READER_RUNG_MS = Number.isFinite(deps.readerBudgetMs) ? Math.max(1, deps.readerBudgetMs) : 15000;
+    let readerStarting = null;   // a reader search still running after its rung passed it over
+    const readerDown = () => { try { const a = reader && reader.available(); return a && !a.ok && a.launchFailed ? String(a.reason || 'web search\'s background browser could not start') : ''; } catch (_) { return ''; } };
+    // start(onLaunched) -> the reader's search promise; resolves LATE when the browser has not STARTED within ms
+    function readerWithin(start, ms) {
+      let timer = null, up = false, giveUp = null;
+      const late = new Promise(res => { giveUp = res; });
+      const p = start(() => { up = true; if (timer) { clearTimeout(timer); timer = null; } });
+      if (!up) timer = setTimeout(() => giveUp(LATE), ms);
+      return Promise.race([p, late]).then(v => {
+        if (timer) { clearTimeout(timer); timer = null; }
+        if (v !== LATE) return v;
+        readerStarting = p;
+        const clear = () => { if (readerStarting === p) readerStarting = null; };
+        p.then(clear, clear);
+        return LATE;
+      });
+    }
+    const LATE = { late: true };
     const serviceKeys = {
       resolve: (name, sfc) => (typeof deps.resolveServiceKey === 'function'
         ? deps.resolveServiceKey(name, sfc)
@@ -522,29 +681,66 @@
       if (!query) throw new Error('empty query');
       const parent = opts && opts.signal;   // the run/tool-timeout signal, threaded down so a cancel drops the fetch
       const errors = [];
+      // [source, run, the host it dials — named on a bare transport failure (nameTransport)]
       const chain = [
-        ['mojeek',          () => mojeekSearch(query, parent)],
-        ['duckduckgo-html', () => ddgSearch('https://html.duckduckgo.com/html/', parseDDGHtml, query, parent)],
-        ['duckduckgo-lite', () => ddgSearch('https://lite.duckduckgo.com/lite/', parseDDGLite, query, parent)]
+        ['mojeek',          () => mojeekSearch(query, parent), 'www.mojeek.com'],
+        ['duckduckgo-html', () => ddgSearch('https://html.duckduckgo.com/html/', parseDDGHtml, query, parent), 'html.duckduckgo.com'],
+        ['duckduckgo-lite', () => ddgSearch('https://lite.duckduckgo.com/lite/', parseDDGLite, query, parent), 'lite.duckduckgo.com']
       ];
       // The READER outranks the paid fallback: a real local Chrome sails past the fingerprint checks
       // that throttle the scrape endpoints, costs nothing, and keeps search working with zero keys.
-      if (readerReady()) chain.push(['browser', async () => {
-        const r = await reader.search(query, { signal: parent });
-        return (r && r.results) || [];
-      }]);
-      if (or && or.apiKey) chain.push(['openrouter', () => openrouterSearch(query, parent)]);
-      for (const [source, fn] of chain) {
+      // browserNote: what the Commander is told when this search reached the browser rung and the browser was
+      // down, still starting, or too slow — only when the rung was actually reached (an engine that answered first
+      // makes the browser irrelevant to this search).
+      let browserNote = '';
+      const laterRung = !!(or && or.apiKey);
+      if (reader) {
+        const down = readerDown();
+        const starting = !down && !!readerStarting && laterRung;
+        if (down || starting || readerReady()) chain.push(['browser', async () => {
+          if (down) { browserNote = down; throw new Error(down); }
+          if (starting) { browserNote = 'web search\'s background browser is still starting'; throw new Error(browserNote); }
+          const r = laterRung
+            ? await readerWithin(onLaunched => reader.search(query, { signal: parent, onLaunched }), READER_RUNG_MS)
+            : await reader.search(query, { signal: parent });
+          if (r === LATE) {
+            browserNote = 'web search\'s background browser was not ready within ' + (READER_RUNG_MS >= 1000 ? Math.round(READER_RUNG_MS / 1000) + ' s' : READER_RUNG_MS + ' ms');
+            throw new Error(browserNote);
+          }
+          if (r && r.launchFailed) { browserNote = String(r.reason || 'web search\'s background browser could not start'); throw new Error(browserNote); }
+          return (r && r.results) || [];
+        }]);
+      }
+      if (laterRung) chain.push(['openrouter', () => openrouterSearch(query, parent), 'openrouter.ai']);
+      /* Throttling vs. no connection (2026-10-07). "Every engine declined" is web weather only if some engine
+         ANSWERED (a status, an anomaly page, 0 results). When every HTTP engine failed before any server
+         answered (offline, DNS down, TLS broken on this machine), calling that throttling would be the harness
+         lying about its own connectivity. The reader rung is NEUTRAL: reader.search swallows Chrome's navigation
+         failures and resolves [] — that is no proof either way. A cancelled run is a cancel, never "no results". */
+      let httpTried = 0, httpTransport = 0;
+      for (const [source, fn, host] of chain) {
+        if (parent && parent.aborted) throw (parent.reason instanceof Error ? parent.reason : new Error('web_search cancelled'));
+        if (source !== 'browser') httpTried++;
         try {
           const results = await fn();
-          if (results && results.length) return { results: results.slice(0, (opts && opts.limit) || 8), source };
+          if (results && results.length) return { results: results.slice(0, (opts && opts.limit) || 8), source, browserNote };
           errors.push(source + ': 0 results');
-        } catch (e) { errors.push(source + ': ' + (e && e.message ? e.message : String(e))); }
+        } catch (e) {
+          if (parent && parent.aborted) throw e;
+          nameTransport(e, host);
+          if (source !== 'browser' && isTransportFault(e)) httpTransport++;
+          errors.push(source + ': ' + (e && e.message ? e.message : String(e)));
+        }
       }
-      const e = new Error('web_search failed (' + errors.join(' | ')
-        + '). Search providers are temporarily unavailable; do not immediately repeat the same search. '
-        + 'Use sources already returned, try a known direct URL with web_fetch, or finish with an explicit evidence limitation.');
-      e.__allFailed = true; e.__errors = errors.slice(); throw e;
+      const unreachable = httpTried > 0 && httpTransport === httpTried;
+      const e = new Error(unreachable
+        ? 'web_search could not reach any search engine (' + errors.join(' | ') + '). This machine\'s network '
+          + 'connection may be down, or something on it is blocking HTTPS; this is not engine throttling. Check '
+          + 'connectivity before searching again, or finish with an explicit evidence limitation.'
+        : 'web_search failed (' + errors.join(' | ')
+          + '). Search providers are temporarily unavailable; do not immediately repeat the same search. '
+          + 'Use sources already returned, try a known direct URL with web_fetch, or finish with an explicit evidence limitation.');
+      e.__allFailed = true; e.__unreachable = unreachable; e.__errors = errors.slice(); e.__browserNote = browserNote; throw e;
     }
 
     // ====================================================================
@@ -564,8 +760,9 @@
       if (!deps.jinaKey) { const e = new Error('jina not configured'); e.__retryDirect = true; throw e; }
       const headers = { 'Accept': 'text/plain', 'X-Return-Format': 'text', 'User-Agent': UA };
       if (deps.jinaKey) headers['Authorization'] = 'Bearer ' + deps.jinaKey;
+      // readBodyInfo, like directFetch: a reader body cut at the raw-body ceiling must say so, not read as the whole page
       const res = await withTimeout(signal => doFetch('https://r.jina.ai/' + targetUrl, { headers, signal })
-        .then(async r => ({ status: r.status, body: await readBodyBounded(r) })), FETCH_TIMEOUT_MS, parent);
+        .then(async r => { const info = await readBodyInfo(r); return { status: r.status, body: info.text, bodyTruncated: info.truncated }; }), FETCH_TIMEOUT_MS, parent);
       if (res.status === 401 || res.status === 402 || res.status === 429) {
         const e = new Error('jina ' + res.status); e.__retryDirect = true; throw e;
       }
@@ -576,26 +773,38 @@
         const e = new Error('upstream ' + (w ? w[1] : 'error')); e.__retryDirect = true; throw e;
       }
       const body = res.body.replace(/^(Title:[^\n]*\n)?(URL Source:[^\n]*\n)?(Published Time:[^\n]*\n)?(Markdown Content:\n)?/i, '');
-      return body.trim();
+      return { text: body.trim(), cut: !!res.bodyTruncated };
     }
 
     // FALLBACK: direct fetch + strip. No rate limit; great for static pages. Redirects are followed
     // MANUALLY so every hop is re-validated against the SSRF guard — a public page cannot bounce us
     // to an internal address (e.g. a 302 -> http://169.254.169.254/ cloud-metadata endpoint).
+    // Re-validate a redirect target. Its refusal is never host-authored: the server picked the name (redirectRefusal).
+    async function redirectTarget(loc, base) {
+      try {
+        const next = assertSafeUrl(new URL(loc, base).href);
+        await assertResolvedSafe(next, doLookup);
+        return next;
+      } catch (e) { throw redirectRefusal(e); }
+    }
     async function directFetch(u0, parent) {
       let u = u0;
       for (let hop = 0; hop < 6; hop++) {
-        const res = await withTimeout(signal => doFetch(u.href, {
-          headers: { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml' }, redirect: 'manual', signal
-        }).then(async r => ({ status: r.status, ct: r.headers.get('content-type') || '', loc: r.headers.get('location') || '', body: await readBodyBounded(r) })), FETCH_TIMEOUT_MS, parent);
+        let res;
+        try {
+          res = await withTimeout(signal => fetchPinned(u, {
+            headers: { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml' }, redirect: 'manual', signal
+          }), FETCH_TIMEOUT_MS, parent);
+        } catch (e) { throw hop > 0 ? redirectRefusal(e) : e; }   // fetchPinned re-resolves a redirect hop's name too
         if (res.status >= 300 && res.status < 400 && res.loc) {
-          const next = assertSafeUrl(new URL(res.loc, u.href).href);   // re-validate the redirect target
-          await assertResolvedSafe(next, doLookup);
-          u = next; continue;
+          u = await redirectTarget(res.loc, u.href);   // re-validate the redirect target
+          continue;
         }
         if (res.status >= 400) throw new Error('http ' + res.status);
-        if (/application\/(json|xml)|text\/(plain|csv)/i.test(res.ct)) return res.body.trim();
-        return htmlToText(res.body);
+        // `cut`: the page body hit the raw-body ceiling, so this text comes from its first part only
+        const cut = !!res.bodyTruncated;
+        if (/application\/(json|xml)|text\/(plain|csv)/i.test(res.ct)) return { text: res.body.trim(), cut };
+        return { text: htmlToText(res.body), cut };
       }
       throw new Error('too many redirects');
     }
@@ -606,15 +815,18 @@
       await assertResolvedSafe(u, doLookup);   // refuse names that RESOLVE to private addresses (rebinding)
       const max = (opts && opts.maxChars) || FETCH_MAX_CHARS;
       const parent = opts && opts.signal;   // run/tool-timeout signal, threaded down so a cancel drops the fetch
-      let text, source, jErr;
-      try { text = await jinaFetch(u.href, parent); source = 'jina'; }
-      catch (e) { jErr = e; text = await directFetch(u, parent); source = 'direct'; }
+      let text, source, jErr, cut = false;
+      const direct = async () => { const d = await directFetch(u, parent); cut = d.cut; source = 'direct'; return d.text; };
+      try { const j = await jinaFetch(u.href, parent); text = j.text; cut = j.cut; source = 'jina'; }
+      catch (e) { jErr = e; text = await direct(); }
       if (!text || !text.trim()) {
-        if (source === 'jina') { text = await directFetch(u, parent); source = 'direct'; }
+        if (source === 'jina') text = await direct();
         if (!text || !text.trim()) throw new Error('web_fetch got empty content' + (jErr ? ' (jina: ' + jErr.message + ')' : ''));
       }
       const bounded = clamp(text, max);
-      return { text: bounded, fullText: bounded === text ? null : text, url: u.href, source };
+      const out = { text: bounded, fullText: bounded === text ? null : text, url: u.href, source };
+      if (cut) out.cut = true;   // only when it happened: the result object is otherwise unchanged
+      return out;
     }
 
     // ====================================================================
@@ -697,18 +909,33 @@
       + 5000;
     const searchTool = {
       name: 'web_search', capability: 'web', scope: 'read', requiresConsent: false, timeoutMs: searchChainTimeoutMs,
+      resultScrub: false,   // external content, not a station store (registry.js resultScrubFor; review r3)
       description: 'Search the web and get a list of results (title, url, snippet). Use this to find current information and pages to read. ' +
-        'If every engine is throttled the result says so — that is temporary web weather, not a malfunction; change strategy instead of repeating the search.',
+        'If every engine is throttled the result says so: that is temporary web weather, not a malfunction; change strategy instead of repeating the search.',
       schema: { type: 'object', required: ['query'], properties: { query: { type: 'string' } } },
       run: async (args, ctx) => {
         // visible tool activity is the loop's frozen agent.tool_call / agent.tool_result events
-        let results, source;
-        try { ({ results, source } = await webSearch(args.query, { signal: ctx && ctx.signal })); }
+        let results, source, browserNote = '';
+        try { ({ results, source, browserNote } = await webSearch(args.query, { signal: ctx && ctx.signal })); }
         catch (e) {
           // An exhausted keyless chain is the engines' weather, not a harness fault — answer it as
           // information (see softFetchAnswer's rationale above). webSearch itself still throws, so
-          // programmatic callers and tests keep the strict contract.
-          if (e && e.__allFailed) return {
+          // programmatic callers and tests keep the strict contract. NOT when no engine could even be reached
+          // (__unreachable: offline / TLS broken here) — that is a genuine fault and stays an isError result.
+          // …unless the station browser was DOWN (review 10-14): the browser is what gets past the engines' throttling, so a
+          // dead one is a station fault the Commander must hear about — named in the summary, never called web weather.
+          // That browser is web_search's own (user report 10-28): the agent is told the browser tool is a separate one, so
+          // a dead search helper never reads as "browsing is impossible" and ends a run that browser.navigate could finish.
+          if (e && e.__allFailed && !e.__unreachable && e.__browserNote) return {
+            content: 'No results this time — the keyless engines declined (' + (e.__errors || []).filter(x => !/^browser:/.test(x)).join('; ') + '), and ' +
+                     e.__browserNote + ', so it could not search past them. Do not immediately repeat the same search. ' +
+                     'That background browser belongs to web_search only: if you have the browser tool, browser.navigate ' +
+                     'opens pages in its own, separate browser, which may still start. Otherwise use sources already gathered, ' +
+                     'web_fetch a known URL directly, or finish and state the evidence limitation (name the background browser ' +
+                     'problem to the Commander).',
+            summary: 'no results · ' + e.__browserNote
+          };
+          if (e && e.__allFailed && !e.__unreachable) return {
             content: 'No results this time — every search engine declined (' + (e.__errors || []).join('; ') + '). ' +
                      'This is temporary throttling of the keyless engines, not a malfunction. Do not immediately ' +
                      'repeat the same search: use sources already gathered, web_fetch a known URL directly, or ' +
@@ -722,16 +949,21 @@
               results.map((r, i) => (i + 1) + '. ' + r.title + '\n   ' + r.url + (r.snippet ? '\n   ' + r.snippet : '')).join('\n'),
               'search results (titles/snippets are third-party text)')
           : 'No results.';
-        return { content, summary: results.length + ' result(s) via ' + source };
+        // the station's own note, outside the fence: why this search did not use the station browser
+        const note = browserNote ? 'Note: ' + browserNote + ', so this search used ' + source + '.\n' : '';
+        return { content: note + content, summary: results.length + ' result(s) via ' + source + (browserNote ? ' · ' + browserNote : '') };
       }
     };
 
     const fetchTool = {
       name: 'web_fetch', capability: 'web', scope: 'read', requiresConsent: false,
+      // a page's own text, not a station store: the registry's stored-text scrub turned a Firebase web apiKey or a docs
+      // example the task had to copy into [redacted-…] (registry.js resultScrubFor; review r3)
+      resultScrub: false,
       timeoutMs: FETCH_TIMEOUT_MS + 20000 + (reader ? 45000 : 0),   // the reader rung needs Chrome boot + nav + settle
       description: 'Fetch a web page by URL and return its main text content (cleaned). Use after web_search to read a result. ' +
         'Bot-blocked and JavaScript-only pages are automatically retried through the station\'s own browser, so one call is enough. ' +
-        'If a page still cannot be read (dead link, site outage, verification wall) the result says so — that is information about the site, not a tool failure; use a different source rather than retrying the same URL.',
+        'If a page still cannot be read (dead link, site outage, verification wall) the result says so: that is information about the site, not a tool failure; use a different source rather than retrying the same URL.',
       schema: { type: 'object', required: ['url'], properties: { url: { type: 'string' } } },
       run: async (args, ctx) => {
         let out;
@@ -767,7 +999,9 @@
           if (soft) return soft;
           throw e;                                     // genuine fault (timeout/abort/SSRF/bad URL) → isError
         }
-        return { content: fenceExternal(out.text, 'page text from ' + out.url), fullContent: out.fullText ? fenceExternal(out.fullText, 'page text from ' + out.url) : undefined, summary: out.text.length + ' chars via ' + out.source };
+        // a page cut at the raw-body ceiling says so in its label instead of reading as the whole page
+        const pageLabel = 'page text from ' + out.url + (out.cut ? ' (first ' + RAW_BODY_MAX_LABEL + ' characters of a longer page)' : '');
+        return { content: fenceExternal(out.text, pageLabel), fullContent: out.fullText ? fenceExternal(out.fullText, pageLabel) : undefined, summary: out.text.length + ' chars via ' + out.source };
       }
     };
 
@@ -789,9 +1023,11 @@
        ~2.8M base64 chars, orders of magnitude past any context budget, so for months the harness simply could
        not carry the byte-bearing step of any API workflow. Same cure as ${KEY} headers: the model writes a
        REFERENCE (${file:relative/path}, or a multipart part naming a file), the host resolves it at send
-       time, and the payload never enters model context in either direction. Files resolve through the SAME
-       resolveInside jail as fs.* and browser.upload (deps.readWorkspaceFile), so a request can only ever
-       carry the agent's own workspace. Lowercase 'file:' can never collide with SECRET_REF's [A-Z] names. */
+       time, and the payload never enters model context in either direction. Files resolve through
+       deps.readWorkspaceFile: the per-agent workspace jail only (no project root, no absolute paths, no
+       path-trust), so a request can only ever carry the agent's own workspace. This is deliberately narrower
+       than fs.read and browser.upload, which also reach the run's trusted project: widening an outbound-network
+       tool is a decision, not a polish fix. Lowercase 'file:' can never collide with SECRET_REF's [A-Z] names. */
     const FILE_REF_RE = /\$\{file:([^}]*)\}/g;
     const FILE_REF_TEST = /\$\{file:/;
     const FILE_MAX_BYTES = 20 * 1024 * 1024;      // one referenced file
@@ -800,18 +1036,122 @@
       webp: 'image/webp', svg: 'image/svg+xml', pdf: 'application/pdf', json: 'application/json',
       txt: 'text/plain', csv: 'text/csv', zip: 'application/zip', mp4: 'video/mp4', mp3: 'audio/mpeg' };
     const guessMime = (name) => MIME_BY_EXT[String(name).replace(/^.*\./, '').toLowerCase()] || 'application/octet-stream';
-    const REQUEST_MAX_CHARS = 8000;
+    /* NO TOOL-LEVEL CLAMP ON THE RESPONSE (2026-10-12, user report: an Etsy-factory Publisher could not configure a
+       Printify product). The body used to be cut to 8,000 characters right here, the rest destroyed and nothing
+       parked. A commerce API answers in documents far past that — a Printify product with its variants and print
+       areas runs 50-200 KB, a blueprint's variant catalog the same — so the agent saw a third of a product, could not
+       build a valid PUT (Printify wants EVERY variant when variants are sent), could not read back its own write,
+       and either looped on "cannot verify" or guessed ids. The whole body now goes to the registry, whose
+       window-scaled cap shows what fits and PARKS the rest to a file the agent reads in ranges (registry.js
+       PARKING). `select` below asks for just the fields a step needs, extracted host-side from the whole body. */
+    const SELECT_MAX_PATHS = 40;
+    const UNSAFE_KEY = new Set(['__proto__', 'constructor', 'prototype']);
+    const MISSING = Symbol('missing');
+    const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+    function selectPaths(raw) {
+      const list = Array.isArray(raw) ? raw : (raw == null ? [] : String(raw).split(','));
+      return list.map(s => String(s == null ? '' : s).trim()).filter(Boolean).slice(0, SELECT_MAX_PATHS);
+    }
+    // "variants[].id" -> ['variants','[]','id'] · "[].id" -> ['[]','id'] · jq-ish "$.data[*].title" / "data.*.title" too
+    function pathSegments(p) {
+      return String(p).replace(/^\$?\.?/, '').replace(/\[\*?\]|\.\*(?=\.|$)/g, '.[].').split('.').filter(Boolean);
+    }
+    // The selected sub-tree of `node`, nesting kept, or MISSING. Arrays map element-wise, so paths that share an
+    // array ("variants[].id" + "variants[].price") merge back into one row per element.
+    function pickPath(node, segs) {
+      if (!segs.length) return node;
+      const head = segs[0], rest = segs.slice(1);
+      if (head === '[]') {
+        if (!Array.isArray(node)) return MISSING;
+        const arr = node.map(x => pickPath(x, rest));
+        return arr.some(x => x !== MISSING) ? arr : MISSING;
+      }
+      if (UNSAFE_KEY.has(head) || !node || typeof node !== 'object' || Array.isArray(node) || !own(node, head)) return MISSING;
+      const v = pickPath(node[head], rest);
+      if (v === MISSING) return MISSING;
+      const o = {}; o[head] = v; return o;
+    }
+    function mergePicked(a, b) {
+      if (a === MISSING) return b;
+      if (b === MISSING) return a;
+      if (Array.isArray(a) && Array.isArray(b)) return a.map((x, i) => mergePicked(x, i < b.length ? b[i] : MISSING));
+      if (a && b && typeof a === 'object' && typeof b === 'object' && !Array.isArray(a) && !Array.isArray(b)) {
+        const o = {};
+        for (const k of Object.keys(a)) if (!UNSAFE_KEY.has(k)) o[k] = a[k];
+        for (const k of Object.keys(b)) if (!UNSAFE_KEY.has(k)) o[k] = own(o, k) ? mergePicked(o[k], b[k]) : b[k];
+        return o;
+      }
+      return b;
+    }
+    function projectJson(text, paths) {
+      let data;
+      try { data = JSON.parse(text); } catch (_) { return { ok: false, why: 'the response is not JSON' }; }
+      let out = MISSING; const missed = [];
+      for (const p of paths) {
+        const segs = pathSegments(p);
+        const v = segs.length ? pickPath(data, segs) : MISSING;
+        if (v === MISSING) missed.push(p); else out = mergePicked(out, v);
+      }
+      if (out === MISSING) {
+        // name the real shape so the next call can fix its paths instead of guessing again
+        const shape = Array.isArray(data) ? 'a JSON array of ' + data.length + ' items (start paths with [] , e.g. "[].id")'
+          : (data && typeof data === 'object' ? 'an object with keys: ' + Object.keys(data).slice(0, 30).join(', ') : 'a JSON ' + typeof data);
+        return { ok: false, why: 'none of the selected fields exist; the response is ' + shape };
+      }
+      return { ok: true, text: JSON.stringify(out, (k, v) => (v === MISSING ? null : v)), missed };
+    }
+    /* THE NEXT MOVE, AT THE MOMENT OF BLOCKAGE. A live A/B run (haiku-4.5, 2026-10-12) showed a model handed the whole
+       1.4 MB body (head + tail in view, the rest parked) still never thought of `select` — it paged the parked file and
+       guessed. So when a JSON body is bigger than this result can show, the host names the document's shape and a
+       ready select for it, in front of the body where no cut can reach. */
+    function jsonShapeHint(text, budget) {
+      if (!(text.length > budget)) return '';
+      let data; try { data = JSON.parse(text); } catch (_) { return ''; }
+      const objOf = arr => arr.find(x => x && typeof x === 'object' && !Array.isArray(x));
+      const keysOf = o => { const k = Object.keys(o).filter(x => !UNSAFE_KEY.has(x)); return k.slice(0, 20).join(', ') + (k.length > 20 ? ', …' : ''); };
+      let shape, example = [];
+      if (Array.isArray(data)) {
+        const el = objOf(data);
+        shape = 'an array of ' + data.length + ' items' + (el ? ' shaped {' + keysOf(el) + '}' : '');
+        if (el) example = Object.keys(el).filter(x => !UNSAFE_KEY.has(x)).slice(0, 2).map(k => '[].' + k);
+      } else if (data && typeof data === 'object') {
+        const keys = Object.keys(data).filter(x => !UNSAFE_KEY.has(x));
+        shape = 'an object with ' + keys.slice(0, 20).map(k => {
+          if (!Array.isArray(data[k])) return k;
+          const el = objOf(data[k]);
+          return k + ' (array of ' + data[k].length + (el ? ' {' + keysOf(el) + '}' : '') + ')';
+        }).join('; ');
+        example = keys.filter(k => !Array.isArray(data[k]) && (data[k] === null || typeof data[k] !== 'object')).slice(0, 2);
+        const arrKey = keys.find(k => Array.isArray(data[k]) && objOf(data[k]));
+        if (arrKey) example = example.concat(Object.keys(objOf(data[arrKey])).filter(x => !UNSAFE_KEY.has(x)).slice(0, 2).map(k => arrKey + '[].' + k));
+      } else return '';
+      return 'this JSON response is ' + text.length + ' characters, more than this result can show, so part of it is cut below '
+        + '(the whole body is saved to the file named at the cut). It is ' + shape + '. To get exactly the fields you need from the '
+        + 'WHOLE response, call web_request again with select' + (example.length ? ', e.g. "select": ' + JSON.stringify(example) : '') + '.';
+    }
     const SAFE_METHODS = new Set(['GET', 'HEAD']);
     const ALL_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE']);
+
+    // One refusal per resolver verdict, shared by ${KEY} headers and the auth descriptor.
+    function keyRefusal(r, name) {
+      if (r.reason === 'unattended') return 'this run is unattended and "' + r.name + '" is not approved for unattended use — approve it in CONNECT › ABILITIES › CONNECTED › API KEYS, or run this while watching';
+      if (r.reason === 'unresolved') return '"' + r.name + '" is kept in 1Password and could not be read (' + String(r.detail || 'not read yet') + ') — ask the Commander to unlock 1Password, then try again. Do not ask for the key itself';
+      // A MODEL-PROVIDER key is never handed to a tool and KEYS refuses to store one, so pointing at KEYS here sent
+      // agents to ask the Commander for "access" nobody can grant (2026-09-28: OpenRouter was already connected;
+      // the agent wanted the raw key to chase a transparent background image_generate could not make yet).
+      if (r.reason === 'reserved') return name + ' is a model-provider key: StarNet never hands provider keys to tools and API KEYS cannot store one, so do not ask the Commander for it. Use the built-in tools that already ride the station\'s connection instead: image_generate for images (transparent:true for a transparent background) and image_analyze to look at one.';
+      // A key pasted into chat is saved with keys.save (advertised only on a run whose Commander's messages hold one),
+      // so the fix names that route too — "add it in KEYS" alone sent agents asking for "a new key" (2026-10-25).
+      return 'no enabled service key provides ' + name + ' — if the Commander pasted the key into this chat, save it with keys.save first; '
+        + 'otherwise ask them to paste it here, or add it in CONNECT › ABILITIES › CONNECTED › API KEYS';
+    }
 
     function resolveSecretRefs(value, surface, used) {
       let failure = null;
       const out = String(value).replace(SECRET_REF_RE, (whole, name) => {
         const r = serviceKeys.resolve(name, surface);
         if (r.ok) { used.push(name); return r.value; }
-        failure = failure || (r.reason === 'unattended'
-          ? 'this run is unattended and "' + r.name + '" is not approved for unattended use — approve it in TOOLSETS & CONNECTORS → KEYS, or run this while watching'
-          : 'no enabled service key provides ' + name + ' — add it in TOOLSETS & CONNECTORS → KEYS');
+        failure = failure || keyRefusal(r, name);
         return whole;
       });
       return { out, failure };
@@ -824,23 +1164,25 @@
       name: 'web_request', capability: 'web', scope: 'write', impact: 'external-credentialed',
       requiresConsent: true, network: true, timeoutMs: FETCH_TIMEOUT_MS + 20000,
       description:
-        'Call a third-party REST API (Printify, Etsy, Stripe, any service with an HTTP API) and return the response. ' +
-        'To authenticate, reference a stored key by its environment-variable NAME inside a header value using ${NAME} — ' +
+        'Call a third-party REST API (Printify, Etsy, Stripe, any HTTP API) and return the response. ' +
+        'To authenticate, put a stored key\'s environment-variable NAME in a header value as ${NAME}, ' +
         'e.g. headers {"Authorization": "Bearer ${PRINTIFY_API_KEY}"}. The host substitutes the real value at send time; ' +
-        'you never see it and must never ask the user for it. Placeholders work in headers only, never in the url. ' +
-        'For upload endpoints, attach workspace files host-side instead of pasting bytes: ${file:relative/path} in the ' +
-        'body inserts the file as base64, and the multipart parameter sends real multipart/form-data.',
+        'you never see it; save a key pasted in chat with keys.save. Placeholders work in headers only, never in the url.',
       schema: {
         type: 'object', required: ['url'],
         properties: {
           url: { type: 'string', description: 'Full https URL of the API endpoint.' },
+          select: {
+            type: 'array', items: { type: 'string' },
+            description: 'JSON field paths to return from the WHOLE response; [] walks arrays: ["id","variants[].id"] or ["[].id"].'
+          },
           method: { type: 'string', description: 'GET (default), HEAD, POST, PUT, PATCH or DELETE.' },
-          headers: { type: 'object', description: 'Request headers. Use ${KEY_NAME} to reference a stored key.' },
+          headers: { type: 'object', description: 'Request headers; ${KEY_NAME} placeholders allowed.' },
           body: {
             type: 'string',
-            description: 'Request body for POST/PUT/PATCH (send JSON as a string). Write ${file:relative/path} where ' +
-              'a file\'s base64 belongs and the host reads + encodes the workspace file at send time — e.g. Printify: ' +
-              '{"file_name":"mockup.png","contents":"${file:mockups/mockup.png}"}. Never base64 a file yourself.'
+            description: 'Request body for POST/PUT/PATCH (JSON as a string). Put ${file:relative/path} where a file\'s ' +
+              'base64 belongs; the host encodes that workspace file at send time, e.g. ' +
+              '{"contents":"${file:mockups/mockup.png}"}. Never base64 a file yourself.'
           },
           multipart: {
             type: 'array',
@@ -848,19 +1190,19 @@
               type: 'object', required: ['name'],
               properties: {
                 name: { type: 'string', description: 'Form field name.' },
-                file: { type: 'string', description: 'Workspace-relative path to attach as this part (curl -F style).' },
-                value: { type: 'string', description: 'Literal text value for a plain field. Give file OR value, not both.' },
+                file: { type: 'string', description: 'Workspace-relative file to attach (curl -F style).' },
+                value: { type: 'string', description: 'Text of a plain field; give file OR value, not both.' },
                 filename: { type: 'string', description: 'Filename to present (defaults to the file\'s own name).' },
                 contentType: { type: 'string', description: 'Part content-type (defaults from the file extension).' }
               }
             },
-            description: 'Send multipart/form-data instead of body — for endpoints that take file uploads as form ' +
-              'fields. Example: [{"name":"file","file":"mockups/a.png"},{"name":"title","value":"Mockup A"}].'
+            description: 'multipart/form-data instead of body, for file-upload endpoints, ' +
+              'e.g. [{"name":"file","file":"mockups/a.png"},{"name":"title","value":"Mockup A"}].'
           },
           auth: {
             type: 'object',
-            description: 'For APIs that want the key as a query parameter instead of a header: ' +
-              '{"key":"SOME_API_KEY","in":"query","name":"api_key"}. The host appends it at send time, so the ' +
+            description: 'For an API that wants the key as a query parameter: ' +
+              '{"key":"SOME_API_KEY","in":"query","name":"api_key"}; the host appends it at send time, so the ' +
               'secret never appears in the url you write. "in":"header" also works (optional "prefix", e.g. "Bearer ").'
           }
         }
@@ -916,11 +1258,7 @@
           if (!/^[A-Z][A-Z0-9_]*$/.test(keyName)) throw new Error('auth.key must be a stored key NAME like PRINTIFY_API_KEY, never a key value');
           if (where !== 'query' && where !== 'header') throw new Error('auth.in must be "query" or "header"');
           const r = serviceKeys.resolve(keyName, surface);
-          if (!r.ok) {
-            throw new Error(r.reason === 'unattended'
-              ? 'this run is unattended and "' + r.name + '" is not approved for unattended use — approve it in TOOLSETS & CONNECTORS → KEYS, or run this while watching'
-              : 'no enabled service key provides ' + keyName + ' — add it in TOOLSETS & CONNECTORS → KEYS');
-          }
+          if (!r.ok) throw new Error(keyRefusal(r, keyName));
           used.push(keyName);
           if (where === 'query') u.searchParams.set(slot, r.value);
           else { headers[slot] = String(auth.prefix || '') + r.value; secretHeaders.add(slot.toLowerCase()); }
@@ -1003,18 +1341,21 @@
         const originOf = (x) => x.protocol + '//' + hostOf(x) + ':' + (x.port || (x.protocol === 'https:' ? '443' : '80'));
         const firstOrigin = originOf(u);
         const isCredential = (k) => secretHeaders.has(k.toLowerCase()) || /^(authorization|cookie|x-api-key)$/i.test(k);
-        let target = u, res = null;
+        let target = u, res = null, responseUrl = null;
         for (let hop = 0; hop < 5; hop++) {
           const sendHeaders = hop === 0 || originOf(target) === firstOrigin
             ? headers
             : Object.keys(headers).reduce((o, k) => (isCredential(k) ? o : (o[k] = headers[k], o)), {});
-          res = await withTimeout(signal => doFetch(target.href, {
-            method, headers: sendHeaders, body: hasBody ? bodyPayload : undefined, redirect: 'manual', signal
-          }).then(async r => ({ status: r.status, ct: r.headers.get('content-type') || '', loc: r.headers.get('location') || '', body: await readBodyBounded(r) })), FETCH_TIMEOUT_MS, ctx && ctx.signal);
+          try {
+            res = await withTimeout(signal => fetchPinned(target, {
+              method, headers: sendHeaders, body: hasBody ? bodyPayload : undefined, redirect: 'manual', signal
+            }), FETCH_TIMEOUT_MS, ctx && ctx.signal);
+          } catch (e) { throw hop > 0 ? redirectRefusal(e) : e; }   // a redirect hop's re-resolve refusal is outside text
+          // Capture the URL that actually answered, before a redirect advances target (even on the last hop).
+          responseUrl = target.href;
           if (res.status >= 300 && res.status < 400 && res.loc) {
-            const next = assertSafeUrl(new URL(res.loc, target.href).href);
-            await assertResolvedSafe(next, doLookup);
-            target = next; continue;
+            target = await redirectTarget(res.loc, target.href);
+            continue;
           }
           break;
         }
@@ -1022,14 +1363,50 @@
         // The response is UNTRUSTED third-party data — fenced like every other external content path so a
         // hostile API body cannot issue instructions. redact() strips any secret that echoed back.
         const scrub = typeof deps.redact === 'function' ? deps.redact : (s => s);
-        const bodyText = clamp(scrub(String(res.body || '')), REQUEST_MAX_CHARS);
+        const bodyText = scrub(String(res.body || ''));
         const label = method + ' ' + u.origin + u.pathname + ' -> HTTP ' + res.status
           + (used.length ? ' (authenticated with ' + used.join(', ') + ')' : '')
           + (sentFiles.length ? ' (sent ' + Math.ceil(payloadBytes / 1024) + 'KB from workspace file' + (sentFiles.length > 1 ? 's' : '') + ': ' + sentFiles.join(', ') + ')' : '');
-        return {
-          content: fenceExternal(bodyText || '(empty response body)', label),
-          summary: method + ' ' + hostOf(u) + ' ' + res.status
-        };
+        // The host's note rides OUTSIDE the fence (it is ours, not the third party's) and BEFORE it, so a head+tail
+        // cut of a large selection can never eat it.
+        const paths = selectPaths(args && args.select);
+        /* A BODY CUT AT THE RAW-BODY CEILING IS NEVER CALLED WHOLE (2026-10-20). The cut used to be silent, and the
+           notes below then described a >2 MB answer as "the whole N-character response" / "The complete response
+           is saved" — so select failed on the cut JSON or the agent reasoned from partial data it was told was
+           complete. A cut body gets the host's own note, and every "whole"/"complete" claim speaks of the
+           received part instead. */
+        const cutBody = !!res.bodyTruncated;
+        // "not downloaded" only when the read really stopped at the byte cap; a body read whole was only not KEPT
+        const cutLine = cutBody ? '[' + (res.bodyDownloadStopped ? RAW_BODY_STOP_NOTE : RAW_BODY_CUT_NOTE) + ']\n' : '';
+        let shown = bodyText, note = '';
+        if (!paths.length && res.status >= 200 && res.status < 300) {
+          let budget = ctx ? ctx.outputMax : null;
+          if (typeof budget === 'function') { try { budget = budget(); } catch (_) { budget = null; } }
+          budget = Number(budget) > 0 ? Number(budget) : 80000;   // registry OUTPUT_MAX when no host budget was passed
+          note = jsonShapeHint(bodyText, budget);
+        } else if (paths.length) {
+          if (res.status < 200 || res.status >= 300) {
+            note = 'select was not applied: the call failed with HTTP ' + res.status + (cutBody ? ', so the received part of the error body follows.' : ', so the whole error body follows.');
+          } else {
+            const p = projectJson(bodyText, paths);
+            if (p.ok) {
+              shown = p.text;
+              note = 'selected ' + (paths.length - p.missed.length) + ' of ' + paths.length + ' field path(s) from '
+                + (cutBody ? 'the first ' + bodyText.length + ' characters of a longer response' : 'the whole ' + bodyText.length + '-character response')
+                + (p.missed.length ? '; not present: ' + p.missed.join(', ') : '')
+                + (cutBody ? '. The received part is saved too; its file is named below.' : '. The complete response is saved too; its file is named below.');
+            } else {
+              note = 'select was not applied: ' + p.why + (cutBody ? '. The received part of the response follows.' : '. The whole response follows.');
+            }
+          }
+        }
+        const fenced = fenceExternal(bodyText || '(empty response body)', label);
+        if (shown === bodyText) return responseProvenance.stamp({ content: cutLine + (note ? '[' + note + ']\n' : '') + fenced, summary: method + ' ' + hostOf(u) + ' ' + res.status }, responseUrl);
+        return responseProvenance.stamp({
+          content: cutLine + '[' + note + ']\n' + fenceExternal(shown, label + ' (selected fields)'),
+          fullContent: fenced,   // the registry parks this whole body and names the file in the result
+          summary: method + ' ' + hostOf(u) + ' ' + res.status + ' (select)'
+        }, responseUrl);
       }
     };
 

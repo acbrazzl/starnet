@@ -40,6 +40,26 @@
   const KEY_MAX = 4096;
   const URL_MAX = 512;
   const LIST_MAX = 100;   // sanity bound, not a product gate
+  const REF_MAX = 512;
+
+  /* 1PASSWORD SECRET REFERENCES. A KEYS entry may hold `op://vault/item/[section/]field` instead of the pasted value:
+     the record stores only the reference (`ref`), and the host (sidecar/onepassword.js) reads the value with the
+     1Password CLI when a run needs it, holding it in memory only. Every function below that spends a key reads
+     `key`, so the host hands them a LIVE list (onepassword.js live()) where a reference row carries the value it
+     read, or none plus `refError` when the read failed. A persisted ref row never has a `key`. */
+  function isOpRef(value) { return /^op:\/\//i.test(String(value == null ? '' : value).trim()); }
+  function validateOpRef(value) {
+    const ref = String(value == null ? '' : value).trim();
+    if (!isOpRef(ref)) return { ok: false, error: 'a 1Password reference starts with op://' };
+    if (ref.length > REF_MAX) return { ok: false, error: '1Password reference is too long (max ' + REF_MAX + ' chars)' };
+    if (/[\u0000-\u001f\u007f]/.test(ref)) return { ok: false, error: '1Password reference must be a single line' };
+    const q = ref.indexOf('?');
+    const parts = ref.slice(5, q < 0 ? ref.length : q).split('/');
+    if (parts.length < 3 || parts.length > 4 || parts.some(p => !p.trim())) {
+      return { ok: false, error: 'a 1Password reference looks like op://vault/item/field (copy it from the item\'s field menu: Copy Secret Reference)' };
+    }
+    return { ok: true, ref: ref };
+  }
 
   function slug(name) {
     return String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, NAME_MAX);
@@ -63,7 +83,10 @@
     if (name.length > NAME_MAX) return { ok: false, error: 'name is too long (max ' + NAME_MAX + ' chars)' };
     if (!slug(name)) return { ok: false, error: 'name needs at least one letter or digit' };
     if (!deriveEnvVar(name)) return { ok: false, error: 'name needs at least one letter or digit' };
-    if ('key' in o && o.key != null && o.key !== '') {
+    if ('key' in o && o.key != null && o.key !== '' && isOpRef(o.key)) {
+      const ref = validateOpRef(o.key);
+      if (!ref.ok) return ref;
+    } else if ('key' in o && o.key != null && o.key !== '') {
       const key = String(o.key);
       if (key.length > KEY_MAX) return { ok: false, error: 'key is too long (max ' + KEY_MAX + ' chars)' };
       // one line of printable ASCII (every real API key is) — control chars / spaces are paste accidents
@@ -86,8 +109,19 @@
   function isRecord(v) { return v && typeof v === 'object' && !Array.isArray(v); }
 
   // the shape every /api response carries — by construction there is no `key` field to leak.
+  // A 1Password row shows its reference (not a secret: it names where the key lives) and the host's last read of it,
+  // read off a LIVE record (refReadAt / refError); never a last4 of the value it read.
   function toPublic(record) {
     const r = isRecord(record) ? record : {};
+    if (r.ref) {
+      return Object.assign(toPublic(Object.assign({}, r, { ref: '', key: '' })), {
+        source: '1password',
+        ref: String(r.ref),
+        refReadAt: (typeof r.refReadAt === 'number') ? r.refReadAt : 0,
+        refError: String(r.refError || ''),
+        refReady: !!r.key
+      });
+    }
     return {
       id: String(r.id || ''),
       name: String(r.name || ''),
@@ -122,20 +156,26 @@
     const name = String(input.name).trim();
     const id = slug(name);
     const prev = src.find(r => r.id === id) || null;
-    const key = (input.key == null || input.key === '') ? (prev ? String(prev.key || '') : '') : String(input.key);
-    if (!key) return { error: 'key is required' };
+    // An empty key on update keeps what was saved: the pasted value, or the 1Password reference. A new paste of
+    // either kind replaces the other, so a row is always exactly one of the two.
+    const blank = input.key == null || input.key === '';
+    const ref = blank ? (prev ? String(prev.ref || '') : '') : (isOpRef(input.key) ? validateOpRef(input.key).ref : '');
+    const key = ref ? '' : (blank ? (prev ? String(prev.key || '') : '') : String(input.key));
+    if (!key && !ref) return { error: 'key is required' };
     if (!prev && src.length >= LIST_MAX) return { error: 'too many service keys (max ' + LIST_MAX + ')' };
     const envVar = deriveEnvVar(name);
     if (reservedSet(opts).has(envVar)) {
-      return { error: name + ' is a model provider — add model keys under SETTINGS, not here' };
+      // "Google" / "Gemini" / "OpenAI" collide with a model provider's key var, but users mostly mean a NON-model
+      // API from that company (Maps, YouTube, Places, image gen). Say how to save it here instead of dead-ending.
+      return { error: name + ' would be saved as ' + envVar + ', which is reserved for the ' + name + ' model provider key (add AI model keys under SETTINGS). '
+        + 'For a different ' + name + ' API, name it after the product instead — e.g. "' + name + ' Maps" or "' + name + ' YouTube"' };
     }
     // a rename collision (two names deriving the same env var under different ids) would silently
     // shadow one key with the other in the run env — refuse it instead.
     if (src.some(r => r.id !== id && r.envVar === envVar)) return { error: 'another entry already uses ' + envVar };
     const unattendedSupported = input.unattendedSupported !== false;
     const unattendedReason = unattendedSupported ? '' : String(input.unattendedReason || 'unattended use is not supported for this integration').slice(0, 240);
-    const record = {
-      id: id, name: name, envVar: envVar, key: key,
+    const record = Object.assign({ id: id, name: name, envVar: envVar }, ref ? { ref: ref } : { key: key }, {
       docsUrl: input.docsUrl ? String(input.docsUrl).trim() : (prev ? String(prev.docsUrl || '') : ''),
       enabled: prev ? (prev.enabled !== false) : true,
       // UNATTENDED GRANT — default OFF, and never inferred. `enabled` means "an agent may spend this key
@@ -146,7 +186,7 @@
       unattendedSupported: unattendedSupported,
       unattendedReason: unattendedReason,
       addedAt: prev ? (prev.addedAt || 0) : (typeof now === 'number' ? now : 0)
-    };
+    });
     return { list: src.filter(r => r.id !== id).concat([record]), record: record };
   }
 
@@ -174,13 +214,22 @@
        { ok:true, value }                      — spend it
        { ok:false, reason:'unknown' }          — no such key (or it is disabled)
        { ok:false, reason:'unattended', name } — real key, but not granted for unattended runs
+       { ok:false, reason:'reserved' }         — a model-provider key name (opts.reservedEnv): KEYS can never
+                                                 hold one, so no Commander action can make it resolve
      `surface` is the RUN's surface, not the user's intent: an autonomous run can never talk itself
      into a grant, because the flag lives on the stored record and nothing in the run can write it. */
-  function resolveForRequest(list, envVar, surface) {
+  function resolveForRequest(list, envVar, surface, opts) {
     const want = String(envVar || '').trim();
     if (!want) return { ok: false, reason: 'unknown' };
+    // Checked before the list: a legacy or hand-edited row carrying a provider var is still never spent here.
+    if (reservedSet(opts).has(want)) return { ok: false, reason: 'reserved' };
     const row = cleanList(list).find(r => r.envVar === want && r.enabled !== false && r.key);
-    if (!row) return { ok: false, reason: 'unknown' };
+    if (!row) {
+      // a real, enabled 1Password row whose value could not be read: say THAT, never "no such key"
+      const pending = cleanList(list).find(r => r.envVar === want && r.enabled !== false && r.ref);
+      if (pending) return { ok: false, reason: 'unresolved', name: pending.name, detail: String(pending.refError || 'not read from 1Password yet') };
+      return { ok: false, reason: 'unknown' };
+    }
     if (surface !== 'interactive' && (row.autonomous !== true || row.unattendedSupported === false)) {
       return {
         ok: false,
@@ -263,30 +312,58 @@
      quest block comments warn about. */
   function promptBlock(list, opts) {
     const rows = cleanList(list).filter(r => r.enabled !== false && r.envVar && r.key);
-    if (!rows.length) return '';
+    // 1Password rows the host could not read right now: named with the reason, so the model tells the Commander what to
+    // fix instead of expanding an empty variable (and getting a 401) or denying the key exists.
+    const unread = cleanList(list).filter(r => r.enabled !== false && r.envVar && r.ref && !r.key)
+      .slice().sort((a, b) => String(a.name).localeCompare(String(b.name)))
+      .map(r => '- ' + r.name + ': ' + r.envVar + ' — kept in 1Password, which could not be read for this run ('
+        + String(r.refError || 'not read yet') + '). Ask the Commander to unlock 1Password; do not ask for the key itself.');
+    if (!rows.length && !unread.length) return '';
+    if (!rows.length) {
+      return '<service_keys>\nThe Commander keeps these API keys in 1Password. None could be read for this run, so none is in your environment:\n'
+        + unread.join('\n') + '\n</service_keys>';
+    }
     // WHICH WAY can this run actually spend a key? The block must describe only the routes the run HAS,
     // or it teaches a tool the model wasn't given (the truthful-telemetry violation this block's own
     // history is about). Default to both when unspecified so an un-updated caller stays informative.
     const canShell = !opts || opts.shell !== false;
     const canRequest = !opts || opts.request !== false;
+    // Verified API facts for a known platform (servicekeys-catalog apiNotes). They describe web_request calls, so they
+    // ride only when the run has web_request. A docs link alone left the agent guessing endpoints from a 250 KB page.
+    const notesFor = canRequest && opts && typeof opts.notesFor === 'function' ? opts.notesFor : null;
     const lines = rows
       .slice().sort((a, b) => String(a.name).localeCompare(String(b.name)))
-      .map(r => '- ' + r.name + ': ' + r.envVar
-        + (r.unattendedSupported === false ? ' [watched sessions only; unattended unsupported]' : (r.autonomous === true ? '' : ' [watched sessions only]'))
-        + (r.docsUrl ? ' (API docs: ' + r.docsUrl + ')' : ''));
+      .map(r => {
+        let notes = '';
+        if (notesFor) { try { notes = String(notesFor(r.envVar, r.docsUrl) || '').trim(); } catch (_) { notes = ''; } }
+        return '- ' + r.name + ': ' + r.envVar
+          + (r.unattendedSupported === false ? ' [watched sessions only; unattended unsupported]' : (r.autonomous === true ? '' : ' [watched sessions only]'))
+          + (r.docsUrl ? ' (API docs: ' + r.docsUrl + ')' : '')
+          + (notes ? '\n  API notes: ' + notes : '');
+      });
     const how = [];
     if (canRequest) how.push('with web_request, by writing the NAME as a placeholder in a header — e.g. '
       + 'headers {"Authorization": "Bearer ${' + rows[0].envVar + '}"} — which the host substitutes at send time. '
+      + 'For an API that takes its key as a query parameter (?key=...), pass auth {"key": "' + rows[0].envVar + '", "in": "query", "name": "key"} '
+      + 'instead — never put a ${NAME} placeholder in the url or body. '
       + 'web_request can also SEND workspace files to upload endpoints: write ${file:relative/path} in the body '
       + 'where the base64 belongs, or use its multipart parameter — never read and paste file bytes yourself');
-    if (canShell) how.push('in your shell, where each name is an environment variable (curl etc.)');
+    // The shell is cmd.exe on Windows (environment.js spawns shell:true), where $NAME is sent as literal text and
+    // the API answers 401. Name the syntax that actually expands on THIS host instead of letting the model guess bash.
+    const win = !!(opts && opts.platform === 'win32');
+    if (canShell) how.push(win
+      ? 'in your shell, where each name is an environment variable. This host is Windows and shell.exec runs cmd.exe: write %'
+        + rows[0].envVar + '% (inside powershell -Command use $env:' + rows[0].envVar + '); $' + rows[0].envVar + ' is NOT expanded there'
+      : 'in your shell, where each name is an environment variable ($' + rows[0].envVar + ' in curl etc.)');
     return '<service_keys>\n'
       + 'The Commander has connected API keys for these services. You can use them ' + how.join('; and ') + '.\n'
+      + (canRequest && canShell ? 'Prefer web_request for API calls — it needs no shell quoting and works the same on every OS.\n' : '')
       + 'You will never see a key\'s value and must never ask the Commander for one. NEVER print, echo, or '
       + 'write a value anywhere; reference it only by name.\n'
       + lines.join('\n')
+      + (unread.length ? '\nNot available for this run:\n' + unread.join('\n') : '')
       + '\n</service_keys>';
   }
 
-  return { NAME_MAX, KEY_MAX, LIST_MAX, slug, deriveEnvVar, validate, mask, toPublic, upsert, setEnabled, setAutonomous, remove, applyEnv, runEnv, resolveForRequest, promptBlock };
+  return { NAME_MAX, KEY_MAX, LIST_MAX, REF_MAX, slug, deriveEnvVar, isOpRef, validateOpRef, validate, mask, toPublic, upsert, setEnabled, setAutonomous, remove, applyEnv, runEnv, resolveForRequest, promptBlock };
 });

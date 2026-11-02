@@ -41,6 +41,21 @@ async function rejects(promise, msg) { try { await promise; A.ok(false, msg + ' 
       try { fs.rmSync(outside, { recursive: true, force: true }); } catch (e) {}
     }
   }
+  // A dangling final symlink must not be treated as a missing ordinary file. The
+  // former realpath fallback allowed fs.write to create its outside target.
+  {
+    const outside = path.join(os.tmpdir(), 'starnet-fs-dangling-' + process.pid + '.json');
+    const link = path.join(ROOT, 'ag', 'dangling.json');
+    let linked = false;
+    try { await fsp.symlink(outside, link, 'file'); linked = true; }
+    catch (e) { if (!['EPERM', 'EACCES', 'ENOTSUP'].includes(e.code)) throw e; }
+    if (linked) {
+      await rejects(writeTool.run({ path: 'dangling.json', content: 'x' }, { agentId: 'ag' }), 'fs.write refuses a dangling final symlink');
+      await rejects(appendTool.run({ path: 'dangling.json', content: 'x' }, { agentId: 'ag' }), 'fs.append refuses a dangling final symlink');
+      A.ok(!fs.existsSync(outside), 'dangling symlink did not create the outside target');
+      await fsp.unlink(link);
+    }
+  }
 
   // ---- write -> read -> list roundtrip (real disk) ----
   {
@@ -85,6 +100,35 @@ async function rejects(promise, msg) { try { await promise; A.ok(false, msg + ' 
     A.ok(new RegExp('characters ' + large.length + '-' + large.length + ' of ' + large.length).test(beyond.content), 'a continuation beyond EOF clamps to an honest empty terminal range');
   }
 
+  // ---- numbered reads: cat -n style "<n>\t<line>", offset/limit are LINES; the plain default is untouched ----
+  {
+    const src = 'alpha\nbeta\r\ngamma\ndelta\n';
+    const dir = path.join(ROOT, 'numbered');
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.writeFile(path.join(dir, 'src.js'), src, 'utf8');
+    const ctx = { agentId: 'numbered' };
+    A.eq((await readTool.run({ path: 'src.js' }, ctx)).content, src, 'the plain default returns the bytes exactly as stored (no numbering)');
+    A.eq((await readTool.run({ path: 'src.js', raw: true }, ctx)).content, src, 'raw:true is the explicit spelling of the plain path');
+    const n = await readTool.run({ path: 'src.js', numbered: true }, ctx);
+    A.eq(n.content, '1\talpha\n2\tbeta\n3\tgamma\n4\tdelta', 'numbered: every line is "<n><TAB><text>", CR stripped, no phantom trailing line');
+    A.ok(/lines 1-4 of 4/.test(n.summary), 'numbered summary reports the line range');
+    const page = await readTool.run({ path: 'src.js', numbered: true, offset: 2, limit: 2 }, ctx);
+    A.eq(page.content.split('\n[showing lines ')[0], '2\tbeta\n3\tgamma', 'offset/limit page by 1-based line and line count');
+    A.ok(/\[showing lines 2-3 of 4; next: fs\.read \{"path":"src\.js","numbered":true,"offset":4,"limit":2\}\]/.test(page.content), 'the numbered trailer gives the exact next line-paged call');
+    const tail = await readTool.run({ path: 'src.js', numbered: true, offset: 4 }, ctx);
+    A.eq(tail.content, '4\tdelta\n[showing lines 4-4 of 4; end of file]', 'the last page says end of file');
+    const past = await readTool.run({ path: 'src.js', numbered: true, offset: 9 }, ctx);
+    A.ok(/past the end/.test(past.content) && /has 4 lines/.test(past.content), 'an offset past EOF is an honest note, not an error or empty string');
+    await rejects(readTool.run({ path: 'src.js', numbered: true, limit: 0 }, ctx), 'numbered limit must be positive');
+    // the read-return cap ends a numbered page on a WHOLE line and says where to continue
+    const long = Array.from({ length: 40 }, (_, i) => 'L' + i + ' ' + 'x'.repeat(60)).join('\n');
+    await fsp.writeFile(path.join(dir, 'long.txt'), long, 'utf8');
+    const capped = await readTool.run({ path: 'long.txt', numbered: true }, ctx);   // readReturn is 1000 chars here
+    const rows = capped.content.split('\n[showing lines ')[0].split('\n');
+    A.ok(rows.length > 5 && rows.length < 40 && rows.every(r => /^\d+\tL\d+ x+$/.test(r)), 'a capped numbered page holds only whole numbered lines');
+    A.ok(capped.content.indexOf('(output cap); next: fs.read {"path":"long.txt","numbered":true,"offset":' + (rows.length + 1) + ',') >= 0, 'the cap trailer names the next line to continue from');
+  }
+
   // ---- one agent cannot read another agent's workspace via the path ----
   await rejects(readTool.run({ path: '../other/note.md' }, { agentId: 'ag' }), 'cannot escape to a sibling agent workspace');
 
@@ -102,8 +146,13 @@ async function rejects(promise, msg) { try { await promise; A.ok(false, msg + ' 
     const PT = makeFsTools({ fsp, pathMod: path, root: ROOT, pathTrust: guard, limits: { writeBytes: 64, readReturn: 1000 } });
     const ctx = { agentId: 'project-agent', projectRoot: project };
     A.eq((await PT.readTool.run({ path: 'incident.log' }, ctx)).content, 'PROJECT_LOG', 'project-scoped fs.read resolves a relative path at projectRoot');
-    await PT.writeTool.run({ path: 'fix.txt', content: 'PROJECT_FIX' }, ctx);
+    const pw = await PT.writeTool.run({ path: 'fix.txt', content: 'PROJECT_FIX' }, ctx);
     A.eq(await fsp.readFile(path.join(project, 'fix.txt'), 'utf8'), 'PROJECT_FIX', 'project-scoped fs.write lands in projectRoot');
+    // issue #60: the receipt names WHERE the bytes went, so a verified write can't hide a wrong base folder
+    A.ok(pw.content.indexOf('[location: ' + path.join(project, 'fix.txt') + ']') >= 0, 'project write receipt names the absolute project location');
+    const privW = await PT.writeTool.run({ path: 'priv.txt', content: 'P' }, { agentId: 'project-agent' });
+    A.ok(/\[location: .*priv\.txt \(your private workspace, not a project folder;/.test(privW.content), 'unscoped write receipt says it landed in the private workspace, not a project');
+    A.ok(/absolute path inside it, or work from a conversation scoped to that project\)\]/.test(privW.content), 'and names the way into a project folder (absolute path, or a project-scoped conversation)');
     A.ok(!fs.existsSync(path.join(ROOT, 'project-agent', 'fix.txt')), 'project write does not silently land in the private workspace');
     A.ok(guarded.some(x => x.scope === 'read') && guarded.some(x => x.scope === 'write'), 'project-relative reads and writes still pass through path trust');
     await rejects(PT.readTool.run({ path: '../outside.txt' }, ctx), 'project-relative traversal remains illegal');
@@ -131,6 +180,45 @@ async function rejects(promise, msg) { try { await promise; A.ok(false, msg + ' 
     A.eq((await readTool.run({ path: 'e.txt' }, ctx)).content, 'baz bar', 'edit applied to disk');
     await rejects(editTool.run({ path: 'e.txt', find: 'nope', replace: 'x' }, ctx), 'edit errors when "find" is absent');
   }
+  // ---- fs.edit UNIQUENESS: a multi-match "find" is refused unless replace_all / expected_count says so ----
+  {
+    const ctx = { agentId: 'ag3u' };
+    await writeTool.run({ path: 'm.txt', content: 'x=1; x=2; x=3;' }, ctx);
+    let err = null;
+    try { await editTool.run({ path: 'm.txt', find: 'x=', replace: 'y=' }, ctx); } catch (e) { err = e; }
+    A.ok(err && /matches 3 places/.test(err.message) && /replace_all/.test(err.message) && /expected_count/.test(err.message), 'multi-match find is refused with the count + both escape hatches named');
+    A.eq((await readTool.run({ path: 'm.txt' }, ctx)).content, 'x=1; x=2; x=3;', 'a refused multi-match edit changed NOTHING');
+    err = null;
+    try { await editTool.run({ path: 'm.txt', find: 'x=', replace: 'y=', expected_count: 2 }, ctx); } catch (e) { err = e; }
+    A.ok(err && /matches 3 places/.test(err.message) && /expected_count is 2/.test(err.message), 'a wrong expected_count is refused with both numbers');
+    await rejects(editTool.run({ path: 'm.txt', find: 'x=', replace: 'y=', expected_count: 0 }, ctx), 'expected_count must be a positive integer');
+    const e3 = await editTool.run({ path: 'm.txt', find: 'x=', replace: 'y=', expected_count: 3 }, ctx);
+    A.ok(/3 replacements/.test(e3.content), 'an exact expected_count applies all matches');
+    A.eq((await readTool.run({ path: 'm.txt' }, ctx)).content, 'y=1; y=2; y=3;', 'expected_count edit landed');
+    const e4 = await editTool.run({ path: 'm.txt', find: 'y=', replace: 'z=', replace_all: true }, ctx);
+    A.ok(/3 replacements/.test(e4.content), 'replace_all applies every match');
+    A.eq((await readTool.run({ path: 'm.txt' }, ctx)).content, 'z=1; z=2; z=3;', 'replace_all edit landed');
+    const e5 = await editTool.run({ path: 'm.txt', find: 'z=1', replace: 'w=1' }, ctx);
+    A.ok(/1 replacement\b/.test(e5.content), 'exactly-one-match keeps the historic path with no flag');
+  }
+  // ---- fs.edit READ-BEFORE-EDIT: a file this agent never observed is refused with a machine-readable precondition ----
+  {
+    const ctx = { agentId: 'ag3r' };
+    await fsp.mkdir(path.join(ROOT, 'ag3r'), { recursive: true });
+    await fsp.writeFile(path.join(ROOT, 'ag3r', 'unseen.txt'), 'alpha beta');   // created OUTSIDE the tools
+    let err = null;
+    try { await editTool.run({ path: 'unseen.txt', find: 'alpha', replace: 'omega' }, ctx); } catch (e) { err = e; }
+    A.ok(err && /have not read unseen\.txt/.test(err.message), 'editing a never-read file is refused');
+    A.ok(err && /in this run/.test(err.message) && !/in this session/.test(err.message), 'the refusal says "in this run" (read stamps live per run: makeFsTools is rebuilt each run)');
+    A.eq(err && err.precondition, { code: 'read_before_edit', requiredTool: 'fs.read', requiredState: 'current_file_observed' }, 'the refusal names fs.read as the precondition');
+    A.eq(await fsp.readFile(path.join(ROOT, 'ag3r', 'unseen.txt'), 'utf8'), 'alpha beta', 'nothing was written');
+    await readTool.run({ path: 'unseen.txt' }, ctx);
+    const ok = await editTool.run({ path: 'unseen.txt', find: 'alpha', replace: 'omega' }, ctx);
+    A.ok(/Edited unseen\.txt/.test(ok.content), 'after fs.read the same edit lands');
+    // a file this agent itself created via the tools is already observed — create-then-edit never trips
+    await writeTool.run({ path: 'mine.txt', content: 'one two' }, ctx);
+    A.ok(/Edited mine\.txt/.test((await editTool.run({ path: 'mine.txt', find: 'one', replace: '1' }, ctx)).content), 'a file written via fs.write is editable without a separate read');
+  }
   // ---- fs.list recursive: nested tree with dir markers ----
   {
     const ctx = { agentId: 'ag4' };
@@ -138,6 +226,33 @@ async function rejects(promise, msg) { try { await promise; A.ok(false, msg + ' 
     await writeTool.run({ path: 'sub/b.txt', content: '2' }, ctx);
     const tree = await listTool.run({ recursive: true }, ctx);
     A.ok(tree.content.indexOf('sub/') >= 0 && tree.content.indexOf('sub/b.txt') >= 0, 'recursive list shows the nested tree');
+    // token-burn audit 2026-10-17: dependency/VCS/cache folders are LISTED but not expanded; a huge tree ends on a usable note
+    const base = (await _internals.resolveInside('ag4', '.')).abs;
+    const fsx = require('fs'), px = require('path');
+    fsx.mkdirSync(px.join(base, 'node_modules', 'leftpad'), { recursive: true }); fsx.writeFileSync(px.join(base, 'node_modules', 'leftpad', 'index.js'), 'x');
+    fsx.mkdirSync(px.join(base, '.git', 'objects'), { recursive: true }); fsx.writeFileSync(px.join(base, '.git', 'HEAD'), 'ref');
+    const t2 = (await listTool.run({ recursive: true }, ctx)).content;
+    A.ok(/^node_modules\/ +\[not expanded — fs\.list \{"path":"node_modules"\} to look inside\]$/m.test(t2), 'node_modules is listed, marked not expanded, with how to look inside');
+    A.ok(t2.indexOf('node_modules/leftpad') < 0 && t2.indexOf('.git/HEAD') < 0 && t2.indexOf('.git/objects') < 0, 'its contents (and .git internals) are not walked');
+    A.ok(t2.indexOf('sub/b.txt') >= 0, 'ordinary folders are still expanded');
+    A.ok((await listTool.run({ path: 'node_modules', recursive: true }, ctx)).content.indexOf('leftpad/index.js') >= 0, 'listing the folder by path still looks inside');
+    // listing a SUBFOLDER: the hint must name a path that resolves where the folder really is (not relative to the listed folder)
+    fsx.mkdirSync(px.join(base, 'proj', 'node_modules', 'lodash'), { recursive: true }); fsx.writeFileSync(px.join(base, 'proj', 'node_modules', 'lodash', 'lodash.js'), 'x');
+    const sub = (await listTool.run({ path: 'proj', recursive: true }, ctx)).content;
+    const hinted = /fs\.list \{"path":("[^"]+")\}/.exec(sub);
+    A.ok(hinted && JSON.parse(hinted[1]) === 'proj/node_modules', 'a subfolder listing hints the full path: ' + (hinted && hinted[1]));
+    A.ok((await listTool.run({ path: JSON.parse(hinted[1]), recursive: true }, ctx)).content.indexOf('lodash/lodash.js') >= 0, 'following the hint really looks inside (never a false "(empty)")');
+    // the CHARACTER budget alone (well under 500 entries) cuts a listing of long names, and says so
+    fsx.mkdirSync(px.join(base, 'long'), { recursive: true });
+    for (let i = 0; i < 200; i++) fsx.writeFileSync(px.join(base, 'long', 'n' + String(i).padStart(3, '0') + '_' + 'x'.repeat(140) + '.txt'), '');
+    const longList = await listTool.run({ path: 'long', recursive: true }, ctx);
+    const longLines = longList.content.split('\n');
+    A.ok(longLines.length < 200 && /…\[truncated at \d+ entries/.test(longList.content), 'the 16k character budget cuts a long-name listing below the entry cap, with the note (' + longLines.length + ' lines)');
+    A.ok(longList.content.length > 15000 && longList.content.length <= 16000 + 400, 'and stops at the budget (' + longList.content.length + ' chars)');
+    for (let i = 0; i < 520; i++) fsx.writeFileSync(px.join(base, 'sub', 'f' + String(i).padStart(4, '0') + '.txt'), '');
+    const big = await listTool.run({ recursive: true }, ctx);
+    A.ok(/…\[truncated at \d+ entries — list one subdirectory/.test(big.content) && /\(truncated\)$/.test(big.summary), 'a huge tree ends on a truncation note that says how to continue');
+    A.ok(big.content.length <= 16000 + 400, 'a recursive listing stays inside its character budget (' + big.content.length + ')');
   }
 
   // ---- two concurrent agents writing the SAME relative path do NOT collide (per-agent jail roots) ----

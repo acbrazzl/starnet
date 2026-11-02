@@ -9,6 +9,7 @@
      · friendlyerror's oauth door reads ⏼ RECONNECT GROK / ⏼ RECONNECT KIMI, and the xAI 403-allowlist case
        routes to the XAI (API KEY) provider instead of a dead-end reconnect */
 'use strict';
+const { readSidecarSource } = require('./helpers/source');
 const A = require('./_assert.js');
 const fs = require('fs'); const path = require('path');
 const read = (...p) => fs.readFileSync(path.join(__dirname, '..', ...p), 'utf8');
@@ -66,7 +67,11 @@ A.ok(/p !== 'codex' && p !== 'grok' && p !== 'kimi'/.test(keycta), 'keycta treat
   A.eq(g.kind, 'oauth', 'a grok_not_connected error classifies as the oauth sign-in class');
   A.eq(g.provider, 'grok', 'the verdict carries the grok provider so the door can name it');
   A.ok(/key/i.test(g.userMessage), 'the grok oauth message still names the add-a-key alternative (never a dead-end)');
-  A.eq(actionButton(g).label, '⏼ RECONNECT GROK', 'the grok door reads ⏼ RECONNECT GROK');
+  // never connected is not "expired": nothing to reconnect, so the door reads SIGN IN
+  A.eq(actionButton(g).label, '⏼ SIGN IN TO GROK', 'a never-connected grok door reads ⏼ SIGN IN TO GROK');
+  A.ok(!/expired/i.test(g.userMessage), 'a never-connected grok is not told its sign-in expired');
+  const gDead = friendlyError(new Error('Grok (xAI) http 401 - invalid access token'));
+  A.eq(actionButton(gDead).label, '⏼ RECONNECT GROK', 'a grok sign-in that died mid-life still reads ⏼ RECONNECT GROK');
 
   const km = friendlyError(new Error('kimi_auth_error: refresh_token rejected — sign in again'));
   A.eq(km.kind, 'oauth', 'a kimi auth error classifies as oauth');
@@ -81,10 +86,12 @@ A.ok(/p !== 'codex' && p !== 'grok' && p !== 'kimi'/.test(keycta), 'keycta treat
   // it must NOT read as a reconnect-grok door (that would be the dead-end this case exists to avoid).
   A.ok(!/RECONNECT GROK/.test(gxBtn.label), 'the allowlist case never offers the doomed RECONNECT GROK door');
 
-  // regression: codex stays RECONNECT CHATGPT (provider defaults to codex when unnamed).
+  // codex names itself like grok/kimi (provider defaults to codex when unnamed): never signed in reads SIGN IN TO
+  // CHATGPT, a dead refresh reads RECONNECT CHATGPT (org P03).
   const cx = friendlyError(new Error('codex_not_connected'));
   A.eq(cx.provider, 'codex', 'a codex oauth error still resolves to the codex provider');
-  A.eq(actionButton(cx).label, '⏼ RECONNECT CHATGPT', 'the codex door is unchanged (⏼ RECONNECT CHATGPT)');
+  A.eq(actionButton(cx).label, '⏼ SIGN IN TO CHATGPT', 'a never-signed-in codex door reads ⏼ SIGN IN TO CHATGPT');
+  A.eq(actionButton(friendlyError(new Error('refresh_token_reused'))).label, '⏼ RECONNECT CHATGPT', 'a dead codex refresh reads ⏼ RECONNECT CHATGPT');
 }
 
 // ---- FIRST sign-in reachability (live-caught 2026-07-17, widened to codex 2026-07-21): a never-signed-in
@@ -97,6 +104,7 @@ A.ok(/p !== 'codex' && p !== 'grok' && p !== 'kimi'/.test(keycta), 'keycta treat
   const ui = read('frontend', 'app', 'stationui.js');
   A.ok(/data-act="prov-oauth-signin"/.test(ui), 'the provider card renders a ⏼ SIGN IN action for a not-signed-in device-code provider');
   A.ok(/wantsOAuthSignin\s*=\s*p\.live\s*&&\s*isOAuthProvider\(p\.id\)\s*&&\s*!credentialSaved/.test(ui), 'the card sign-in covers EVERY device-code provider (codex included) without a stored sign-in — never just OAUTH_EXTRA');
+  A.ok(!/wantsOAuthSignin\s*=[^;]*!codexDead/.test(ui) && /codexDead \? '⏼ RECONNECT' : '⏼ SIGN IN'/.test(ui), '#92: a KNOWN-dead sign-in keeps the card button, labelled ⏼ RECONNECT (the RE-SIGN-IN row under API KEYS was the only way back in)');
   A.ok(/prov-oauth-signin"\]'\)/.test(ui) && /OAuthSignIn\.for\(pid\)/.test(ui), 'the card sign-in drives the SAME shared engine (OAuthSignIn.for), no bespoke fetch loop');
   A.ok(/id="prov-oauth-code-'\s*\+\s*esc\(p\.id\)/.test(ui) && /id="prov-oauth-status-'\s*\+\s*esc\(p\.id\)/.test(ui), 'the card owns a per-provider inline device-code surface (no id collision)');
   const signinHandler = ui.slice(ui.indexOf("querySelector('[data-act=\"prov-oauth-signin\"]')"));
@@ -104,6 +112,15 @@ A.ok(/p !== 'codex' && p !== 'grok' && p !== 'kimi'/.test(keycta), 'keycta treat
   // the card handler must route codex's connected truth to its literal status state (codexStatusKnown), not
   // the grok/kimi shared cache — otherwise the row keeps reading NOT SIGNED IN after a successful sign-in.
   A.ok(/pid === 'codex'.*codexStatusKnown\s*=\s*\{\s*connected:\s*true/.test(signinHandler), "a card-driven codex sign-in lands in codexStatusKnown (the codex truth the row actually reads)");
+  // org P03 review: a Settings repaint mid-sign-in (the first open's background checks) replaced the card and the
+  // device code went into the detached box. The box is drawn FROM state, and the callbacks repaint the live box.
+  A.ok(/const oauthCardFlow = \{\}/.test(ui) && /function oauthCardFlowView\(pid, keepEnded\)/.test(ui), 'the card sign-in keeps its flow in module state, not in the card DOM');
+  A.ok(/\(wantsOAuthSignin \|\| cardFlow\s*\?/.test(ui) && /cardFlow \? '' : ' hidden'/.test(ui), 'the card render draws an in-flight sign-in box (code + page) from that state');
+  const starter = ui.slice(ui.indexOf('function startCardSignin('), ui.indexOf('function startCardSignin(') + 3000);
+  A.ok(/onCode: c => \{[\s\S]*?Object\.assign\(mine, \{ phase: 'code'/.test(starter) && !/card\.querySelector/.test(starter), 'onCode writes the code into state and paints whatever card is live — never a captured node');
+  // a RECONNECT door on a card with no sign-in key (still listed as connected) starts the same card flow itself
+  A.ok(/if \(b\) b\.click\(\); else if \(isOAuthProvider\(id\)\) startCardSignin\(id\)/.test(ui), 'a sign-in door always runs a sign-in, even on a card that shows no ⏼ SIGN IN key');
+  A.ok(/if \(!card\.isConnected\) \{ land\(\); return; \}/.test(ui), 'a repaint right after the landing lands on the new card, not at the top of the page');
 }
 
 // ---- 2026-07-22 auth-lifecycle hardening (source-locks; the live races/keychain failures need real tokens
@@ -111,7 +128,7 @@ A.ok(/p !== 'codex' && p !== 'grok' && p !== 'kimi'/.test(keycta), 'keycta treat
 {
   const ui = read('frontend', 'app', 'stationui.js');
   const harness = read('frontend', 'app', 'harness.js');
-  const sidecar = read('sidecar', 'index.js');
+  const sidecar = readSidecarSource();
   // single-flight refresh: concurrent refreshes on a ROTATING refresh token false-expire a live sign-in
   // (the 2026-07-08 class, self-inflicted). Both the codex literal path and the grok/kimi shared path coalesce.
   A.ok(/codexRefreshInFlight\s*=\s*refreshCodexTokensOnce\(\)\.finally/.test(sidecar), 'codex refresh is single-flight (coalesced in-flight promise)');
@@ -121,7 +138,8 @@ A.ok(/p !== 'codex' && p !== 'grok' && p !== 'kimi'/.test(keycta), 'keycta treat
   A.ok(/\.then\(r => \{ setDesktopConfigured\(p, on\); return r; \}\)/.test(harness), 'setKey flips configured only after the keychain write resolves');
   A.ok(/err && err\.message/.test(ui) && /could not verify and store the ' \+ provName\(provider\) \+ ' key/.test(ui), 'Settings key save renders the exact validation/keychain failure copy');
   // Settings OAuth state changes mirror into the desktop configured-map (genesis already did; Settings must too).
-  A.ok(/Harness\.setDesktopConfigured\('codex', true\)/.test(ui) && /Harness\.setDesktopConfigured\(pid, true\)/.test(ui), 'Settings sign-in feeds the desktop configured-map');
+  // (org P03 wiring) every sign-in — card, door, or the API KEYS row's RE-SIGN-IN, codex included — finishes in startCardSignin
+  A.ok(/function startCardSignin\(pid, retryLabel\) \{[\s\S]*?Harness\.setDesktopConfigured\(pid, true\)/.test(ui) && /if \(act === 'codex-resign'\) \{ startCardSignin\('codex', '⏼ RE-SIGN-IN'\); return; \}/.test(ui), 'Settings sign-in feeds the desktop configured-map');
   A.ok(/Harness\.setDesktopConfigured\('codex', false\)/.test(ui) && /Harness\.setDesktopConfigured\(pid, false\)/.test(ui), 'Settings disconnect clears the desktop configured-map');
   // model reconcile on OAuth card select: a foreign global model slug must not ride to the new endpoint.
   A.ok(/isOAuthProvider\(p\) && typeof fetch === 'function'/.test(ui) && /\/api\/auth\/' \+ p \+ '\/models/.test(ui), 'selecting an OAuth provider card reconciles the model against that provider\'s catalog');

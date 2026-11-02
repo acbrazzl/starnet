@@ -19,21 +19,49 @@
   // a verb the agent can carry out (or a filename) -> TASK, regardless of any courtesy wrapper
   const ACTIONABLE = /\b(research|search|google|find|look ?up|fetch|scrape|crawl|download|browse|visit|go to|read|open|write|save|create|generate|build|make|draft|compile|summari[sz]e|report|list|extract|analy[sz]e|investigate|compare|check|calculate|translate|plan|schedule|email|post|send)\b|\.(md|txt|js|ts|py|csv|json|html?|pdf)\b/;
   // pure pleasantries / acknowledgements / short answers — a greeting or ack word, optionally trailed by a
-  // few non-actionable tokens ("hey there", "thanks a lot", "sounds good", "good morning friend") over the
-  // WHOLE message -> CHAT. (ACTIONABLE is tested first, so a greeting that carries a real instruction —
+  // few tokens that are THEMSELVES pleasantries ("hey there", "thanks a lot", "sounds good", "good morning friend")
+  // over the WHOLE message -> CHAT. (ACTIONABLE is tested first, so a greeting that carries a real instruction —
   // "sure, send it" — never reaches here.) Acks like "yes / got it / sounds good" are answers, not missions.
-  const CHATTY = /^(hi+|hey+|hello|yo|sup|hiya|howdy|gm|good (morning|evening|night|afternoon)|good (idea|one|call)|thanks?|thank you|ty|np|nice( one)?|cool|awesome|great( job)?|good job|well done|perfect|exactly|agreed|makes sense|sounds? good|got it|will do|right|correct|ok(ay)?|k|yes|ya|yeah|yep|yup|no|nope|nah|sure|fine|lol|haha|nvm|never ?mind|bye|cya|see ya)([\s,!.?]+\w+){0,3}[\s!.?]*$/;
+  // Any other trailing word carries work and falls through to TASK: a retry ("ok, try it now"), a redirect
+  // ("no, use the dish") or a new topic ("yes, bitcoin price today") was chat while the tail took ANY three words,
+  // so the run got zero tools and the agent told the Commander it had no web tool with a DISH placed.
+  // ACK is shared by the head AND the tail, so two acks in a row ("ok got it", "sure, sounds good", "ok thx") stay
+  // chat — a task there drops an INTAKE box on the work-only belt and mints a recurring job from a closing ack.
+  // Trade-off: an agent's name after a greeting ("hey nova", "thanks claude") is not a pleasantry word -> TASK.
+  const ACK = "hi+|hey+|hello|yo|sup|hiya|howdy|gm|good (?:morning|evening|night|afternoon)|good (?:idea|one|call)|thanks?|thank you|ty|thx|np|nice(?: one)?|cool|awesome|great(?: job)?|good job|well done|perfect|exactly|agreed|makes sense|sounds? good|got it|will do|understood|right|correct|ok(?:ay)?|k|yes|ya|yeah|yep|yup|no|nope|nah|sure|fine|lol|haha|nvm|never ?mind|bye|cya|see ya";
+  const CHATTY = new RegExp('^(?:' + ACK + ')([\\s,!.?]+(?:' + ACK + '|there|again|so|much|a|lot|very|man|bro|dude|friend|guys|mate|buddy|all|everyone|then|too|thank|you|for|that|this|the|it|help|anyway|worries|problem|prob|thing|by|me|works|worked|work|job|is|does|not|yet|i|agree|good|great|one|morning|evening|night|afternoon|please|pls|appreciated?|now|at|love)\\b){0,3}[\\s!.?]*$');
   // questions ABOUT the agent itself (the WHOLE message; a few trailing words allowed — "how are you today")
   // -> CHAT
   const ABOUT_SELF = /^(how are you|how('?s| is) it going|how do you feel|how'?s your day|who are you|what('?s| is) your name|what are you|are you (ok|okay|alright|there|conscious|sentient|alive|real|happy|sure|awake|busy|free))([\s,!.?]+\w+){0,3}[\s!.?]*$/;
 
-  function isTaskDirective(text) {
+  // ctx.priorAgentTurn (optional): the agent's last reply in this conversation — a bare "yes" that answers its offer
+  // to act is the task itself (see isAffirmation/offeredWork below). Absent = the text alone decides, as before.
+  function isTaskDirective(text, ctx) {
     const t = String(text == null ? '' : text).trim().toLowerCase();
     if (!t) return false;
     if (ACTIONABLE.test(t)) return true;            // explicit intent beats a courtesy prefix
+    if (ctx && ctx.priorAgentTurn && isAffirmation(t) && offeredWork(ctx.priorAgentTurn)) return true;   // "yes" to "want me to draft it?"
     if (CHATTY.test(t) || ABOUT_SELF.test(t)) return false;   // greetings / acks / self-questions: no tools, no work framing
     return true;                                    // default: keep TOOLS available (the desk trip is reactive, so an
                                                     // unused toolset stays invisible — a real task is never left tool-less)
+  }
+
+  /* "YES" TO AN OFFER IS A GO (2026-10-01). An ack alone is chat ("thanks", "got it") — but when the agent's last
+     turn OFFERED to do work ("Want me to draft it?", "Shall I go ahead?"), the Commander's "yes" / "sure" / "do it"
+     IS the task directive. Classified as chat it ran with no tools, so the agent could only promise the work.
+     isAffirmation: the WHOLE message is a yes (a few trailing words allowed: "yes please", "sure, go for it").
+     offeredWork: the agent's reply ends on a question that offers to act. Both must hold. */
+  const AFFIRM = /^(y(es|ea|eah|ep|up)?|sure|ok(ay)?|k|alright|please|please do|do it|go( for it| ahead)?|let'?s do it|let'?s go|sounds good|absolutely|definitely|of course|yes please|why not|proceed|continue|carry on)([\s,!.]+(please|do it|go ahead|go for it|sure|yes|that'?d be great|sounds good|let'?s do it|proceed))*[\s!.]*$/;
+  const OFFER = /\b(shall i|should i|want me to|would you like( me)? to|do you want( me)? to|like me to|can i go ahead|ok(ay)? to (go|proceed|start)|go ahead and|ready (for me )?to|i can (go ahead|start|do|draft|write|build|run|set))\b/;
+  function isAffirmation(text) {
+    const t = String(text == null ? '' : text).trim().toLowerCase();
+    return !!t && t.length <= 60 && AFFIRM.test(t);
+  }
+  function offeredWork(agentText) {
+    const t = String(agentText == null ? '' : agentText).trim().toLowerCase();
+    if (!t) return false;
+    const tail = t.slice(-400);                     // the offer is the reply's closing question, not something said mid-way
+    return /\?\s*[)"'*_`]*\s*$/.test(tail) && OFFER.test(tail.slice(tail.lastIndexOf('\n') + 1) || tail);
   }
 
   /* CONTENT TAG — what KIND of work is this, so a FILTER junction can sort it to the right agent's bay.
@@ -67,5 +95,5 @@
      Locked by classify.test.js. */
   function stanceFor(isTask) { return isTask ? 'task' : 'talk'; }
 
-  return { isTaskDirective, getTag, stanceFor };
+  return { isTaskDirective, isAffirmation, offeredWork, getTag, stanceFor };
 });

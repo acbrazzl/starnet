@@ -25,7 +25,7 @@ const EVOLUTION_NAMES = ['DRIFT', 'VECTOR', 'ORBIT', 'CONSTELLATION', 'DEEP FIEL
 const METRIC_CAP = 40, OUTCOME_CAP = 300, RECEIPT_CAP = 100, HISTORY_CAP = 24;
 const AGENT_RE = /^[A-Za-z0-9_-]{1,40}$/;
 
-const clip = (v, n) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim().slice(0, n);
+const clip = (v, n) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim().slice(0, n).replace(/[\uD800-\uDBFF]$/, '');   // never half an emoji (a lone surrogate)
 const finite = v => typeof v === 'number' && Number.isFinite(v);
 const number = v => {
   if (v == null || (typeof v === 'string' && !v.trim())) return null;
@@ -33,7 +33,11 @@ const number = v => {
 };
 const stamp = v => Math.max(0, Math.floor(number(v) || 0));
 const domain = v => DOMAIN_SET.has(String(v || '').toLowerCase()) ? String(v).toLowerCase() : null;
-const agent = v => AGENT_RE.test(String(v || '')) ? String(v) : null;
+// __proto__ / constructor / prototype match AGENT_RE but are object-model keys, not agents: rec.suppressed['__proto__']
+// IS Object.prototype, so one POST /api/journey adaptation.suppress wrote a domain name onto every object in the
+// process. Refuse them wherever an agent id becomes a property key.
+const PROTO_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const agent = v => AGENT_RE.test(String(v || '')) && !PROTO_KEYS.has(String(v)) ? String(v) : null;
 
 function tierFor(count) {
   const n = Math.max(0, Number(count) | 0);
@@ -107,8 +111,13 @@ function normAchievement(a) {
 function progressionFor(rec) {
   const points = rec.commanderPoints;
   const level = Math.floor(points / 100) + 1;
+  // `activity` + `startedAt` are ADDITIVE (2026-10-19, the quest-log battle pass): every retained achievement's
+  // timestamp/kind/points (bounded by OUTCOME_CAP), so the pass can compute a daily streak + this week's challenges
+  // from the same verified awards that make the points — never from runs, spend, or anything it would have to guess.
   return { level, points, levelStartsAt: (level - 1) * 100, nextLevelAt: level * 100,
-    pointsToNextLevel: level * 100 - points, achievements: rec.achievements.slice(-30) };
+    pointsToNextLevel: level * 100 - points, achievements: rec.achievements.slice(-30),
+    activity: rec.achievements.map(a => ({ at: a.at, kind: a.kind, points: a.points, goalId: a.goalId, step: /^milestone:/.test(a.key) })),
+    startedAt: rec.startedAt || null };
 }
 
 function award(rec, input, now) {
@@ -218,6 +227,18 @@ function foldOutcome(rec, input, now) {
   return { changed: true, outcome: d, receipt };
 }
 
+/* questFoldGate (2026-10-19): recordQuest's pre-lock refusals, in ONE place, shared with pendingQuestFolds so the
+   reconcile filter and the writer can never disagree about which quest is foldable. sourceId is computed with the
+   same clip normOutcome applies before foldOutcome's outcomeKeys check. A filter that wrongly drops a quest would
+   silently stop the crash-recovery fold (the journey would under-report) — test/journey-read-cache.test.js pins
+   filter/writer parity across the whole matrix. */
+function questFoldGate(q) {
+  if (!q || !q.id || q.status !== 'done') return { ok: false, error: 'a completed quest is required' };
+  const attest = q.attest && q.attest.confirmed === true ? q.attest : null;
+  if (q.contract && q.contract.type === 'attest' && !attest) return { ok: false, error: 'attest completion requires Commander-confirmed evidence' };
+  return { ok: true, attest, sourceId: clip('quest:' + q.id, 120) };
+}
+
 function makeJourneyStore(deps) {
   deps = deps || {};
   if (!deps.path || !deps.workspaces) throw new Error('makeJourneyStore requires path + workspaces');
@@ -226,9 +247,23 @@ function makeJourneyStore(deps) {
     writeDurable: deps.writeDurable, onRecover: deps.onRecover, onCorrupt: deps.onCorrupt
   });
 
+  /* READ CACHE (2026-10-19, idle-CPU pass) — the quest-store discipline: keep the last CLEAN ('ok') parse and serve
+     it while durable.signature() (the main file's bigint stat + this process's write generation, taken BEFORE the
+     read) is unchanged. recovered / absent / corrupt / unreadable keep their uncached path and their exact
+     results/throws. Every writer below still goes through durable.update(), which re-reads disk under the lock.
+     ⚠ READ-ONLY CONTRACT: read() — and the rows snapshot() shares with it — are the SAME objects on every call.
+     Never mutate them; copy first. test/journey-read-cache.test.js deep-freezes the cache under every reader. */
+  let cache = null;   // { sig, rec }
   function read() {
+    const sig = durable.signature(STORE_KEY);
+    if (sig !== null && cache && cache.sig === sig) return cache.rec;
+    cache = null;
     const r = durable.readKey(STORE_KEY);
-    if (r.status === 'ok' || r.status === 'recovered') return normalize(r.value);
+    if (r.status === 'ok' || r.status === 'recovered') {
+      const rec = normalize(r.value);
+      if (sig !== null && r.status === 'ok') cache = { sig, rec };
+      return rec;
+    }
     if (r.status === 'absent') return normalize(null);
     const e = new Error('journey ledger is ' + r.status);
     e.code = r.status === 'unreadable' ? 'ESTORE_UNREADABLE' : 'ESTORE_CORRUPT';
@@ -246,14 +281,25 @@ function makeJourneyStore(deps) {
       goals: rec.goals, progression: progressionFor(rec),
       metrics: rec.metrics.filter(m => m.status !== 'retired'),
       outcomes: rec.outcomes.slice(-50), mastery: rec.mastery.slice(), receipts: rec.receipts.slice(-20),
+      // every recorded plan-step completion (not only the last 50 outcomes): the webview folds these onto its
+      // goal tree, so a step the sidecar settled while the window was closed shows done when it reopens.
+      milestones: rec.outcomes.filter(o => o.kind === 'milestone').slice(-100)
+        .map(o => ({ goalId: o.goalId, milestoneId: o.milestoneId, evidence: o.evidence, verifiedBy: o.verifiedBy, at: o.at })),
       suppressed: rec.suppressed, evolution: evolutionFor(rec.goalsReached)
     };
   }
 
+  // lifetime set of completed plan steps, keyed goalId + ':' + milestoneId (the outcome rows are capped for
+  // display; the source-key ledger is not, so an old completion can never read as open again).
+  function milestoneDoneKeys() {
+    const rec = read();
+    return new Set(rec.outcomeKeys.filter(k => k.indexOf('milestone:') === 0).map(k => k.slice('milestone:'.length)));
+  }
+
   async function recordQuest(q, activeGoal, now) {
-    if (!q || !q.id || q.status !== 'done') return { ok: false, error: 'a completed quest is required' };
-    const attest = q.attest && q.attest.confirmed === true ? q.attest : null;
-    if (q.contract && q.contract.type === 'attest' && !attest) return { ok: false, error: 'attest completion requires Commander-confirmed evidence' };
+    const gate = questFoldGate(q);
+    if (!gate.ok) return { ok: false, error: gate.error };
+    const attest = gate.attest;
     const aid = attest && attest.source === 'commander' ? null : (agent(q.completedBy) || agent(attest && attest.agentId) || agent(q.agentId));
     const proof = q.contract && q.contract.type === 'attest' ? 'commander-confirmed' : 'harness-contract';
     const evidence = attest && attest.evidence
@@ -279,15 +325,39 @@ function makeJourneyStore(deps) {
     return { ok: true, duplicate: !result.changed && !result.skipped, skipped: !!result.skipped, outcome: result.outcome, receipt: result.receipt };
   }
 
-  async function recordMilestone(d, now) {
+  /* pendingQuestFolds(quests) (2026-10-19, idle-CPU pass): the done quests recordQuest WOULD still write, in list
+     order (so jo:/jr: seq ids and receipt order are unchanged). The crash-recovery reconcile (index.js, awaited by
+     every GET /api/journey) used to call recordQuest for EVERY done quest, and each call re-read + re-normalized the
+     whole journey under the lock only to find it already folded — ~200 ms of unbroken event-loop block every 4 s at
+     the caps. This applies recordQuest's exact no-write tests against one (cached) read: the shared gate, the reset
+     epoch, and the lifetime source-key ledger. It only narrows WHICH quests reach recordQuest; recordQuest still
+     re-reads under the lock and stays the idempotency authority. Throws exactly as read() does. */
+  function pendingQuestFolds(quests) {
+    const rec = read();
+    const folded = new Set(rec.outcomeKeys);
+    return (Array.isArray(quests) ? quests : []).filter(q => {
+      const gate = questFoldGate(q);
+      if (!gate.ok) return false;
+      if (rec.startedAt > 0 && stamp(q.completedAt) < rec.startedAt) return false;
+      return !folded.has(gate.sourceId);
+    });
+  }
+
+  // opts.authority (sidecar-internal ONLY — the POST /api/journey route never passes a third argument, so a client
+  // can never claim it): the step was settled by the harness from its quest slate (sidecar/goal-advance.js), which
+  // names the honest authority — 'harness-contract' when a mechanical contract completed work, 'commander-confirmed'
+  // when every completed quest was the Commander's own report.
+  async function recordMilestone(d, now, opts) {
     d = d || {}; let result = null;
     const sourceId = 'milestone:' + clip(d.goalId, 64) + ':' + clip(d.milestoneId, 80);
     if (!clip(d.goalId, 64) || !clip(d.milestoneId, 80) || clip(d.evidence, 1000).length < 4) return { ok: false, error: 'goal, milestone, and evidence are required' };
+    const internal = opts && ['harness-contract', 'commander-confirmed'].indexOf(opts.authority) >= 0 ? opts.authority : null;
+    const verifiedBy = internal || (d.source === 'commander' ? 'commander-confirmed' : 'commander-client');
     await durable.update(STORE_KEY, cur => {
       const rec = normalize(cur);
       result = foldOutcome(rec, {
         sourceId, kind: 'milestone', goalId: d.goalId, milestoneId: d.milestoneId, agentId: d.agentId,
-        domain: d.domain, title: d.milestoneText || d.goalText, evidence: d.evidence, verifiedBy: d.source === 'commander' ? 'commander-confirmed' : 'commander-client', goalDone: false
+        domain: d.domain, title: d.milestoneText || d.goalText, evidence: d.evidence, verifiedBy, goalDone: false
       }, now);
       if (result.changed) award(rec, { key: sourceId, goalId: d.goalId, kind: 'milestone',
         title: d.milestoneText || d.goalText, evidence: d.evidence, verifiedBy: d.source === 'commander' ? 'commander-confirmed' : 'commander-client' }, now);
@@ -419,23 +489,36 @@ function makeJourneyStore(deps) {
     return { ok: true };
   }
 
-  function adaptationBlock(agentId) {
+  /* opts.counts === false: the TIER-ONLY form for the cache-stable system prompt (index.js CACHE-STABLE PREFIX). A count
+     changes with every verified outcome, so a counted line re-wrote the cached prefix mid-conversation; this form names
+     domain + tier + instruction, ordered by tier then domain, and changes only when a tier is crossed or a domain is
+     added or muted. Default: the counted lines, ordered by count (the STARNET_STABLE_PREFIX=0 prompt, unchanged). */
+  const TIER_RANK = { proven: 3, practiced: 2, tested: 1 };
+  function adaptationBlock(agentId, opts) {
+    const counts = !(opts && opts.counts === false);
     const aid = agent(agentId); if (!aid) return '';
     const rec = read(), muted = rec.suppressed[aid] || {};
-    const rows = rec.mastery.filter(m => m.agentId === aid && !muted[m.domain]).sort((a, b) => b.count - a.count || a.domain.localeCompare(b.domain));
-    if (!rows.length) return '';
+    // WHICH five: always the most-practised (by count), in both forms (review 2026-10-12: picking the five by tier, then
+    // name, let a tier-mate that sorts first push out the agent's most-practised domain). The tier-only form then RENDERS
+    // them by tier and domain, so its bytes change only when the 5th and 6th swap, a tier is crossed, or a domain is
+    // added or muted.
+    const byCount = (a, b) => b.count - a.count || a.domain.localeCompare(b.domain);
+    const byTier = (a, b) => (TIER_RANK[b.tier] || 0) - (TIER_RANK[a.tier] || 0) || a.domain.localeCompare(b.domain);
+    const top = rec.mastery.filter(m => m.agentId === aid && !muted[m.domain]).sort(byCount).slice(0, 5);
+    if (!top.length) return '';
+    const rows = counts ? top : top.slice().sort(byTier);
     const lines = ['<VERIFIED_JOURNEY_ADAPTATION>', 'Use this agent\'s verified outcome history as a planning prior, never as permission or proof about a new task:'];
-    for (const m of rows.slice(0, 5)) {
+    for (const m of rows) {
       const instruction = m.tier === 'proven' ? 'Reuse established patterns.'
         : m.tier === 'practiced' ? 'Prefer relevant repeated patterns, while stating uncertainty.'
           : 'Treat this as early evidence; consider the pattern but verify it.';
-      lines.push('- ' + m.domain + ': ' + m.count + ' verified outcome' + (m.count === 1 ? '' : 's') + ' (' + m.tier + '). ' + instruction + ' State uncertainty outside this track.');
+      lines.push('- ' + m.domain + (counts ? ': ' + m.count + ' verified outcome' + (m.count === 1 ? '' : 's') : '') + ' (' + m.tier + '). ' + instruction + ' State uncertainty outside this track.');
     }
     lines.push('</VERIFIED_JOURNEY_ADAPTATION>');
     return lines.join('\n');
   }
 
-  return { read, snapshot, currentEpoch, registerGoal, confirmGoal, recordQuest, recordMilestone, createMetric, updateMetric, retireMetric, setSuppressed, reset, adaptationBlock, _durable: durable };
+  return { read, snapshot, milestoneDoneKeys, currentEpoch, registerGoal, confirmGoal, recordQuest, pendingQuestFolds, recordMilestone, createMetric, updateMetric, retireMetric, setSuppressed, reset, adaptationBlock, _durable: durable };
 }
 
-module.exports = { makeJourneyStore, normalize, tierFor, evolutionFor, progressionFor, DOMAINS, _internals: { normMetric, normOutcome, reached, foldOutcome } };
+module.exports = { makeJourneyStore, normalize, tierFor, evolutionFor, progressionFor, DOMAINS, _internals: { normMetric, normOutcome, reached, foldOutcome, questFoldGate } };

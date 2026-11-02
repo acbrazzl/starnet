@@ -80,6 +80,22 @@ async function run() {
     A.eq(lastRun.messages[2], { role: 'user', content: 'research foo' }, 'newest user turn last');
   }
 
+  // ---- B1. "yes" to the agent's offer is a task: the hub re-asks the REAL classifier with the agent's last reply ----
+  {
+    const { isTaskDirective } = require('../frontend/app/classify.js');
+    const runs = [];
+    const runOnce = async (o) => { runs.push(o); o.emit('agent.run.start', { agentId: o.agentId, runId: o.runId, trigger: 'event', model: o.model }); o.emit('agent.token', { agentId: o.agentId, runId: o.runId, delta: 'ok' }); o.emit('agent.run.end', { agentId: o.agentId, runId: o.runId, reason: 'done', turns: 1, usd: 0 }); };
+    const store = fakeStore();
+    store.hist.set('tg_31', [{ role: 'user', content: 'plan the welcome note' }, { role: 'assistant', content: 'Here is the plan. Want me to draft it?' }]);
+    store.hist.set('tg_32', [{ role: 'user', content: 'thanks for that' }, { role: 'assistant', content: 'Any time. Anything else?' }]);
+    const hub = makeChannelHub({ runOnce, store, send: () => Promise.resolve({ ok: true }), secrets: () => ({ key: 'k', model: 'm' }), classify: isTaskDirective, newId: idGen() });
+    await hub.onInbound(dm('yes please', '31'));
+    A.eq(runs[0].isTask, true, '"yes please" after "want me to draft it?" runs as a task');
+    A.ok(/task/i.test(runs[0].system), '…with the task prompt');
+    await hub.onInbound(dm('yes', '32'));
+    A.eq(runs[1].isTask, false, '"yes" after a plain question stays chat');
+  }
+
   // ---- B2. configured agentId + system: runs as the SAME app agent (shared memory) with its real prompt ----
   {
     const store = fakeStore(); let lastRun = null; const sends = [];
@@ -90,6 +106,21 @@ async function run() {
     A.ok(lastRun.system.indexOf('You are ULTRON, the Commander\'s agent.') === 0, 'the REAL composed system prompt is used, not the default persona');
     A.eq((store.hist.get('agent') || []).length, 2, 'history stored under the shared agentId');
     A.eq(store.hist.has('tg_555'), false, 'did NOT create a separate tg_<chatId> agent');
+  }
+
+  // ---- B3. a STRING persona (or none) is the run's persona — never a function's source text ----
+  // Live-caught on the wire 2026-10-20 (sweep/channels): every station-bot run with no configured system prompt reached
+  // the provider with a system prompt that began "() => p" — the persona fallback's factory was never invoked, so the
+  // run got the source text of an arrow function instead of TELEGRAM_PERSONA / DISCORD_PERSONA / the default persona.
+  {
+    const runs = [];
+    const runOnce = async (o) => { runs.push(o); o.emit('agent.run.start', { agentId: o.agentId, runId: o.runId }); o.emit('agent.token', { agentId: o.agentId, runId: o.runId, delta: 'ok' }); o.emit('agent.run.end', { agentId: o.agentId, runId: o.runId, reason: 'done' }); };
+    const mk = (persona) => makeChannelHub(Object.assign({ runOnce, store: fakeStore(), send: () => Promise.resolve({ ok: true }), secrets: () => ({ key: 'k', model: 'm' }), classify: () => false, newId: idGen() }, persona === undefined ? {} : { persona }));
+    await mk('You are the TELEGRAM persona.').onInbound(dm('hello'));
+    A.ok(runs[0].system.indexOf('You are the TELEGRAM persona.') === 0, 'a string persona opens the system prompt: ' + JSON.stringify(runs[0].system.slice(0, 40)));
+    await mk(undefined).onInbound(dm('hello'));
+    A.ok(runs[1].system.indexOf('You are the Commander\'s AI agent') === 0, 'no persona -> the default persona: ' + JSON.stringify(runs[1].system.slice(0, 40)));
+    A.ok(runs.every(r => !/=>/.test(r.system.slice(0, 20))), 'no run is handed function source as its persona');
   }
 
   // ---- B3. Codex OAuth config: no API key is required, but provider must reach runOnce ----
@@ -173,7 +204,10 @@ async function run() {
     const p1 = hub.onInbound(dm('first'));   // parks
     await hub.onInbound(dm('second'));         // aborts the first, runs + delivers
     await p1;                                  // first unwinds: superseded -> no delivery
-    A.eq(sends, ['second-reply'], 'only the latest message is answered (first run superseded, no partial sent)');
+    // 2026-10-11: superseded, never SILENT — a one-line notice that the earlier task stopped, then the newer reply; no stale partial
+    A.eq(sends.length, 2, 'the stop notice + the latest reply');
+    A.ok(/Stopped the earlier task/.test(sends[0]), 'the chat is told the earlier task was stopped for the newer message');
+    A.eq(sends[1], 'second-reply', 'only the latest message is answered (first run superseded, no partial sent)');
   }
 
   // ---- H. onStatus -> channel.connect; pure helpers ----
@@ -258,7 +292,7 @@ async function run() {
     // an UNBOUND chat still records the resolved agent (the notifier needs some chat for that agent)
     await hub.onInbound(dm('hello', '777'));
     A.eq(saves.length, 1, 'unbound chat -> binding persisted');
-    A.eq(saves[0], { chatId: '777', rec: { agentId: 'researcher', channel: 'telegram' } }, 'unbound chat records the resolved agent');
+    A.eq(saves[0], { chatId: '777', rec: { agentId: 'researcher', channel: 'telegram', streamId: 'channel_telegram_777' } }, 'unbound chat records the resolved agent (and its canonical stream, from the first message)');
   }
 
   /* ---- J4. WORK BELONGS TO A LINE (Andrew's ruling, 2026-08-07) ----
@@ -702,7 +736,27 @@ async function run() {
     A.eq(sends.filter(s => /E-STOP/.test(s)).length, 1, 'the stop notice is delivered exactly once');
   }
 
-  // ---- V2. a supersede by a NEWER message stays silent (the control for V) ---------------------------
+  // ---- V1. THE STATION'S OWN FAULT is not an E-STOP (wave 2 repair, conveyor-backend-08): the process-fault containment marks the
+  // runs it kills `faulted` first, so the chat is told the station hit a fault — never that someone pressed an E-STOP ----------------
+  {
+    const { killAll, markFaulted } = require('../sidecar/halt.js');
+    const store = fakeStore(); const sends = [];
+    const runOnce = async (o) => {
+      o.emit('agent.run.start', { agentId: o.agentId, runId: o.runId, trigger: 'event', model: o.model });
+      await new Promise(res => { if (o.signal.aborted) return res(); o.signal.addEventListener('abort', () => res(), { once: true }); });
+      o.emit('agent.run.end', { agentId: o.agentId, runId: o.runId, reason: 'cancelled', turns: 0, usd: 0 });
+    };
+    const hub = makeChannelHub({ runOnce, store, send: (c, t) => { sends.push(t); return Promise.resolve({ ok: true }); }, secrets: () => ({ key: 'k', model: 'm' }), classify: () => false, newId: idGen() });
+    const parked = hub.onInbound(dm('do the long thing'));
+    await new Promise(r => setTimeout(r, 10));
+    markFaulted(hub._internals.inflight);
+    A.eq(killAll(null, hub._internals.inflight), 1, 'fault: the containment aborted the one in-flight channel run');
+    await parked;
+    A.eq(sends.filter(s => /internal fault/.test(s)).length, 1, 'fault: the chat is told once that the station hit a fault — ' + JSON.stringify(sends));
+    A.ok(!sends.some(s => /E-STOP/.test(s)), 'fault: never "E-STOP was pressed"');
+  }
+
+  // ---- V2. a supersede by a NEWER message is NOT silent (2026-10-11), but never says E-STOP either --------
   {
     const store = fakeStore(); const sends = []; let call = 0;
     const runOnce = async (o) => {
@@ -719,7 +773,10 @@ async function run() {
     const p1 = hub.onInbound(dm('first'));
     await hub.onInbound(dm('second'));
     await p1;
-    A.eq(sends, ['second-reply'], 'a supersede by a newer message is still SILENT — no stop notice, no stale partial');
+    A.ok(!sends.some(x => /stale partial/.test(x)), 'no stale partial');
+    A.ok(!sends.some(x => /E-STOP/.test(x)), 'a newer message is not an E-STOP');
+    A.eq(sends.filter(x => /Stopped the earlier task/.test(x)).length, 1, 'the earlier task stop is said exactly once');
+    A.eq(sends[sends.length - 1], 'second-reply', 'the newer message is answered');
   }
 
   // ---- W. quick plain-text bubbles become one thought; commands/media stay exact ---------------------
@@ -746,6 +803,151 @@ async function run() {
     const media = dm('caption', 'batch'); media.media = [{ kind: 'photo', fileId: 'p', name: 'p.jpg', mime: 'image/jpeg', size: 1 }];
     await hub.onInbound(media);
     A.eq(runs.length, 2, 'a media turn bypasses text batching and keeps its existing delivery path');
+  }
+
+  // ---- X. 2026-10-11 ("they start a task and then stop repeatedly with no explanation"): a follow-up sent while the
+  //         chat's run is working JOINS that run through the host's steer seam instead of killing it ----------------
+  const parkedRun = (log) => async (o) => {
+    log.push(o.runId);
+    o.emit('agent.run.start', { agentId: o.agentId, runId: o.runId, trigger: 'event', model: o.model });
+    if (log.length === 1) {   // the first run works until released (or aborted)
+      await new Promise(res => { log.release = res; if (o.signal.aborted) return res(); o.signal.addEventListener('abort', () => res(), { once: true }); });
+      if (o.signal.aborted) { o.emit('agent.run.end', { agentId: o.agentId, runId: o.runId, reason: 'cancelled', turns: 0, usd: 0 }); return; }
+      o.emit('agent.token', { agentId: o.agentId, runId: o.runId, delta: 'page built, and it is blue' });
+      o.emit('agent.run.end', { agentId: o.agentId, runId: o.runId, reason: 'done', turns: 2, usd: 0 });
+      return;
+    }
+    o.emit('agent.token', { agentId: o.agentId, runId: o.runId, delta: 'second-reply' });
+    o.emit('agent.run.end', { agentId: o.agentId, runId: o.runId, reason: 'done', turns: 1, usd: 0 });
+  };
+  {
+    const store = fakeStore(); const sends = []; const runs = []; const steers = [];
+    const hub = makeChannelHub({ runOnce: parkedRun(runs), store, send: (c, t) => { sends.push(t); return Promise.resolve({ ok: true }); }, secrets: () => ({ key: 'k', model: 'm' }), classify: () => true, newId: idGen(),
+      steerRun: (runId, text) => { steers.push({ runId, text }); return { ok: true }; } });
+    const p1 = hub.onInbound(dm('build the landing page'));
+    await waitFor(() => runs.length === 1 && typeof runs.release === 'function');
+    await hub.onInbound(dm('also make it blue'));
+    A.eq(steers, [{ runId: 'run1', text: 'also make it blue' }], 'the follow-up was steered into the RUNNING task');
+    A.ok(/Added to the task that is already running/.test(sends[0] || ''), 'the chat is told the follow-up joined the running task');
+    A.ok(store.appends.some(x => x.role === 'user' && x.content === 'also make it blue'), 'the follow-up is in the transcript');
+    runs.release();
+    await p1;
+    A.eq(runs.length, 1, 'no second run: the task was NOT killed and restarted');
+    A.eq(sends[sends.length - 1], 'page built, and it is blue', 'the running task finished and delivered');
+    A.ok(!sends.some(x => /Stopped the earlier task/.test(x)), 'nothing was stopped, so nothing says it was');
+  }
+  {
+    // a refused steer (no live loop to read it) falls back to the supersede path — which now SAYS so
+    const store = fakeStore(); const sends = []; const runs = [];
+    const hub = makeChannelHub({ runOnce: parkedRun(runs), store, send: (c, t) => { sends.push(t); return Promise.resolve({ ok: true }); }, secrets: () => ({ key: 'k', model: 'm' }), classify: () => true, newId: idGen(),
+      steerRun: () => ({ ok: false, status: 404 }) });
+    const p1 = hub.onInbound(dm('build the landing page'));
+    await waitFor(() => runs.length === 1);
+    await hub.onInbound(dm('also make it blue'));
+    await p1;
+    A.eq(runs.length, 2, 'a refused steer starts the newer run');
+    A.ok(sends.some(x => /Stopped the earlier task/.test(x)), 'the earlier task\'s stop is announced, never silent');
+  }
+  {
+    // 409: the running task already FINISHED its work (its reply is settling) — it must deliver, never be aborted
+    const store = fakeStore(); const sends = []; const runs = [];
+    const hub = makeChannelHub({ runOnce: parkedRun(runs), store, send: (c, t) => { sends.push(t); return Promise.resolve({ ok: true }); }, secrets: () => ({ key: 'k', model: 'm' }), classify: () => true, newId: idGen(),
+      steerRun: () => ({ ok: false, status: 409 }) });
+    const p1 = hub.onInbound(dm('build the landing page'));
+    await waitFor(() => runs.length === 1 && typeof runs.release === 'function');
+    const p2 = hub.onInbound(dm('also make it blue'));
+    await waitFor(() => runs.length === 2);
+    runs.release();
+    await Promise.all([p1, p2]);
+    A.ok(sends.includes('page built, and it is blue'), 'the finished task still delivered its answer');
+    A.ok(sends.includes('second-reply'), 'and the newer message was answered too');
+    A.ok(!sends.some(x => /Stopped the earlier task/.test(x)), 'nothing was stopped, so nothing says it was');
+  }
+  {
+    // a plain "stop" from the owner while the task runs IS /stop: no supersede notice, no paid model run on the word
+    // "stop" (review voice-remote-channels-04)
+    const store = fakeStore(); const runs = []; const steers = []; const sends = [];
+    const hub = makeChannelHub({ runOnce: parkedRun(runs), store, send: (c, t) => { sends.push(t); return Promise.resolve({ ok: true }); }, secrets: () => ({ key: 'k', model: 'm' }), classify: () => true, newId: idGen(),
+      isOwner: () => true, steerRun: (runId, text) => { steers.push(text); return { ok: true }; } });
+    const p1 = hub.onInbound(dm('build the landing page'));
+    await waitFor(() => runs.length === 1);
+    await hub.onInbound(dm('stop'));
+    await p1;
+    A.eq(steers.length, 0, 'a plain "stop" never rides into the running task as an instruction');
+    A.eq(runs.length, 1, 'a plain "stop" starts no model run of its own');
+    A.ok(sends.includes('Stopped the run in progress.'), 'it answers exactly like /stop: ' + JSON.stringify(sends));
+    A.ok(!sends.some(x => /Stopped the earlier task/.test(x)), 'never framed as a newer request to handle');
+  }
+  for (const [ownerIs, label] of [[false, 'a non-owner direct-chat "stop"'], [true, 'the owner\'s "stop" in a group']]) {
+    // only the owner's DIRECT-chat stop is /stop; anything else still stops the run through the supersede path
+    const store = fakeStore(); const runs = []; const steers = []; const sends = [];
+    const hub = makeChannelHub({ runOnce: parkedRun(runs), store, send: (c, t) => { sends.push(t); return Promise.resolve({ ok: true }); }, secrets: () => ({ key: 'k', model: 'm' }), classify: () => true, newId: idGen(),
+      isOwner: () => ownerIs, steerRun: (runId, text) => { steers.push(text); return { ok: true }; } });
+    const asGroup = (m) => (ownerIs ? Object.assign(m, { chatType: 'group', userName: 'Bo' }) : m);
+    const p1 = hub.onInbound(asGroup(dm('build the landing page')));
+    await waitFor(() => runs.length === 1);
+    await hub.onInbound(asGroup(dm('stop')));
+    await p1;
+    A.eq(steers.length, 0, label + ' never rides into the running task as an instruction');
+    A.ok(!sends.includes('Stopped the run in progress.'), label + ' is not the owner\'s /stop: ' + JSON.stringify(sends));
+    A.eq(runs.length, 2, label + ' takes the supersede path (the earlier run stops, the message runs)');
+  }
+  for (const [label, second] of [
+    ['a non-owner "stop"', dm('stop')],
+    ['a group message', Object.assign(dm('also make it blue'), { chatType: 'group', userName: 'Ana' })],
+    ['a forwarded message', Object.assign(dm('also make it blue'), { forwarded: true, forwardFrom: 'someone' })]
+  ]) {
+    const store = fakeStore(); const runs = []; const steers = [];
+    const hub = makeChannelHub({ runOnce: parkedRun(runs), store, send: () => Promise.resolve({ ok: true }), secrets: () => ({ key: 'k', model: 'm' }), classify: () => true, newId: idGen(),
+      steerRun: (runId, text) => { steers.push(text); return { ok: true }; } });
+    const p1 = hub.onInbound(Object.assign(dm('build the landing page'), second.chatType === 'group' ? { chatType: 'group', userName: 'Bo' } : {}));
+    await waitFor(() => runs.length === 1);
+    await hub.onInbound(second);
+    await p1;
+    A.eq(steers.length, 0, label + ' never rides into the running task as an instruction');
+  }
+
+  // ---- Y. every non-clean END says what happened, in words -------------------------------------------------------
+  const endWith = async (endPayload, extra) => {
+    const sends = [];
+    const runOnce = async (o) => {
+      o.emit('agent.run.start', { agentId: o.agentId, runId: o.runId, trigger: 'event', model: o.model });
+      for (let i = 0; i < ((extra && extra.tools) || 0); i++) {
+        o.emit('agent.token', { agentId: o.agentId, runId: o.runId, delta: 'writing it now' });
+        o.emit('agent.tool_call', { agentId: o.agentId, runId: o.runId, callId: 'c' + i, name: 'fs_write' });
+        o.emit('agent.tool_result', { agentId: o.agentId, runId: o.runId, callId: 'c' + i, ok: true, isError: false });
+      }
+      if (extra && extra.token) o.emit('agent.token', { agentId: o.agentId, runId: o.runId, delta: extra.token });
+      if (extra && extra.error) o.emit('agent.run.error', { agentId: o.agentId, runId: o.runId, message: extra.error, transient: false });
+      o.emit('agent.run.end', Object.assign({ agentId: o.agentId, runId: o.runId, turns: 1, usd: 0 }, endPayload));
+    };
+    const hub = makeChannelHub({ runOnce, store: fakeStore(), send: (c, t) => { sends.push(t); return Promise.resolve({ ok: true }); }, secrets: () => ({ key: 'k', model: 'm' }), classify: () => false, newId: idGen() });
+    await hub.onInbound(dm('go'));
+    return sends.join('\n');
+  };
+  {
+    const empty = await endWith({ reason: 'empty' });
+    A.ok(/empty reply, so nothing was done/.test(empty) && /continue/.test(empty), 'an empty end says what happened and what to do: ' + empty);
+    A.ok(!/\(no reply\)|stopped: empty/.test(empty), 'never the raw "(no reply) (stopped: empty)"');
+    // a tool already ran (the file IS written), then the model went silent: never "nothing was done" (review threads-backend-03)
+    const emptyAfterTools = await endWith({ reason: 'empty' }, { tools: 2 });
+    A.ok(!/nothing was done/.test(emptyAfterTools) && /2 tool steps/.test(emptyAfterTools) && /may already have made changes/.test(emptyAfterTools) && /^⚠ The model/.test(emptyAfterTools),
+      'an empty end after tool steps says they ran: ' + emptyAfterTools);
+    A.ok(/\/model/.test(emptyAfterTools), 'the channel copy still names its /model door: ' + emptyAfterTools);
+    const cut = await endWith({ reason: 'done', finishReason: 'length' }, { token: 'half of the ans' });
+    A.ok(/half of the ans/.test(cut) && /output limit/.test(cut), 'a provider-cut reply carries a cut-short note (finishReason is no longer ignored): ' + cut);
+    const clean = await endWith({ reason: 'done' }, { token: 'all done' });
+    A.eq(clean, 'all done', 'a clean reply gets no note');
+    const unpriced = await endWith({ reason: 'budget', budgetScope: 'run', unpricedModel: 'x/mystery', unpricedTokens: 2000001, unpricedCapTokens: 2000000 }, { token: 'partial' });
+    A.ok(/2,000,000-token safety ceiling/.test(unpriced) && /does not change this/.test(unpriced) && !/raise it in the app under SETTINGS › SPENDING LIMITS/.test(unpriced), 'the unpriced TOKEN ceiling is named as itself, not a $ cap to raise: ' + unpriced);
+    A.ok(!/\)\.\)/.test(unpriced) && /SKYNET_MODEL_PRICES\.\)$/.test(unpriced), 'the unpriced note ends cleanly, never "…).)" (review voice-remote-channels-12): ' + unpriced);
+    const subscription = await endWith({ reason: 'budget', budgetScope: 'run', subscriptionModel: 'claude-opus', subscriptionCapTokens: 2000000 }, { token: 'partial' });
+    A.ok(/2,000,000-token per-run ceiling/.test(subscription) && /Runtime limits/.test(subscription), 'the subscription TOKEN ceiling names its real lever: ' + subscription);
+    A.ok(!/\)\.\)/.test(subscription) && /STARNET_MAX_SUBSCRIPTION_TOKENS\.\)$/.test(subscription), 'the subscription note ends cleanly, never "…).)": ' + subscription);
+    const cancelled = await endWith({ reason: 'cancelled' }, { token: 'partial' });
+    A.ok(/stopped from the StarNet app/.test(cancelled), 'a station-side cancel says who stopped it: ' + cancelled);
+    const stuck = await endWith({ reason: 'error' }, { error: 'loop guard: fs_read failed 3 times with identical arguments — stopping a stuck loop' });
+    A.ok(/got stuck repeating one step: fs_read failed 3 times/.test(stuck), 'a loop-guard stop leads with what happened in plain words: ' + stuck);
   }
 
   A.report('channels.hub.test');

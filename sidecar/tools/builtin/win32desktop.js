@@ -6,7 +6,8 @@
    command fragment. */
 'use strict';
 
-const CP = require('node:child_process');
+const CP = require('../../child-env.js').guardChildProcess(require('node:child_process'));
+const { stationChildEnv } = require('../../child-env.js');
 
 const POWERSHELL = String.raw`
 $ErrorActionPreference = 'Stop'
@@ -22,6 +23,9 @@ public static class StarNetNative {
   [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
   [DllImport("user32.dll", SetLastError=true)] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
+  [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT point);
+  [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
   [StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public INPUTUNION U; }
   [StructLayout(LayoutKind.Explicit)] public struct INPUTUNION { [FieldOffset(0)] public KEYBDINPUT ki; }
   [StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public UIntPtr dwExtraInfo; }
@@ -63,7 +67,13 @@ try {
   if ($request.kind -eq 'foreground') {
     $h = [StarNetNative]::GetForegroundWindow(); $title = New-Object Text.StringBuilder 1024; [void][StarNetNative]::GetWindowText($h, $title, $title.Capacity)
     [uint32]$windowPid = 0; [void][StarNetNative]::GetWindowThreadProcessId($h, [ref]$windowPid); $proc = ''; try { $proc = (Get-Process -Id $windowPid -ErrorAction Stop).ProcessName } catch {}
-    Emit @{ title = $title.ToString(); process = $proc }
+    Emit @{ title = $title.ToString(); process = $proc; pid = $windowPid }
+  } elseif ($request.kind -eq 'windowAt') {
+    # the TOP-LEVEL window a click at (x, y) lands in (GA_ROOT = 2), so a WebView child resolves to its app window
+    $pt = New-Object StarNetNative+POINT; $pt.X = [int]$request.x; $pt.Y = [int]$request.y
+    $h = [StarNetNative]::GetAncestor([StarNetNative]::WindowFromPoint($pt), 2); $title = New-Object Text.StringBuilder 1024; [void][StarNetNative]::GetWindowText($h, $title, $title.Capacity)
+    [uint32]$windowPid = 0; [void][StarNetNative]::GetWindowThreadProcessId($h, [ref]$windowPid); $proc = ''; try { $proc = (Get-Process -Id $windowPid -ErrorAction Stop).ProcessName } catch { $proc = '' }
+    Emit @{ title = $title.ToString(); process = $proc; pid = $windowPid }
   } elseif ($request.kind -eq 'capture') {
     $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
     $bmp = New-Object Drawing.Bitmap $vs.Width, $vs.Height
@@ -96,10 +106,12 @@ function makeWin32DesktopDriver(opts) {
   const platform = opts.platform || process.platform;
   if (platform !== 'win32') return null;
   const execFile = opts.execFile || CP.execFile;
-  const envBase = opts.env || process.env;
+  // no station secrets in the PowerShell helper's env (child-env.js); built per call so it tracks live keys
+  const baseEnv = () => opts.env || stationChildEnv(process.env);
   const timeoutMs = Number(opts.timeoutMs) || 20000;
   function invoke(payload) {
     return new Promise((resolve, reject) => {
+      const envBase = baseEnv();
       const env = Object.assign({}, envBase, { STARNET_REMOTE_DESKTOP_REQUEST: JSON.stringify(payload) });
       execFile(powershellPath(envBase), ['-NoProfile', '-NonInteractive', '-Command', POWERSHELL], {
         windowsHide: true, timeout: timeoutMs, maxBuffer: 40 * 1024 * 1024, env
@@ -114,6 +126,7 @@ function makeWin32DesktopDriver(opts) {
     perform: async action => { const out = await invoke({ kind: 'perform', action: action || {} }); return out && out.action ? 'performed ' + out.action : 'performed'; },
     capture: () => invoke({ kind: 'capture' }),
     foreground: () => invoke({ kind: 'foreground' }),
+    windowAt: (x, y) => invoke({ kind: 'windowAt', x: Number(x) || 0, y: Number(y) || 0 }),
     _invoke: invoke
   };
 }

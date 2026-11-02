@@ -23,11 +23,11 @@ A.eq(NR.fmtLocalTime(null, -300), '', 'null ms → empty string');
 /* ---------- bindingPhrase(): every gate has an honest sentence; unknowns stay honest ---------- */
 A.ok(/not allowed to act/i.test(NR.bindingPhrase('posture')), 'posture phrase says it may not act unattended');
 A.ok(/away/i.test(NR.bindingPhrase('present')), 'present phrase names your presence');
-A.ok(/leash/i.test(NR.bindingPhrase('leash')), 'leash phrase names the leash');
+A.ok(/job limit/i.test(NR.bindingPhrase('leash')), 'leash phrase names the daily job limit');
 A.ok(/gate/i.test(NR.bindingPhrase('some-future-gate')), 'an unknown binding renders honestly (names the gate), never a fabricated reason');
-A.ok(/no gate/i.test(NR.bindingPhrase(null)), 'null binding → "no gate is blocking" (a beat could fire now)');
+A.ok(/nothing is blocking/i.test(NR.bindingPhrase(null)), 'null binding → "nothing is blocking" (a job could run now)');
 // EL-11: the halt phrase must name its LIFT (re-set the dial), not just the stop.
-A.ok(/dial/i.test(NR.bindingPhrase('halt')), 'halt phrase names the lift — re-set the autonomy dial');
+A.ok(/ON ITS OWN/.test(NR.bindingPhrase('halt')), 'halt phrase names the lift — press an ON ITS OWN button');
 // EL-11: 'readiness' is a real gate the status route reports; it must have plain copy (what the gate checks —
 // grounded knowledge: dossier/activity), never the raw "held back by the readiness gate" jargon.
 A.ok(NR.BINDING_PHRASE.readiness, 'BINDING_PHRASE carries a readiness entry');
@@ -60,7 +60,7 @@ const acted = NR.compose({
 });
 A.eq(acted.hasReport, true, 'acts present → hasReport:true');
 A.eq(acted.actCount, 2, 'two acts counted');
-A.ok(/2 beats fired/.test(acted.headline), 'headline names the beats fired');
+A.ok(/2 jobs done/.test(acted.headline), 'headline names the jobs done');
 A.ok(/2 drafts on your desk/.test(acted.headline), 'headline names the drafts on the desk');
 A.eq(acted.actLines, ['✓ Refactor plan', '✓ Test outline'], 'one act line per draft, by real title');
 A.eq(acted.idleReason, '', 'a night that ACTED has no idle sentence');
@@ -79,8 +79,8 @@ const mixed = NR.compose({
 });
 A.eq(mixed.declineCount, 2, 'two declines counted');
 A.eq(mixed.declineLines.length, 1, 'two declines on the SAME gate collapse to one grouped line');
-A.ok(/2 beats skipped/.test(mixed.declineLines[0]), 'the decline line names the count');
-A.ok(/leash/i.test(mixed.declineLines[0]), 'the decline line names the binding gate');
+A.ok(/2 jobs skipped/.test(mixed.declineLines[0]), 'the decline line names the count');
+A.ok(/job limit/i.test(mixed.declineLines[0]), 'the decline line names the binding gate');
 A.ok(/by 1:10 AM/.test(mixed.declineLines[0]), 'the decline line names the LOCAL time of the last occurrence');
 
 /* ---------- NS-5b: the report LEADS with the declared night FOCUS + its cited evidence ---------- */
@@ -134,17 +134,17 @@ const panelOff = NR.panelModel({ status: { active: false, away: false, beatsUsed
 A.eq(panelOff.reachable, true, 'a real status → reachable:true');
 A.eq(panelOff.stateText, 'OFF', 'inactive timer → OFF');
 A.ok(/away/i.test(panelOff.why), 'OFF-because-present names the reason from the binding');
-A.eq(panelOff.leashText, '0/3 beats today', 'leash text is used/leash, honest');
-A.eq(panelOff.lastBeatText, 'no beat yet', 'no last beat → honest "no beat yet", not a fake time');
+A.eq(panelOff.leashText, '0 of 3 jobs today', 'leash text is used of leash, honest');
+A.eq(panelOff.lastBeatText, 'no job yet', 'no last job → honest "no job yet", not a fake time');
 
 const panelActive = NR.panelModel({ status: { active: true, away: true, beatsUsedToday: 2, leashPerDay: 3, binding: 'cooldown', lastBeatAt: T0610Z, nextEligibleAt: T0610Z + 2700000 }, tzOffsetMin: -300 });
 A.ok(/ACTIVE/.test(panelActive.stateText), 'active + away → ACTIVE on watch');
-A.eq(panelActive.leashText, '2/3 beats today', 'leash reflects beats used');
+A.eq(panelActive.leashText, '2 of 3 jobs today', 'leash reflects jobs used');
 A.eq(panelActive.leashSpent, false, '2/3 is not spent');
 A.eq(panelActive.lastBeatText, '1:10 AM', 'last beat renders in LOCAL time');
 A.eq(NR.panelModel({ status: { active: true, away: true, beatsUsedToday: 3, leashPerDay: 3 }, tzOffsetMin: 0 }).leashSpent, true, '3/3 → leashSpent:true');
 // a null leashPerDay (never configured) must NOT render "used/null" — honest fallback.
-A.eq(NR.panelModel({ status: { active: true, away: true, beatsUsedToday: 1, leashPerDay: null }, tzOffsetMin: 0 }).leashText, '1 beats today', 'null leash → "N beats today", never "1/null"');
+A.eq(NR.panelModel({ status: { active: true, away: true, beatsUsedToday: 1, leashPerDay: null }, tzOffsetMin: 0 }).leashText, '1 job today', 'null leash → "N jobs today" (singular-safe), never "1 of null"');
 
 /* ---------- panelModel(): the durable E-STOP halt is VISIBLE and names its lift (EL-11 FIX 1) ----------
    Regression: status.halted landed but the panel ignored it — a durably-halted shift rendered
@@ -154,7 +154,7 @@ A.eq(panelHalted.reachable, true, 'a halted status is still reachable telemetry'
 A.eq(panelHalted.halted, true, 'panelModel exposes the durable halt');
 A.ok(/E-STOP/i.test(panelHalted.stateText) && /halted/i.test(panelHalted.stateText), 'the state names the halt (E-STOP), prominently');
 A.ok(!/standing by|on watch/i.test(panelHalted.stateText), 'a halted shift NEVER claims "standing by"/"on watch"');
-A.ok(/dial|level/i.test(panelHalted.why), 'the halted why names WHICH control lifts it (the autonomy dial / LEVEL buttons)');
+A.ok(/ON ITS OWN rung/.test(panelHalted.why) && /RESUME AUTOMATION in the top bar/.test(panelHalted.why), 'the halted why names WHICH controls lift it (an ON ITS OWN rung, or RESUME AUTOMATION — org P06)');
 A.ok(/stopped|will not|won.t/i.test(panelHalted.why), 'the halted why says plainly the shift is stopped');
 A.ok(!/\d{1,2}:\d{2}\s*(AM|PM)/.test(panelHalted.nextEligibleText), 'no NEXT ELIGIBLE clock while halted — the shift will NOT run at that time');
 A.ok(/E-STOP|halt/i.test(panelHalted.nextEligibleText), 'the next-eligible slot says WHY there is no next time');
@@ -163,6 +163,20 @@ A.ok(!/standing by|on watch/i.test(NR.panelModel({ status: { active: true, away:
 // non-halted statuses stay exactly as before, and expose halted:false.
 A.eq(panelActive.halted, false, 'a live status carries halted:false');
 A.eq(panelOff.halted, false, 'an OFF status carries halted:false');
+// org pass P09-a: binding 'posture' (dial on WAIT / SUGGEST) means no job runs at any time — NEXT JOB EARLIEST never names a clock
+const panelPosture = NR.panelModel({ status: { active: false, away: false, beatsUsedToday: 0, leashPerDay: 3, binding: 'posture', lastBeatAt: 0, nextEligibleAt: T0610Z + 2700000 }, tzOffsetMin: -300 });
+A.ok(!/\d{1,2}:\d{2}\s*(AM|PM)/.test(panelPosture.nextEligibleText) && /not scheduled/.test(panelPosture.nextEligibleText) && /WAIT or SUGGEST/.test(panelPosture.nextEligibleText), 'a posture-bound shift shows no next-job clock and names the dial as the reason');
+A.ok(/\d{1,2}:\d{2}\s*(AM|PM)/.test(panelActive.nextEligibleText), 'a cooldown-bound shift still shows its real next-job clock');
+// sweep/autonomy 2026-10-20: a SPENT LEASH is not cleared by the cooldown clock — it refills at the local midnight the
+// status carries (leashResetsAt). And a gate no clock clears (budget, no provider, readiness…) has no next-job time.
+const resetAt = T0610Z + 18 * 3600000;
+const panelLeash = NR.panelModel({ status: { active: true, away: true, beatsUsedToday: 3, leashPerDay: 3, binding: 'leash', lastBeatAt: T0610Z, nextEligibleAt: T0610Z + 2700000, leashResetsAt: resetAt }, tzOffsetMin: -300 });
+A.ok(panelLeash.nextEligibleText.indexOf(NR.fmtLocalTime(T0610Z + 2700000, -300)) < 0, 'a leash-bound shift never names the cooldown clock as its next job');
+A.ok(panelLeash.nextEligibleText.indexOf(NR.fmtLocalTime(resetAt, -300)) >= 0 && /limit/.test(panelLeash.nextEligibleText), 'it names the leash refill time and why: ' + panelLeash.nextEligibleText);
+for (const binding of ['budget', 'spend-unknown', 'no-provider', 'readiness', 'precheck-error', 'persist-failed']) {
+  const p = NR.panelModel({ status: { active: true, away: true, beatsUsedToday: 1, leashPerDay: 3, binding, lastBeatAt: T0610Z, nextEligibleAt: T0610Z + 2700000 }, tzOffsetMin: -300 });
+  A.ok(!/\d{1,2}:\d{2}\s*(AM|PM)/.test(p.nextEligibleText) && /not scheduled/.test(p.nextEligibleText), binding + '-bound: no next-job clock a clock cannot clear (' + p.nextEligibleText + ')');
+}
 
 /* ---------- panelModel(): BUILD-vs-DRAFT mode + cold-start readiness honesty (2026-07-13) ----------
    Regression: at dial=free/sandbox with no away-workshop grant every beat silently degraded to a reason-only
@@ -178,19 +192,42 @@ const pmReach = NR.panelModel({ status: Object.assign({}, stBase, { buildMode: '
 A.ok(/reach/i.test(pmReach.modeText), 'reach-gated draft mode names the REACH dial as the unlock');
 A.eq(pmReach.modeWarn, false, 'reach-gated drafting is the Commander’s setting, not a warning');
 A.eq(NR.panelModel({ status: stBase, tzOffsetMin: 0 }).modeText, '', 'an older sidecar without buildMode → empty modeText (never a guess)');
-// readiness: cold/warm tiers explain BOTH hot bars; hot / absent → no line.
-const rdWarm = { tier: 'warm', usableDims: ['goals', 'pain', 'ambition'], goalsUsable: true, activityCount: 1, hotDimsMin: 4, hotRunsMin: 4 };
+// readiness: cold/warm tiers explain BOTH grounding paths (current aims, or a recent run); hot / absent → no line.
+// (bug 41b2d015) the bars are one aim / one run — the line names those, never an area count that no longer gates.
+const rdWarm = { tier: 'warm', usableDims: ['pain', 'ambition'], goalsUsable: false, goalsStale: false, activityCount: 0, hotDimsMin: 1, hotRunsMin: 1 };
 const pmWarm = NR.panelModel({ status: Object.assign({}, stBase, { binding: 'readiness', readiness: rdWarm }), tzOffsetMin: 0 });
-A.ok(/3\/4 areas/.test(pmWarm.readinessText) && /1\/4 recent runs/.test(pmWarm.readinessText), 'readinessText shows dims and runs against the hot bars');
+A.ok(/has no aim it can act on yet/.test(pmWarm.readinessText) && /0 of 1 recent run;/.test(pmWarm.readinessText) && !/areas/.test(pmWarm.readinessText), 'readinessText shows the aims and runs against the grounding bars, no area count');
+A.ok(/too old to act on/.test(NR.readinessText(Object.assign({}, rdWarm, { goalsStale: true }))), 'stale aims are named as too old, not as unknown');
+// (41b2d015 review) the panel shows the stand-down WHY (the readiness binding phrase) right beside readinessText, and
+// the morning report reuses the same phrase. It must be true in EVERY non-hot state, so it can never contradict the line
+// beside it: nothing known (cold), a seed-only aim (a quick-setup chip), aims past the recency window, other areas only.
+for (const [label, rd] of [
+  ['cold', { tier: 'cold', usableDims: [], goalsUsable: false, goalsStale: false, activityCount: 0, hotDimsMin: 1, hotRunsMin: 1 }],
+  ['seed-only aim', { tier: 'warm', usableDims: ['goals'], goalsUsable: false, goalsStale: false, activityCount: 0, hotDimsMin: 1, hotRunsMin: 1 }],
+  ['stale aims', Object.assign({}, rdWarm, { goalsStale: true })],
+  ['other areas only', rdWarm]
+]) {
+  const pm = NR.panelModel({ status: Object.assign({}, stBase, { binding: 'readiness', readiness: rd }), tzOffsetMin: 0 });
+  A.eq(pm.why, NR.bindingPhrase('readiness'), label + ': the panel WHY is the readiness binding phrase');
+  A.ok(/no current aim or recent run/.test(pm.why) && !/nothing of yours|doesn’t know/.test(pm.why), label + ': the WHY says no CURRENT aim or recent run — never "nothing of yours" or "doesn’t know"');
+  A.ok(!/doesn’t know/.test(pm.readinessText) && !/I know what you want/.test(NR.readinessPlain(rd)), label + ': neither readiness line claims the station does not know what they want');
+}
+{
+  const pmStale = NR.panelModel({ status: Object.assign({}, stBase, { binding: 'readiness', readiness: Object.assign({}, rdWarm, { goalsStale: true }) }), tzOffsetMin: 0 });
+  A.ok(/too old to act on/.test(pmStale.readinessText) && /no current aim/.test(pmStale.why), 'stale panel: "aims too old" sits beside "no current aim" (they agree)');
+}
 A.eq(NR.panelModel({ status: Object.assign({}, stBase, { readiness: { tier: 'hot' } }), tzOffsetMin: 0 }).readinessText, '', 'hot readiness → no still-learning line');
 A.eq(NR.panelModel({ status: stBase, tzOffsetMin: 0 }).readinessText, '', 'absent readiness detail → no line (never invented)');
 // the new binding phrases are real sentences, not the forward-compat fallback.
 A.ok(!/held back by/.test(NR.bindingPhrase('budget')), 'budget binding has a plain phrase');
 A.ok(!/held back by/.test(NR.bindingPhrase('no-provider')), 'no-provider binding has a plain phrase');
+// unknown spend history is NOT an exhausted budget: no resume or cap change clears it, so the phrase never offers one
+A.ok(!/held back by|exhausted|raise the cap|resume/i.test(NR.bindingPhrase('spend-unknown')) && /SPENDING LIMITS/.test(NR.bindingPhrase('spend-unknown'))
+  && NR.bindingPhrase('spend-unknown') !== NR.bindingPhrase('budget'), 'spend-unknown says history is unverifiable and points at SPENDING LIMITS');
 A.ok(/verify|check/i.test(NR.bindingPhrase('precheck-error')) && /stood down safely/i.test(NR.bindingPhrase('precheck-error')), 'precheck-error explains the unproven safety read and safe stand-down in plain language');
 
 /* ---------- trailLine(): one honest ledger row for the panel ---------- */
-A.eq(NR.trailLine({ ts: T0610Z, kind: 'decline', binding: 'leash' }, -300), '1:10 AM · declined · the daily leash was already spent', 'a decline row: local time · declined · gate reason');
+A.eq(NR.trailLine({ ts: T0610Z, kind: 'decline', binding: 'leash' }, -300), '1:10 AM · declined · today’s job limit was already used', 'a decline row: local time · declined · gate reason');
 A.eq(NR.trailLine({ ts: T0610Z, kind: 'act', detail: { title: 'Wrote X' } }, -300), '1:10 AM · acted · Wrote X', 'an act row names the title from detail');
 A.ok(/noted/.test(NR.trailLine({ ts: T0610Z, kind: 'note', reason: 'delivered' }, -300)), 'a note row renders its reason');
 
@@ -229,12 +266,33 @@ A.eq(NR.postureOutlook({}), '', 'a status with no buildMode/readiness detail →
 // cold-start build pick with no away-workshop grant: it will only DRAFT, and it's still learning — say BOTH.
 const outCold = NR.postureOutlook(Object.assign({}, stBase, { buildMode: 'draft', draftReason: 'no-workshop-grant', readiness: rdWarm }));
 A.ok(/while you.re away/i.test(outCold), 'the outlook is framed as what happens WHILE AWAY');
-A.ok(/drafts only/i.test(outCold) && /grant/i.test(outCold), 'a build pick that can only draft says so + names the missing grant');
-A.ok(/still learning you/i.test(outCold) && /3\/4 areas/.test(outCold), 'the cold-start readiness caveat rides the same line');
-// a fully-hot, granted build station: the outlook is the plain "beats BUILD…" truth, no readiness caveat.
+A.ok(/draft small jobs, not build them/i.test(outCold) && /grant/i.test(outCold), 'a build pick that can only draft says so + names the missing grant');
+A.ok(/LAST REPORT in SETTINGS › AUTONOMY/.test(outCold), 'draft mode names where the drafts really surface (LAST REPORT), not a desk');
+// call #57 (org pass 10-14): a readiness hold reads as ONE plain reason, never a counter or an unlock ladder…
+// (bug 41b2d015) …and it names the one thing that grounds a job, never "a few of your runs".
+A.ok(/I’ll start once you tell me in your own words what you want help with, or I’ve seen one of your runs\./.test(outCold), 'the cold-start hold is one plain present-tense reason that names the requirement');
+A.ok(!/a few/.test(outCold), 'the hold never asks for "a few" runs (no usage ladder)');
+A.ok(!/\d+ of \d+/.test(outCold) && !/reaching either|lets it act|set REACH/i.test(outCold), 'the readout carries no N-of-M counter and no unlock instruction');
+// …and the exact counts are never dropped: readinessText keeps them for SETTINGS › AUTONOMY and LAST REPORT.
+A.ok(/still learning you/i.test(NR.readinessText(rdWarm)) && /0 of 1 recent run/.test(NR.readinessText(rdWarm)), 'readinessText still carries the exact N-of-M run count');
+// P09 review fix: the counts line names a NECESSARY condition, never a promise — with the dial on WAIT / SUGGEST, clearing a
+// bar does not make it act, and LAST REPORT shows this line with no dial context at all.
+A.ok(/; to act on its own it needs either your current aims or 1 recent run$/.test(NR.readinessText(rdWarm)) && !/starts acting|once either|lets it act|one of those is complete|won’t act on its own before/i.test(NR.readinessText(rdWarm)), 'readinessText names the bar it needs — EITHER current aims or 1 recent run, never read as both (g1 P09 final round) — and never promises it will act once a bar clears');
+A.eq(NR.readinessPlain({ tier: 'hot' }), '', 'a hot station has no hold-back reason');
+// a fully-hot, granted build station: present tense, the real pace from leashPerDay, each job a new session in the rail.
 const outBuild = NR.postureOutlook(Object.assign({}, stBase, { buildMode: 'build', draftReason: null, workshopGranted: true, readiness: { tier: 'hot' } }));
-A.ok(/beats BUILD real deliverables/i.test(outBuild), 'a granted, hot station promises real building');
-A.ok(!/still learning/i.test(outBuild), 'a hot station adds no still-learning caveat');
+A.eq(outBuild, 'While you’re away I’ll do up to 3 small jobs a day; each arrives as a new session in your rail.', 'a granted, hot station says what it will do, at the status pace');
+// (org P09/P31 wire) onboarding speaks postureOutlook in the Dialogue panel (VT323): no symbol glyph that falls back to another font
+for (const st of [outBuild, outCold, NR.postureOutlook({ buildMode: 'build', leashPerDay: 7 }), NR.postureOutlook({ buildMode: 'draft', draftReason: 'no-workshop-grant' })]) {
+  A.ok(!/[\u2600-\u27BF\u2B00-\u2BFF]/.test(st), 'the posture outlook carries no fallback-font symbol glyph: ' + JSON.stringify(st));
+}
+A.ok(/up to 7 small jobs a day/.test(NR.postureOutlook({ buildMode: 'build', leashPerDay: 7 })), 'the job count follows status.leashPerDay, never a fixed number');
+A.ok(!/\d/.test(NR.postureOutlook({ buildMode: 'build', leashPerDay: null })), 'an unknown leashPerDay drops the number instead of inventing one');
+A.ok(!/still learning|I’ll start once/i.test(outBuild), 'a hot station adds no still-learning caveat');
+A.ok(/set REACH to LOCAL ONLY/.test(NR.modeText({ buildMode: 'draft', draftReason: 'reach' })), 'the panel MODE line names the REACH rung by its rendered label, LOCAL ONLY');
+// a SUGGEST/WAIT pick (initiative below leash): the driver binds on 'posture', nothing ever runs unattended, so the
+// readout promises nothing — even though buildMode reads 'draft'/'reach' and a cold station has readiness detail.
+A.eq(NR.postureOutlook(Object.assign({}, stBase, { binding: 'posture', active: false, buildMode: 'draft', draftReason: 'reach', readiness: rdWarm })), '', 'a posture-bound (SUGGEST) status says nothing — no draft promise, no "I’ll start once"');
 A.eq(NR.postureOutlook(outBuild) === outBuild, false, 'postureOutlook takes a status object, not its own string (sanity)');
 
 /* ---------- unseenDrafts(): the live-session nudge predicate (NS visibility 2026-07-13) ----------

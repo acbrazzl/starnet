@@ -19,7 +19,10 @@ module.exports = (async () => {
         return new Response('data: [DONE]\n\n');
       };
       await collect(makeOpenAICompatibleProvider({ fetch, key: 'fixture-only', baseUrl: 'https://managed.example.test/v1' }), { model, messages });
-      A.eq(wire.messages.at(-1).role, model.startsWith('anthropic/') ? 'user' : 'system', model + ': managed continuation is not hoisted into forbidden prefill');
+      // every model: the reminder is the user turn after the answer (Claude 'native', others the strict 'chat' shape —
+      // provider.js projectRoles), never a system message after index 0 and never a trailing assistant prefill
+      A.eq(wire.messages.at(-1).role, 'user', model + ': managed continuation is not hoisted into forbidden prefill');
+      A.eq(wire.messages.filter(m => m.role === 'system').length, 1, model + ': one system message, at index 0');
       A.eq(wire.messages[0], messages[0], model + ': leading policy unchanged');
       A.eq(wire.messages.at(-1).content, messages.at(-1).content, model + ': reminder bytes unchanged');
       A.eq(JSON.stringify(messages), original, model + ': durable history unchanged');
@@ -182,6 +185,53 @@ module.exports = (async () => {
     A.eq(argsFor2(starts[1].index), '{"path":"y"}', 'second call keeps its own args');
   }
 
+  // A FILE-SIZED name-echoing call is not re-parsed whole on every delta (2026-10-20). The arbitration above used to
+  // JSON.parse the slot's whole accumulated args per delta: quadratic on the sidecar's main thread (64 KB in 16-char
+  // deltas = ~134 M characters parsed). Same calls, same slots — and only a top-level close is ever parsed.
+  {
+    const big = JSON.stringify({ path: 'big.txt', content: 'x,]}{["\\'.repeat(8 * 1024) });   // brackets, quotes and escapes inside the value
+    const small = '{"path":"y.txt","content":"ok"}';
+    const sse = [];
+    for (let i = 0; i < big.length; i += 16) sse.push(line({ choices: [{ delta: { tool_calls: [{ function: { name: 'fs_write', arguments: big.slice(i, i + 16) } }] } }] }));
+    sse.push(line({ choices: [{ delta: { tool_calls: [{ function: { name: 'fs_write', arguments: small } }] } }] }));
+    sse.push(line({ choices: [{ finish_reason: 'tool_calls', delta: {} }] }), 'data: [DONE]', '');
+    const p = makeOpenAICompatibleProvider({ fetch: async () => new Response(sse.join('\n'), { status: 200, headers: { 'Content-Type': 'text/event-stream' } }), baseUrl: 'http://local/v1' });
+    const realParse = JSON.parse;
+    let parsedChars = 0;
+    let evs;
+    JSON.parse = function (s) { if (typeof s === 'string' && s.startsWith('{"path"')) parsedChars += s.length; return realParse.apply(this, arguments); };
+    try { evs = await collect(p, { model: 'm', messages: [], tools: [{ type: 'function', function: { name: 'fs_write' } }] }); }
+    finally { JSON.parse = realParse; }
+    const starts = evs.filter(e => e.type === 'tool_start');
+    A.eq(starts.length, 2, 'file-sized name-echo: one streamed call plus the next complete call, no more, no fewer');
+    const argsFor3 = idx => evs.filter(e => e.type === 'tool_args' && e.index === idx).map(e => e.chunk).join('');
+    A.eq(argsFor3(starts[0].index), big, 'file-sized name-echo: the big call reassembles byte-exact');
+    A.eq(argsFor3(starts[1].index), small, 'file-sized name-echo: the next call keeps its own args');
+    A.ok(parsedChars <= 2 * (big.length + small.length), 'file-sized name-echo: args parsed ' + parsedChars + ' chars for ' + (big.length + small.length) + ' chars of args (was ~2000x)');
+  }
+
+  // makeArgsTracker answers exactly what JSON.parse of the accumulated text answers, at every prefix of every chunking.
+  {
+    const { makeArgsTracker } = require('../sidecar/providers/openai-compatible.js')._internals;
+    const corpus = ['{"path":"a.txt"}', '{"a":[1,2,{"b":"}]\\"{"}]}', ' {"x":"\\\\"}', '\n[1, {"k": []}]\t', '{"a":1,}', '{"a":1}}', '{}{}', '[1,2]',
+      '"str"', '42', 'null', '{"content":"say "hi" {}"}', '{"a":"\\u0041"}', '{"k":"x\ny"}', '{"a":{"b":{"c":[[]]}}}  ', '  ', '{', '}{', '{"a":"\\"}"}', ']['];
+    let seed = 20261020, checks = 0, mismatches = 0;
+    const rnd = n => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };
+    for (const s of corpus) for (let trial = 0; trial < 60; trial++) {
+      const t = makeArgsTracker();
+      let acc = '';
+      for (let i = 0; i < s.length;) {
+        const c = s.slice(i, i + 1 + rnd(4)); i += c.length;
+        t.feed(c); acc += c; checks++;
+        let old = false; if (acc) { try { JSON.parse(acc); old = true; } catch (_) { old = false; } }
+        if (t.complete() !== old) mismatches++;
+      }
+    }
+    A.ok(checks > 1000, 'tracker equivalence: ' + checks + ' prefixes checked');
+    A.eq(mismatches, 0, 'tracker equivalence: complete() === JSON.parse ok at every prefix');
+    A.eq(makeArgsTracker().complete(), false, 'tracker: empty args are never complete');
+  }
+
   // model catalog parsing and no-auth local shape
   {
     const calls = [];
@@ -196,6 +246,27 @@ module.exports = (async () => {
     A.eq(models[0].id, 'local-model', 'catalog id parsed');
     A.eq(p.contextLimit('local-model'), 1234, 'context length from catalog');
     A.eq(p.supportsTools('local-model'), true, 'tool support from supported_parameters');
+    A.eq(p.outputLimit('local-model'), 0, 'no output ceiling in the catalog or the profile -> outputLimit 0 (unknown)');
+  }
+
+  // OUTPUT LIMIT (bug d3a76db3: the run's spend pool prices a call's output by it). An OpenRouter-shaped list — what the
+  // StarNet proxy relays — names the ceiling under top_provider; a profile's own max_tokens bounds it from below.
+  {
+    const list = { data: [
+      { id: 'anthropic/claude-sonnet-x', context_length: 200000, top_provider: { context_length: 200000, max_completion_tokens: 64000 } },
+      { id: 'flat', context_length: 8000, max_completion_tokens: 2048 }
+    ] };
+    const fetchImpl = async () => new Response(JSON.stringify(list), { status: 200 });
+    const p = makeOpenAICompatibleProvider({ fetch: fetchImpl, baseUrl: 'https://relay.example.test/v1' });
+    const models = await p.listModels();
+    A.eq(models.find(m => m.id === 'anthropic/claude-sonnet-x').max_completion_tokens, 64000, 'a relayed OpenRouter row keeps its top_provider output ceiling');
+    A.eq(p.outputLimit('anthropic/claude-sonnet-x'), 64000, 'outputLimit: the relayed row\'s 64k ceiling');
+    A.eq(p.outputLimit('flat'), 2048, 'outputLimit: a top-level max_completion_tokens');
+    A.eq(p.outputLimit('not-listed'), 0, 'outputLimit: a model the catalog does not list -> 0');
+    const capped = makeOpenAICompatibleProvider({ fetch: fetchImpl, baseUrl: 'https://relay.example.test/v1', maxTokens: 4096 });
+    await capped.listModels();
+    A.eq(capped.outputLimit('anthropic/claude-sonnet-x'), 4096, 'outputLimit: the max_tokens the profile sends, when lower');
+    A.eq(capped.outputLimit('not-listed'), 4096, 'outputLimit: the profile\'s max_tokens alone when the catalog names none');
   }
 
   // provider profile paths can override the default /chat/completions and /models endpoints

@@ -23,13 +23,15 @@
 .agent-dossier .ag-mission-text { font-size: 16px; line-height: 1.55; }
 .agent-dossier .ag-setup { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 9px; }
 .agent-dossier .ag-setup-row { display: grid; grid-template-columns: 1fr auto; gap: 7px; padding: 14px; border: 1px solid rgba(var(--ph-rgb),.2); border-radius: 9px; background: rgba(var(--ph-rgb),.035); text-align: left; }
+/* an odd tile count never strands the last tile beside an empty cell: it spans the row */
+.agent-dossier .ag-setup-row:last-child:nth-child(odd) { grid-column: 1 / -1; }
 .agent-dossier .ag-setup-lbl { font-size: 12px; }
 .agent-dossier .ag-setup-val { grid-column: 1; font-size: 15px; line-height: 1.4; overflow-wrap: anywhere; }
 .agent-dossier .ag-setup-go { grid-column: 2; grid-row: 1 / 3; align-self: center; }
 .agent-dossier :is(.sec,.gx-sec) { height: auto; flex-wrap: wrap; gap: 8px; margin: 20px 0 12px; border: 0; padding: 0; }
 .agent-dossier .sec-l,.agent-dossier .gx-title { font-size: 18px; letter-spacing: .3px; line-height: 1.35; }
 .agent-dossier .gx-ref { display: none; }
-.agent-dossier .gx-tag { white-space: normal; font-size: 12px; line-height: 1.5; letter-spacing: .1px; }
+.agent-dossier .gx-tag { white-space: normal; font-size: var(--sn-type-meta, 14px); line-height: 1.5; letter-spacing: .1px; }
 .agent-dossier :is(.cf-grp-note,.cf-desc,.mc-note,.mc-hint,.sk-note,.ag-foot-row,.ag-del-why) { font-size: 14px; line-height: 1.55; letter-spacing: 0; }
 .agent-dossier :is(.bb,.consent-btn,.cf-nav-b,.ov-vchip,.lb-tx-btn) { font: inherit; font-size: 13px; line-height: 1.4; padding: 9px 12px; border: 1px solid rgba(var(--ph-rgb),.24); border-radius: 7px; background: rgba(var(--ph-rgb),.035); color: var(--ph); box-shadow: none; text-shadow: none; cursor: pointer; }
 .agent-dossier :is(.bb,.consent-btn,.cf-nav-b,.ov-vchip):hover { background: var(--menu-glass); border-color: var(--ph); color: var(--ph-bright); }
@@ -55,7 +57,7 @@
 .agent-dossier .ag-command { border: 0; padding: 0; }
 .agent-dossier .ag-cmd-sec { margin: 0 0 16px; padding: 0; }
 .agent-dossier .ag-cmd-lbl { font-size: 14px; margin-bottom: 12px; }
-.agent-dossier .ag-cmd-danger { padding: 16px; border: 1px solid rgba(255,100,90,.22); border-radius: 9px; margin-top: 20px; }
+.agent-dossier .cf-card.ag-del-card { padding: 16px; border: 1px solid rgba(255,100,90,.22); border-radius: 9px; margin-top: 20px; }
 .agent-dossier .ag-skin-thumb { border-radius: 8px; background: rgba(var(--ph-rgb),.035); box-shadow: none; }
 .agent-dossier .ag-skin-thumb.sel { background: var(--menu-glass); border-color: var(--ph); }
 .agent-dossier :is(.mc-rec,.mc-row) { padding: 16px; border: 1px solid rgba(var(--ph-rgb),.19); border-radius: 10px; background: rgba(0,0,0,.12); box-shadow: none; margin-bottom: 12px; }
@@ -69,6 +71,12 @@
 .agent-dossier .set-row input[type="checkbox"] { appearance: none; position: relative; width: 34px; height: 20px; flex: 0 0 34px; border-radius: 20px; border: 1px solid rgba(var(--ph-rgb),.4); background: rgba(var(--ph-rgb),.07); margin: 0; }
 .agent-dossier .set-row input[type="checkbox"]::after { content: ''; position: absolute; top: 3px; left: 3px; width: 12px; height: 12px; border-radius: 50%; background: var(--ph-dim); transform: none; }
 .agent-dossier .set-row input[type="checkbox"]:checked::after { left: 17px; transform: none; background: var(--ph-bright); }
+/* PERSONALITY › FINE-TUNE (EMOJI / BLUNT) toggles sit inline in a label.cf-desc, not a .set-row: the same station
+   switch, or the browser paints its own white box (sweep/world 2026-10-20; the control floor only tints a CHECKED tick). */
+.agent-dossier input[data-persona-toggle] { appearance: none; -webkit-appearance: none; position: relative; display: inline-block; vertical-align: middle; width: 34px; height: 20px; border-radius: 20px; border: 1px solid rgba(var(--ph-rgb),.4); background: rgba(var(--ph-rgb),.07); margin: 0 8px 0 0; cursor: pointer; }
+.agent-dossier input[data-persona-toggle]::after { content: ''; position: absolute; top: 3px; left: 3px; width: 12px; height: 12px; border-radius: 50%; background: var(--ph-dim); }
+.agent-dossier input[data-persona-toggle]:checked::after { left: 17px; background: var(--ph-bright); }
+.agent-dossier label:has(> input[data-persona-toggle]) { display: inline-flex; align-items: center; margin: 8px 22px 8px 0; cursor: pointer; }
 /* Progression and achievement shelf: earned state comes entirely from Xp. */
 .agent-dossier .ag-growth-hero { display: flex; align-items: center; gap: 24px; padding: 24px; margin-bottom: 18px; border: 1px solid rgba(var(--ph-rgb),.35); border-radius: 14px; background: radial-gradient(ellipse at 0% 50%,rgba(var(--ph-rgb),.19),transparent 65%),var(--menu-glass); }
 .agent-dossier .ag-level-badge { flex: 0 0 94px; height: 94px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; border: 2px solid var(--ph); outline: 1px solid rgba(var(--ph-rgb),.2); outline-offset: 5px; border-radius: 22px; background: rgba(0,0,0,.2); box-shadow: inset 0 0 22px rgba(var(--ph-rgb),.16),0 0 20px rgba(var(--ph-rgb),.08); }
@@ -119,7 +127,14 @@
 
 .agent-dossier .cf-group[open] > summary .cf-group-summary { display: none; }
 
-.agent-dossier .mp-wrap { gap: 8px; }
+/* the picker is the CARD's width, never its catalog's (walk 10-14 #7): an inline-flex wrap took the widest model name as
+   its width (a 418px select in a 242px column) and pushed the EFFORT select out of the window, unreachable. A block flex
+   row lets the model select shrink and the effort select drop under it whenever both do not fit one line. */
+.agent-dossier .mp-wrap { display: flex; width: 100%; box-sizing: border-box; gap: 8px; }
+.agent-dossier .mp-wrap .mp-model { flex: 1 1 180px; width: 0; min-width: 0; max-width: 100%; }
+.agent-dossier .mp-wrap .mp-effort { flex: 0 1 auto; min-width: 0; max-width: 100%; }
+/* when the effort select drops under the model select, MODEL labels the first line, not the gap between the two */
+.agent-dossier .mc-pick-row > label { align-self: flex-start; margin-top: 13px; font-size: var(--sn-type-meta, 14px); }
 .agent-dossier .mp-wrap select { min-height: 40px; padding: 10px 30px 10px 12px; border: 1px solid rgba(var(--ph-rgb),.3); border-radius: 8px; background-color: rgba(0,0,0,.18); font: inherit; font-size: 14px; box-shadow: none; }
 .agent-dossier .ag-effective { font-size: 14px; line-height: 1.55; margin-bottom: 18px; }
 .agent-dossier .ag-effective .perk-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 9px; margin: 14px 0; }
@@ -134,3 +149,34 @@
 .agent-dossier .ag-portrait-well { box-sizing: content-box; border: 1px solid rgba(var(--ph-rgb),.24); border-radius: 14px; background: radial-gradient(ellipse at 50% 90%,rgba(var(--ph-rgb),.16),transparent 70%),rgba(0,0,0,.14); box-shadow: inset 0 1px 0 rgba(var(--ph-bright-rgb),.12); }
 .agent-dossier #ag-portrait { border: 0; background: transparent; box-shadow: none; }
 .agent-dossier :is(.ag-ptick,.ag-psweep) { display: none; }
+/* ACCESS = the three answers; the exact reach ladder + asking pair fold under MORE OPTIONS (2026-10-04) */
+.agent-dossier .cf-access-more { margin-top: 12px; }
+.agent-dossier .cf-access-more > summary { cursor: pointer; color: var(--ph-dim); font-size: 14px; }
+.agent-dossier .cf-access-more > summary:hover { color: var(--ph); }
+.agent-dossier .cf-access-more > .cf-card { margin-top: 10px; }
+/* SHARE TO MARKET (2026-10-18): the form opens inside the skill card (ABILITIES › skill library), like Edit. Shelf and license are pressed keys
+   (never a native select or radio); the agreement is the SETTINGS toggle. */
+.sk-lib .sk-share { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; padding-top: 12px; border-top: 1px solid rgba(var(--ph-rgb),.18); }
+.sk-lib .sk-share > :is(label,.skm-label) { font-size: 12px; letter-spacing: 1.2px; color: var(--ph); margin-top: 6px; }
+.sk-lib .sk-share .key-input { width: 100%; padding: 9px 12px; }
+.sk-lib .sk-share .skm-desc { min-height: 72px; }
+.sk-lib .skm-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.sk-lib .skm-chips .consent-btn { padding: 6px 10px; }
+.sk-lib .skm-chips .consent-btn[aria-pressed="true"] { color: var(--ph-bright); background: var(--menu-glass); border-color: var(--ph); }
+.sk-lib .skm-agree { display: flex; align-items: flex-start; gap: 10px; margin-top: 10px; font-size: 13px; line-height: 1.4; color: var(--text); letter-spacing: 0; cursor: pointer; }
+.sk-lib .skm-agree input[type="checkbox"] { appearance: none; -webkit-appearance: none; flex: 0 0 34px; width: 34px; height: 20px; border: 1px solid rgba(var(--ph-rgb), .35); border-radius: 20px; background: rgba(var(--ph-rgb), .05); position: relative; margin: 0; cursor: pointer; }
+.sk-lib .skm-agree input[type="checkbox"]::after { content: ''; position: absolute; width: 12px; height: 12px; top: 3px; left: 3px; border-radius: 50%; background: var(--ph-dim); }
+.sk-lib .skm-agree input[type="checkbox"]:checked { background: rgba(var(--ph-rgb), .18); border-color: var(--ph); }
+.sk-lib .skm-agree input[type="checkbox"]:checked::after { left: 17px; background: var(--ph-bright); }
+.sk-lib .skm-result:empty { display: none; }
+.sk-lib .skm-agree input[type="checkbox"]:focus-visible { outline: 2px solid var(--ph); outline-offset: 3px; }
+/* the five tabs on ONE row (the sweep 10-25 caught CONFIG wrapped alone onto a second row in a laptop-sized window):
+   the strip never wraps; when the window is too narrow for icon + word, the icons step out, then the padding tightens */
+.agent-dossier.sn-menu .con-toptabs { flex-wrap: nowrap; container: dossier-tabs / inline-size; }
+.agent-dossier.sn-menu .con-toptab { flex: 1 1 auto; min-width: 0; }
+@container dossier-tabs (max-width: 470px) {
+  .agent-dossier.sn-menu .con-toptab .con-rail-glyph { display: none; }
+}
+@container dossier-tabs (max-width: 340px) {
+  .agent-dossier.sn-menu .con-toptab { padding-inline: 4px; }
+}

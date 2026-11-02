@@ -20,6 +20,8 @@
   <nav class="topnav" aria-label="Site">
     <a href="../index.html#station">Product</a>
     <a href="index.html" class="on">Docs</a>
+    <a href="../market.html">Skills</a>
+    <a href="../maps.html">Maps</a>
     <a href="../pricing.html" data-pricing-link>Pricing</a>
     <a href="https://github.com/androoAGI/starnet" target="_blank" rel="noopener">GitHub<svg class="nav-external" aria-hidden="true" focusable="false" viewBox="0 0 16 16" width="12" height="12"><path d="M3 13 13 3M4 3h9v9" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></a>
   </nav>
@@ -63,7 +65,7 @@
     <summary class="side-title">Repeat &amp; automate</summary>
     <a href="guides/routines.html">Create repeatable work</a>
     <a href="skills.html">Skills &amp; routines reference</a>
-    <a href="guides/night-shift.html">Set up Night Shift</a>
+    <a href="guides/night-shift.html">Set up autonomy</a>
     <a href="autonomy.html">Autonomy controls</a>
     </details>
     <details class="side-group">
@@ -95,8 +97,8 @@ use any model you allow.</p>
 <h2 id="supported-providers">Supported providers</h2>
 <p>The provider picker is a first-class roster, not one generic endpoint wearing different labels:</p>
 <ul>
-<li><b>Account sign-in:</b> ChatGPT (Codex), Grok, and Kimi for Coding. These use the provider's
-sign-in flow instead of asking you to paste an API key.</li>
+<li><b>Account sign-in:</b> ChatGPT (Codex), Grok, Kimi for Coding, and Claude CLI. These use the provider's
+sign-in flow (for Claude CLI, your existing Claude Code sign-in) instead of asking you to paste an API key.</li>
 <li><b>Direct API keys:</b> OpenRouter, OpenAI, Anthropic, Google Gemini, xAI, Groq, Mistral,
 DeepSeek, Together AI, Fireworks AI, Perplexity, and Cerebras.</li>
 <li><b>Local and custom:</b> Ollama on your machine, or any custom endpoint that speaks the
@@ -105,21 +107,34 @@ OpenAI-compatible wire format.</li>
 <div class="callout"><b>Release note:</b> these docs track current source. The stable installer linked
 from the site can lag while the next Windows and macOS builds pass signing and notarization.</div>
 
+<h2 id="starnet-account">StarNet account</h2>
+<p>If <b>STARNET</b> is offered on the first-run connection screen, select it and choose
+<b>CONNECT STARNET ACCOUNT</b>. Confirm the short code in your browser, then return to the
+app and check its connection status before continuing.</p>
+
+<h2 id="model-choice-and-account-plans">Model choice and account plans</h2>
+<p>Change an individual agent&rsquo;s model in <b>CREW &rsaquo; AGENTS</b>, in its dossier.
+Reasoning effort, when supported by that model, is a separate control; <b>MAX</b> is an effort
+setting, not a subscription plan. A model&rsquo;s tier badge is an editorial rating, not an account entitlement.</p>
+<p>The model picker&rsquo;s <b>STARNET SUBSCRIPTION</b> link opens the pricing page in your browser. In the
+app&rsquo;s <b>STORE</b>, <b>ADD CREDITS</b> and, when shown for an existing subscription,
+<b>MANAGE PLAN</b> also open your browser. These account actions are separate from model selection
+and from installing app updates through <b>Update Center</b>.</p>
+
 <h2 id="where-keys-live">Where keys live</h2>
 <p>Keys are stored locally in your OS keychain via the desktop shell — never in plain project
 files, never sent anywhere except the provider they belong to. Provider requests leave your
 machine only when an agent actually runs.</p>
 
-<h2 id="service-keys-the-keys-tab">Service keys (the KEYS tab)</h2>
+<h2 id="service-keys-the-keys-tab">Service keys (CONNECTED &rsaquo; API KEYS)</h2>
 <p>Beyond model providers, agents sometimes need platform keys to do real work — a Stripe test
-key, a GitHub token, a search API key. The <b>KEYS</b> tab lets you paste any service key;
+key, a GitHub token, a search API key. <b>CONNECT &rsaquo; ABILITIES &rsaquo; CONNECTED &rsaquo; API KEYS</b> lets you paste any service key;
 StarNet exposes it to agent runs as an environment variable and tells the agent only the
-<b>name</b> of what's available, never the value. The key itself never enters the model prompt.</p>
+<b>name</b> of what's available, never the value. The key itself never enters the model prompt. The key field also takes a 1Password reference
+(<code>op://vault/item/field</code>), read through the 1Password CLI and kept only in memory.</p>
 
 <h2 id="cost-honesty">Cost honesty</h2>
-<p>Every run records what it actually cost, from the provider's own usage numbers. The ledger
-shows real spend per agent and per task — there is no abstraction layer marking up your tokens,
-and no meter that guesses.</p>
+<p>SETTINGS &rsaquo; SPENDING LIMITS shows what you have spent. Runs on StarNet credits and runs on your own provider key are billed separately. If a run stopped before StarNet recorded what it cost, it is listed there as <b>INTERRUPTED</b>. If StarNet also didn't record which account paid for it, the row says <b>BILLING SOURCE UNKNOWN</b>. StarNet never guesses the amount: enter the verified charge and press <b>SETTLE</b>. If you set a spending limit yourself, paid runs are refused until those runs are settled.</p>
 
 <nav class="doc-pager" aria-label="More in Start here"><a class="pg prev" href="getting-started.html"><span class="pg-k">&larr; PREVIOUS</span><span class="pg-t">Install &amp; first task</span></a><a class="pg next" href="index.html#start"><span class="pg-k">Explore this topic &rarr;</span><span class="pg-t">Start here</span></a></nav>
   </main>
@@ -133,6 +148,8 @@ and no meter that guesses.</p>
     <a href="https://github.com/androoAGI/starnet-releases/releases/latest" target="_blank" rel="noopener">RELEASES</a>
     <a href="../pricing.html" data-pricing-link>PRICING</a>
     <a href="index.html">DOCS</a>
+    <a href="../market.html">SKILLS</a>
+    <a href="../maps.html">MAPS</a>
     <a href="help.html">HELP</a>
     <a href="https://github.com/androoAGI/starnet/issues" target="_blank" rel="noopener">COMMUNITY</a>
     <a href="../legal/privacy.html">PRIVACY</a>

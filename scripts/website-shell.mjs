@@ -55,7 +55,7 @@ export const NAV = [
   { id: 'automation', group: 'Repeat & automate', description: 'Reuse good work, schedule routines, and configure unattended runs.', items: [
     { url: 'docs/guides/routines.html', title: 'Create repeatable work', kind: 'Guide' },
     { url: 'docs/skills.html', title: 'Skills & routines reference', kind: 'Reference' },
-    { url: 'docs/guides/night-shift.html', title: 'Set up Night Shift', kind: 'Guide' },
+    { url: 'docs/guides/night-shift.html', title: 'Set up autonomy', kind: 'Guide' },
     { url: 'docs/autonomy.html', title: 'Autonomy controls', kind: 'Reference' },
   ]},
   { id: 'connections', group: 'Connect your tools', description: 'Connect services, message your station, or work with another harness.', items: [
@@ -76,7 +76,7 @@ const FLAT = NAV.flatMap(g => g.items.map(i => ({ ...i, group: g.group, groupId:
 // Only these load site.js (the one api.github.com request) — they get the live version badge.
 const LOADS_SITE_JS = ['index.html', 'pricing.html'];
 // Pages that get the topbar + footer but no sidebar/pager.
-const TOP_PAGES = ['index.html', 'pricing.html', '404.html', 'legal/privacy.html', 'legal/terms.html',
+const TOP_PAGES = ['index.html', 'pricing.html', 'market.html', 'maps.html', '404.html', 'legal/privacy.html', 'legal/terms.html',
   'legal/_privacy.nocredits.html', 'legal/_terms.nocredits.html'];
 
 // ---------------------------------------------------------------------------------------
@@ -95,11 +95,15 @@ function topbar(page) {
   const h = (u) => is404 ? '/' + u : here(u);
   const dc = page.startsWith('docs/') ? ' class="on"' : '';
   const pr = page === 'pricing.html' ? ' class="on"' : '';
+  const mk = page === 'market.html' ? ' class="on"' : '';
+  const mp = page === 'maps.html' ? ' class="on"' : '';
   return `<header class="topbar" id="topbar">
   <a class="brand" href="${root || '#top'}" aria-label="StarNet home"><img src="${h('assets/starnet-logo-small.png')}" alt="StarNet" width="355" height="60"></a>
   <nav class="topnav" aria-label="Site">
     <a href="${root}#station">Product</a>
     <a href="${h('docs/index.html')}"${dc}>Docs</a>
+    <a href="${h('market.html')}"${mk}>Skills</a>
+    <a href="${h('maps.html')}"${mp}>Maps</a>
     <a href="${h('pricing.html')}"${pr} data-pricing-link${LOADS_SITE_JS.includes(page) ? ' hidden' : ''}>Pricing</a>
     <a href="${GITHUB}" target="_blank" rel="noopener">GitHub<svg class="nav-external" aria-hidden="true" focusable="false" viewBox="0 0 16 16" width="12" height="12"><path d="M3 13 13 3M4 3h9v9" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></a>
   </nav>
@@ -153,6 +157,8 @@ function footer(page) {
     <a href="${RELEASES}" target="_blank" rel="noopener">RELEASES</a>
     <a href="${here('pricing.html')}" data-pricing-link${LOADS_SITE_JS.includes(page) ? ' hidden' : ''}>PRICING</a>
     <a href="${here('docs/index.html')}">DOCS</a>
+    <a href="${here('market.html')}">SKILLS</a>
+    <a href="${here('maps.html')}">MAPS</a>
     <a href="${here('docs/help.html')}">HELP</a>
     <a href="${GITHUB}/issues" target="_blank" rel="noopener">COMMUNITY</a>
     <a href="${here('legal/privacy.html')}">PRIVACY</a>
@@ -248,7 +254,8 @@ for (const page of pages) {
     const sections = [...main.matchAll(/<h[23][^>]*id="([^"]+)"[^>]*>([\s\S]*?)<\/h[23]>([\s\S]*?)(?=<h[23]\b|<nav class="doc-pager"|$)/g)].map(m => ({ id: m[1], t: textOf(m[2]).replace(/^\d+[.\s]*/, ''), b: textOf(m[3]).slice(0, 2400) }));
     index.push({ u: page.replace(/^docs\//, ''), t: entry.title, g: entry.group, k: entry.kind, d: textOf(desc), h: heads, s: sections });
   } else {
-    html = html.replace(/(href="(?:\.\.\/)?(?:styles\.css|docs\/docs\.css|\/styles\.css))(?:\?v=[^"]*)?"/, `$1?v=${V}"`);
+    const styleVersion = page === 'index.html' ? '20260924-home-rules' : V;
+    html = html.replace(/(href="(?:\.\.\/)?(?:styles\.css|docs\/docs\.css|\/styles\.css))(?:\?v=[^"]*)?"/, `$1?v=${styleVersion}"`);
     if (LOADS_SITE_JS.includes(page)) {
       html = html.replace(/(<span (?:id="ver-badge"|class="ver")>)v[\d.]+(<\/span>)/g, `$1v${FALLBACK_RELEASE}$2`);
       html = html.replace(/(src="site\.js\?v=)[^"]+/, `$1${V}`);

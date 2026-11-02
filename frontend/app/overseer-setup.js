@@ -7,10 +7,10 @@ window.OverseerSetup = (() => {
   const providers = {
     grok: ['Grok','Sign in'], kimi: ['Kimi','Sign in'], openrouter: ['OpenRouter','API key'],
     openai: ['OpenAI','ChatGPT or API key'], anthropic: ['Anthropic','API key'], gemini: ['Gemini','API key'],
-    ollama: ['Ollama','Free · local'], claudecode: ['Claude','Your Claude login'], xai: ['xAI','API key'], groq: ['Groq','API key'],
+    ollama: ['Ollama','Free · local'], xai: ['xAI','API key'], groq: ['Groq','API key'],
     mistral: ['Mistral','API key'], deepseek: ['DeepSeek','API key'], together: ['Together','API key'],
     fireworks: ['Fireworks','API key'], perplexity: ['Perplexity','API key'], cerebras: ['Cerebras','API key'],
-    custom: ['Custom','Your endpoint']
+    custom: ['Custom','Your endpoint'], 'claude-cli': ['Claude Code','Your Claude subscription']
   };
   function reflectProvider(provider) {
     const title = el('ov-connection-title');
@@ -18,7 +18,7 @@ window.OverseerSetup = (() => {
     const help = el('ov-connection-help');
     if (help) help.textContent = provider === 'starnet' ? 'Confirm your account in the browser, then choose a model.'
       : provider === 'ollama' ? 'Choose a model installed on this computer.'
-      : provider === 'claudecode' ? 'Runs on this computer’s Claude Code sign-in (your Claude subscription). No API key. Choose a model.'
+      : provider === 'claude-cli' ? 'Sign in with your Claude subscription, then choose a model.'
       : provider === 'custom' ? 'Enter your endpoint, then choose or enter a model ID.'
       : provider === 'openai' ? 'Sign in with ChatGPT or add an OpenAI API key.'
       : ['grok','kimi','codex'].includes(provider) ? 'Sign in, then choose a model from your account.'
@@ -26,7 +26,7 @@ window.OverseerSetup = (() => {
     const logo = el('ov-connection-logo');
     if (logo) {
       logo.classList.toggle('ov-starnet-logo', provider === 'starnet');
-      logo.style.setProperty('--provider-icon', 'url("' + new URL('assets/brand/' + (provider === 'starnet' ? 'starnet-wordmark.svg' : 'providers/' + (provider === 'codex' ? 'openai' : provider === 'claudecode' ? 'anthropic' : provider) + '.svg'), document.baseURI).href + '")');
+      logo.style.setProperty('--provider-icon', 'url("' + new URL('assets/brand/' + (provider === 'starnet' ? 'starnet-wordmark.svg' : 'providers/' + (provider === 'codex' ? 'openai' : provider) + '.svg'), document.baseURI).href + '")');
     }
   }
   function beginConnection() {
@@ -43,7 +43,9 @@ window.OverseerSetup = (() => {
   function reflectModel(item, provider) {
     currentModel = { ...item, provider };
     if (el('ov-model-dialog')?.open) return;
-    el('ov-model-name').textContent = item.id ? ModelDock.labels.model(item) : 'Choose a model';
+    // an id with no display name of its own (typed, or a bare catalog row) shows verbatim — humanized it read as StarNet
+    // stripping the dashes from the id it would send (#126)
+    el('ov-model-name').textContent = !item.id ? 'Choose a model' : (!item.name || item.name === item.id) ? item.id : ModelDock.labels.model(item);
     el('ov-model-detail').textContent = item.id ? 'Change model or browse the catalog' : 'Browse the model catalog';
     renderReasoning();
   }
@@ -117,7 +119,7 @@ window.OverseerSetup = (() => {
       const id = button.dataset.prov, info = providers[id];
       if (!info) return;
       const icon = document.createElement('span'); icon.className = 'ov-provider-logo';
-      icon.style.setProperty('--provider-icon', 'url("' + new URL('assets/brand/providers/' + (id === 'claudecode' ? 'anthropic' : id) + '.svg', document.baseURI).href + '")');
+      icon.style.setProperty('--provider-icon', 'url("' + new URL('assets/brand/providers/' + id + '.svg', document.baseURI).href + '")');
       icon.setAttribute('aria-hidden', 'true');
       const label = document.createElement('span'); label.className = 'ov-provider-label';
       const name = document.createElement('span'); name.textContent = info[0];

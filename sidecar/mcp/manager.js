@@ -42,7 +42,15 @@
     // tools-only projection rather than a crash.
     const makeAuxDefs = ('makeAuxDefs' in deps) ? deps.makeAuxDefs : (translateMod && translateMod.connectorAuxDefs);
     const clock = deps.clock || { now: () => 0 };
-    const timeoutMs = deps.timeoutMs || 30000;
+    /* 30s -> 120s DEFAULT (h1 audit 2026-09-22). A real connector WRITE (create an invoice, send a batch, render a
+       report) routinely takes longer than 30s; cutting it off did not stop it — the effect landed anyway while the
+       model was told it timed out, and retried. Still configurable exactly as before: deps.timeoutMs (the host
+       wiring) and a per-connector cfg.timeoutMs (normalizeTimeout, clamped 1s..10min) both win over this. */
+    const timeoutMs = deps.timeoutMs || 120000;
+    // The registry's per-tool timer must sit ABOVE the connector's own request timeout, so the client's timer (which
+    // cleans its pending entry and names its budget) always fires first. Without it a connector tool inherited the
+    // host's 30s fast-tool default and every longer per-connector timeout was silently capped at 30s.
+    const REGISTRY_SLACK_MS = 5000;
     const onEvent = typeof deps.onEvent === 'function' ? deps.onEvent : function () {};
     // AUTO-RECONNECT deps (injected so the manager stays timer/rng-free for tests + determinism lint). When absent
     // the reconnect scheduler is INERT (setTimeoutImpl null -> no reconnect armed), so existing callers are unchanged.
@@ -54,6 +62,9 @@
     const schemaCache = deps.schemaCache || null;
     const fingerprintConfig = typeof deps.fingerprintConfig === 'function' ? deps.fingerprintConfig : function () { return ''; };
     const validateConfig = typeof deps.validateConfig === 'function' ? deps.validateConfig : function () { return ''; };
+    // awaited before EVERY (re)connect builds its transport: the host readies what the transport will run in (a
+    // stdio server's Safe Cell, which may have stopped since the last connect). A throw fails this connect honestly.
+    const prepareConnect = typeof deps.prepareConnect === 'function' ? deps.prepareConnect : null;
     const STDIO_IDLE_MS = Math.max(0, Number(deps.stdioIdleMs) || 15 * 60 * 1000);
     const STDIO_MAX_LIFETIME_MS = Math.max(0, Number(deps.stdioMaxLifetimeMs) || 6 * 60 * 60 * 1000);
     const RECONNECT_BASE_MS = Math.max(250, Number(deps.reconnectBaseMs) || 1000);
@@ -244,6 +255,7 @@
         // connector surfaces an HONEST 401/error (visible + reloadable), never a crash or a silently-frozen stale token.
         let liveToken = c.token;
         if (typeof c.tokenProvider === 'function') { const got = await resolveToken(c, false); if (got.token != null) liveToken = got.token; }
+        if (prepareConnect) await prepareConnect({ id: c.id, transport: c.transportKind, agentId: c.agentId });
         if (!isCurrent()) { if (drained) closeResources(drained.client, drained.transport, 'reconnect'); return { ok: false, state: 'down', toolCount: 0, superseded: true }; }
         attempt.transport = makeTransport({
           id: c.id,
@@ -327,12 +339,14 @@
         if (!isCurrent()) return { ok: false, state: 'down', toolCount: 0, superseded: true };
         if (c.connecting === attempt) c.connecting = null;
         c.tools = []; c.resources = []; c.prompts = [];
-        if (AUTH_401.test((e && e.message) || '')) {
+        if (AUTH_401.test((e && e.message) || '') || (e && e.authRejected === true)) {
           // THE SERVER IS THE AUTHORITY ON AUTH: a 401 handshake means this credential is dead, and backoff
           // cannot mint a new one — reconnect-hammering a 401 just burns the attempt cap (the reported Wix/Gmail
           // failure mode). Honest terminal state; sign-in / a token edit reconfigures and recovers.
+          // A non-HTTP transport (the Gmail app-password IMAP adapter) flags `authRejected` and carries its own
+          // plain-language fix in the message, which is shown instead of the generic HTTP 401 text.
           c.authRequired = true;
-          setState(c, 'error', authDetail(c));
+          setState(c, 'error', (e && e.authRejected === true && e.message) || authDetail(c));
           return { ok: false, state: 'error', toolCount: 0, error: c.detail, authRequired: true };
         }
         setState(c, 'error', (e && e.message) || String(e));
@@ -478,12 +492,12 @@
         ? 'reauthentication required — the server rejected this connector\'s sign-in (HTTP 401); sign in again'
         : 'authentication rejected (HTTP 401) — update this connector\'s token';
     }
-    function markAuthRequired(c) {
+    function markAuthRequired(c, detail) {
       bumpEpoch(c);                                             // stale death callbacks from this connection are void
       teardown(c);                                              // clears the reconnect timer + closes client/transport
       c.tools = []; c.resources = []; c.prompts = [];
       c.authRequired = true;
-      setState(c, 'error', authDetail(c));
+      setState(c, 'error', detail || authDetail(c));
       // deliberately NO scheduleReconnect: backoff cannot mint a credential. Sign-in (reconfigure) or a manual
       // Reload with a fixed token recovers — connect() clears authRequired on the next accepted handshake.
     }
@@ -573,8 +587,11 @@
       if (!c.client || c.state !== 'up') throw notConnected(id, toolName, ctx);
       if (!(c.tools || []).some(t => t && t.name === toolName)) throw new Error('connector tool "' + toolName + '" is no longer published by the current server');
       c.lastUsedAt = clock.now();
-      if (c.transportKind !== 'http') return c.client.callTool(toolName, args || {});
-      return httpCall(c, toolName, args, false);
+      // The run's abort signal rides into the client: a STOP rejects the pending call at once (and tells the server)
+      // instead of waiting out a slow connector. The call may still have landed remotely — the registry says so.
+      const callOpts = (ctx && ctx.signal) ? { signal: ctx.signal } : undefined;
+      if (c.transportKind !== 'http') return c.client.callTool(toolName, args || {}, callOpts);
+      return httpCall(c, toolName, args, false, callOpts);
     }
 
     /* The http call path with auth truth. A 401 gets ONE forced-fresh-token reconnect + retry (the bearer may
@@ -585,14 +602,16 @@
     function toolStillPublished(c, toolName) {
       if (!(c.tools || []).some(t => t && t.name === toolName)) throw new Error('connector tool "' + toolName + '" is no longer published by the current server');
     }
-    async function httpCall(c, toolName, args, isRetry) {
+    async function httpCall(c, toolName, args, isRetry, callOpts) {
       const epochAtCall = c._epoch;
       try {
-        const r = await c.client.callTool(toolName, args || {});
+        const r = await c.client.callTool(toolName, args || {}, callOpts);
         c._callFails = 0;
         return r;
       } catch (e) {
         const msg = (e && e.message) || '';
+        // a non-HTTP adapter's own auth verdict (Gmail app password): terminal, with its own fix text, no refresh dance
+        if (e && e.authRejected === true) { markAuthRequired(c, msg); throw e; }
         if (AUTH_401.test(msg)) {
           const reauthError = () => new Error('connector "' + c.id + '" needs reauthentication — the server rejected its credential (HTTP 401); sign in to it again');
           const reconnectedSince = () => c._epoch !== epochAtCall && c.client && c.state === 'up';
@@ -600,7 +619,7 @@
           // ANOTHER caller already reconnected this connector since our call left (the epoch moved and it is up
           // again): our 401 was answered by the OLD bearer. Retry on the live connection — no second refresh
           // (OAuth 2.1 rotates refresh tokens; a needless rotation is how the loser used to lose).
-          if (reconnectedSince()) { toolStillPublished(c, toolName); return httpCall(c, toolName, args, true); }
+          if (reconnectedSince()) { toolStillPublished(c, toolName); return httpCall(c, toolName, args, true, callOpts); }
           const got = await resolveToken(c, true);
           const kind = got.refreshError && got.refreshError.kind;
           if (kind === 'invalid_grant') { markAuthRequired(c); throw reauthError(); }   // the AS said the GRANT is dead
@@ -613,13 +632,13 @@
             scheduleReconnect(c);
             throw new Error('connector "' + c.id + '" could not refresh its sign-in (' + kind + '); retrying shortly');
           }
-          if (reconnectedSince()) { toolStillPublished(c, toolName); return httpCall(c, toolName, args, true); }
+          if (reconnectedSince()) { toolStillPublished(c, toolName); return httpCall(c, toolName, args, true, callOpts); }
           const r = await sharedConnect(c);
           if (c.client && c.state === 'up') {
             // the fresh credential was ACCEPTED — this is not an auth outage. Retry once; a vanished tool is its
             // own honest error, not a reauth prompt.
             toolStillPublished(c, toolName);
-            return httpCall(c, toolName, args, true);
+            return httpCall(c, toolName, args, true, callOpts);
           }
           // the SHARED reconnect settled somewhere other than up. Only ITS OWN 401 handshake is auth truth; a
           // superseded attempt (a concurrent Reload/configure) or a plain connect failure already recorded its
@@ -638,10 +657,12 @@
           if (c.client && c.state === 'up') {
             c._callFails = failsBefore;   // a re-initialize is not a successful CALL — a persistent 404 still accrues
             toolStillPublished(c, toolName);
-            return httpCall(c, toolName, args, true);
+            return httpCall(c, toolName, args, true, callOpts);
           }
           throw e;
         }
+        // a caller's own cancel (the run was stopped) says nothing about the connector's health
+        if (e && e.cancelled) throw e;
         if (CALL_FAIL_LIMIT > 0) {
           c._callFails = (c._callFails || 0) + 1;
           if (c._callFails >= CALL_FAIL_LIMIT && c.state === 'up') { onTransportDeath(c, c._epoch, 'connector unreachable (' + c._callFails + ' consecutive call failures)'); }
@@ -660,11 +681,23 @@
       if (!t) return null;
       return { name: t.name, readOnlyHint: !!(t.annotations && t.annotations.readOnlyHint === true), state: c.state };
     }
+    // A run that wants this connector's tools while it sits in the GAVE-UP error state (bounded reconnect exhausted —
+    // e.g. the station booted offline, or the laptop slept through all 8 attempts) re-arms ONE more bounded cycle.
+    // Without this an HTTP connector stayed toolless for the rest of the session even after the network came back.
+    // Demand-driven, so an unused dead connector still never retries forever; a dead credential is left alone.
+    function rearmOnDemand(c) {
+      if (!c || c.state !== 'error' || !c.enabled || c.authRequired || c.reconnectTimer != null || c.connecting) return;
+      if ((c.reconnectAttempt || 0) < RECONNECT_MAX_ATTEMPTS) return;
+      c.reconnectAttempt = 0;
+      scheduleReconnect(c);
+    }
     function toolDefsFor(id) {
       const c = conns.get(String(id));
+      if (c && !configIssue(c) && c.transportKind === 'http') rearmOnDemand(c);
       if (!c || configIssue(c) || (c.state !== 'up' && c.state !== 'cached')) return [];
-      const bound = (toolName, args, ctx) => call(c.id, toolName, args, ctx);   // ctx rides through for connector_required
-      const defs = (c.tools || []).map(t => makeToolDef({ connectorId: c.id, label: c.label, mcpTool: t, call: bound, localProcess: c.transportKind === 'stdio' }));
+      const bound = (toolName, args, ctx) => call(c.id, toolName, args, ctx);   // ctx rides through for connector_required + the run's abort signal
+      const defTimeoutMs = (c.timeoutMs || timeoutMs) + REGISTRY_SLACK_MS;
+      const defs = (c.tools || []).map(t => makeToolDef({ connectorId: c.id, label: c.label, mcpTool: t, call: bound, localProcess: c.transportKind === 'stdio', timeoutMs: defTimeoutMs }));
       /* The resources/prompts tools are projected ONLY for a server that actually publishes them, so a
          tools-only connector's catalogue is byte-identical to before — nobody pays schema bytes for a
          primitive their server does not serve. They ride the same projection as tools, which is why they
@@ -679,7 +712,7 @@
         const claimed = {};
         for (const d of defs) claimed[d.name] = true;
         for (const d of makeAuxDefs({
-          connectorId: c.id, label: c.label,
+          connectorId: c.id, label: c.label, timeoutMs: defTimeoutMs,
           listResources: (c.resources || []).length ? (() => Promise.resolve(c.resources)) : null,
           readResource: (c.resources || []).length ? ((uri) => readResource(c.id, uri)) : null,
           listPrompts: (c.prompts || []).length ? (() => Promise.resolve(c.prompts)) : null,

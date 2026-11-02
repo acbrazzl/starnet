@@ -5,6 +5,7 @@
    ALSO (G2.1): the runTeeView egress policy for broadcast-opted server-initiated runs — every
    agent.tool_call tees NAME-ONLY (args stripped structurally), agent.token never tees. */
 'use strict';
+const { readSidecarSource, sidecarFunctionSource } = require('./helpers/source');
 const A = require('./_assert.js');
 const { makeSseHub, runTeeView, formatKeepalive } = require('../sidecar/channels/sse.js');
 
@@ -167,16 +168,17 @@ A.eq(runTeeView('agent.reasoning', { agentId: 'a1', runId: 'r1', on: true }), nu
 {
   const fs = require('fs');
   const path = require('path');
-  const src = fs.readFileSync(path.join(__dirname, '../sidecar/index.js'), 'utf8');
+  const src = readSidecarSource();
   const i = src.indexOf('const emit = o.broadcast');
   A.ok(i > 0, 'index.js has the broadcast-opted tee');
   const seg = src.slice(i, i + 400);
   A.ok(/runTeeView\(name,\s*payload\)/.test(seg), 'the tee routes through the runTeeView egress policy');
   A.ok(/redact\(view\)/.test(seg), 'the teed view still passes redact() as a second backstop');
 
-  const keepaliveAt = src.indexOf('const ka = setInterval', src.indexOf('function handleChannelEvents'));
+  const channelEvents = sidecarFunctionSource('handleChannelEvents');
+  const keepaliveAt = channelEvents.indexOf('const ka = setInterval');
   A.ok(keepaliveAt > 0, 'handleChannelEvents owns one bounded keepalive interval');
-  const keepaliveSeg = src.slice(keepaliveAt, keepaliveAt + 160);
+  const keepaliveSeg = channelEvents.slice(keepaliveAt, keepaliveAt + 160);
   A.ok(/sse\.keepalive\(res\)/.test(keepaliveSeg), 'the channel interval uses the tested hub keepalive path');
   A.ok(/25000/.test(keepaliveSeg), 'the existing 25-second keepalive cadence is preserved');
   A.ok(!src.includes("res.write(': ka\\n\\n')"), 'the browser-invisible SSE comment keepalive is retired');
@@ -226,16 +228,21 @@ A.eq(runTeeView('agent.reasoning', { agentId: 'a1', runId: 'r1', on: true }), nu
   const makeBridge = new Function('EventSource', 'setTimeout', 'clearTimeout', `
     let bridgePaused = false, chanES = null, retryTimer = null, backoff = 1000;
     let bridgeCursor = '', bridgeRecovering = false;
-    const emitted = []; let snapshots = 0;
+    const emitted = []; let snapshots = 0; const readyOrder = [];
+    const motionWake = () => {};   // STILL (world.js): the link state is drawn on the next vsync — a no-op here
     let lastSseEventAt = 0, fnow = 0;
-    const apiUrl = x => x, fetchSnapshot = () => { snapshots++; };
+    const apiUrl = x => x, fetchSnapshot = () => { snapshots++; readyOrder.push('snapshot'); };
+    // FIRST SHIP's own reset (world.js forgetShipBase) — the one collaborator the bridge's replay completion calls besides the snapshot
+    const forgetShipBase = () => { readyOrder.push('forget-ship-base'); };
     const window = { __STARNET_API_TOKEN__: '' };
+    const ApiTicket = { sseUrl: q => '/api/channels/events?' + q + '&ticket=T' + (++minted) };   // app/apiticket.js stand-in
+    let minted = 0;
     const performance = { now: () => 0 };
     const U = { bus: { emit(name, payload) { emitted.push({name, payload}); } } };
     ${openSource}
     return {
       open,
-      emitted, snapshots: () => snapshots,
+      emitted, snapshots: () => snapshots, readyOrder,
       resume() { if (!chanES) open(); },
       source() { return chanES; }
     };
@@ -265,6 +272,10 @@ A.eq(runTeeView('agent.reasoning', { agentId: 'a1', runId: 'r1', on: true }), nu
   A.eq(bridge.emitted.length, 1, 'a replayed duplicate is applied only once');
   resumed.onmessage({ data: JSON.stringify({ stream: 'ready', cursor: 'a:2', reset: false }), lastEventId: 'a:2' });
   A.eq(bridge.snapshots(), 1, 'replay completion refreshes authoritative state');
+  // (conveyor-final repair) FIRST SHIP's baseline reset was inlined AHEAD of the snapshot inside open()'s catch-all, so any throw in
+  // it silently skipped the authoritative refresh: the snapshot comes first, then FIRST SHIP's own forgetShipBase
+  A.eq(bridge.readyOrder, ['snapshot', 'forget-ship-base'], 'replay completion refreshes authoritative state FIRST, then lets FIRST SHIP re-read its counts');
+  A.ok(!/shipBase\s*=|shipApplied|refreshShipBase/.test(openSource), 'the bridge reaches into no FIRST SHIP internals — one call to forgetShipBase');
   resumed.onerror(); bridge.resume();
   A.ok(bridge.source().url.includes('cursor=a%3A2'), 'a manually recreated EventSource carries the acknowledged cursor');
 

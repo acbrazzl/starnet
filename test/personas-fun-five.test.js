@@ -44,7 +44,7 @@ const setter = app.match(/function setAgentPersona\(agentId, personaId, tuning\)
 const lead = { id: 'lead', personaId: 'composed' }, worker = { id: 'worker', personaId: 'warm' };
 const agents = new Map([['lead', lead], ['worker', worker]]), calls = [];
 const set = new Function('agents', 'agent', 'Personas', 'composeSystemPrompt', 'Chat', 'Voice', 'syncChannels', 'pushRoster', 'persist', setter + '; return setAgentPersona;')(
-  agents, lead, P, a => P.compose(a.personaId, a.voiceTraits, a.customVoice), { setSystem: p => calls.push(['chat', p]) }, { init: () => calls.push(['voice']) }, () => calls.push(['channels']), () => calls.push(['roster']), () => calls.push(['persist']));
+  agents, lead, P, a => P.compose(a.personaId, a.voiceTraits, a.customVoice), { setSystem: p => calls.push(['chat', p]) }, { setPersona: () => calls.push(['voice']), init: () => calls.push(['voice-init-teardown']) }, () => calls.push(['channels']), () => calls.push(['roster']), () => calls.push(['persist']));
 assert.equal(set('worker', 'witty', { traits: { humor: 0 }, custom: 'Use short sentences.' }), true);
 assert.equal(worker.personaId, 'dry'); assert.equal(lead.personaId, 'composed');
 assert.deepEqual(calls.map(c => c[0]), ['roster', 'persist']);
@@ -52,6 +52,9 @@ assert.ok(worker.systemPrompt.includes('HUMOR: No jokes'));
 assert.equal(set('lead', 'hype'), true);
 assert.equal(lead.personaId, 'upbeat');
 assert.ok(calls.some(c => c[0] === 'chat' && c[1] === lead.systemPrompt));
+// the focused agent's voice is re-keyed WITHOUT Voice.init (which tore down a live call mid-sentence)
+assert.ok(calls.some(c => c[0] === 'voice'), 'focused persona change re-keys the voice');
+assert.ok(!calls.some(c => c[0] === 'voice-init-teardown'), 'persona change never re-inits (tears down) the voice session');
 assert.equal(set('missing', 'dry'), false);
 assert.equal(set('lead', 'invalid'), false);
 set('worker', 'unhinged'); assert.equal(worker.voiceTraits.humor, 0, 'preset changes preserve explicit tuning');
@@ -84,10 +87,13 @@ assert.equal(P.ambient('dry', { humor: 0 }).includes('standing by. a classic.'),
 assert.equal(P.ambient('unhinged', {}, 'No banter.').length, 0, 'fixed ambient quips cannot override custom voice instructions');
 
 // Execute the actual timer callback: a same-agent update must send once, then stay quiet.
+// (context-key-redact r3: the tick goes through syncSessionContext, which records the context only once a push went out)
 const tickSource = voice.match(/contextTimer = setInterval\(\(\) => \{([\s\S]*?)\n        \}, 2000\)/)[1];
+const syncSource = voice.match(/function syncSessionContext\(\) \{[\s\S]*?\n  \}/)[0];
 const timer = new Function('voiceContextFingerprint', 'stationContext', `
-  let active = true, realtime = true, lastContextFingerprint = '', updates = 0;
-  function pushSessionContext() { updates++; }
+  let active = true, realtime = true, lastContextFingerprint = '', pendingContextFingerprint = '', updates = 0;
+  function pushSessionContext() { updates++; return Promise.resolve(true); }
+  ${syncSource}
   return { tick() { ${tickSource} }, updates: () => updates };
 `)(fingerprintOf, () => ctx);
 timer.tick(); timer.tick(); assert.equal(timer.updates(), 1, 'unchanged live call sends no redundant update');

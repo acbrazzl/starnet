@@ -10,10 +10,33 @@ many of these — they win on any wording conflict.
 
 ## Product
 
+- **Feedback is critical, and it compounds (Andrew, 2026-10-01).** Every like and dislike the
+  Commander gives must persist (survive restarts, no short TTLs, no RAM-only stores) and must reach
+  later prompts, so agents converge on exactly how the Commander wants work done over months. A
+  feedback signal that is logged but never read back is a bug. Shipped shape (`agent/feedback-learning`):
+  a rating + correction becomes one user-confirmed Preference record per rated run
+  (`sidecar/feedbackmemory.js`, origin `feedback`), editable/forgettable in the Memory Core; the
+  newest feedback rides EVERY run, station-wide (taste is about the Commander, not the rated agent);
+  a run rated missed counts as a failure in the track record; rating review packets are durable.
+  Respects the personalization pause. Only words that read as feedback on the work become taste.
 - **StarNet is for beginners and power users.** It is easier for beginners to use, never
   beginner-limited: sandbox freedom, full power from minute one, and no grind/unlock/usage
   walls. User-work quotas default off; users or deployers may opt into limits. Restricted
   postures enforce their advertised consent/sandbox boundaries. (Locked; see also skills.)
+  - **Amendment (2026-09-17, Andrew; `agent/runaway-breaker`): the per-DAY spend cap ships ON at
+    $25 as a SOFT rail.** A customer's full-access loop ran 98 overnight passes re-confirming
+    files existed and burned ~$98 with every cap at 0. The rail is not a usage wall: hitting it
+    ends the run with reason `budget`/`day`, the Budget panel offers one-click RESUME (+$25
+    headroom), the value is editable, and saving 0 turns it off. Unmetered (OAuth/subscription)
+    runs never touch it. Per-run, per-agent and global caps still default off
+    (`sidecar/budgetcaps.js` SHIPPED_DEFAULTS) — **one exception (Andrew, 2026-09-30, GitHub #53):** a run on
+    StarNet credits with no per-run cap chosen reserves (and may spend) at most $2 (`managedRunCapUsd`,
+    `SKYNET_BUDGET_MANAGED_PER_RUN` overrides it), because one simple prompt drained a $10 wallet. A per-run
+    cap the user saves above 0 always wins; own-key and subscription runs are unaffected. Paired with the LOOP stall breaker: a loop whose
+    passes change nothing (no file, no commit, no findings, or the same report again) parks
+    itself `paused` after 3 — the ledger decides, never the model's mood. **Confirmed for merge by
+    Andrew on 2026-09-23** ("merge the runaway breaker"); per-run loop detection in `sidecar/loop-breaker.js`
+    (Hermes-gap Step 2) is separate and is not a quota. **Strict vs soft (2026-09-23):** a cap someone CHOSE (env or a saved Budget value) stays fail-closed when spend history is uncertain (test/spend-authority.http.test.js); the shipped $25 default is SOFT — after a crash leaves unsettled spend it cannot be enforced, so it proceeds instead of refusing every paid run, and the Budget panel shows the day spend as unknown (sidecar/budget.js strictScope).
 - **FULL POWER MEANS THE WHOLE LOCAL COMPUTER** (2026-08-14, Andrew; supersedes every older
   Full-Access/hard-floor/desktop-lease limitation). Per-agent Full Access and the station-wide
   master bypass are host-minted scopes of one general authority: StarNet must project every
@@ -36,6 +59,34 @@ many of these — they win on any wording conflict.
   Never build per-agent prop kits.
 - **Skills = HOW, Recipes = WHAT, Routines = WHEN.** Marketplace framing; meter compute, not
   recipes (open-core).
+- **The Skill Market is curated, hosted on starnetos.com, originals first** (2026-09-29, Andrew: "all
+  recommended"). D1 the catalog is static files on starnetos.com (Cloudflare Pages), never the
+  starnet-cloud money server; D2 a catalog skill whose downloaded bytes reproduce the catalog's
+  pinned digest installs in ONE click at the curated (`trusted`) tier — the local guard scan still
+  runs and a dangerous finding is still refused; D3 installs land in the station SKILL LIBRARY, not
+  one agent; D4 StarNet Originals lead the catalog, then credited community picks; D5 the bundled
+  library stays, the market is its update channel and the only home for new skills. Community
+  publishing waits for a review queue. Plan: https://claude.ai/artifact/HuPtbuXdPrQC3xBVKVf79f
+  **Trust (2026-09-29, Andrew: "go for it"):** the catalog and the pulled-skills list are signed
+  with an Ed25519 key that lives only on the publisher's machine (never the website, never the
+  repo); the app ships the public keys (a working key + an offline backup) and refuses unsigned,
+  mis-signed or older-serial documents. The market can PULL a skill (skills-catalog/revoked.json):
+  stations with market skills installed re-read the signed pulled list every few minutes and switch
+  it off. Market packages are text only — SKILL.md, a license, plain-text references/ — and the app
+  enforces that rule itself, not just the build. Serials are tracked per catalog, the app ships a
+  minimum official serial (market-floor.json, pinned after each catalog deploy), and bundled
+  originals carry their own `version:` so the newer of built-in and market copy is the one used.
+  Every skill also downloads from starnetos.com/market.html as a standard Agent Skills .zip.
+  **Uploads (2026-10-06, Andrew: "time we allowed uploaded skills"; the plan's recommended options,
+  taken as defaults, his to change):** anyone with a (free) StarNet account submits a SKILL.md + up to
+  five text references on account.starnetos.com › ACCOUNT › SKILLS, reached from SHARE YOUR SKILL on
+  market.html; the author picks MIT or CC BY 4.0 and a plain-text credit; a name belongs to whoever
+  first submitted it. Every upload waits for a PERSON in /admin/skills (approve, or send back with a
+  note the author sees). Approving publishes nothing: `scripts/pull-skill-submissions.mjs` pulls
+  approved packages onto the publisher's PC with its own token (SKILL_REVIEW_TOKEN, never the
+  credit-minting ADMIN_TOKEN), the normal catalog build scans and signs them there, and they go live
+  with the next website deploy. Uploads sit on the community shelf, marked `uploaded`, so older apps
+  read them like any community skill. Runbook: docs/SKILL_MARKET_UPLOADS.md.
 - **Connectors OUT > channels IN** (two-axis framing, 2026-07-06). Google Workspace is a
   connector, not a messaging channel. Curated one-click MCP catalog is the chosen path for
   "more connectors"; paste-a-key tier is bearer-only-honest; OAuth 2.1 generic client is live.
@@ -128,3 +179,31 @@ many of these — they win on any wording conflict.
   every candidate-bound wave W0–W7 passes. Neither verdict authorizes publishing, deployment,
   credential rotation, or any other external release operation; those still require the owner's
   explicit authorization.
+- **Transcript row provenance is one rule: `rowTaint` in `sidecar/transcriptstore.js`** (review
+  memory-learning-07, 2026-10-13). A stored row with `taint` taints whatever reads it. A row is clean
+  only when its writer stamped it (`taintKnown`, recorded whenever a taint value is passed, `null`
+  included). Every other row is "taint unverifiable", whatever its age: a date cutoff is unsafe
+  (an older build kept writing un-stamped tainted rows for anyone who upgraded late), and a
+  per-install "stamped since" marker could only clear a row whose writer forgot the stamp. So every
+  transcript write outside the store itself (`append`, `appendStrict`, `appendNew`, `appendNewStrict`,
+  in any sidecar module) must pass `taint`; test/recall.test.js scans all of sidecar/ and locks it.
+  recall_conversation and the repeat-work owner proof (`trusted-learning.js` cleanOwnerRows) read
+  rows by this rule. No released build (through v0.13.3) wrote the clean stamp, so after the update
+  every recall hit on older history taints the run: on COMMS a later command asks first even with a
+  standing grant (Full Access excepted), and on autonomy runs and channel chats without `/approvals`
+  it is refused. Replay (`transcriptStore.taintOf`) and the earlier-conversation note count only an
+  explicit `taint`, so they treat those same rows as clean: applying the rule there would start
+  every older conversation tainted. **OPEN: Andrew decides before the next cut** (raised 2026-10-13,
+  release review): ship strict recall with a release-note line ("Recalling a chat from before this
+  update now asks before running commands."), or pick another split. Until he answers, the branch
+  ships strict recall.
+
+
+## Build mode / conveyors (Andrew, 2026-10-10/11)
+
+- SEND TO is an OUTBOX pointer to another line’s INBOX, never a belt. Each finished job starts that line’s own job with its own crew and budget; circles are refused.
+- SELECT MOVES: MOVE is retired. Click selects; a selected piece dragged onto open floor moves. A single machine dropped onto another machine connects them, selected or not. An unselected machine dragged onto open floor lays a belt. Shift+drag moves.
+- THE HAND: Conveyors hotbar keys 1–8 pick pieces, right-click removes, Q copies the pointed piece. PICK WHAT GOES HERE is a docked station window, never a popover.
+- Hold Alt for the floor’s junction settings and SEND TO overlay; keep the one-voice display rule.
+- No belt may close a work-line circle except a LOOP’s valid back lane. Copying a line preserves its internal settings and crew, not external SEND TOs, project folders or triggers.
+- A PARTIAL JOIN IS A DELIVERED REPLY, NOT A SHIPMENT (2026-10-12, conveyor runtime review). A JOINER that sends on without every branch (one failed, or never arrived before its timeout) still delivers the merged reply, marked PARTIAL, so the job is never swallowed. The job is not a product: no line-output at the OUTBOX, no SHIPPED receipt, no SEND TO hand-off, no 'delivered' verdict. SEND TO still hears of it as partial, so the next line's record says why nothing came.

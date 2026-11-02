@@ -32,6 +32,7 @@ const { spawn } = require('child_process');
 const { bootToken } = require('./_httpToken.js');
 const Pipeline = require('../frontend/app/pipeline.js');
 const Events = require('../shared/events.js');
+const { allocatePort, BIND_REFUSED } = require('./helpers/ports.js');
 
 const HOST = '127.0.0.1';
 const INDEX = path.resolve(__dirname, '..', 'sidecar', 'index.js');
@@ -95,9 +96,9 @@ function boot(port, env, attemptsLeft) {
     const onData = d => {
       out += d.toString();
       if (!settled && out.indexOf('http://' + HOST + ':' + port) >= 0) { settled = true; resolve({ child, port }); }
-      else if (!settled && /already in use/i.test(out)) {
+      else if (!settled && BIND_REFUSED.test(out)) {
         settled = true; try { child.kill(); } catch (_) {}
-        if (attemptsLeft > 0) resolve(boot(port + 1, env, attemptsLeft - 1));
+        if (attemptsLeft > 0) resolve(allocatePort().then(next => boot(next, env, attemptsLeft - 1)));
         else reject(new Error('no free port'));
       }
     };
@@ -183,7 +184,7 @@ function twoStagePlan() {
     SKYNET_OPENROUTER_KEY: 'sk-or-v1-routing-sample-fake',
     SKYNET_DEFAULT_MODEL: 'test/model'
   };
-  const { child, port } = await boot(9130 + (process.pid % 50), env, 20);
+  const { child, port } = await boot(await allocatePort(), env, 20);
   const B = 'http://' + HOST + ':' + port;
   let sse = null;
   try {
@@ -213,9 +214,22 @@ function twoStagePlan() {
     A.ok(/no work line is armed/.test(String(noPlan.j.error || '')), 'the refusal names the real reason: ' + noPlan.j.error);
 
     /* ---- 3. HAPPY PATH through a posted two-stage floor ---- */
+    /* the docks' ROOM is bounded by the saved station (a posted plan may only narrow it — qa/bugs/a9a4f53c): save both
+       bays with a workstation each and a workbench in their room, so the bay room is computer + workbench and the shell
+       probe in section 5 meets a projected, consent-gated shell.exec */
+    const WM = require('../frontend/app/worldmodel.js');
+    const stDoc = WM.defaultDoc();
+    stDoc.props.push({ id: 'b1', t: 'bay', x: 2, y: 1, w: 1, h: 1, agentId: 'research-agent' }, { id: 'pc1', t: 'console', x: 4, y: 1, w: 2, h: 1, agentId: 'research-agent' },
+      { id: 'b2', t: 'bay', x: 8, y: 1, w: 1, h: 1, agentId: 'writer-agent' }, { id: 'pc2', t: 'console', x: 10, y: 1, w: 2, h: 1, agentId: 'writer-agent' },
+      { id: 'wb1', t: 'workbench', x: 13, y: 1, w: 2, h: 1, block: true });
+    stDoc._nid = 6;
+    const prior = ((await (await fetch(B + '/api/save?agent=agent', { headers })).json()) || {}).save;
+    const sv = await fetch(B + '/api/save', { method: 'POST', headers,
+      body: JSON.stringify({ schema: 'starnet.save', version: 5, _saveRevision: (prior && prior._saveRevision) || 0, updatedAt: Date.now(), agent: { id: 'agent' }, station: stDoc }) });
+    A.ok(sv.status === 200 && ((await sv.json()) || {}).ok === true, 'the station the line runs on (two bays, a workstation each, a workbench) is saved');
     const posted = await fetch(B + '/api/routing', { method: 'POST', headers, body: JSON.stringify(twoStagePlan()) });
     A.eq(posted.status, 200, 'the two-stage floor deploys');
-    sse = await startSseCollector(B + '/api/channels/events?token=' + encodeURIComponent(token));
+    sse = await startSseCollector(B + '/api/channels/events?' + require('./_httpToken.js').sseQuery(token));
 
     const happy = await post({});
     A.eq(happy.status, 200, 'the sample answers 200 after the line delivered');
@@ -240,7 +254,9 @@ function twoStagePlan() {
     const BRIEF_HDR = 'YOUR STANDING BRIEF FOR THIS STATION:';
     const lastUserOf = rq => { const m = [...((rq && rq.messages) || [])].reverse().find(x => x && x.role === 'user'); return String((m && m.content) || ''); };
     const sysOf = rq => ((rq && rq.messages) || []).filter(x => x && x.role === 'system').map(x => String(x.content || '')).join('\n');
-    const entryReq = mock.requests.find(rq => lastUserOf(rq).indexOf('SAMPLE JOB') >= 0 && lastUserOf(rq).indexOf('PIPELINE HANDOFF') < 0);
+    // the station's own background jobs (the quest master reads recent activity, which can quote the sample) are not the
+    // entry dock's run: a race picked one of them now and then
+    const entryReq = mock.requests.find(rq => lastUserOf(rq).indexOf('SAMPLE JOB') >= 0 && lastUserOf(rq).indexOf('PIPELINE HANDOFF') < 0 && sysOf(rq).indexOf('quest master') < 0);
     A.ok(entryReq, 'the entry dock\'s provider request was recorded');
     A.ok(sysOf(entryReq).indexOf(BRIEF_HDR + '\n' + ENTRY_BRIEF) >= 0,
       'the ENTRY dock\'s standing brief rode its run\'s system context: ' + sysOf(entryReq).slice(-160));
@@ -275,7 +291,17 @@ function twoStagePlan() {
     const hopCrate = placed.find(p => p.kind === 'chain' && p.agentId === 'writer-agent');
     A.eq(hopCrate.lineId, planLineId, 'and the handoff crate carries the SAME line end to end');
     A.ok(Events.validate('workitem.placed', hopCrate).ok, 'the additive lineId validates against the frozen workitem.placed contract');
-    const outDel = deliveredEv.find(p => p.finalQueueId === 'outbox');
+    // A separate line-output authority receipt can arrive first. Follow this sample's
+    // exact crate identity; selecting by sample:true would hide a missing marker.
+    const outDel = deliveredEv.find(p => p.finalQueueId === 'outbox' && p.workitemId === h.workitemId);
+    A.eq(entry.workitemId, h.workitemId, 'the response and placed sample identify the same crate');
+    A.eq(deliveredEv.filter(p => p.finalQueueId === 'outbox' && p.workitemId === h.workitemId).length, 1, 'the sample crate receives exactly one OUTBOX completion');
+    const entryRun = h.runs.find(r => r.agentId === 'research-agent');
+    const terminal = deliveredEv.find(p => p.box === 'line-output' && p.entryRunId === entryRun.runId);
+    A.ok(terminal && terminal.workitemId !== h.workitemId, 'the line terminal receipt has separate authority identity');
+    A.ok(terminal && terminal.lineId === planLineId && terminal.outboxId === 'o', 'the terminal receipt names the exact completed line and OUTBOX');
+    A.ok(terminal && terminal.workitemIds.includes(hopCrate.workitemId), 'the terminal receipt identifies the successful downstream work item');
+    A.ok(terminal && Events.validate('workitem.delivered', terminal).ok, 'the authority receipt validates independently against the frozen contract');
     A.ok(outDel, 'the sample crate DELIVERED to the outbox');
     A.eq(outDel.sample, true, 'the delivery carries the sample:true marker too');
     // re-prove the schema law this marker leans on: obj() stanzas set no additionalProperties:false
@@ -324,6 +350,10 @@ function twoStagePlan() {
     for (const rq of mock.requests.slice(before)) {
       for (const m of ((rq && rq.messages) || [])) if (m && m.role === 'tool') toolMsgs.push(String(m.content || ''));
     }
+    // the saved WORKBENCH is in the probe's bay room (its consent-free shell_bg_status rides the wire; the consent-gated
+    // shell_exec is withheld from an unattended run), so the denial below is the workbench's consent posture, not a missing room
+    A.ok(mock.requests.slice(before).some(rq => ((rq && rq.tools) || []).some(t => /^shell[._]bg[._]status$/.test(String((t.function && t.function.name) || t.name || '')))),
+      'the probe\'s bay room holds the saved workbench (shell_bg_status offered)');
     A.ok(toolMsgs.length >= 1, 'the model\'s shell.exec attempt produced a tool result the provider saw');
     A.ok(!toolMsgs.some(t => /pwned/.test(t)), 'the command NEVER executed — no unattended grant reached the sample run: ' + JSON.stringify(toolMsgs).slice(0, 300));
 

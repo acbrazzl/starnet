@@ -138,7 +138,8 @@
     const sendMediaTo = typeof deps.sendMediaTo === 'function' ? deps.sendMediaTo : null;
 
     const targetsTool = {
-      name: 'channel.targets', capability: 'comms', scope: 'read', requiresConsent: false,
+      // impact none: it lists the chats the host already holds; no network, no send
+      name: 'channel.targets', capability: 'comms', impact: 'none', scope: 'read', requiresConsent: false,
       description: 'List the messaging chats this station can actually send to (channel, chat, which agent it is bound to, and whether that channel is connected right now). Call this before channel.send.',
       schema: { type: 'object', properties: {} },
       run: async () => {
@@ -154,18 +155,29 @@
     };
 
     const sendTool = {
-      name: 'channel.send', capability: 'comms', scope: 'execute', requiresConsent: true, timeoutMs: 30000,
-      description: 'Send a message from this station to a connected messaging chat (Telegram, Discord, Slack, Matrix, Signal), optionally with files attached. Use this when the Commander asks to be told, pinged, notified, or messaged somewhere, or to report a result outside the station — including sending them an image, chart, or document you produced. The target must be a chat channel.targets lists — an agent cannot message a new id.',
+      /* impact external-unknown, DECLARED, and deliberately the lane it always fell into. It acts OUTWARD as the station
+         on a third-party platform with the channel's stored bot token and can carry workspace files out (capability
+         registry: "the obvious prompt-injection exfiltration target"), and this lane is the strictest one that still
+         lets the Commander send: a watched run asks an exact per-call confirmation and ANY yes covers that one send only
+         (no "always" grant is ever recorded); a delegated worker and an unattended ASK run are never offered it; a
+         tainted run loses it; Full Access keeps it. Declared, it is also refused on a dispatch that carries no run
+         authority at all (registry.js reads a declared external-unknown; every run context carries one, index.js dctx).
+         external-credentialed (web_request's class) was tried in quick win 8
+         and rejected in review: it made one "Always" a station-wide comms:execute grant, offered it to delegated workers
+         under a watched lead, and offered it to unattended runs whose exec lockout refuses every call. Moving it to a
+         class that stores grants waits for Andrew's security sign-off. */
+      name: 'channel.send', capability: 'comms', impact: 'external-unknown', scope: 'execute', requiresConsent: true, timeoutMs: 30000,
+      description: 'Send a message from this station to a connected messaging chat (Telegram, Discord, Slack, Matrix, Signal), optionally with files attached. Use it when the Commander asks to be told, pinged, notified or messaged somewhere, or to report a result outside the station, including sending them an image, chart or document you produced. The target must be a chat channel.targets lists; an agent cannot message a new id.',
       schema: {
         type: 'object',
         required: ['target', 'text'],
         properties: {
           target: { type: 'string', description: 'A target token from channel.targets (a channel name or chat id also works when it matches exactly one).' },
-          text: { type: 'string', maxLength: TEXT_CHARS, description: 'The message body. Plain text; it is split into platform-sized parts automatically.' },
+          text: { type: 'string', maxLength: TEXT_CHARS, description: 'Plain-text body; split into platform-sized parts automatically.' },
           files: {
             type: 'array', maxItems: MAX_FILES,
             items: { type: 'string' },
-            description: 'Optional workspace-relative paths of files to attach (images send inline, everything else as a document). Up to ' + MAX_FILES + '. On a channel that cannot carry files the message still sends and names the path instead.'
+            description: 'Workspace-relative files to attach (images inline, the rest as documents), up to ' + MAX_FILES + '. A channel that cannot carry files still gets the message, naming the path.'
           }
         }
       },
@@ -214,7 +226,7 @@
            Each file is reported truthfully in the result: the model must be able to tell "sent with 2 files"
            from "sent, and the files did not go". */
         const wanted = Array.isArray(args && args.files) ? args.files.filter(x => typeof x === 'string' && x.trim()) : [];
-        const fileNotes = [], attached = [];
+        const fileNotes = [], attached = [], unreadable = [];
         if (wanted.length && !error) {
           if (wanted.length > MAX_FILES) {
             fileNotes.push(wanted.length + ' files requested (limit ' + MAX_FILES + ') — only the first ' + MAX_FILES + ' were attempted');
@@ -225,6 +237,7 @@
             try { got = await readFile(String((ctx && ctx.agentId) || ''), rel); }
             catch (e) { got = { ok: false, error: (e && e.message) || 'read threw' }; }
             if (!got || got.ok === false || !got.buffer || !got.buffer.length) {
+              unreadable.push(rel);
               fileNotes.push('"' + rel + '" could not be read from your workspace (' + ((got && got.error) || 'not found') + ') — nothing was attached');
               continue;
             }
@@ -236,11 +249,16 @@
           }
           // Say so IN THE CHAT, not just in the tool result: the human is the one who wanted the file, and a
           // silent omission would leave them waiting for an attachment that is never coming.
-          const missed = wanted.slice(0, MAX_FILES).filter(f => attached.indexOf(f) === -1);
-          if (missed.length) {
-            const note = 'Note: ' + (missed.length === 1 ? 'this file' : 'these files') + ' could not be attached here — '
-              + missed.map(f => '"' + f + '"').join(', ') + '. ' + (missed.length === 1 ? 'It is' : 'They are') + ' saved in the workspace on the station.';
-            try { await sendTo(t.target, note); } catch (_) { /* the note is a courtesy; never fail the send over it */ }
+          // Only a file that was READ and then failed to upload is on the station. One that could not be read (missing,
+          // empty, or a refused path like "../../channels/secrets.json") was claimed "saved in the workspace" too (2026-10-20).
+          const missed = wanted.slice(0, MAX_FILES).filter(f => attached.indexOf(f) === -1 && unreadable.indexOf(f) === -1);
+          const lines = [];
+          if (missed.length) lines.push((missed.length === 1 ? 'this file' : 'these files') + ' could not be attached here — '
+            + missed.map(f => '"' + f + '"').join(', ') + '. ' + (missed.length === 1 ? 'It is' : 'They are') + ' saved in the workspace on the station.');
+          if (unreadable.length) lines.push((unreadable.length === 1 ? 'this file' : 'these files') + ' could not be found in the workspace, so nothing was attached — '
+            + unreadable.map(f => '"' + f + '"').join(', ') + '.');
+          if (lines.length) {
+            try { await sendTo(t.target, 'Note: ' + lines.join('\nNote: ')); } catch (_) { /* the note is a courtesy; never fail the send over it */ }
           }
         }
 
@@ -283,5 +301,6 @@
     };
   }
 
-  return { makeCommsTools, DEFAULT_MAX_LEN, MAX_CHUNKS, TEXT_CHARS };
+  // kindForMime + MAX_FILES are shared with routine-media.js: a routine's delivery attaches files exactly like this tool.
+  return { makeCommsTools, DEFAULT_MAX_LEN, MAX_CHUNKS, TEXT_CHARS, MAX_FILES, kindForMime };
 });

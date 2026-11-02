@@ -17,12 +17,19 @@ const ReturnStore = (() => {
   let hbTimer = 0;
   let wired = false;    // unload stamp wired once
   let recoveryTimer = 0, recoveryGeneration = 0;
+  /* ONE WRITER (perf, 2026-10-20). The world asks pendingCount() on every drawn frame (the OUTBOX crate memo), and it
+     used to run Returns.hydrate(state) for it: a filter of the ledger, a Set and a filter of up to 10k digested ids,
+     60 times a second. Every write below goes through setState with a value a Returns.* call returned, so the state is
+     ALWAYS hydrated and the count is just its pending length. `rev` moves on every write — the world memoizes its
+     per-chute crate map on it (keyed on the count, a resolve + a fold between two frames left a stale map). */
+  let rev = 0;
+  function setState(next) { state = next; rev++; }
 
   function load() { try { const raw = localStorage.getItem(KEY); return raw ? JSON.parse(raw) : null; } catch (_) { return null; } }
   function save() { try { if (state) localStorage.setItem(KEY, JSON.stringify(state)); return true; } catch (_) { return false; } }
   const ready = () => typeof Returns !== 'undefined' && !!state;
 
-  function beat() { if (!ready()) return; state = Returns.heartbeat(state, Date.now()); save(); }
+  function beat() { if (!ready()) return; setState(Returns.heartbeat(state, Date.now())); save(); }
 
   // fetch this station's run history (ALL agents — cron routines run on crew too) + the routine
   // A failed or partial history read must reject: empty work and unread work are different states.
@@ -80,7 +87,7 @@ const ReturnStore = (() => {
     if (generation !== recoveryGeneration || !ready()) return;
     // The API is newest-first, but the OUTBOX is FIFO. Crate every row oldest-first; only the visible
     // digest below is capped, so the other completed runs remain rateable instead of disappearing.
-    state = Returns.fold(state, rows.slice().sort((a, b) => (+a.ts || 0) - (+b.ts || 0)));
+    setState(Returns.fold(state, rows.slice().sort((a, b) => (+a.ts || 0) - (+b.ts || 0))));
     state.awayRanges = [];
     if (!save()) {
       state.awayRanges = ranges;
@@ -88,8 +95,10 @@ const ReturnStore = (() => {
       return;
     }
     // an already-open OUTBOX window re-renders with the fresh crates (no-op when closed)
-    try { if (typeof StationUI !== 'undefined' && StationUI.rerender) StationUI.rerender('outbox'); } catch (_) {}
+    try { if (typeof OutboxView !== 'undefined' && OutboxView.refresh) OutboxView.refresh(); } catch (_) {}   // DELIVERABLES › TO REVIEW
     if (!rows.length || fired) return;
+    // THE ONE RETURN REPORT owns the welcome-back message; the crates above still land on the OUTBOX
+    try { if (typeof Briefing !== 'undefined' && Briefing.ownsReturn && Briefing.ownsReturn()) { fired = true; return; } } catch (_) {}
     fired = true;
     if (typeof Chat !== 'undefined' && Chat.awayDigest) Chat.awayDigest(rows.slice(0, Returns.DIGEST_CAP), { onRated: resolve, openWork: openWork });
   }
@@ -101,7 +110,7 @@ const ReturnStore = (() => {
   function init(opts) {
     opts = opts || {};
     if (state && hbTimer) return; // enterGame re-entry is not a second closed interval
-    state = (typeof Returns !== 'undefined') ? Returns.hydrate(load()) : null;
+    setState((typeof Returns !== 'undefined') ? Returns.hydrate(load()) : null);
     if (!state) return;
     const awaySince = state.lastSeenAt;             // 0 on the first-ever session -> engine digests nothing
     if (opts.enabled !== false && awaySince > 0) state.awayRanges.push({ since: awaySince, until: Date.now() });
@@ -128,10 +137,12 @@ const ReturnStore = (() => {
   // the copy a digest-dismiss should show (item #3): dismissing the beat is NOT discarding the work — every listed
   // run's crate is already pending in the OUTBOX and stays collectable there. One honest sentence the render site
   // (chat.js awayDigest, Lane B) drops next to the dismiss control so "dismiss" never reads as "lose it".
-  function outboxLine() { return 'the crate on the floor holds these until you review them.'; }
+  function outboxLine() { return 'they wait in TO REVIEW until you rate them.'; }
 
   // ---- the OUTBOX crate surface (world.js renders from these; clicking the chute reviews) ----
-  function pendingCount() { return ready() ? Returns.pendingCount(state) : 0; }
+  function pendingCount() { return ready() ? state.pending.length : 0; }   // == Returns.pendingCount(state): state is always hydrated (ONE WRITER)
+  // moves on every state write — a cheap memo key for anything derived from the ledger (world.js outboxCrateMap)
+  function revision() { return rev; }
   // the full uncollected ledger, oldest first (crate order) — the OUTBOX window renders from this.
   // Copies, so a render can't mutate the durable state.
   function pendingRows() { return ready() ? Returns.hydrate(state).pending.map(r => Object.assign({}, r)) : []; }
@@ -153,6 +164,16 @@ const ReturnStore = (() => {
     }
     if (!sid || typeof Workstreams === 'undefined' || !Workstreams.adopt) return false;
     let w = Workstreams.get(sid);
+    // a delegated worker's own thread is never a session of its own: its work opens on the asking conversation's card
+    // (known here, or only to the overseer when this page never adopted it)
+    const ov = !w && typeof Overseer !== 'undefined' && Overseer.snapshot ? Overseer.snapshot() : null;
+    const filed = ov && (ov.threads || []).find(t => t && t.id === sid && t.worker === true && t.parentStreamId && Workstreams.get(t.parentStreamId));
+    if ((w && Workstreams.isHidden && Workstreams.isHidden(w)) || filed) {
+      if (typeof App === 'undefined' || !App.openWorkstream) return false;
+      App.openWorkstream(w ? sid : filed.parentStreamId);
+      if (!w && typeof Delegated !== 'undefined' && Delegated.reveal) Delegated.reveal(sid);
+      return true;
+    }
     if (!w || !(w.history || []).some(m => m && m.role === 'assistant')) {
       // no session yet (or an output-less shell) — adopt + fold the durable transcript so the work is readable.
       // revive:true — this is a DELIBERATE Commander click ("review the work"), the one case that may
@@ -178,8 +199,25 @@ const ReturnStore = (() => {
     Chat.awayReview(row, { onRated: resolve, openWork: openWork });
     return true;
   }
-  // rated (collected) — clear the crate
-  function resolve(runId) { if (ready() && runId) { state = Returns.resolve(state, runId); save(); } }
+  /* rated (collected) — clear the crate, then every OTHER surface that shows it repaints (org P14: a run waits in TWO places — DELIVERABLES ›
+     TO REVIEW and the delivered result in WORKFLOWS — so a rating in one must not leave the other still asking for it). `from` names the
+     caller, which repaints itself: TO REVIEW's own collected() fade would be cut short by a rebuild of its list. COMMS' away beats pass no
+     `from`, so both windows catch up. */
+  function resolve(runId, from) { if (ready() && runId) { setState(Returns.resolve(state, runId)); save(); changed(from, [runId]); } }
+  // `runIds` reaches WORKFLOWS so it repaints only when its delivered result shows the rate control for one of them: a full repaint
+  // there closes every open drawer (How each step did it, Last time …), so a rating elsewhere must not snap the one being read shut
+  function changed(from, runIds) {
+    if (from !== 'outbox') try { if (typeof OutboxView !== 'undefined' && OutboxView.refresh) OutboxView.refresh(); } catch (_) {}   // DELIVERABLES › TO REVIEW
+    if (from !== 'workflows') try { if (typeof WorkflowsWindow !== 'undefined' && WorkflowsWindow.refresh) WorkflowsWindow.refresh(runIds); } catch (_) {}   // the delivered result's rate control
+  }
+  // TO REVIEW's CLEAR ALL — collect every listed crate in ONE save (the runs stay in the library; only the reminder goes)
+  function resolveAll(runIds) {
+    if (!ready() || !Array.isArray(runIds)) return;
+    for (const id of runIds) if (id) setState(Returns.resolve(state, id));
+    save();
+    try { if (typeof OutboxView !== 'undefined' && OutboxView.refresh) OutboxView.refresh(); } catch (_) {}   // DELIVERABLES › TO REVIEW
+    try { if (typeof WorkflowsWindow !== 'undefined' && WorkflowsWindow.refresh) WorkflowsWindow.refresh(runIds.filter(Boolean)); } catch (_) {}   // WORKFLOWS' rate control goes too (when it shows one of these)
+  }
 
   /* foldRow(row) — PROOF crate (guided workflow Phase 4): fold ONE real finished-run row into the pending
      ledger NOW, so the sample job the Commander just fired lands on the OUTBOX like any delivered run. The
@@ -189,7 +227,7 @@ const ReturnStore = (() => {
      crate through the identical path. Returns false when the store isn't live or the row carries no runId. */
   function foldRow(row) {
     if (!ready() || !row || !row.runId) return false;
-    state = Returns.fold(state, [{
+    setState(Returns.fold(state, [{
       runId: String(row.runId),
       agentId: String(row.agentId || 'agent'),
       title: String(row.title || '').replace(/\s+/g, ' ').trim().slice(0, 90),
@@ -198,20 +236,20 @@ const ReturnStore = (() => {
       turns: Math.max(0, row.turns | 0),
       ts: +row.ts || Date.now(),
       streamId: String(row.streamId || '')
-    }]);
+    }]));
     save();
     // an already-open OUTBOX window re-renders with the fresh crate (no-op when closed)
-    try { if (typeof StationUI !== 'undefined' && StationUI.rerender) StationUI.rerender('outbox'); } catch (_) {}
+    try { if (typeof OutboxView !== 'undefined' && OutboxView.refresh) OutboxView.refresh(); } catch (_) {}   // DELIVERABLES › TO REVIEW
     return true;
   }
 
   // S2/new-hero: a fresh Commander inherits no prior pending crates or attendance trail.
   function reset() {
     ++recoveryGeneration; clearTimeout(recoveryTimer); clearInterval(hbTimer); hbTimer = 0;
-    state = null; fired = false; try { localStorage.removeItem(KEY); } catch (_) {}
+    setState(null); fired = false; try { localStorage.removeItem(KEY); } catch (_) {}
   }
 
-  return { init, pendingCount, pendingRows, reviewNext, resolve, foldRow, reset, lastSeen, isAttended, outboxLine, openWork };
+  return { init, pendingCount, revision, pendingRows, reviewNext, resolve, resolveAll, foldRow, reset, lastSeen, isAttended, outboxLine, openWork };
 })();
 
 if (typeof module !== 'undefined' && module.exports) module.exports = { ReturnStore };

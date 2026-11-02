@@ -151,6 +151,24 @@ FunctionEnd
   Pop $0
   Sleep 400
 
+  ; 3. Anything else still running from StarNet's OWN bundled folders: a helper an orphaned older station left behind
+  ;    (node-pty's OpenConsole.exe under node_modules) holds its own file open and stalls NSIS on "error opening file for
+  ;    writing". A current shell's job already ended its station's tree with step 1; this is for what an older one left.
+  ;    ONLY the folders the app ships that can hold a program (tauri.conf.json bundle.resources: node_modules, sidecar,
+  ;    bin, shared), never the rest of $INSTDIR: the default install dir also holds the default WORKSPACES (agent-built
+  ;    programs, venvs), an install typed into a shared folder (D:\Apps) holds other apps, and the uninstaller itself runs
+  ;    IN PLACE as $INSTDIR\uninstall.exe when Tauri's "uninstall before installing" page runs it with _?= (killing it
+  ;    aborts that install with "unable to uninstall"). For the same reason this PowerShell's own ancestors (the installer
+  ;    or uninstaller running it) are never stopped, wherever they sit. A prefix sibling never matches (the trailing \).
+  ;    Each stop is printed to the install log. The folder arrives through the ENVIRONMENT, never pasted into the command
+  ;    (an apostrophe in the profile path broke a quoted literal — see the PATH hook below).
+  ;    test/installer-stop-leftovers.test.js runs this exact line against planted processes.
+  System::Call 'Kernel32::SetEnvironmentVariable(t "STARNET_INSTALL_DIR", t "$INSTDIR")'
+  ; STARNET_STOP_LEFTOVERS
+  nsExec::ExecToLog '"$R9" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$d=$$env:STARNET_INSTALL_DIR; if (-not $$d) { exit }; $$d=$$d.TrimEnd($\'\$\')+$\'\$\'; $$own=$\'node_modules$\',$\'sidecar$\',$\'bin$\',$\'shared$\' | ForEach-Object { $$d+$$_+$\'\$\' }; $$all=@(Get-CimInstance Win32_Process); $$by=@{}; $$all | ForEach-Object { $$by[[int]$$_.ProcessId]=$$_ }; $$keep=@{}; $$i=[int]$$PID; while ($$i -and -not $$keep[$$i]) { $$keep[$$i]=1; $$i=[int]$$by[$$i].ParentProcessId }; $$all | Where-Object { $$x=[string]$$_.ExecutablePath; $$x -and -not $$keep[[int]$$_.ProcessId] -and ($$own | Where-Object { $$x.StartsWith($$_, [StringComparison]::OrdinalIgnoreCase) }) } | ForEach-Object { $\'StarNet: stopping $\' + $$_.ExecutablePath; Stop-Process -Id $$_.ProcessId -Force -ErrorAction SilentlyContinue }"'
+  Pop $0
+  Sleep 300
+
   Pop $R9
   Pop $1
   Pop $0
@@ -158,6 +176,55 @@ FunctionEnd
 
 !macro NSIS_HOOK_PREINSTALL
   !insertmacro STARNET_STOP_INSTALL_PROCESSES
+!macroend
+
+; ── TERMINAL MODE: `starnet` ON THE USER'S PATH ────────────────────────────────────────────────
+; The app ships the `starnet` command in $INSTDIR\bin (starnet.cmd runs it on the app's own node.exe). After an install
+; that folder joins the CURRENT USER's PATH, so typing `starnet` in any NEW terminal opens the dashboard — the way
+; Hermes's installer puts `hermes` on PATH. The uninstaller takes it back off. (macOS: the app links it on launch,
+; sidecar/cli-link.js — a dragged-in app has no installer.)
+; - Through the .NET registry API, NEVER ReadRegStr/WriteRegStr: an NSIS string caps at NSIS_MAX_STRLEN, so a long
+;   user PATH read that way comes back TRUNCATED and writing it back would destroy the rest of it.
+; - Read UNEXPANDED, written back as REG_EXPAND_SZ: entries like %USERPROFILE%\bin stay exactly as they were.
+; - Idempotent (an entry already there — any case, with or without a trailing \ — is not added twice; a reinstall or an
+;   update adds nothing) and FAIL-OPEN (a PowerShell failure leaves PATH untouched and the install goes on).
+; - The broadcast (WM_SETTINGCHANGE "Environment") is what makes Explorer, and every terminal opened after it, see it.
+; Same 64-bit PowerShell as above; NSIS expands `$`, so every PowerShell variable below is written `$$`, and `$\'` is a
+; PowerShell single quote. test/cli-path-hook.test.js runs these exact lines against a scratch registry key.
+; - The folder reaches PowerShell through the ENVIRONMENT (STARNET_PATH_DIR, set in this installer process and inherited
+;   by nsExec's child), never pasted into the command: a profile path with an apostrophe (C:\Users\O'Brien\...) broke the
+;   quoted literal, PowerShell refused to parse, and fail-open meant `starnet` silently never reached PATH.
+!macro STARNET_RESOLVE_POWERSHELL
+  StrCpy $R9 "$WINDIR\SysNative\WindowsPowerShell\v1.0\powershell.exe"
+  IfFileExists "$R9" +2 0
+    StrCpy $R9 "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe"
+!macroend
+
+!macro NSIS_HOOK_POSTINSTALL
+  Push $0
+  Push $R9
+  !insertmacro STARNET_RESOLVE_POWERSHELL
+  DetailPrint "Putting the starnet command on your PATH ($INSTDIR\bin)..."
+  System::Call 'Kernel32::SetEnvironmentVariable(t "STARNET_PATH_DIR", t "$INSTDIR\bin")'
+  ; STARNET_PATH_ADD
+  nsExec::ExecToLog '"$R9" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$d=$$env:STARNET_PATH_DIR; if (-not $$d) { exit }; $$k=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($\'Environment$\'); $$p=[string]$$k.GetValue($\'Path$\',$\'$\',[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames); $$a=@($$p -split $\';$\' | Where-Object { $$_ -ne $\'$\' }); if (-not ($$a | Where-Object { $$_.TrimEnd($\'\$\') -eq $$d.TrimEnd($\'\$\') })) { $$k.SetValue($\'Path$\', (@($$a) + $$d) -join $\';$\', [Microsoft.Win32.RegistryValueKind]::ExpandString) }"'
+  Pop $0
+  SendMessage 0xFFFF 0x001A 0 "STR:Environment" /TIMEOUT=5000
+  Pop $R9
+  Pop $0
+!macroend
+
+!macro NSIS_HOOK_POSTUNINSTALL
+  Push $0
+  Push $R9
+  !insertmacro STARNET_RESOLVE_POWERSHELL
+  System::Call 'Kernel32::SetEnvironmentVariable(t "STARNET_PATH_DIR", t "$INSTDIR\bin")'
+  ; STARNET_PATH_REMOVE
+  nsExec::ExecToLog '"$R9" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$d=$$env:STARNET_PATH_DIR; if (-not $$d) { exit }; $$k=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($\'Environment$\'); $$p=[string]$$k.GetValue($\'Path$\',$\'$\',[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames); $$a=@($$p -split $\';$\' | Where-Object { $$_ -ne $\'$\' }); $$keep=@($$a | Where-Object { $$_.TrimEnd($\'\$\') -ne $$d.TrimEnd($\'\$\') }); if ($$keep.Count -ne $$a.Count) { $$k.SetValue($\'Path$\', $$keep -join $\';$\', [Microsoft.Win32.RegistryValueKind]::ExpandString) }"'
+  Pop $0
+  SendMessage 0xFFFF 0x001A 0 "STR:Environment" /TIMEOUT=5000
+  Pop $R9
+  Pop $0
 !macroend
 
 ; Future uninstallers own the same process cleanup. This does not repair an already-corrupt old

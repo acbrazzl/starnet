@@ -33,7 +33,62 @@
 
   // the reply marker the agent is instructed to emit — one line, machine-findable, human-readable:
   //   FORK: terse summary or full detail? || terse | full detail
-  const LINE = /^\s*FORK:\s*(.+?)\s*\|\|\s*(.+?)\s*$/m;
+  /* ONE GRAMMAR FOR BOTH CHOICE MARKERS (rc walk 2026-10-14). Models write the marker the way they write prose: bold-wrapped
+     ("**FORK: which angle?** || a | b | c"), bulleted or quoted, or glued onto the end of a sentence ("…one quick
+     clarification: TASK_QUESTION: …"). Each of those missed the old line-start parse, so the reply showed raw machine syntax
+     in COMMS and no chips. A marker is: the keyword, a colon, the question, `||`, the options — anywhere on its line, with
+     markdown decoration around the keyword, the question or the options ignored. Group 1 is the prose before it on the
+     same line (kept when the marker is stripped), 2 the question, 3 the options. Prose that merely says "FORK:" has no
+     `||` after it and never matches. No lookbehind: older macOS WebKit cannot parse one. */
+  const DECO = '[*_`~]*';
+  /* ONE WAY TO READ EACH CHARACTER (perf p5, 2026-10-20: "eats my PC's resources"). The grammar used to be written as a lazy
+     prefix followed by three quantifiers that all eat spaces (`[ \t>+-]*` `[ \t]*` `[*_`~]*` `[ \t]*`), so a line with a long
+     run of spaces — an ASCII box, a padded table — was tried every way the run can be split, at every position: a 20-line box
+     with 58-space interiors cost ~200 ms per live frame and one 400-space line ~8 s. Same language, same captures, written so
+     each character has one reading:
+       - the prose before the marker (group 1) is empty or ends on a character the lead-in can't take (a minimal prefix always
+         does: one that ended on a space could give that space to the lead-in and be shorter);
+       - the lead-in is list marks, then an optional list number with its spaces, then optional decoration with its spaces;
+       - after the colon the decoration and spaces are taken whole (the question never starts inside them);
+       - the question (2) and the options (3) are empty or end on a non-space, the spaces before `||` and the line end go to
+         the spaces rule. test/fork-marker-perf.test.js checks this grammar against the old one on random text. */
+  const LEAD = '[ \\t>+-]*(?:\\d{1,2}[.)][ \\t]*)?(?:[*_`~]+[ \\t]*)?';
+  const PRE = '((?:[^\\n]*?[^\\n \\t>+-])??)';
+  // a list number before the marker ("1. TASK_QUESTION: …") is decoration too — it must never stay behind as a dangling "1."
+  function markerSource(key) {
+    return '^' + PRE + LEAD + key + DECO + '[ \\t]*:' + DECO + '(?:[ \\t]+(?![ \\t])|(?![*_`~ \\t]))((?:[^\\n]*?[^\\n \\t])??)[ \\t]*(?:[*_`~]+[ \\t]*)?'
+      + '\\|\\|[ \\t]*((?:[^\\n]*?[^\\n \\t])??)[ \\t]*$';
+  }
+  /* ONE CASE RULE (rc review 2026-10-14). The keyword carries its own case, so every regex built from it — here, in the loop's
+     "this reply waits on the Commander" check (sidecar/loop.js) and the phone push — agrees on what a marker is. FORK in
+     capitals or title case: a lowercase "fork:" is prose or code ("const fork: Fork = a || b"), never a marker. TASK_QUESTION
+     in any case: the word is unmistakable. No regex built from these takes the `i` flag. */
+  const FORK_KEY = '\\bF(?:ORK|ork)', TASK_KEY = '[Tt][Aa][Ss][Kk]_[Qq][Uu][Ee][Ss][Tt][Ii][Oo][Nn]';
+  const MARKER_KEY = '(?:' + FORK_KEY + '|' + TASK_KEY + ')';
+  // every marker holds its keyword: text without one never runs a line grammar at all (a plain reply costs one scan)
+  const FORK_RE = new RegExp(FORK_KEY), TASK_RE = new RegExp(TASK_KEY), MARKER_RE = new RegExp(MARKER_KEY);
+  const LINE = new RegExp(markerSource(FORK_KEY), 'm');
+  /* Trailing trims in one backward pass. `.replace(/[ \t]+$/, '')` retries from every space run INSIDE the text, not just the
+     last one — quadratic on a long padded line, and the half-typed-keyword trim runs over the whole live reply. Same result. */
+  function trimEnd(s, chars) { let e = s.length; while (e > 0 && chars.indexOf(s[e - 1]) >= 0) e--; return e === s.length ? s : s.slice(0, e); }
+  const DECO_CHAR = /[\s*_`~]/;
+  const undeco = v => {   // what .replace(/^[\s*_`~]+|[\s*_`~]+$/g, '') did, without retrying every inner run
+    const s = String(v == null ? '' : v);
+    let a = 0, e = s.length;
+    while (a < e && DECO_CHAR.test(s[a])) a++;
+    while (e > a && DECO_CHAR.test(s[e - 1])) e--;
+    return s.slice(a, e);
+  };
+  // remove every marker matched by `re` (global; `key` is its keyword): the prose before a marker on its line stays; a line
+  // that was only the marker (plus decoration) goes. Byte-identical when nothing matched.
+  function stripWith(re, key, text) {
+    const s = String(text == null ? '' : text);
+    if (!key.test(s)) return s;
+    re.lastIndex = 0;
+    if (!re.test(s)) return s;
+    re.lastIndex = 0;
+    return s.replace(re, (m, pre) => trimEnd(String(pre || ''), ' \t')).replace(/\n{3,}/g, '\n\n').trim();
+  }
 
   // is the fork instruction earned right now? `read` is the understanding read (UnderstandingStore.read()).
   // Fail-closed: no read / malformed → NOT offered (an unearned fork is exactly the interruption Andrew
@@ -68,18 +123,66 @@
   // find the fork in an agent reply. Returns { question, options: [2..3] } or null (no marker / malformed /
   // too few options — a broken marker renders as plain text, never a broken chip row).
   function parse(text) {
-    const m = LINE.exec(String(text == null ? '' : text));
+    const s = String(text == null ? '' : text);
+    const m = FORK_RE.test(s) ? LINE.exec(s) : null;
     if (!m) return null;
-    const question = m[1].trim().slice(0, Q_CHARS);
-    const options = m[2].split('|').map(s => s.trim()).filter(Boolean).slice(0, MAX_OPTS)
+    const question = undeco(m[2]).slice(0, Q_CHARS);
+    const options = m[3].split('|').map(undeco).filter(Boolean).slice(0, MAX_OPTS)
       .map(s => s.length > OPT_CHARS ? s.slice(0, OPT_CHARS - 1) + '…' : s);
     if (!question || options.length < 2) return null;
     return { question, options };
   }
 
   // strip the marker line from the rendered reply (the chips replace it; the raw FORK: line never shows).
-  function strip(text) {
-    return String(text == null ? '' : text).replace(LINE, '').replace(/\n{3,}/g, '\n\n').trim();
+  // EVERY marker line, not the first: a model that asks twice left the second one printed raw (first-hour walk).
+  const LINE_ALL = new RegExp(LINE.source, 'gm');
+  function strip(text) { return stripWith(LINE_ALL, FORK_RE, text).trim(); }
+  /* Both choice markers — FORK: and TASK_QUESTION: — are machine lines for the chip row, never prose. The chat
+     rendered them raw in three places (first-hour walk 2026-09-28): every FORK line live (nothing called strip),
+     a second TASK_QUESTION line, and all of them again whenever history re-rendered from the server transcript.
+     One remover for display, used by the live reply, the saved history row and the history render. */
+  function stripMarkers(text) {
+    const s = String(text == null ? '' : text);
+    const out = stripWith(TASK_LINE_ALL, TASK_RE, stripWith(LINE_ALL, FORK_RE, s));
+    return out === s ? s : out;   // no marker: byte-identical (prose that merely says "FORK:" included)
+  }
+  /* THE LIVE REPLY NEVER SHOWS A MARKER BEING TYPED (rc walk 2026-10-14). The chat renders a reply while it streams, so a
+     marker sat on screen raw until its run ended — and forever, in a paragraph a tool call had already closed. The live
+     text drops every complete marker AND the marker still arriving on the last line (its keyword and colon are in, its
+     `||` is not yet — or the keyword itself is half-typed). If it never becomes a marker it shows when its line completes. */
+  const OPEN_TAIL = new RegExp('(^|\\n)' + PRE + LEAD + MARKER_KEY + DECO + '[ \\t]*:[^\\n]*$');
+  // a keyword still being typed: capitals ("TASK_QU", "FOR"), "Fork", or any case once it carries the underscore ("task_qu") —
+  // never a plain lowercase or title-case word ("for", "For", "task"), which would hold back ordinary prose
+  function halfKeyword(w) {
+    const up = w.toUpperCase();
+    if (w !== up && w !== 'Fork' && w.indexOf('_') < 0) return false;
+    return 'TASK_QUESTION:'.indexOf(up) === 0 || ((w === up || w === 'Fork') && 'FORK:'.indexOf(up) === 0);
+  }
+  function liveText(text) {
+    let s = stripMarkers(text);
+    // OPEN_TAIL runs to the end of the text, so it can only sit on the LAST line: read that line alone (the whole reply was
+    // scanned on every frame), and only when it holds a keyword
+    const nl = s.lastIndexOf('\n'), last = nl < 0 ? s : s.slice(nl);
+    const open = MARKER_RE.test(last) ? OPEN_TAIL.exec(last) : null;
+    if (open) { const at = Math.max(0, nl) + open.index; return s.slice(0, at) + open[1] + trimEnd(open[2], ' \t'); }
+    const half = /(^|[\s*_`~:>-])([A-Za-z_]{3,13})$/.exec(s);
+    if (half && halfKeyword(half[2])) s = trimEnd(s.slice(0, half.index + half[1].length), ' \t*_`~');
+    return s;
+  }
+  /* A marker nothing turned into a card (a group reply, a channel) still never shows machine syntax: the question reads
+     as a line of prose and its options as a short list under it. */
+  const ANY_LINE_ALL = new RegExp(markerSource(MARKER_KEY), 'gm');
+  function readable(text) {
+    const s = String(text == null ? '' : text);
+    if (!MARKER_RE.test(s)) return s;
+    ANY_LINE_ALL.lastIndex = 0;
+    if (!ANY_LINE_ALL.test(s)) return s;
+    ANY_LINE_ALL.lastIndex = 0;
+    return s.replace(ANY_LINE_ALL, (m, pre, q, opts) => {
+      const head = trimEnd(String(pre || ''), ' \t');
+      const list = String(opts || '').split('|').map(undeco).filter(Boolean).map(o => '- ' + o).join('\n');
+      return (head ? head + '\n' : '') + undeco(q) + (list ? '\n' + list : '');
+    });
   }
 
   // the dossier belief a pick banks: the Commander's answer, with the question kept as context so the
@@ -94,7 +197,7 @@
   // TASK CONTEXT is the complementary, task-local decision protocol. It intentionally lives beside durable
   // preference forks so the browser and Node host share one already-shipped decision-protocol module without
   // adding another release-surface path. Unlike FORK, its answers stay in the Task Brief, never the dossier.
-  const TASK_LINE = /^\s*TASK_QUESTION:\s*(.+?)\s*\|\|\s*(.+?)\s*$/mi;
+  const TASK_LINE = new RegExp(markerSource(TASK_KEY), 'm');   // the shared marker grammar (see markerSource; the key carries its case)
   // An EXCLUSIVE question is a fork: 2-3 options or it is a menu, not a decision. A MULTI-SELECT question
   // is a checklist ("which sources?", "which constraints?") and legitimately runs longer — 3 was starving
   // exactly the question type multi-select exists for, while the clarify card already rendered up to 6.
@@ -142,24 +245,25 @@
     return seen;
   }
   function taskParse(text) {
-    const m = TASK_LINE.exec(String(text == null ? '' : text));
+    const src = String(text == null ? '' : text);
+    const m = TASK_RE.test(src) ? TASK_LINE.exec(src) : null;
     if (!m) return null;
-    const question = taskClean(m[1], TASK_Q_CHARS);
-    if(m[2].trim()==='[free text]') return question ? {question,options:[],mode:'conversation'} : null;
+    const question = taskClean(undeco(m[2]), TASK_Q_CHARS);
+    const raw = m[3].split('|').map(undeco).join('|');
+    if(raw.trim()==='[free text]') return question ? {question,options:[],mode:'conversation'} : null;
     // The marker is the LAST-RESORT path — taken by exactly the models that format badly, and unlike brief_ask
     // it has no retry loop. Returning null here does not mean "fail closed": upstream it means "no question was
     // asked", so the brief completes as done and the raw `TASK_QUESTION: …` line leaks into the transcript and
     // out to channels. So dedupe is best-effort: if it would leave fewer than two choices, keep the raw list
     // rather than destroy a recoverable question.
-    const deduped = taskDedupeOptions(m[2].split('|'));
+    const deduped = taskDedupeOptions(raw.split('|'));
     const options = deduped.length >= 2
       ? deduped
-      : m[2].split('|').map(x => taskClean(x, TASK_OPT_CHARS)).filter(Boolean).slice(0, TASK_MAX_OPTS);
+      : raw.split('|').map(x => taskClean(x, TASK_OPT_CHARS)).filter(Boolean).slice(0, TASK_MAX_OPTS);
     return question && options.length >= 2 ? { question, options } : null;
   }
-  function taskStrip(text) {
-    return String(text == null ? '' : text).replace(TASK_LINE, '').replace(/\n{3,}/g, '\n\n').trim();
-  }
+  const TASK_LINE_ALL = new RegExp(TASK_LINE.source, 'gm');
+  function taskStrip(text) { return stripWith(TASK_LINE_ALL, TASK_RE, text).trim(); }
   function taskDirective(contextBlock) {
     const lines = [
       'TASK CONTEXT — LISTEN BEFORE YOU BUILD:',
@@ -203,8 +307,17 @@
     loosen: taskLoosen, dedupeOptions: taskDedupeOptions, sameOption: taskSameOption,
     MAX_QUESTION: TASK_Q_CHARS, MAX_OPTION: TASK_OPT_CHARS, MAX_OPTIONS: TASK_MAX_OPTS, MAX_OPTIONS_MULTI: TASK_MAX_OPTS_MULTI,
     // one place decides how many options a question may carry, so policy / store / card can never drift
-    maxOptionsFor: (multiSelect) => (multiSelect === true ? TASK_MAX_OPTS_MULTI : TASK_MAX_OPTS)
+    maxOptionsFor: (multiSelect) => (multiSelect === true ? TASK_MAX_OPTS_MULTI : TASK_MAX_OPTS),
+    /* THE BRIEF GATE'S PAUSE IS NOT A FAILURE (rc walk 2026-10-14). A consequential call made before the Task Brief settles
+       is held by the host and NOT run; the model settles the brief and makes the call again. The tool result has to stay
+       an error for the model, but every surface drew it as a red "✗ failed" chip. The host stamps this one summary on that
+       result (sidecar/index.js) and the chat reads it back to draw the held call as the neutral, not-run state it is. */
+    GATE_HELD: 'not run yet — waiting on the task brief',
+    isGateHeld: ev => !!(ev && ev.isError && ev.summary === 'not run yet — waiting on the task brief'),
+    // the held result's TEXT (a reloaded transcript keeps the content, not the summary): the host opens it with this lead
+    GATE_HELD_LEAD: 'Task Brief gate: nothing ran.',
+    isGateHeldBody: body => /^(?:ERROR: )?Task Brief gate: nothing ran\./.test(String(body == null ? '' : body))
   };
 
-  return { shouldOffer, directive, parse, strip, beliefText, CONF_FLOOR, MAX_OPTS, TaskIntent };
+  return { shouldOffer, directive, parse, strip, stripMarkers, liveText, readable, beliefText, CONF_FLOOR, MAX_OPTS, MARKER_KEY, TaskIntent };
 });

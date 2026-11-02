@@ -19,9 +19,20 @@ const { pathToFileURL, fileURLToPath } = require('node:url');
 const { diagnosticDelta } = require('./verify.js');
 
 const DEFAULT_SERVERS = Object.freeze([
-  { id: 'typescript', command: 'typescript-language-server', args: ['--stdio'], extensions: ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'], languageIds: { '.ts': 'typescript', '.tsx': 'typescriptreact', '.js': 'javascript', '.jsx': 'javascriptreact', '.mjs': 'javascript', '.cjs': 'javascript' } },
+  /* typescript-language-server EXECUTES THE PROJECT too (review security-storage-01): with no tsserver.path set it
+     forks the workspace's own node_modules/typescript/lib/tsserver.js (searching parent folders too) ahead of its
+     bundled copy. An agent's fs.write can plant that file, so it gets the same watched-run-only gate as rust-analyzer
+     below. The gate only stops UNATTENDED runs from starting it: a planted file still runs on the next watched .js/.ts
+     edit under that folder. Closing that needs tsserver.path pinned to a TypeScript outside the workspace. */
+  { id: 'typescript', command: 'typescript-language-server', args: ['--stdio'], extensions: ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'], languageIds: { '.ts': 'typescript', '.tsx': 'typescriptreact', '.js': 'javascript', '.jsx': 'javascriptreact', '.mjs': 'javascript', '.cjs': 'javascript' }, executesProject: true,
+    executesWhy: 'can run the project\'s own TypeScript (node_modules/typescript)' },
   { id: 'pyright', command: 'pyright-langserver', args: ['--stdio'], extensions: ['.py', '.pyi'], languageIds: { '.py': 'python', '.pyi': 'python' } },
-  { id: 'rust-analyzer', command: 'rust-analyzer', args: [], extensions: ['.rs'], languageIds: { '.rs': 'rust' } },
+  /* rust-analyzer EXECUTES THE PROJECT (2026-10-10 security pass): `cargo metadata` honours the project's .cargo/config
+     (build.rustc / rustc-wrapper) and rust-toolchain.toml (a path toolchain), and by default it also runs build.rs,
+     proc macros and `cargo check` on save. An agent's own fs.write can plant any of those, so starting it is code
+     execution: it starts only for a WATCHED run (executesProject) and never builds, expands or checks on its own. */
+  { id: 'rust-analyzer', command: 'rust-analyzer', args: [], extensions: ['.rs'], languageIds: { '.rs': 'rust' }, executesProject: true,
+    settings: { cargo: { buildScripts: { enable: false } }, procMacro: { enable: false }, checkOnSave: false, check: { workspace: false } } },
   { id: 'gopls', command: 'gopls', args: ['serve'], extensions: ['.go'], languageIds: { '.go': 'go' } },
   { id: 'clangd', command: 'clangd', args: ['--background-index=0'], extensions: ['.c', '.h', '.cc', '.cpp', '.cxx', '.hpp', '.hh'], languageIds: { '.c': 'c', '.h': 'c', '.cc': 'cpp', '.cpp': 'cpp', '.cxx': 'cpp', '.hpp': 'cpp', '.hh': 'cpp' } }
 ]);
@@ -38,8 +49,11 @@ function cleanMessage(s, max) {
 
 function safeChildEnv(env) {
   env = env || {};
+  // SystemDrive/ProgramData/ALLUSERSPROFILE are Windows system locations (never secrets): without them native
+  // code resolves "%ProgramData%\..." caches as RELATIVE paths and litters the child's cwd (the user's project).
   const allow = ['PATH', 'Path', 'PATHEXT', 'SYSTEMROOT', 'SystemRoot', 'WINDIR', 'TEMP', 'TMP',
-    'HOME', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'LANG', 'LC_ALL', 'RUSTUP_HOME', 'CARGO_HOME'];
+    'HOME', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'LANG', 'LC_ALL', 'RUSTUP_HOME', 'CARGO_HOME',
+    'SystemDrive', 'ProgramData', 'ALLUSERSPROFILE'];
   const out = {};
   for (const key of allow) if (env[key] != null) out[key] = String(env[key]);
   return out;
@@ -223,7 +237,7 @@ function makeLspManager(deps) {
       }
       if (msg && msg.id != null && msg.method) {
         let result = null;
-        if (msg.method === 'workspace/configuration') result = (msg.params && msg.params.items || []).map(() => null);
+        if (msg.method === 'workspace/configuration') result = (msg.params && msg.params.items || []).map(it => (this.descriptor.settings && it && it.section === this.descriptor.id) ? this.descriptor.settings : null);
         else if (msg.method === 'workspace/workspaceFolders') result = [{ uri: pathToFileURL(this.projectRoot).href, name: P.basename(this.projectRoot) }];
         try { this.send({ jsonrpc: '2.0', id: msg.id, result }); } catch (_) {}
         return;
@@ -298,7 +312,8 @@ function makeLspManager(deps) {
             workspace: { workspaceFolders: true, configuration: true },
             textDocument: { publishDiagnostics: { relatedInformation: false, versionSupport: true } }
           },
-          workspaceFolders: [{ uri: pathToFileURL(this.projectRoot).href, name: P.basename(this.projectRoot) }]
+          workspaceFolders: [{ uri: pathToFileURL(this.projectRoot).href, name: P.basename(this.projectRoot) }],
+          initializationOptions: this.descriptor.settings || undefined
         });
         this.capabilities = init && init.capabilities || {};
         this.notify('initialized', {});
@@ -399,6 +414,14 @@ function makeLspManager(deps) {
       if (input.signal && input.signal.aborted) throw Object.assign(new Error('diagnostic check aborted'), { name: 'AbortError' });
       const descriptor = descriptorFor(file.abs);
       if (!descriptor) { ticket.unsupported.push(String(file.rel || file.abs)); continue; }
+      if (descriptor.executesProject && input.allowProjectExecution !== true) {
+        // detection first (a stat, never a spawn): the watched-run reason is only true for a server that exists
+        const reason = locateExecutable(descriptor)
+          ? descriptor.command + ' ' + (descriptor.executesWhy || 'runs the project\'s own build configuration') + ', so it starts only for a watched run'
+          : descriptor.command + ' is not installed on PATH';
+        ticket.unavailable.push({ file: String(file.rel || file.abs), server: descriptor.id, reason });
+        continue;
+      }
       const got = getClient(descriptor, file.abs, file.base);
       if (got.unavailable) { ticket.unavailable.push({ file: String(file.rel || file.abs), server: descriptor.id, reason: got.reason }); continue; }
       try {

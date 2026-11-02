@@ -70,18 +70,37 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
                              // NEVER merged into `present` — that list is what dossiers, routing and permissions act on.
   const runningAgents = new Map();   // agentId -> live-run COUNT (concurrent streams can share an agentId, e.g. 'agent')
   const runSeenAt = new Map();       // agentId -> performance.now() of the last counted run.start (agentLive's veto grace)
+  /* LINE TEST (2026-09-29, handed over by the steptest-stuck investigation): a run on a line test's OWN stream — a step
+     test's steptest-…, RUN ONE REAL JOB's sample-… (agent.run.start carries streamId) — is real work, but its words live in
+     the line's TEST view, not in the agent's COMMS: a Commander who opened COMMS saw nothing and read the row as stuck. The
+     crew row names it LINE TEST and its tip says where it shows and how it stops.
+     (2026-09-30) A sample-… stream is also every job the WORK › AUTOMATE › WORKFLOWS window sends — real work, not a test — so the row says
+     ON A WORKFLOW and its tip names both places one shows: the WORKFLOWS window, or a step test's TEST view in BUILD. */
+  const testRunIds = new Map();      // runId -> agentId, for the live runs that are line tests
+  const isLineTestStream = s => /^(steptest|sample)-/.test(String(s || ''));
+  function lineTestOnly(id) {        // every live run of this agent is a line test (a mix reads WORKING)
+    let n = 0; for (const a of testRunIds.values()) if (a === id) n++;
+    return n > 0 && n >= (runningAgents.get(id) || 0);
+  }
+  function dropTestRuns(id) { for (const [r, a] of Array.from(testRunIds)) if (a === id) testRunIds.delete(r); }
+  const LINE_TEST_TIP = 'working on a workflow — it shows in WORK › AUTOMATE › WORKFLOWS (a step test: in BUILD › the line’s TEST view), not in COMMS; ■ STOP there ends it';
   let crewLiveWired = false;         // the crew-status live listener is registered exactly once
   let repaintAutonomyDial = null;    // GROWTH Tier 3: the open Settings AUTONOMY panel's paint fn (null when closed) — lets an accepted trust offer repaint the EARNED badge live
   // Same idiom for the open Settings PERMISSIONS panel's per-agent APPROVAL list. The list is painted from
   // the live roster, so a SUMMON or a DELETE while the panel is open must repaint it — otherwise it keeps
   // offering a flip for an agent that no longer exists (and hides one that does). null when closed.
   let repaintPermAgents = null;
+  /* CLOSED MEANS NULL (night-leak, 2026-10-15). Both hooks are closures over the render that armed them (host .con-pane,
+     the dial and crew wraps …), so a hook left armed after SETTINGS closed kept that whole closed window alive — 3,509
+     elements found detached after a dock sweep, retained only by these two module variables. Closing SETTINGS drops them. */
+  function dropSettingsRepaints() { repaintAutonomyDial = null; repaintPermAgents = null; }
   /* Which PERMISSIONS crew rows the Commander has expanded, by agent id. MODULE scope, deliberately:
      the rows are <details> that paintCrew replaces wholesale, and the settings builder itself re-runs on
      every `rerender('settings')` (a tab swap, a live refresh) — so a Set declared inside that builder is
      a NEW Set each time and the row you just opened slams shut. Measured exactly that before moving it
      here. Ids only: an agent that is deleted simply stops being asked about. */
   const permCrewOpen = new Set();
+  const permExactOpen = new Set();   // which crew rows have MORE OPTIONS open (survives the wholesale repaint, like permCrewOpen)
   let lastStageSummary = '';         // #8: last screen-reader summary text, so we only update the live region on change
   let access = {};           // { totals(), activity() } injected by app.js
   let sel = 0;               // selected agent index (dossier / crew)
@@ -95,24 +114,58 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   // independent bloom dial that also tames the hand-tuned presets. 100 = the shipped look, untouched.
   // `backdrop` is what the station floats in (SpaceBG's registry). 'void' is the shipped sky, so
   // every save that predates this key merges to the exact look it already had.
-  // panelBright (0–100, default 0) is the tube's BRIGHTNESS knob: it lifts the panel glass's black
-  // level toward the phosphor colour (never toward white). 0 = the shipped look, untouched.
-  function defaults() { return { theme: 'amber', themeHue: 35, themeSat: 100, themeGlow: 100, panelBright: 0, roomLighting: 'low', textScale: 0, flicker: true, crtGlass: 'full', staticLevel: 100, sound: true, backdrop: 'void', sessionRow: 'compact', keepComputerAwake: false, notifyPrefs: notifyDefaults() }; }
-  // Raise overall room exposure without changing the distribution of its lights.
-  // Existing saves retain their chosen level; missing values start at LOW.
-  const ROOM_LIGHTING_STEPS = [
-    ['low', 'LOW', 0.82],
-    ['medium', 'MEDIUM', 0.72],
-    ['high', 'HIGH', 0.62],
-  ];
-  function resolveRoomLighting(v) { return ROOM_LIGHTING_STEPS.some(([id]) => id === v) ? v : 'low'; }
-  function applyRoomLighting(value) {
+  // panelBright (−100…100, default 0) is the tube's BRIGHTNESS knob: above 0 it lifts the panel glass's black
+  // level toward the phosphor colour (never toward white); below 0 it takes the panels DOWN toward true black
+  // (Andrew 10-01: "it doesnt get dark enough"). 0 = the shipped look, untouched.
+  function defaults() { return { theme: 'amber', themeHue: 35, themeSat: 100, themeGlow: 100, panelBright: 0, roomLighting: 0, textScale: 0, flicker: true, crtGlass: 'full', staticLevel: 100, sound: true, hints: true, backdrop: 'void', sessionRow: 'compact', keepComputerAwake: false, notifyPrefs: notifyDefaults() }; }
+  // ROOM LIGHT is a 0–100 slider (Andrew 10-10: "maybe we should have adjustable lighting setting?").
+  // 0 is the approved station, untouched, and the default. Ambient alone barely moved the screen (the old
+  // HIGH chip measured +3% over LOW, 10-10 player report: "high lighting but still too dark"): WorldLight's
+  // deck film, the pool cut, the KEY light and the CRT density film all set what reaches the eye, so the
+  // slider drives all of them together. `film` scales the renderer's own CRT.film (the classic world's 0 stays 0).
+  // 100 = the brightest tuned look (hab mean luma 15.9 at 0 → 28.5 at 100). Old LOW/MEDIUM/HIGH saves map to 0/15/30.
+  const ROOM_LIGHTING_MIN = { ambient: 0.82, cut: 1, key: 0, film: 1 };
+  const ROOM_LIGHTING_MAX = { ambient: 0.3, cut: 2.4, key: 2, film: 0.26 };
+  const ROOM_LIGHTING_LEGACY = { low: 0, medium: 15, high: 30 };
+  let roomLightingFilm = null;   // the renderer's CRT.film before the slider touched it
+  let roomLightingBaked = null, roomLightingTimer = 0;   // the ambient/cut/key the station was last baked with
+  function resolveRoomLighting(v) {
+    if (typeof v === 'string' && Object.prototype.hasOwnProperty.call(ROOM_LIGHTING_LEGACY, v)) return ROOM_LIGHTING_LEGACY[v];
+    const n = typeof v === 'number' || (typeof v === 'string' && v.trim() !== '') ? Number(v) : NaN;
+    return Number.isFinite(n) ? Math.round(Math.min(100, Math.max(0, n))) : 0;
+  }
+  function roomLightingKnobs(level) {
+    const t = resolveRoomLighting(level) / 100, out = {};
+    for (const k of Object.keys(ROOM_LIGHTING_MIN)) out[k] = +(ROOM_LIGHTING_MIN[k] + (ROOM_LIGHTING_MAX[k] - ROOM_LIGHTING_MIN[k]) * t).toFixed(4);
+    return out;
+  }
+  // `live` (a slider drag) reaches the next frame on its own: the CRT film, and (industrial world) WorldLight's deck
+  // ambient plus its pool cut + key, which worldrenderer.js begin() hands to WorldLight.configure over the same bake.
+  // So a drag never rebakes. A commit (release) rebakes once, for StationBake's baked ambient (a full StationBake
+  // freezes a big station for ~2.5 s), and only when the knobs differ from the ones last baked. A drag that ends
+  // where it began then owes nothing to the next unrelated applySettings.
+  function applyRoomLighting(value, live) {
     if (typeof StationBake === 'undefined') return;
-    const level = resolveRoomLighting(value);
-    const ambient = ROOM_LIGHTING_STEPS.find(([id]) => id === level)[2];
-    if (StationBake.LIGHT.ambient === ambient) return;
-    StationBake.LIGHT.ambient = ambient;
+    if (!live && roomLightingTimer) { clearTimeout(roomLightingTimer); roomLightingTimer = 0; }   // this commit supersedes a queued one
+    const step = roomLightingKnobs(value);
+    const crt = typeof World !== 'undefined' && World.crt;
+    const tex = typeof IndustrialTextures !== 'undefined' && IndustrialTextures.lighting;
+    if (crt) {
+      if (roomLightingFilm == null) roomLightingFilm = Number(crt.film) || 0;
+      crt.film = +(roomLightingFilm * step.film).toFixed(4);   // a per-frame post pass: no rebake needed
+    }
+    const knobs = () => StationBake.LIGHT.ambient + ',' + (tex ? tex.cut + ',' + tex.key : '');
+    if (roomLightingBaked == null) roomLightingBaked = knobs();   // the first call sees what the station booted (and baked) with
+    StationBake.LIGHT.ambient = step.ambient;
+    if (tex) { tex.cut = step.cut; tex.key = step.key; }
+    if (live || knobs() === roomLightingBaked) return;
+    roomLightingBaked = knobs();
     if (typeof World !== 'undefined' && World.rebake) World.rebake();
+  }
+  // The slider's `change` (a mouse release, or every arrow-key step): a burst of steps costs one bake, not one each.
+  function commitRoomLighting(read) {
+    if (roomLightingTimer) clearTimeout(roomLightingTimer);
+    roomLightingTimer = setTimeout(() => { roomLightingTimer = 0; applyRoomLighting(read()); }, 150);
   }
   // TEXT SIZE steps (percent → chip label; 0 = AUTO, the default). Applied as a body zoom in
   // applySettings(): zoom scales layout too, so every hard-px face (COMMS included) grows together —
@@ -167,6 +220,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       const r = JSON.parse(localStorage.getItem(KEY));
       if (r && r.v === 1) {
         r.settings = Object.assign(defaults(), r.settings || {});
+        r.settings.roomLighting = resolveRoomLighting(r.settings.roomLighting);   // an old LOW/MEDIUM/HIGH save reads back as its 0/15/30 level
         r.settings.notifyPrefs = Object.assign(notifyDefaults(), r.settings.notifyPrefs || {});   // merge new keys onto an old save
         if (!Array.isArray(r.tasks)) r.tasks = [];
         if (!Array.isArray(r.notifs)) r.notifs = [];
@@ -184,7 +238,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     try { localStorage.setItem(KEY, JSON.stringify(store)); lastSaveOk = true; return true; }
     catch (_) {
       const wasSaved = lastSaveOk; lastSaveOk = false;
-      if (wasSaved) try { notify('Could not save local settings. Changes may be lost when you restart.', 'warn'); } catch (_) {}
+      if (wasSaved) try { notify('Could not save local settings. Changes may be lost when you restart.', 'warn', undefined, { kind: 'alert', key: 'settings-save-failed' }); } catch (_) {}
       return false;
     }
   }
@@ -248,6 +302,66 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   const PRESET_HS = { amber: [35, 100], green: [136, 100], blue: [198, 100], purple: [270, 100], red: [3, 100], white: [120, 8] };
 
   /* ---------- settings → DOM ---------- */
+  /* SCREEN FLICKER clock (#69): the station's 7s CRT flicker used to be an `infinite` CSS opacity animation on the
+     whole game screen, which made the compositor redraw the full window every vsync all day for a dip that lasts
+     280ms. Now this clock plays the dip once per 7s (app.css .flick-dip) and the compositor rests in between.
+     Same look; the SETTINGS toggle (body.no-flicker) still turns it off; a hidden page skips it. */
+  let flickerClock = 0;
+  function armFlickerClock() {
+    if (flickerClock || typeof setInterval !== 'function' || typeof document === 'undefined') return;
+    flickerClock = setInterval(() => { try {
+      if (document.hidden || document.body.classList.contains('no-flicker')) return;
+      const g = document.getElementById('screen-game');
+      if (!g || !g.classList.contains('active')) return;
+      g.classList.add('flick-dip');
+      setTimeout(() => g.classList.remove('flick-dip'), 400);
+    } catch (_) {} }, 7000);
+    if (flickerClock && flickerClock.unref) flickerClock.unref();   // never hold a headless test process open
+  }
+
+  /* MOTION REST (#69): any running `infinite` CSS animation — a status pulse, a blinking caret, the stale save-dot —
+     makes the compositor produce a new frame every vsync, and a station left open all day on a high-refresh panel
+     spent most of a GPU core on that alone (measured: one 2.4s pulse on a 12px dot = ~0.6 GPU-process cores).
+     While the window is visible but NOT focused and untouched for REST_AFTER_MS, the decorative loops hold still;
+     focus, a pointer or a key resumes every one of them immediately. Only infinite loops are touched: one-shot
+     entrances/vanishes (which other code waits on via animationend) always run to completion, and no class or
+     text changes — the state a loop decorates stays exactly what the harness reported. A hidden page needs none
+     of this (the browser stops animating it). */
+  const REST_AFTER_MS = 2500;
+  let motionRestClock = 0, motionEngagedUntil = 0;
+  const restingAnims = new Set();
+  function motionAtRest() {
+    try { return !document.hidden && !document.hasFocus() && performance.now() >= motionEngagedUntil; } catch (_) { return false; }
+  }
+  function motionWake() {
+    for (const a of restingAnims) { try { if (a.playState === 'paused') a.play(); } catch (_) {} }
+    restingAnims.clear();
+  }
+  function motionSweep() {
+    if (!motionAtRest()) { if (restingAnims.size) motionWake(); return; }
+    // a held loop whose node left the page (a finished run's card) is dropped, never kept alive all day
+    for (const a of restingAnims) { const el = a.effect && a.effect.target; if (a.playState === 'idle' || !el || !el.isConnected) restingAnims.delete(a); }
+    for (const a of document.getAnimations()) {
+      if (a.playState !== 'running' || restingAnims.has(a)) continue;
+      const t = a.effect && a.effect.getTiming ? a.effect.getTiming() : null;
+      if (!t || t.iterations !== Infinity) continue;
+      try { a.pause(); restingAnims.add(a); } catch (_) {}
+    }
+  }
+  function motionEngage() { try { motionEngagedUntil = performance.now() + REST_AFTER_MS; } catch (_) {} if (restingAnims.size) motionWake(); }
+  function armMotionRest() {
+    if (motionRestClock || typeof setInterval !== 'function' || typeof document === 'undefined' || typeof document.getAnimations !== 'function') return;
+    motionEngage();
+    motionRestClock = setInterval(() => { try { motionSweep(); } catch (_) {} }, 1000);
+    if (motionRestClock && motionRestClock.unref) motionRestClock.unref();
+    try {
+      window.addEventListener('focus', motionEngage);
+      for (const ev of ['pointermove', 'pointerdown', 'wheel', 'keydown']) window.addEventListener(ev, motionEngage, { passive: true, capture: true });
+    } catch (_) {}
+  }
+  /** test/QA readout: how many decorative loops are holding still right now */
+  function motionRestState() { return { atRest: motionAtRest(), resting: restingAnims.size }; }
+
   function applySettings() {
     const s = store.settings;
     applyRoomLighting(s.roomLighting);
@@ -277,7 +391,9 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     // station remains byte-identical to the shipped look. Reads the palette IN FORCE (preset class
     // or custom inline) and writes on <body> — the bezel-var-trap side of the line; THEME_VARS
     // clears these on the next pass so theme switches always re-derive from clean class values.
-    const lift = clampN(s.panelBright, 0, 100, 0) / 100 * 0.16;
+    const knob = clampN(s.panelBright, -100, 100, 0);
+    const lift = Math.max(0, knob) / 100 * 0.16;
+    const dim = Math.max(0, -knob) / 100 * 0.85;   // below 0: the same three ground tokens mix toward black
     if (lift > 0.001) {
       const cs = getComputedStyle(document.body);
       const phRgb = (cs.getPropertyValue('--ph-rgb') || '255, 170, 51').split(',').map(Number);
@@ -293,6 +409,16 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         if (!c) continue;
         const rgb = c.rgb.map((v, i) => Math.round(v + (phRgb[i] - v) * lift));
         document.body.style.setProperty(tok, c.a == null ? rgbHex(rgb) : 'rgba(' + rgb.join(', ') + ', ' + c.a + ')');
+      }
+    } else if (dim > 0.001) {
+      const cs = getComputedStyle(document.body);
+      for (const tok of ['--panel', '--panel2', '--ph-faint']) {
+        const str = (cs.getPropertyValue(tok) || '').trim();
+        const m = /rgba?\(([^)]+)\)/.exec(str);
+        const c = m ? m[1].split(',').map(Number) : (/^#[0-9a-fA-F]{6}$/.test(str) ? hexRgb(str) : null);
+        if (!c) continue;
+        const rgb = c.slice(0, 3).map(v => Math.round(v * (1 - dim)));
+        document.body.style.setProperty(tok, c.length > 3 ? 'rgba(' + rgb.join(', ') + ', ' + c[3] + ')' : rgbHex(rgb));
       }
     }
     // WHERE THE STATION IS. One saved value spans two layers that work opposite ways: a SKY is
@@ -350,6 +476,10 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       });
     }
     document.body.classList.toggle('no-flicker', !s.flicker);
+    armFlickerClock(); armMotionRest();
+    // HINTS off: hint.js shows no glossary bubble (it reads this class); clear one already on screen
+    document.body.classList.toggle('no-hints', !s.hints);
+    if (!s.hints && typeof Hint === 'object' && Hint.hide) Hint.hide();
     if (typeof SFX === 'object') SFX.on = !!s.sound;
     syncKeepAwake(!!s.keepComputerAwake);
   }
@@ -365,8 +495,8 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   /* ---------- time ---------- */
   function clock(ts) {
     const d = new Date(ts || Date.now());
-    const p = n => (n < 10 ? '0' : '') + n;
-    return p(d.getHours()) + ':' + p(d.getMinutes());
+    const h = d.getHours(), m = d.getMinutes();   // 12-hour clock — never military time (Andrew 10-03)
+    return ((h % 12) || 12) + ':' + (m < 10 ? '0' : '') + m + ' ' + (h < 12 ? 'AM' : 'PM');
   }
   const ts = t => '<span class="ts">[' + clock(t) + ']</span>';
   const NF_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -614,6 +744,27 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   // P2: re-clamp every open (non-minimized) window back inside the viewport on a browser resize, so a panel
   // dragged to a corner can't be stranded off-screen when the window shrinks. CSS-centered consoles are skipped
   // by fitTermInViewport (they stay centered); only explicitly-moved windows are pulled back into view.
+  /* TEXT SIZE from the keyboard (2026-10-11 user report: "I wish I could change the text"): Ctrl/Cmd with = + - 0
+     steps the SAME TEXT SIZE dial as SETTINGS › LOOK & SOUND. The desktop shell has no zoom hotkeys of its own, so the
+     keys people try first did nothing. Steps are the fixed chips; from AUTO it moves from the size AUTO resolved to,
+     and Ctrl+0 returns to AUTO. The toast names the setting so the keys teach where it lives. */
+  window.addEventListener('keydown', ev => {
+    if (!(ev.ctrlKey || ev.metaKey) || ev.altKey || ev.defaultPrevented) return;
+    const dir = (ev.key === '=' || ev.key === '+') ? 1 : (ev.key === '-' || ev.key === '_') ? -1 : ev.key === '0' ? 0 : null;
+    if (dir === null) return;
+    ev.preventDefault();
+    const steps = TEXT_SCALES.map(([v]) => v).filter(v => v > 0);
+    const cur = resolveTextScale(store.settings.textScale);
+    let next = 0;
+    if (dir > 0) next = steps.find(v => v > cur) || steps[steps.length - 1];
+    else if (dir < 0) next = steps.slice().reverse().find(v => v < cur) || steps[0];
+    store.settings.textScale = next;
+    applySettings(); save();
+    try { rerender('settings'); } catch (_) {}
+    const name = next === 0 ? 'AUTO · ' + autoTextScale() + '%' : (TEXT_SCALES.find(([v]) => v === next) || [0, ''])[1] + ' · ' + next + '%';
+    const mod = ev.metaKey ? 'Cmd' : 'Ctrl';   // name the key that was pressed (Cmd on a Mac); a plain '-' is what the user types
+    notify('TEXT SIZE ' + name + '. ' + mod + ' + and ' + mod + ' - change it, ' + mod + ' 0 resets. Also in SETTINGS › LOOK & SOUND.', '', undefined, { transient: true });
+  });
   let resizeClampTimer = 0;
   window.addEventListener('resize', () => {
     // AUTO text size re-resolves here so dragging the app to a different monitor picks up that
@@ -811,7 +962,8 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     if (w.contains(active)) {
       // hand focus to the dock GROUP trigger (always visible), NOT the in-menu item (it lives in a
       // display:none popover when the dock is closed — focusing a hidden node silently drops to <body>).
-      const item = document.querySelector('.bb[data-term="' + CSS.escape(key) + '"]');
+      const fam = familyOf(key);   // a MY WORK / AUTOMATE / CONNECT window's dock door is its menu button
+      const item = document.querySelector('.bb[data-term="' + CSS.escape(key) + '"]') || (fam ? document.querySelector('.bb[data-family="' + fam + '"]') : null);
       const grpBtn = item && item.closest('.bb-group') ? item.closest('.bb-group').querySelector('.bb-grp') : null;
       const target = (grpBtn && grpBtn.offsetParent !== null) ? grpBtn : null;
       try { target ? target.focus() : (active.blur && active.blur()); } catch (_) {}
@@ -860,7 +1012,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       // a window closed while minimized (or minimized-then-restored, then torn down) must leave no orphan chip.
       const wasMin = !!minimized[key];
       if (wasMin) { delete minimized[key]; removeChip(key); }
-      if (w._onClose) { try { w._onClose(); } catch (_) {} }   // e.g. tear down the live arcade canvas
+      if (w._onClose) { try { w._onClose(w); } catch (_) {} }   // e.g. tear down the live arcade canvas (gets the closing window)
       const opener = w._opener;   // a11y: the control that opened this window, to restore focus to
       // free the slot NOW so a re-open (toggle) mounts a fresh window while this one animates out.
       delete open[key]; sfx('close');
@@ -904,6 +1056,9 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     const drafts = w && w.querySelector && w.querySelector('.term-body')?._questDrafts;
     return !!(w && w.querySelector && w.querySelector('textarea[data-dirty="1"]'))
       || !!(w && w.querySelector && w.querySelector('.quests-content input[data-dirty="1"]'))
+      // a one-line composer that holds a draft (TASKS' "What would you like to get done?"): typed text is unsaved work, so a
+      // tab click or ✕ arms the guard instead of dropping it (QA 2026-10-02 — 0.12.5 kept TASKS in its own window)
+      || !!(w && w.querySelectorAll && Array.from(w.querySelectorAll('input[data-draft]')).some(i => String(i.value || '').trim()))
       || !!(drafts && Array.from(drafts.values()).some(d => d.dirty));
   }
   function requestCloseTerm(key) {
@@ -917,6 +1072,156 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     clearTimeout(w._closeArmTimer);
     w._closeArmTimer = setTimeout(() => { if (!w) return; w._closeArmed = false; w._closeArmTimer = 0; const b = w.querySelector('.term-unsaved-bar'); if (b) b.remove(); }, 3000);
   }
+  /* ============== ONE MENU, ONE WINDOW (front doors, 2026-10-01) ==============
+     Andrew: "less different menus … easy for users to do what they want without a million different things,
+     without removing any functionality." Related windows are ONE menu: one dock button, and a tab strip under
+     the window's title that swaps between them in place (same spot, same size) — MY WORK (tasks, finished work,
+     work awaiting a rating, ready-made jobs), AUTOMATE (workflows, schedules, goal loops, away work), CONNECT
+     (abilities, channels). Every member window, alias, deep link and slash command still opens exactly as
+     before (and gets the strip), so nothing is removed and no builder changes. The tabs keep each window's own
+     name — the name the manual, the agents and every error door already use. Never a merged card grid: each
+     tab stays its own distinct surface (the August ABILITIES lesson). */
+  const FAMILIES = {
+    mywork: { label: 'MY WORK', first: 'deliverables', tabs: [
+      { id: 'tasks', k: 'tasks', label: 'TASKS', tip: 'Planned work you track — chats and routines live in COMMS' },
+      { id: 'deliverables', k: 'deliverables', label: 'DELIVERABLES', tip: 'Everything your crew finished, with its files' },
+      { id: 'recipes', k: 'marketplace', label: 'RECIPES', tip: 'Ready-made jobs to start',
+        is: () => typeof Marketplace !== 'undefined' && Marketplace.currentTab && Marketplace.currentTab() === 'recipes',
+        open: () => { if (typeof App !== 'undefined' && App.openRecipes) App.openRecipes(); } }
+    ] },
+    automate: { label: 'AUTOMATE', tabs: [
+      { id: 'workflows', k: 'workflows', label: 'WORKFLOWS', tip: 'Send a job down a line of agents' },
+      { id: 'schedules', k: 'automation', section: 'routines', match: ['routines', 'routines-create'], label: 'SCHEDULES', tip: 'Run any job on a schedule' },
+      { id: 'loops', k: 'automation', section: 'loops', match: ['loops', 'loops-start'], label: 'GOAL LOOPS', tip: 'Repeat a job until it is done' },
+      { id: 'away', k: 'automation', section: 'away', match: ['away'], label: 'AWAY WORK', tip: 'What agents work on between your messages' }
+    ] },
+    connect: { label: 'CONNECT', tabs: [
+      { id: 'abilities', k: 'connectors', label: 'ABILITIES', tip: 'Tools, apps, connectors and skills your agents can use' },
+      { id: 'channels', k: 'messaging', label: 'CHANNELS', tip: 'Talk to your agents from Telegram, Slack, Discord' }
+    ] }
+  };
+  // which menu a window belongs to (marketplace counts only while it is the RECIPES library, not the recruit bay)
+  function familyOf(key) {
+    for (const id of Object.keys(FAMILIES)) {
+      if (FAMILIES[id].tabs.some(t => t.k === key && (!t.is || t.is()))) return id;
+    }
+    return null;
+  }
+  function familyActiveTab(famId, key) {
+    const tabs = FAMILIES[famId].tabs.filter(t => t.k === key);
+    if (tabs.length < 2) return tabs[0] || null;
+    const sec = consoleSection[key];
+    return tabs.find(t => (t.match || []).includes(sec)) || tabs[0];
+  }
+  function rememberFamilyTab(famId, tabId) {
+    if (!store.famLast || typeof store.famLast !== 'object') store.famLast = {};
+    if (store.famLast[famId] === tabId) return;
+    store.famLast[famId] = tabId; save();
+  }
+  function syncFamilyTabs(w, key) {
+    // only the LIVE window speaks for its menu — a window closing behind a tab switch must not re-save its own tab
+    if (!w || open[key] !== w || w.classList.contains('term-closing')) return;
+    const nav = w.querySelector('.fam-tabs'); if (!nav) return;
+    const famId = nav.dataset.family, act = familyActiveTab(famId, key);
+    nav.querySelectorAll('[data-fam-tab]').forEach(b => {
+      const on = !!act && b.dataset.famTab === act.id;
+      b.classList.toggle('on', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); b.tabIndex = on ? 0 : -1;
+    });
+    if (act) rememberFamilyTab(famId, act.id);
+  }
+  function mountFamilyTabs(w, key) {
+    const famId = familyOf(key); if (!famId || !w) return;
+    const fam = FAMILIES[famId];
+    const nav = mkEl('nav', 'fam-tabs'); nav.dataset.family = famId;
+    nav.setAttribute('role', 'tablist'); nav.setAttribute('aria-label', fam.label);
+    // the window is named for its MENU (MY WORK / AUTOMATE / CONNECT) — the lit tab says which part is showing,
+    // so the title never changes under the Commander as they move between tabs
+    const titleEl = w.querySelector('.term-title'); if (titleEl) titleEl.textContent = fam.label;
+    const plate = w.querySelector('.term-foot-k'); if (plate) plate.textContent = fam.label;
+    const x = w.querySelector('.term-x'); if (x) x.setAttribute('aria-label', 'Close ' + fam.label);
+    nav.innerHTML = fam.tabs.map(t =>
+      '<button type="button" role="tab" class="fam-tab" data-fam-tab="' + esc(t.id) + '" data-tip="' + esc(t.tip) + '">' + esc(t.label) + '</button>').join('');
+    const head = w.querySelector('.term-head'); if (!head) return;
+    head.after(nav);
+    nav.querySelectorAll('[data-fam-tab]').forEach(b => b.addEventListener('click', () => {
+      const tab = fam.tabs.find(t => t.id === b.dataset.famTab); if (tab) { sfx('click'); switchFamilyTab(key, famId, tab); }
+    }));
+    nav.addEventListener('keydown', ev => {
+      const bs = Array.from(nav.querySelectorAll('[data-fam-tab]')), i = bs.indexOf(document.activeElement);
+      const n = ev.key === 'ArrowRight' ? (i + 1) % bs.length : ev.key === 'ArrowLeft' ? (i + bs.length - 1) % bs.length : -1;
+      if (i < 0 || n < 0) return;
+      ev.preventDefault(); bs[n].focus();
+    });
+    // a section change inside the window (AUTOMATION's own rail) moves the lit tab with it
+    w.addEventListener('click', () => setTimeout(() => syncFamilyTabs(w, key), 0));
+    syncFamilyTabs(w, key);
+  }
+  // open one tab of a menu (its own window, at its own section)
+  function openFamilyTab(famId, tab) {
+    rememberFamilyTab(famId, tab.id);
+    if (tab.open) { tab.open(); return; }
+    if (open[tab.k] && tab.section) { consoleSection[tab.k] = tab.section; rerender(tab.k); syncFamilyTabs(open[tab.k], tab.k); if (minimized[tab.k]) restoreTerm(tab.k); return; }
+    openTerm(tab.k, tab.section);
+    if (open[tab.k]) syncFamilyTabs(open[tab.k], tab.k);
+  }
+  // a tab click: the next window takes the current one's place (spot, size, docked height), the current one closes
+  function switchFamilyTab(fromKey, famId, tab) {
+    const w = open[fromKey];
+    /* UNSAVED WORK SURVIVES A TAB CLICK (sweep 2026-10-02). The first click on another tab with an unsaved draft arms the
+       guard and switches nothing; a second click within 3s discards and switches (it used to CLOSE the whole menu).
+       The lit tab again is a no-op (RECIPES used to close + reopen and drop the recipe in progress), and a tab in the
+       SAME window (AUTOMATE's SCHEDULES / GOAL LOOPS / AWAY WORK) meets the same guard (a half-typed schedule vanished). */
+    const lit = familyActiveTab(famId, fromKey);
+    if (tab.k === fromKey && lit && lit.id === tab.id) return;
+    if (w && windowDirty(w) && !w._closeArmed) { requestCloseTerm(fromKey); return; }   // arms only: a dirty window never closes on a first click
+    if (tab.k === fromKey) { openFamilyTab(famId, tab); return; }
+    swapInPlace(fromKey, () => openFamilyTab(famId, tab), tab.k);
+  }
+  // the next window takes the current one's spot, size and docked height; the current one closes. toKey is optional
+  // (the opener names it); without it the geometry is carried by key after the open. While the flag is up, the closing
+  // sheet and the opening one skip their travel animations (glass-demo moveSheet + the .term power keyframes), so a
+  // tab reads as a tab, not a close-and-rise.
+  function swapInPlace(fromKey, openNext, toKey) {
+    const carry = k => {
+      if (!k || k === fromKey) return;
+      if (termPos[fromKey]) termPos[k] = Object.assign({}, termPos[fromKey]); else delete termPos[k];
+      if (termSize[fromKey]) termSize[k] = Object.assign({}, termSize[fromKey]);
+      if (store.termDock && store.termDock[fromKey]) store.termDock[k] = Object.assign({}, store.termDock[fromKey]);
+    };
+    carry(toKey);
+    save();
+    document.body.setAttribute('data-fam-switch', '');
+    clearTimeout(swapInPlace._t);
+    swapInPlace._t = setTimeout(() => document.body.removeAttribute('data-fam-switch'), 400);
+    const fam = familyOf(fromKey);
+    const before = new Set(Object.keys(open));
+    if (open[fromKey]) closeTerm(fromKey);
+    openNext();
+    // the opener did not name its window: find the menu window that just appeared and seat it where the old one was
+    if (!toKey) {
+      const k = Object.keys(open).find(x => !before.has(x) && familyOf(x) === fam);
+      // the sheet was already seated from ITS OWN dock state when it mounted: re-seat it from the carried one
+      if (k && open[k] && termPos[fromKey]) { carry(k); placeTerm(open[k], k); if (typeof open[k]._reseatDock === 'function') open[k]._reseatDock(); }
+    }
+  }
+  // the dock button of a menu: open its last-used tab — or, like every dock button, raise / close what is showing.
+  // A menu's FIRST open lands on its `first` tab when it names one (MY WORK opens on DELIVERABLES: the TASKS board
+  // stays empty after plain COMMS work, org pass 10-14 #45/#46); the tab ORDER, aliases and deep links never change.
+  function toggleFamily(famId) {
+    const fam = FAMILIES[famId]; if (!fam) return;
+    const showing = Object.keys(open).filter(k => open[k] && !minimized[k] && familyOf(k) === famId);
+    if (showing.length) {
+      const k = showing[0], z = e => (parseInt(e.style.zIndex, 10) || 0);
+      const maxZ = Object.keys(open).filter(x => !minimized[x]).reduce((m, x) => Math.max(m, z(open[x])), 0);
+      if (z(open[k]) < maxZ) { open[k].style.zIndex = U.zTop(); sfx('open'); return; }
+      requestCloseTerm(k); return;
+    }
+    const min = Object.keys(open).find(k => open[k] && minimized[k] && familyOf(k) === famId);
+    if (min) { restoreTerm(min); return; }
+    const last = store.famLast && store.famLast[famId];
+    openFamilyTab(famId, fam.tabs.find(t => t.id === last) || (fam.first && fam.tabs.find(t => t.id === fam.first)) || fam.tabs[0]);
+  }
+
   function toggleTerm(key, title, builder, opts) {
     // a minimized window's dock button RESTORES it; a BURIED visible window is RAISED (not closed); only the
     // topmost visible window toggles closed (through the unsaved-draft guard). This kills the "clicked the dock to
@@ -936,9 +1241,12 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       requestCloseTerm(key);
       return;
     }
-    // Mode-exclusivity: a dock panel and full-screen REFIT must never be mounted at once.
+    // Mode-exclusivity: a dock panel and full-screen BUILD MODE must never be mounted at once.
     // Opening a panel exits refit first so two features can't stack (see COHERENCE_MATRIX dim T).
     if (typeof Build !== 'undefined' && Build.isOpen && Build.isOpen()) { try { Build.close(); } catch (_) {} }
+    // DOOR LAW (systems.js): whatever opened this window — the dock, a deep link, a quest, the agent — its station
+    // system is online from now on, so the dock never hides a window the Commander has been sent to.
+    if (typeof Systems !== 'undefined' && Systems.openedTerm) { try { Systems.openedTerm(key); } catch (_) {} }
     sfx('open');
     // re-measure the band before the window exists: the desktop titlebar mounts after this module
     // loads, and the rails re-flow on every breakpoint — a stale band would place the first window
@@ -1025,6 +1333,15 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     $('#terms').appendChild(w);
     open[key] = w;
     placeTerm(w, key);   // land in a cascaded slot (or its remembered spot) — never dead-center pile-up
+    mountFamilyTabs(w, key);   // ONE MENU: a window that belongs to MY WORK / AUTOMATE / CONNECT carries that menu's tabs
+    // SEAT BEFORE BUILD (10-26 window-open lag): the dock seats a sheet from its own MutationObserver, which runs after this
+    // function returns — after the builder filled the window and w.focus() had laid all of it out at the CSS default width,
+    // so the dock's width then laid it all out a second time. Seated now, while the window is still an empty frame, its
+    // first full layout is at the docked width. (The rAF fit after the first paint re-seats a sheet that sizes to its content.)
+    { const host = $('#terms'); if (host && typeof host._seatSheet === 'function') { try { host._seatSheet(w); } catch (_) {} } }
+    // UI FIRST (world.js): the floor stands aside while this window builds, lays out and rises, so its first paint is not
+    // queued behind a station draw (median click → window on screen 168 → 102 ms on a 26-agent station)
+    if (typeof World !== 'undefined' && typeof World.yieldToUi === 'function') { try { World.yieldToUi(); } catch (_) {} }
     w.addEventListener('mousedown', ev => {
       w.style.zIndex = U.zTop();
       // pull focus into the dialog on a background click so the window-level Esc/Tab handlers keep working —
@@ -1146,7 +1463,22 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         } catch (_) { /* a rebuilt control that refuses restore is no worse than the old wipe */ }
       }
     };
+    /* REENTRANCY: a builder that resyncs stores can make one of them poke rerender(key) for THIS window while
+       it is still building. rerender is synchronous, so that poke used to recurse into the builder until the stack
+       overflowed — and the swallowed RangeError then let every one of those ~1,600 frames finish a full paint
+       (QUEST LOG, 2026-10-07: "the whole program started lagging … 10-20 seconds to even click"). A poke landing
+       mid-build is now owed ONE follow-up paint after this build finishes; pokes during that follow-up are
+       already reflected in it or ride the next tick, so no store can ever loop the window. */
+    let building = false, owed = false;
     w._render = (swap) => {
+      if (building) { owed = true; return; }
+      building = true;
+      try {
+        paint(swap);
+        if (owed) { owed = false; paint(false); }
+      } finally { building = false; owed = false; }
+    };
+    const paint = (swap) => {
       const keep = swap === false ? captureForms() : null;   // background poke: preserve what the Commander typed
       builder(body);
       if (keep && keep.length) restoreForms(keep);
@@ -1179,6 +1511,8 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   function rerender(key, swap) { if (open[key]) open[key]._render(swap !== false); }
   function syncBB() {
     document.querySelectorAll('.bb[data-term]').forEach(b => b.classList.toggle('active', !!open[b.dataset.term]));
+    // a menu's dock button is lit while any of its windows is open
+    document.querySelectorAll('.bb[data-family]').forEach(b => b.classList.toggle('active', Object.keys(open).some(k => open[k] && familyOf(k) === b.dataset.family)));
   }
 
   /* ============== CONSOLE MODE — the large two-pane window framework ==============
@@ -1206,6 +1540,10 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     body.innerHTML = '';
     // pick the section to land on: remembered > first. A stale remembered id (section removed) falls back.
     let activeId = consoleSection[key];
+    if (key === 'settings' && activeId === 'nightshift') activeId = 'autonomy';   // folded into AUTONOMY (ONE WORD: AUTONOMY)
+    if (key === 'settings' && (activeId === 'models' || activeId === 'livevoice')) activeId = activeId === 'models' ? 'providers' : 'appearance';   // the same aliases openTerm applies (a remembered LIVE VOICE reopened on AI & MODELS)
+    const retired = SECTION_ALIAS[key] && SECTION_ALIAS[key][activeId];   // a remembered section that became a block (ONE FLAT LIST)
+    if (retired) activeId = retired[0];
     if (!sections.some(s => s.id === activeId)) activeId = sections[0] && sections[0].id;
 
     // ---- left: optional rail-top slot (e.g. the dossier roster) + optional search + the section rail (role=tablist) ----
@@ -1283,7 +1621,9 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       item.dataset.section = sec.id;
       item.setAttribute('role', 'tab');
       item.id = 'con-tab-' + key + '-' + sec.id;
-      item.innerHTML = '<span class="con-rail-glyph" aria-hidden="true">' + (sec.glyph || '▪') + '</span>' +
+      // one drawn icon set (railicons.js) — the old symbol glyph stays only when no icon matches the section
+      const railIcon = (typeof RailIcons !== 'undefined' && RailIcons.forSection) ? RailIcons.forSection(sec.label, sec.id) : null;
+      item.innerHTML = '<span class="con-rail-glyph' + (railIcon ? ' has-ico' : '') + '" aria-hidden="true">' + (railIcon || sec.glyph || '▪') + '</span>' +
         '<span class="con-rail-label">' + esc(sec.label) + '</span>';
       item.addEventListener('click', () => selectSection(sec.id, true));
       (tabsTop ? topTabs : rail).appendChild(item);
@@ -1385,15 +1725,20 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
 
     // ---- search: filter rows across every section, dim empty sections, group matches ----
     if (searchInput) {
+      let lastQuery = '';
       const doFilter = () => {
         const q = (searchInput.value || '').trim().toLowerCase();
         body.classList.toggle('con-searching', !!q);
+        // new results start at the top: the pane kept the scroll of whatever was read before, so the first hit sat
+        // cut off above the fold ("gmail" in CONNECT, UX night 10-25)
+        if (q !== lastQuery) { lastQuery = q; if (q) host.scrollTop = 0; }
         if (!q) {
           if (searchEmpty) searchEmpty.hidden = true;
           // restore: show the active section only, clear all row dimming + section flags
           Object.keys(panes).forEach(k => {
             panes[k].classList.remove('con-sec-nomatch', 'con-sec-searchshow');
             panes[k].querySelectorAll('.con-hit, .con-miss').forEach(r => r.classList.remove('con-hit', 'con-miss'));
+            panes[k].querySelectorAll('details[data-search-opened]').forEach(d => { d.open = false; delete d.dataset.searchOpened; });   // only the folds search opened
             railItems[k].classList.remove('con-rail-dim', 'con-rail-hit');
           });
           selectSection(activeId, false);
@@ -1412,10 +1757,13 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
           // 48 connectable platforms were rendered on screen and indexed by zero of them ("google" → 0 hits
           // while a Google Workspace card was visible). A search box a user types a platform name into must
           // index the platforms. Locked by test/connectors-ui.test.js.
+          // A hint INSIDE a card is part of that card's row, not a row of its own: matched separately it was marked a
+          // miss and hidden (display:none !important) while its card matched — a pulled skill showed REMOVE with no reason.
           const rows = pane.querySelectorAll('.con-sec-body .set-row, .con-sec-body label.set-row, .con-sec-body .prov-card, .con-sec-body .key-row, .con-sec-body .set-about, .con-sec-body .ms-h, .con-sec-body .perk, .con-sec-body .sk-card, .con-sec-body .mc-hint, .con-sec-body .mc-row, .con-sec-body .ts-row, .con-sec-body .cc-card');
+          const ownRows = Array.from(rows).filter(r => !(r.parentElement && r.parentElement.closest('.cc-card, .sk-card')));
           let hits = 0;
           const headingMatch = sec.label.toLowerCase().includes(q);
-          rows.forEach(r => {
+          ownRows.forEach(r => {
             // `data-search` carries ALIASES that are deliberately not on screen (a Google Workspace card says
             // "Gmail, Calendar, Drive…" in its blurb but never "gdrive"/"g suite"). Searching a name the user
             // actually types must not depend on that name happening to appear in marketing copy.
@@ -1425,6 +1773,8 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
             r.classList.toggle('con-miss', !hit);
             if (hit) hits++;
           });
+          // SEARCH OPENS WHAT IT FINDS: a hit sealed inside a closed fold would be a dead end the search made
+          pane.querySelectorAll('details').forEach(d => { if (!d.open && d.querySelector('.con-hit')) { d.open = true; d.dataset.searchOpened = '1'; } });
           // also let a section match by its own label/desc even if no granular row matched
           const secMatch = hits > 0 || sec.label.toLowerCase().indexOf(q) >= 0 || (sec.desc || '').toLowerCase().indexOf(q) >= 0;
           if (secMatch) matches.push(sec.id);
@@ -1480,27 +1830,31 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   function crewPortrait(a) {
     return '<span class="crew-portrait" aria-hidden="true"><img alt="" draggable="false" hidden></span>';
   }
+  // the empty-crew mark: the dock's own AGENTS line icon (glass-demo.js menuPaths.agents), drawn as SVG — the '▯' glyph
+  // came from a fallback font and read as a missing-font box above NO AGENTS ON STATION
+  const NO_AGENTS_MARK = '<span class="es-glyph" aria-hidden="true"><svg viewBox="0 0 16 16" focusable="false"><path d="M5 2h6v5H5zM3 14v-4h10v4"/></svg></span>';
   function crewRender() {
     wireCrewLive();   // ensure the per-agent run-state listener is live
     const ul = $('#crew'); if (!ul) return;
     if (!present.length && !externalCrew.length) {
-      ul.innerHTML = '<li class="crew-empty"><div class="empty-state"><span class="es-glyph">▯</span><b>NO AGENTS ON STATION</b><span>Commission one from RECRUITMENT to begin.</span></div></li>';
+      ul.innerHTML = '<li class="crew-empty"><div class="empty-state">' + NO_AGENTS_MARK + '<b>NO AGENTS ON STATION</b><span>RECRUIT one from the CREW dock.</span></div></li>';
       $('#crew-sum').innerHTML = '';
       return;
     }
     ul.innerHTML = present.map((a, i) =>
-      '<li class="crew-row" role="button" tabindex="0" aria-label="Open dossier for ' + esc(a.name || a.id) + '" data-i="' + i + '" data-agent-id="' + esc(a.id) + '" style="--ci:' + i + '">' +
+      '<li class="crew-row" role="button" tabindex="0" aria-label="' + (present.length > 1 ? 'Show sessions with ' + esc(a.name || a.id) + '; Shift+F10 for the dossier" aria-keyshortcuts="Shift+F10' : 'Open dossier for ' + esc(a.name || a.id)) + '" data-i="' + i + '" data-agent-id="' + esc(a.id) + '" style="--ci:' + i + '">' +
       crewPortrait(a) +
       '<span class="dot on"></span>' +
       '<div class="crew-main">' +
-      '<div class="crew-name" style="color:' + esc(a.color) + '">' + esc(a.name) +
+      '<div class="crew-name" style="color:' + esc(a.color) + '"><span class="crew-nm">' + esc(a.name) + '</span>' +
       (duplicateAgentName(a) ? '<span class="crew-id">[' + esc(duplicateAgentName(a)) + ']</span>' : '') +
       '<span class="crew-room">' + (a.stats && a.stats.level ? 'Lv ' + a.stats.level : '') + '</span></div>' +
       '<div class="crew-status" id="cs-' + esc(a.id) + '">…</div>' +
       // in-flight work bar: hidden until the row is .working (crewTick toggles it from the real run state).
       // The shimmer (.bar-active) reads as live activity; it's an indeterminate sweep, not a % readout.
       '<div class="crew-prog bar-active" id="cp-' + esc(a.id) + '" aria-hidden="true"><div></div></div>' +
-      '</div></li>').join('') + externalCrewHtml();
+      '</div>' +
+      '</li>').join('') + externalCrewHtml();
     // (the head's roster count moved out — #crew-sum below the list already totals the same crew)
     ul.querySelectorAll('.crew-row.crew-ext').forEach(li => {
       li.addEventListener('click', () => { sfx('click'); try { if (typeof ClaudeCrew !== 'undefined') ClaudeCrew.open(li.dataset.extId); } catch (_) {} });
@@ -1508,9 +1862,22 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     });
     ul.querySelectorAll('.crew-row:not(.crew-ext)').forEach(li => {
       if (typeof AgentPortraits !== 'undefined') AgentPortraits.paint(li.querySelector('.crew-portrait img'), present[+li.dataset.i]);
-      li.addEventListener('click', () => { sfx('click'); openAgent(+li.dataset.i); });
+      // PER-AGENT THREADS: a row click narrows the SESSIONS rail to this agent's sessions (again = all of them).
+      // A one-agent station has nothing to narrow — every session is already that agent's — so there the
+      // row keeps opening the dossier, as it always has.
+      li.addEventListener('click', () => {
+        sfx('click');
+        // "needs your OK" (the gold card): one click lands where it is waiting — the approval or the question
+        const waiting = li.classList.contains('asking') && typeof App !== 'undefined' && App.waitingSessionOf ? App.waitingSessionOf(li.dataset.agentId) : null;
+        if (waiting && App.openWorkstream) { App.openWorkstream(waiting); return; }
+        if (present.length > 1 && typeof App !== 'undefined' && App.filterRailByAgent) App.filterRailByAgent(li.dataset.agentId);
+        else openAgent(+li.dataset.i);
+      });
+      li.addEventListener('contextmenu', ev => { ev.preventDefault(); sfx('click'); openAgent(+li.dataset.i); });
       li.addEventListener('keydown', ev => {
         if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); li.click(); }
+        // the row advertises Shift+F10 (aria-keyshortcuts); WKWebView (macOS) fires no contextmenu for it, so handle the key
+        else if (ev.key === 'ContextMenu' || (ev.shiftKey && ev.key === 'F10')) { ev.preventDefault(); sfx('click'); openAgent(+li.dataset.i); }
       });
     });
     crewTick();
@@ -1528,16 +1895,22 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     const act = activity();
     let focusedId = '';
     try { focusedId = (typeof App !== 'undefined' && App.currentAgent && App.currentAgent() || {}).id || ''; } catch (_) {}
+    // the agent whose sessions the rail is narrowed to (App owns it; '' = every session)
+    let railFilter = '';
+    try { railFilter = (typeof App !== 'undefined' && App.railAgentFilter && App.railAgentFilter()) || ''; } catch (_) {}
     let working = 0, visible = 0;
     present.forEach(a => {
       const live = agentLive(a.id);
       if (live) working++;
       const e = $('#cs-' + a.id);
       if (e) {
-        const status = live ? (a.id === focusedId && act === 'talk' ? 'IN CONVERSATION' : 'WORKING') : 'IDLE';
+        const status = live ? (a.id === focusedId && act === 'talk' ? 'IN CONVERSATION' : lineTestOnly(a.id) ? 'ON A WORKFLOW' : 'WORKING') : 'IDLE';
         if (e.textContent !== status) e.textContent = status;
+        const tip = status === 'ON A WORKFLOW' ? LINE_TEST_TIP : '';
+        if ((e.getAttribute('data-tip') || '') !== tip) { if (tip) e.setAttribute('data-tip', tip); else e.removeAttribute('data-tip'); }
         const row = e.closest('.crew-row');
         row.classList.toggle('selected', a.id === focusedId);
+        row.classList.toggle('filtering', !!railFilter && a.id === railFilter);
         const hide = !!crewQuery && !String(a.name || a.id).toLowerCase().includes(crewQuery) && !String(a.id).toLowerCase().includes(crewQuery);
         if (row.hidden !== hide) row.hidden = hide;
         if (!row.hidden) visible++;
@@ -1558,9 +1931,10 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     const sum = $('#crew-sum');
     const empty = $('#crew-search-empty');
     if (empty) empty.hidden = !crewQuery || visible > 0;
+    // crewcards.js seats this beside the CREW title ("2 WORKING · 1 IDLE"); the ▮ ▯ marks were fallback-font glyphs
     if (sum) sum.innerHTML =
-      '<span class="pos">▮ ' + working + ' WORKING</span>' +
-      '<span class="dim">▯ ' + (present.length - working) + ' IDLE</span>' +
+      '<span class="pos">' + working + ' WORKING</span>' +
+      '<span class="dim">' + (present.length - working) + ' IDLE</span>' +
       (ext.length ? '<span class="dim">◆ ' + ext.length + ' CLAUDE' + (extBusy ? ' · ' + extBusy + ' BUSY' : '') + (extNeeds ? ' · ' + extNeeds + ' NEED YOU' : '') + '</span>' : '');
     // #8: keep the canvas's screen-reader live region in sync (the <canvas> itself is opaque to AT).
     // Update only when the text actually changes so the region doesn't spam announcements every tick.
@@ -1574,7 +1948,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   // one finishing doesn't prematurely flip the pill to IDLE while the other is still live. Deleted at 0 so
   // crewTick's agentLive(id) stays a clean "is this agent working?" test.
   function incRun(id) { runningAgents.set(id, (runningAgents.get(id) || 0) + 1); runSeenAt.set(id, performance.now()); }
-  function decRun(id) { const n = (runningAgents.get(id) || 0) - 1; if (n > 0) runningAgents.set(id, n); else { runningAgents.delete(id); runSeenAt.delete(id); } }
+  function decRun(id) { const n = (runningAgents.get(id) || 0) - 1; if (n > 0) runningAgents.set(id, n); else { runningAgents.delete(id); runSeenAt.delete(id); dropTestRuns(id); } }
   // THE one "is this agent working?" predicate (crew list, warroom dots, dossier roster). The local count is
   // event-fed only, so a LOST agent.run.end (dropped SSE frame, stream that closed without the end event,
   // sidecar restart) would assert "working at the terminal" forever while the world correctly stands the
@@ -1588,7 +1962,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     try { if (typeof World !== 'undefined' && World.agentRunsLive) worldN = World.agentRunsLive(id); } catch (_) { worldN = -1; }
     if (!runningAgents.has(id)) return worldN > 0;
     if (worldN === 0 && performance.now() - (runSeenAt.get(id) || 0) > 8000) {
-      runningAgents.delete(id); runSeenAt.delete(id);   // self-heal: the world PROVES no live run — drop the stale count
+      runningAgents.delete(id); runSeenAt.delete(id); dropTestRuns(id);   // self-heal: the world PROVES no live run — drop the stale count
       return false;
     }
     return true;
@@ -1597,8 +1971,8 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   function wireCrewLive() {
     if (crewLiveWired || typeof U === 'undefined' || !U.bus) return;
     crewLiveWired = true;
-    U.bus.on('agent.run.start', p => { if (p && p.agentId) { incRun(p.agentId); crewTick(); } });
-    U.bus.on('agent.run.end', p => { if (p && p.agentId) { decRun(p.agentId); crewTick(); } });
+    U.bus.on('agent.run.start', p => { if (p && p.agentId) { if (p.runId && isLineTestStream(p.streamId)) testRunIds.set(p.runId, p.agentId); incRun(p.agentId); crewTick(); } });
+    U.bus.on('agent.run.end', p => { if (p && p.agentId) { if (p.runId) testRunIds.delete(p.runId); decRun(p.agentId); crewTick(); } });
   }
   // Called from chat.js's run-teardown ONLY on the abort/throw path, where agent.run.end is LOST (E-STOP /
   // cancel / disconnect / network drop) and would otherwise leave the count stuck >0. Normal completions
@@ -1619,6 +1993,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   // 'brief' fallback; it's the single source of truth for the memory-live guard + the BRIEF-only tick.
   function agSection() { return consoleSection['agents'] || 'brief'; }
   const agEdit = {};        // config fileKey -> true while its editor is open
+  const agEditBase = {};    // config fileKey -> { id, text } the doc held when its editor opened (SAVE's stale-text check)
   let memLiveWired = false, memRefreshTimer = 0;   // M-mem.6: the once-wired, debounced Memory Core live-refresh
   let skillsLiveWired = false, skillsRefreshTimer = 0;   // A3: the once-wired, debounced AGENT SKILLS live-refresh
 
@@ -1627,13 +2002,15 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       desc: 'The system prompt sent to the model on every run — the heart of who your agent is.',
       ph: 'You are …' },
     { key: 'purpose', file: 'purpose.md', badge: 'YOU WRITE THIS',
-      desc: 'What your agent is for. Folded into the prompt so it colours everything it does.',
+      // P23 REACH: the purpose and house rules are THIS agent's only; rules for every agent are YOU › PREFERENCES'
+      // standing orders (DossierStore.composeBlock rides every agent's prompt + cron's withDossier). Name the reach.
+      desc: n => 'What ' + n + ' is for. It rides only ' + n + '’s prompt, so it colours everything ' + n + ' does. In a workflow, a step’s DOES adds to it for that step only.',
       ph: 'e.g. Track AI-policy news and brief me each morning.' },
     { key: 'context', file: 'context.md', badge: 'YOU WRITE THIS',
       desc: 'About you and your world — your project, domain, and what "good" looks like. Grounds every run.',
       ph: 'e.g. I build TypeScript web apps solo; "good" = tested, minimal diffs, no hand-waving.' },
     { key: 'manual', file: 'operating-manual.md', badge: 'YOU WRITE THIS',
-      desc: 'House rules appended to every run — tone, format, the do-nots. Always obeyed.',
+      desc: n => 'House rules only ' + n + ' follows: tone, format, the do-nots. Rules for every agent live in YOU › PREFERENCES.',
       ph: '- Cite your sources.\n- Keep it terse.\n- Never message anyone without asking first.' }
   ];
 
@@ -1676,10 +2053,10 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       // NAME — read-only with a ✎ rename affordance, or an inline editor while agEdit['__name'] is set (wired in wireHead).
       (agEdit['__name']
         ? '<div class="ag-name-edit">' +
-            '<input id="ag-rename-in" class="ag-name-input" type="text" maxlength="18" spellcheck="false" autocomplete="off" value="' + esc(a.name) + '" aria-label="Rename agent" style="color:' + a.color + '">' +
+            '<input id="ag-rename-in" class="ag-name-input" type="text" maxlength="18" spellcheck="false" autocomplete="off" value="' + esc(a.name) + '" aria-label="Rename agent" style="color:' + esc(a.color) + '">' +
             '<button class="ag-name-ok" id="ag-rename-save" title="save name" aria-label="Save name">✓</button>' +
             '<button class="ag-name-x" id="ag-rename-cancel" title="cancel" aria-label="Cancel rename">✕</button></div>'
-        : '<div class="ag-name" style="color:' + a.color + '">' + esc(a.name) +
+        : '<div class="ag-name" style="color:' + esc(a.color) + '">' + esc(a.name) +
             (duplicateAgentName(a) ? '<span class="ag-name-id">[' + esc(duplicateAgentName(a)) + ']</span>' : '') +
             '<button class="ag-rename" id="ag-rename-btn" title="rename this agent" aria-label="Rename agent">✎</button>' +
             (lv ? '<span class="ag-lv">Lv ' + lv + '</span>' : '') + '</div>') +
@@ -1727,16 +2104,23 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     // stating this plainly. (test/permissions-ui.test.js greps the SOURCE for the index form — so this comment
     // must not spell it out either; a locked grep is a contract on the text, not just on the behaviour.)
     const prof = executionProfileOf(executionProfileId(a));
+    // ORG P21: VOICE and SKILLS are per-agent settings that live OUTSIDE the dossier (SETTINGS › LOOK & SOUND's VOICE FOR,
+    // ABILITIES › AGENT SKILLS) — the strip is the index, so it names them too. Each row's tip says where its click lands.
+    let voice = '';
+    // the picker's word for the stored choice (HEART, never the engine id af_heart) — Voice.voiceLabel
+    try { voice = (typeof Voice !== 'undefined' && Voice.voiceChoice && a && a.id) ? Voice.voiceChoice(a.id) : ''; if (voice && Voice.voiceLabel) voice = Voice.voiceLabel(voice); } catch (_) { voice = ''; }
     const rows = [
-      { lbl: 'MODEL',     val: pin || 'station default', dim: !pin,                 go: 'ag-model-card' },
-      { lbl: 'PERSONALITY',     val: persona || '—',           dim: !persona,             go: 'ag-persona-card' },
-      { lbl: 'ACCESS',    val: 'checking effective access…', dim: false, go: 'ag-approval-card' },
-      { lbl: 'PROFILE',   val: prof.label.toLowerCase(),  dim: false,               go: 'ag-execution-card' },
-      { lbl: 'AWAY WORK', val: (a && a.workshop) ? 'on'  : 'off', dim: !(a && a.workshop), go: 'ag-workshop-card' }
+      { lbl: 'MODEL',     val: pin || 'station default', dim: !pin,                 go: 'ag-model-card',     tip: 'change it in CONFIG › MODEL' },
+      { lbl: 'PERSONALITY',     val: persona || '—',           dim: !persona,             go: 'ag-persona-card',   tip: 'change it in CONFIG › PERSONALITY' },
+      { lbl: 'ACCESS',    val: 'checking effective access…', dim: false, go: 'ag-approval-card',  tip: 'change it in CONFIG › ACCESS' },
+      { lbl: 'PROFILE',   val: prof.label.toLowerCase(),  dim: false,               go: 'ag-execution-card', tip: 'change it in CONFIG › ACCESS' },
+      { lbl: 'VOICE',     val: voice || 'station default', dim: !voice,             go: 'ag-voice',          tip: 'opens SETTINGS › LOOK & SOUND › VOICE FOR this agent' },
+      { lbl: 'SKILLS',    val: 'its own procedures',       dim: true,               go: 'ag-skills',         tip: 'opens ABILITIES › SKILLS › LEARNED SKILLS for this agent' },
+      { lbl: 'AWAY WORK', val: (a && a.workshop) ? 'on'  : 'off', dim: !(a && a.workshop), go: 'ag-workshop-card',  tip: 'opens AUTOMATE › AWAY WORK' }
     ];
     return '<div class="ag-setup" role="group" aria-label="How this agent is set up">' +
       rows.map(r =>
-        '<button type="button" class="ag-setup-row" data-goconfig="' + r.go + '" title="change this in CONFIG">' +
+        '<button type="button" class="ag-setup-row" data-goconfig="' + r.go + '" data-tip="' + esc(r.tip) + '" data-tip-below>' +
           '<span class="ag-setup-lbl">' + r.lbl + '</span>' +
           '<span class="ag-setup-val' + (r.dim ? ' dim' : '') + '">' + esc(r.val) + '</span>' +
           '<span class="ag-setup-go" aria-hidden="true">›</span></button>').join('') +
@@ -1755,24 +2139,15 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       '<div class="sec ag-brief-sec"><span class="sec-l">SET UP AS</span><span class="sec-r"></span><span class="sec-nd"></span></div>' +
       agSetupStrip(a) +
       '<div class="sec ag-brief-sec"><span class="sec-l">CAN DO</span><span class="sec-r"></span><span class="sec-nd"></span></div>' +
-      agSkills(a && a.id) +
+      agSkillsBrief(a && a.id) +
       '<div class="ag-foot-row">on station since <b>' + since + '</b></div>';
   }
 
-  // COMMANDER CONTROLS (dossier BRIEF): change this agent's SKIN and DELETE it. Both use the SAME genesis skin
-  // catalog (DATA.SKINS — single source of truth) and reuse the .skin-thumb visual vocabulary from the create
-  // screen. DELETE is a two-click armed confirm (ArmConfirm) and is disabled — with a stated reason, not a
-  // prompt — for the hero and for the last remaining agent. Wired in wireCommand.
-  function agCommand(a) {
-    const skins = (typeof DATA !== 'undefined' && DATA.SKINS) ? DATA.SKINS : {};
-    // A retired saved ID can alias an approved catalog entry without becoming an extra tile.
-    const cur = (a && a.skin && Object.keys(skins).find(id => skins[id] === skins[a.skin]))
-      || (typeof DATA !== 'undefined' ? DATA.DEFAULT_SKIN : '');
-    const thumbs = Object.keys(skins).map(id => {
-      const sk = skins[id];
-      return '<button type="button" class="skin-thumb ag-skin-thumb' + (id === cur ? ' sel' : '') + '" data-skin="' + esc(id) + '" title="' + esc(sk.name || id) + '" aria-label="' + esc(sk.name || id) + '" aria-pressed="' + (id === cur ? 'true' : 'false') + '">' +
-        '<img src="assets/sprites/' + esc(sk.set) + '/rot_south.png" alt="' + esc(sk.name || id) + '" draggable="false"></button>';
-    }).join('');
+  // DELETE AGENT — its OWN row at the foot of CONFIG, never inside a group. It used to sit in a DANGER block at
+  // the bottom of the collapsed APPEARANCE group, and Commanders kept asking how to delete an agent at all: an
+  // action nobody can find is an action that doesn't exist. Two-click armed confirm (ArmConfirm) and disabled —
+  // with a stated reason, not a prompt — for the hero and for the last remaining agent. Wired in wireCommand.
+  function agDeleteRow(a) {
     // DELETE gating: the hero (orchestrator / id 'agent') is undeletable; so is the last agent on station.
     const isHero = (a && (a.id === 'agent' || a.role === 'orchestrator'));
     const crewCount = (access.config && typeof access.config.crewCount === 'function') ? access.config.crewCount() : present.length;
@@ -1784,6 +2159,22 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         '<span class="ag-del-why">' + esc(disabledReason) + '</span>'
       : '<button class="bb sm ag-del" id="ag-del-btn" title="archive this agent and remove it from the station">✕ DELETE AGENT</button>' +
         '<span class="ag-del-why">work is archived, not erased</span>';
+    return '<div class="cf-card ag-del-card" id="ag-del-card"><div class="ag-del-row">' + delBtn + '</div></div>';
+  }
+
+  // COMMANDER CONTROLS (dossier CONFIG › APPEARANCE): change this agent's SKIN. Uses the SAME genesis skin
+  // catalog (DATA.SKINS — single source of truth) and reuses the .skin-thumb visual vocabulary from the create
+  // screen. Wired in wireCommand. (DELETE lives in agDeleteRow, outside every group.)
+  function agCommand(a) {
+    const skins = (typeof DATA !== 'undefined' && DATA.SKINS) ? DATA.SKINS : {};
+    // A retired saved ID can alias an approved catalog entry without becoming an extra tile.
+    const cur = (a && a.skin && Object.keys(skins).find(id => skins[id] === skins[a.skin]))
+      || (typeof DATA !== 'undefined' ? DATA.DEFAULT_SKIN : '');
+    const thumbs = Object.keys(skins).map(id => {
+      const sk = skins[id];
+      return '<button type="button" class="skin-thumb ag-skin-thumb' + (id === cur ? ' sel' : '') + '" data-skin="' + esc(id) + '" title="' + esc(sk.name || id) + '" aria-label="' + esc(sk.name || id) + '" aria-pressed="' + (id === cur ? 'true' : 'false') + '">' +
+        '<img src="assets/sprites/' + esc(sk.set) + '/rot_south.png" alt="' + esc(sk.name || id) + '" draggable="false"></button>';
+    }).join('');
     // a 44px still of a chunky sprite is unidentifiable, so the picker sits beside a LIVE stage (shared
     // SkinStage) that plays the picked — or merely hovered — skin's real walk cycle big enough to judge.
     // Same vocabulary as the Recruitment Bay's SUMMON stage; wired (mount + hover scrub) in wireCommand.
@@ -1799,14 +2190,32 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
           '<div class="ag-skin-row skin-picker" role="group" aria-label="Agent skin">' + thumbs + '</div>' +
           stage +
         '</div></div>' +
-      '<div class="ag-cmd-sec ag-cmd-danger"><div class="ag-cmd-lbl">DANGER</div>' +
-        '<div class="ag-del-row">' + delBtn + '</div></div>' +
       '</div>';
   }
 
   // GROWTH tab — the premium agent-growth dossier: XP ladder, a physical satisfaction gauge (honest "—"
   // while calibrating), the milestone trophy case, and the station-prestige rollup. All read off the pure
   // Xp engine; the satisfaction marker rides the agent's own suit colour so it reads as "this unit's measure".
+  /* ONE PROGRESS HOME (front doors, 2026-10-01): the station-wide prestige level is station progress, so it lives in
+     QUESTS › Progress beside the station systems and milestones — not repeated inside every agent's GROWTH tab. */
+  function stationPrestigeHtml() {
+    const sStats = (typeof XpStore !== 'undefined' && XpStore.stationStats) ? XpStore.stationStats() : null;
+    const s = sStats ? Xp.compute(sStats) : null;
+    const nAg = present.length || 1;
+    return s ? (
+      '<div class="gx-station" style="margin-top:18px;">' +
+      '<div class="hd"><span class="badge">●</span><span class="ttl">STATION XP</span><span class="agents">&Sigma; ' + nAg + ' AGENT' + (nAg === 1 ? '' : 'S') + '</span></div>' +
+      '<div class="body">' +
+        '<div class="lv"><div class="gx-lbl" style="font-size:9px;">STATION</div><div class="n">' + s.level + '</div><div class="gx-lbl" style="font-size:9px;">LEVEL</div></div>' +
+        '<div style="flex:1;">' +
+          '<div class="gx-row" style="margin-bottom:6px;"><span class="gx-val" style="font-size:13px;">' + s.xp.toLocaleString() + ' <span class="gx-dim">/</span> ' + Xp.xpForLevel(s.level + 1).toLocaleString() + ' <span class="gx-dim" style="font-size:11px;">XP</span></span><span class="gx-val" style="color:var(--gold);font-size:13px;">' + s.pct + '%</span></div>' +
+          '<div class="gx-trk"><div class="gx-gfill" style="width:' + s.pct + '%;"></div></div>' +
+          '<div class="gx-row" style="margin-top:7px;"><span class="gx-val gx-dim" style="font-size:11px;">' + s.toNext.toLocaleString() + ' XP TO LV ' + (s.level + 1) + '</span>' +
+            '<span class="gx-mono" style="font-size:10px;color:var(--ph-dim);">' + s.positiveFeedback + ' THUMBS-UP &middot; <span style="color:var(--ph);">' + (s.known ? s.band.toUpperCase() : 'CALIBRATING') + '</span></span></div>' +
+        '</div>' +
+      '</div></div>'
+    ) : '';
+  }
   function agGrowth(a) {
     if (typeof Xp === 'undefined' || !a.stats) return '<div class="ag-growth-empty"><h3>Waiting for growth data</h3><p>Growth metrics unavailable. This agent’s XP and achievements will appear when its activity data is available.</p></div>';
     const g = Xp.compute(a.stats);
@@ -1814,7 +2223,8 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     const earned = cat.filter(m => m.earned).length, locked = cat.length - earned;
     const nextMilestone = cat.find(m => !m.earned);
     const pad2 = n => (n < 10 ? '0' : '') + n;
-    const mark = a.color || 'var(--ph-bright)';
+    // the gauge mark paints only a hex suit tint (the crew restore rule), else the phosphor default.
+    const mark = /^#[0-9a-f]{3,8}$/i.test(String(a.color || '')) ? String(a.color) : 'var(--ph-bright)';
 
     const progression =
       '<div class="ag-xp-panel">' +
@@ -1888,26 +2298,10 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       '<div style="display:flex;align-items:center;gap:6px;"><span class="gl">' + (m.earned ? '&#9733;' : '&#9675;') + '</span><span class="nm">' + m.label + '</span></div>' +
       '<div class="sub">' + (m.earned ? 'EARNED · ' + m.hint : m.hint) + '</div></div>').join('');
     const trophies =
-      '<div class="gx-trohead"><div class="gx-sec" style="flex:1;margin:0;border:0;height:auto;"><span class="gx-ref">▦</span><span class="gx-title">Trophy case</span></div>' +
+      '<div class="gx-trohead"><div class="gx-sec" style="flex:1;margin:0;border:0;height:auto;"><span class="gx-ref">▦</span><span class="gx-title">Achievements</span></div>' +
       '<span class="gx-tag">' + pad2(earned) + ' earned &middot; ' + pad2(locked) + ' to earn</span></div>' +
       '<div class="gx-tros">' + tros + '</div>';
 
-    const sStats = (typeof XpStore !== 'undefined' && XpStore.stationStats) ? XpStore.stationStats() : null;
-    const s = sStats ? Xp.compute(sStats) : null;
-    const nAg = present.length || 1;
-    const station = s ? (
-      '<div class="gx-station" style="margin-top:18px;">' +
-      '<div class="hd"><span class="badge">●</span><span class="ttl">Station prestige</span><span class="agents">&Sigma; ' + nAg + ' AGENT' + (nAg === 1 ? '' : 'S') + '</span></div>' +
-      '<div class="body">' +
-        '<div class="lv"><div class="gx-lbl" style="font-size:9px;">STATION</div><div class="n">' + s.level + '</div><div class="gx-lbl" style="font-size:9px;">LEVEL</div></div>' +
-        '<div style="flex:1;">' +
-          '<div class="gx-row" style="margin-bottom:6px;"><span class="gx-val" style="font-size:13px;">' + s.xp.toLocaleString() + ' <span class="gx-dim">/</span> ' + Xp.xpForLevel(s.level + 1).toLocaleString() + ' <span class="gx-dim" style="font-size:11px;">XP</span></span><span class="gx-val" style="color:var(--gold);font-size:13px;">' + s.pct + '%</span></div>' +
-          '<div class="gx-trk"><div class="gx-gfill" style="width:' + s.pct + '%;"></div></div>' +
-          '<div class="gx-row" style="margin-top:7px;"><span class="gx-val gx-dim" style="font-size:11px;">' + s.toNext.toLocaleString() + ' XP TO LV ' + (s.level + 1) + '</span>' +
-            '<span class="gx-mono" style="font-size:10px;color:var(--ph-dim);">' + s.positiveFeedback + ' APPROVALS &middot; <span style="color:var(--ph);">' + (s.known ? s.band.toUpperCase() : 'CALIBRATING') + '</span></span></div>' +
-        '</div>' +
-      '</div></div>'
-    ) : '';
 
     /* The old gx-head said "AGENT DOSSIER // GROWTH READOUT" + the agent's name + "CLEARANCE LEVEL 04" — inside a
        window titled AGENT DOSSIER, on a tab labelled GROWTH, with the agent selected and named in the left rail,
@@ -1918,7 +2312,8 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       '<div class="ag-growth-heading"><span class="ag-growth-eyebrow">AGENT PROGRESSION</span><h3>' + esc(a.name || 'Agent') + '</h3><p>' + g.xp.toLocaleString() + ' total XP · ' + earned + ' of ' + cat.length + ' achievements earned</p>' + progression + '</div></div>' +
       (nextMilestone ? '<div class="ag-next-challenge"><span>CHALLENGE TO AIM FOR</span><b>' + nextMilestone.label + '</b><span>' + nextMilestone.hint + '</span></div>' : '') +
       '<div class="ag-growth-section-title">Performance &amp; learning</div><div class="gx-2">' + confidence + reliabilityBlk + practiceBlk + '</div>' +
-      station + '<section class="ag-achievements">' + trophies + '</section></div>';
+      '<p class="ag-growth-station-link">The station’s own level, systems and milestones: <button type="button" class="bb xs" data-open-progress>QUESTS › PROGRESS</button></p>' +
+      '<section class="ag-achievements">' + trophies + '</section></div>';
   }
 
   /* Fill the B3 PRACTICE block for `agentId`. Reads through Harness.agentSkillsRead so a FAILED read renders
@@ -1964,6 +2359,10 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   function agSkills(agentId) {
     return '<div class="ag-effective" data-access-agent="' + esc(agentId || 'agent') + '" role="status">Checking effective access…</div>';
   }
+  // the BRIEF tab's one-line readout of the SAME live /api/toolsets answer CONFIG › ACCESS shows in full
+  function agSkillsBrief(agentId) {
+    return '<div class="ag-effective" data-access-agent="' + esc(agentId || 'agent') + '" data-access-compact role="status">Checking effective access…</div>';
+  }
 
   function loadEffectiveAccess(body, a) {
     const targets = body.querySelectorAll('[data-access-agent]');
@@ -1977,7 +2376,26 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         if (!view || !view.authority || !Array.isArray(view.toolsets)) throw Error('Access unavailable');
         const authority = view.authority;
         const summary = body.querySelector('[data-goconfig="ag-approval-card"] .ag-setup-val');
-        if (summary) summary.textContent = authority.unrestricted ? 'Full Power · no prompts' : 'ASK · standing grants apply';
+        // ORG P21: the summary speaks the ONE ACCESS posture words. FULL POWER only when the live authority is unrestricted;
+        // otherwise the agent's saved posture if it is an asking one, else custom — never a posture the live answer contradicts.
+        const askingPosture = () => { const AP = agentPostureOf(a); return (AP && AP.approval === 'ask') ? AP.label : 'custom'; };
+        // the value is the posture word alone (the tile is narrow); what it means rides the row's tip
+        if (summary) summary.textContent = authority.unrestricted ? 'FULL POWER' : askingPosture();
+        // FULL POWER that comes from OUTSIDE this agent (the launch environment or the station-wide switch) beats its
+        // saved answer: CONFIG › ACCESS says so instead of showing the saved posture as if it were in force.
+        const overrideBy = !authority.unrestricted || authority.source === 'agent' ? ''
+          : authority.source === 'environment' ? 'the SKYNET_FULL_ACCESS launch setting' : 'the station-wide FULL POWER switch';
+        const accessRow = body.querySelector('[data-goconfig="ag-approval-card"]');
+        if (accessRow && accessRow.dataset) accessRow.dataset.tip = (authority.unrestricted
+          ? 'never asks first' + (overrideBy ? ', set by ' + overrideBy : '') : 'asks first; standing grants apply') + ' · change it in CONFIG › ACCESS';
+        if (overrideBy) {
+          const SP = agentPostureOf(a);
+          const said = 'FULL POWER — on for every agent by ' + overrideBy + '. Its saved answer, ' + (SP ? SP.label : 'a custom mix') + ', applies again when that is off.';
+          const groupSummary = body.querySelector('#cf-grp-behaves .cf-group-summary');
+          if (groupSummary) groupSummary.textContent = said;
+          const plain = body.querySelector('#ag-access-plain');
+          if (plain) plain.textContent = said;
+        }
         const reach = body.querySelector('#ag-execution-plain');
         if (reach) reach.textContent = authority.filesystemLabel + (authority.unrestricted ? '. Full Power overrides the saved profile below.' : '. The selected profile and standing grants apply.');
         const html = '<p><b>' + esc(authority.approvalLabel) + '</b><br>' + esc(authority.filesystemLabel) + ' · ' + esc(authority.profileLabel) + '</p>' +
@@ -1986,7 +2404,21 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
             '</div><div class="perk-desc">' + esc(t.grantSource || 'No current grant') + '</div></div>').join('') + '</div>' +
           '<p class="sk-note">' + esc(authority.revoke) + ' Service credentials, task-specific permissions and operating-system limits still apply. Unattended jobs have their own grants.</p>' +
           '<button class="bb sm" data-access-manage>MANAGE ABILITIES</button> <button class="bb sm" data-access-settings>STATION PERMISSIONS</button> <button class="bb sm" data-access-refresh>REFRESH ACCESS</button>';
+        // BRIEF's compact line: how many toolsets are ready, which ones, and the approval mode — one jump to the full grid
+        const ready = view.toolsets.filter(x => x.available);
+        // in the words TOOLS and the ACCESS tile use (UX night 10-26): "7 of 8 tools ready · CHECK WITH ME", never the
+        // sidecar's "ASK — standing grants apply"
+        const postureWord = authority.unrestricted ? 'FULL POWER' : (askingPosture() === 'custom' ? 'custom access' : askingPosture());
+        const compactHtml = '<p class="ag-can-do"><b>' + ready.length + ' of ' + view.toolsets.length + ' tools ready</b>'
+          + (ready.length ? ' · ' + ready.slice(0, 6).map(x => esc(x.label)).join(', ') + (ready.length > 6 ? ' +' + (ready.length - 6) : '') : '')
+          + ' · ' + esc(postureWord) + '</p><button class="bb sm" data-access-full>SEE FULL ACCESS</button>';
         targets.forEach(target => {
+          if (typeof target.hasAttribute === 'function' && target.hasAttribute('data-access-compact')) {
+            target.innerHTML = compactHtml;
+            // CONFIG opens with every group folded: open ACCESS, where the full grid lives (it landed on six closed groups)
+            target.querySelector('[data-access-full]').onclick = () => { cfOpen.set(a.id + ':cf-grp-behaves', true); consoleSection['agents'] = 'config'; sfx('click'); rerender('agents'); };
+            return;
+          }
           target.innerHTML = html;
           target.querySelector('[data-access-manage]').onclick = () => openTerm('connectors', 'toolsets');
           target.querySelector('[data-access-settings]').onclick = () => openTerm('settings', 'permissions');
@@ -2007,7 +2439,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       '<span class="cf-badge you">' + f.badge + '</span>' +
       '<span class="cf-bytes">' + (val || '').length + ' chars</span>' +
       (editing ? '' : '<button class="bb sm cf-edit" data-edit="' + f.key + '">✎ EDIT</button>') +
-      '</div><div class="cf-desc">' + f.desc + '</div>';
+      '</div><div class="cf-desc">' + (typeof f.desc === 'function' ? f.desc(esc((a && a.name) || 'this agent')) : f.desc) + '</div>';
     if (editing) {
       return '<div class="cf cf-on">' + head +
         '<textarea class="cf-ta" id="cf-ta-' + f.key + '" aria-label="' + esc(f.file) + '" spellcheck="false" placeholder="' + esc(f.ph) + '">' + esc(val) + '</textarea>' +
@@ -2037,7 +2469,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       // sidecar (station-wide, not per-agent — the reflect loop is a station engine). Plus a plain scope note.
       '<div class="gx-sec"><span class="gx-ref">◈</span><span class="gx-title">Reflection</span></div>' +
       '<div class="mc-note" id="mc-scope">How the station learns from finished work.</div>' +
-      '<label class="set-row"><input type="checkbox" id="mc-reflect-on"> REFLECTION ON <span class="dim">— propose memories after a completed task</span></label>' +
+      '<label class="set-row"><input type="checkbox" id="mc-reflect-on"> REFLECTION <b id="mc-reflect-state">…</b> (all agents) <span class="dim">— propose memories after a completed task</span></label>' +
       '<div class="set-row"><label for="mc-cooldown">TIME BETWEEN SUGGESTIONS (MINUTES)</label><input id="mc-cooldown" class="key-input" type="number" min="0" max="60" step="1" style="max-width:90px" title="minimum gap between turn-in beats per agent"></div>' +
       '<div class="mc-acts"><button class="bb sm" id="mc-reflect-save">SAVE</button><span class="msg" id="mc-reflect-msg"></span></div></div>' +
       // AWAITING A VERDICT — the durable high-stakes deck. Runs that finish while nobody is watching (a routine, a
@@ -2093,6 +2525,11 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     const head = mkEl('div', 'mc-head');
     const tag = mkEl('span', 'turnin-kind'); tag.textContent = MEM_KIND[p.kind] || 'NOTE'; head.appendChild(tag);
     const org = originChip(p.origin); if (org) head.appendChild(org);
+    // releases#7: a proposal says when the run that raised it FAILED (the sidecar carries the run's outcome). The failure
+    // review's lessons already wear that chip as their origin; anything else a failed run raised gets the same one here.
+    if (p.outcome === 'failed' && p.origin !== 'failure-review') {
+      const f = mkEl('span', 'mc-scope'); f.textContent = ORIGIN_LABEL['failure-review']; f.title = 'raised by a run that failed'; head.appendChild(f);
+    }
     card.appendChild(head);
     const bodyEl = mkEl('div', 'mc-body'); bodyEl.textContent = p.replaceId ? 'Update remembered preference: “' + p.previousBody + '” → “' + p.content + '”' : (p.content || '(empty)'); card.appendChild(bodyEl);
     const meta = mkEl('div', 'mc-meta');
@@ -2121,13 +2558,16 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
      can arrive from a routine, a night shift, or a messaging channel — and "the agent believes this about me" and
      "someone said this in a group chat" are different claims. 'commander' renders NO chip: the ordinary case must
      stay quiet, or the label becomes noise nobody reads. */
-  const ORIGIN_LABEL = { schedule: '⏱ routine', nightshift: '☾ night shift', api: '⇄ external app' };
+  // 'feedback' = the Commander's OWN rating / correction of a run (sidecar/feedbackmemory.js): it is theirs, so its
+  // tip must never say it was learned unwatched. 'failure-review' = a lesson from a run that failed.
+  const ORIGIN_LABEL = { schedule: '⏱ routine', nightshift: '◈ autonomy', api: '⇄ external app', feedback: '★ your rating', 'failure-review': '⚠ failed run' };
+  const ORIGIN_TIP = { feedback: 'from your own rating of a run — every agent shapes its work to this', 'failure-review': 'a lesson taken from a run that failed' };
   function originChip(origin) {
     const o = String(origin || 'commander');
     if (o === 'commander') return null;
     const label = ORIGIN_LABEL[o] || (o.indexOf('channel:') === 0 ? '✆ ' + o.slice(8) : o);
     const el = mkEl('span', 'mc-scope'); el.textContent = label;
-    el.title = 'learned on a run you were not watching (' + o + ')';
+    el.title = ORIGIN_TIP[o] || ('learned on a run you were not watching (' + o + ')');
     return el;
   }
 
@@ -2136,10 +2576,14 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     const onBox = $('#mc-reflect-on'), cd = $('#mc-cooldown'), scope = $('#mc-scope'), msg = $('#mc-reflect-msg'), saveBtn = $('#mc-reflect-save');
     if (!onBox || !cd) return;
     const setMsg = (t, ok) => { if (msg) { msg.textContent = t || ''; msg.className = 'msg' + (ok ? ' ok' : ''); } };
+    // the label says the switch's position in words (ON / OFF), not only the knob
+    const paintState = () => { const o = $('#mc-reflect-on'), st = $('#mc-reflect-state'); if (o && st) st.textContent = o.checked ? 'ON' : 'OFF'; };
+    if (!onBox._stateWired) { onBox._stateWired = true; onBox.addEventListener('change', paintState); }
     Harness.api.get('/api/memory/config').then(cfg => {
       const o = $('#mc-reflect-on'), c = $('#mc-cooldown'), s = $('#mc-scope');
       if (!o || !c) return;   // retabbed mid-fetch
       o.checked = cfg.reflectEnabled !== false;
+      paintState();
       c.value = String(Math.round((cfg.reflectCooldownMs != null ? cfg.reflectCooldownMs : 180000) / 60000));
       if (s && cfg.scopeNote) s.textContent = cfg.scopeNote;
     }).catch(() => { setMsg('could not load reflection settings'); });   // never paint an error body as config
@@ -2220,6 +2664,16 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     card.appendChild(head);
 
     const bodyEl = mkEl('div', 'mc-body'); bodyEl.textContent = rec.body || '(empty)'; card.appendChild(bodyEl);
+    // memory-truth-1027: what this belief REPLACED. A newer claim on the same subject (or a correction) retires the old
+    // text from recall; it stays visible here, newest first, instead of silently vanishing. The full list is the tip.
+    const hist = Array.isArray(rec.history) ? rec.history : [];
+    if (hist.length) {
+      const was = mkEl('div', 'mc-meta'), line = mkEl('span', 'mc-prov');
+      const h = hist[0];
+      line.textContent = 'replaced: “' + h.body + '”' + (h.replacedAt ? ' · ' + new Date(h.replacedAt).toLocaleDateString() : '') + (hist.length > 1 ? ' · +' + (hist.length - 1) + ' earlier' : '');
+      line.title = hist.map(x => '“' + x.body + '”' + (x.restoredAs ? ' (restored as its own memory)' : '')).join('\n');
+      was.appendChild(line); card.appendChild(was);
+    }
 
     const meta = mkEl('div', 'mc-meta');
     const prov = mkEl('span', 'mc-prov');
@@ -2293,7 +2747,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     U.bus.on('deliverable', p => {
       if (!p || p.kind !== 'skill') return;
       if (!open['connectors'] || !$('#sk-agent')) return;             // the AGENT SKILLS host lives in the ABILITIES console (skills lane)
-      const a = present[sel]; const shownId = (a && a.id) || 'agent';
+      const shownId = skillsAgentId();
       if ((p.agentId || 'agent') !== shownId) return;                 // only refresh the agent the panel is actually showing
       clearTimeout(skillsRefreshTimer);
       skillsRefreshTimer = setTimeout(() => { if (open['connectors'] && $('#sk-agent')) loadAgentSkills(shownId); }, 400);
@@ -2306,7 +2760,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
 
        WHAT IT KNOWS  — the four markdown files that literally compose the system prompt.
        HOW IT BEHAVES — the runtime decisions: voice, model, where it runs, whether it asks, the away shift.
-       THE UNIT       — appearance and deletion. Last, because it is the rarest and the most destructive.
+       THE UNIT       — appearance. (DELETE AGENT sits on its own row under every group — see agDeleteRow.)
 
      The per-card "PER-AGENT" badge is retired with the grouping. It appeared on five of nine cards inside a
      window whose title is AGENT DOSSIER and whose left rail names the selected agent — it carried no
@@ -2327,17 +2781,18 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       purpose ? fileCard(a, purpose) : '',
       CONFIG_FILES.filter(f => f.key !== 'purpose').map(f => fileCard(a, f)).join(''),
       modelCard(a), personaCard(a),
-      agSkills(a.id) + executionProfileCard(a) + approvalCard(a), agCommand(a)
+      agSkills(a.id) + accessAnswerCard(a), agCommand(a)
     ];
     const summaries = [a.purpose || 'What should this agent accomplish?', 'Identity, context and operating rules · edit each source file',
       a.model || 'Follow station default', (typeof Personas !== 'undefined' && Personas.get(a.personaId)?.name) || 'Station personality',
-      'Effective reach, execution and approval settings',
+      (() => { const AP = agentPostureOf(a); return AP ? AP.label + ' — ' + AP.agentBlurb : 'Custom — its own mix of reach and asking'; })(),
       ((typeof DATA !== 'undefined' && DATA.SKINS && DATA.SKINS[a.skin]) || {}).name || 'Choose a skin'];
-    return '<p class="cf-grp-note">Choose what to change. Instructions, model and personality tuning use SAVE; personality presets, appearance and access controls apply when selected.</p>' +
+    return '<p class="cf-grp-note">Choose what to change. Text you edit needs SAVE; buttons apply right away.</p>' +
       CF_GROUPS.map((g, i) => {
         const key = a.id + ':' + g.id;
         return '<details class="cf-group" id="' + g.id + '" data-cf-group="' + esc(key) + '"' + (cfOpen.get(key) ? ' open' : '') + '><summary><span class="cf-group-title">' + g.label + '</span><span class="cf-group-summary">' + esc(summaries[i]) + '</span></summary><div class="cf-group-body">' + content[i] + '</div></details>';
-      }).join('') + '<div class="cf-card" id="ag-away-link"><button class="bb sm" data-away-open>WHILE I’M AWAY → AUTOMATION</button></div>';
+      }).join('') + '<div class="cf-card" id="ag-away-link"><button class="bb sm" data-away-open data-tip="opens AUTOMATE › AWAY WORK">AWAY WORK ▸</button></div>' +
+      agDeleteRow(a);
   }
 
   // W3 per-agent AWAY-WORKSHOP surface (rebuilt 2026-07-15 UX audit — the queue was invisible, the cadence
@@ -2356,7 +2811,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       '</label>' +
       '<div id="ag-workshop-msg" class="msg"></div>' +
       '<div id="ag-ws-live"><div class="dim" style="font-size:11px;">reading the build list…</div></div>' +
-      '<p class="ws-queue-help">Add work from a quest’s <b>Build while away</b> action, or type <code>/build-away</code> in COMMS.</p>' +
+      '<p class="ws-queue-help">Add work from a quest’s <b>Build while away</b> action, or type <code>/away</code> in COMMS.</p>' +
     '</div>';
   }
 
@@ -2394,17 +2849,36 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
        a posture may not put a crew member somewhere the harness has not confirmed it can run.
      · Applying counts what actually changed and reports THAT number (an agent deleted from another
        surface mid-click must not be counted as converted). */
+  /* THE ON ITS OWN RUNGS (org pass 10-14, call #57): the dial's rendered names in ONE place. The ids are the stored
+     autonomy.js INITIATIVE values and never change; the labels are what the Commander reads, so a trust offer or a
+     PERMISSIONS notice that names a rung reads it from here and can never print the internal id ('leash').
+     'leash' reads SMALL JOBS (its own tip's words): BUILD clashed with the BUILD dock, and DRAFT is untrue once
+     the away workshop is on and jobs build real deliverables. */
+  const INITIATIVE_RUNGS = [
+    { id: 'wait', label: 'WAIT', tip: 'nothing runs unless you ask' },
+    { id: 'propose', label: 'SUGGEST', tip: 'lines up suggestions you approve — never acts on its own' },
+    { id: 'leash', label: 'SMALL JOBS', tip: 'does a few small grounded jobs a day on its own' },
+    { id: 'free', label: 'FREE', tip: 'picks & does work toward your goals while you’re away' }
+  ];
+  const initiativeLabel = (id) => { const r = INITIATIVE_RUNGS.find(x => x.id === id); return r ? r.label : String(id || '').toUpperCase(); };
   const STATION_POSTURES = [
     { id: 'careful', label: 'CHECK WITH ME', approval: 'ask', profile: 'station-gear', level: 'suggest',
       blurb: 'It asks you before every risky step, and only touches what you placed on the station.',
-      who: 'Best if you are just starting out.' },
+      who: 'Best if you are just starting out.',
+      agentBlurb: 'Asks before every risky step. Uses only what you placed on the station.' },
     { id: 'balanced', label: 'LET IT WORK', approval: 'ask', profile: 'trusted-project', level: 'draft',
       blurb: 'It still asks before risky steps, but it can work in your project folders and leave drafts while you are away.',
-      who: 'The everyday setting.' },
+      who: 'The everyday setting.',
+      agentBlurb: 'Asks before risky steps. Can work in your approved project folders.' },
     { id: 'open', label: 'FULL POWER', approval: 'full', profile: 'this-computer', level: 'full',
       blurb: 'It never asks and may use the whole local computer to complete your requests.',
-      who: 'Only when you trust it completely.' }
+      who: 'Only when you trust it completely.',
+      agentBlurb: 'Never asks. Can use the whole local computer.' }
   ];
+  // the posture ONE agent matches (approval + reach profile), or null = its own custom mix. The station-wide
+  // unattended level is not part of a single agent's answer — only the whole-station cards set that.
+  const agentPostureOf = (a) => STATION_POSTURES.find(P =>
+    (a && a.approvalMode === 'full' ? 'full' : 'ask') === P.approval && executionProfileId(a) === P.profile) || null;
   // the fallback is the DEFAULT profile by id, never EXECUTION_PROFILES[0] — the array is ordered by reach,
   // so an index-based fallback would silently relabel an unknown profile as the narrowest one.
   const executionProfileOf = (id) => EXECUTION_PROFILES.find(x => x.id === id) ||
@@ -2446,10 +2920,29 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     '</div>';
   }
 
+  /* ACCESS = the SAME three answers as SETTINGS › PERMISSIONS (2026-10-04, "make it less confusing"). This card used
+     to open on two separate controls — a five-rung execution-profile ladder and an ASK / FULL POWER pair — so the
+     dossier asked a different question than the settings pane about the same agent. Now it asks the same one; the
+     two exact controls (unchanged ids + wiring) fold under MORE OPTIONS for the rare case an answer is not enough. */
+  function accessAnswerCard(a) {
+    const AP = agentPostureOf(a);
+    const chips = STATION_POSTURES.map(P =>
+      '<button type="button" class="ov-vchip' + (AP && AP.id === P.id ? ' sel' : '') + '" data-access-posture="' + P.id + '" data-name="' + esc(P.label) + '" title="' + esc(P.agentBlurb) + '" aria-pressed="' + (AP && AP.id === P.id ? 'true' : 'false') + '">' + esc(P.label) + '</button>').join('');
+    return '<div class="cf-card" id="ag-access-card">' +
+      '<div class="cf-head"><span class="cf-file">How much can it do?</span></div>' +
+      '<div class="ov-vchips" id="ag-access-chips">' + chips + '</div>' +
+      '<div class="cf-desc pc-plain" id="ag-access-plain">' + esc(AP ? AP.agentBlurb : 'A custom mix — open More options to see exactly what it can reach and whether it asks first.') + '</div>' +
+      '<div id="ag-access-msg" class="msg"></div>' +
+      '<details class="cf-access-more"' + (executionProfileId(a) === 'remote-ssh' ? ' open' : '') + '><summary>More options — exact reach and asking</summary>' +
+        executionProfileCard(a) + approvalCard(a) +
+      '</details>' +
+    '</div>';
+  }
+
   function approvalCard(a) {
     const full = !!(a && a.approvalMode === 'full');
     const chip = (id, label, desc, sel) =>
-      '<button type="button" class="ov-vchip' + (sel ? ' sel' : '') + '" data-approval="' + id + '" data-name="' + esc(label) + '" title="' + esc(desc) + '" aria-pressed="' + (sel ? 'true' : 'false') + '">' + esc(label) + '</button>';
+      '<button type="button" class="ov-vchip' + (sel ? ' sel' : '') + '" data-approval="' + id + '" data-name="' + esc(label) + '" data-tip="' + esc(desc) + '" aria-pressed="' + (sel ? 'true' : 'false') + '">' + esc(label) + '</button>';
     return '<div class="cf-card" id="ag-approval-card">' +
       '<div class="cf-head"><span class="cf-file">✋ approval prompts</span></div>' +
       '<div class="cf-desc">ASK respects the selected reach profile and pauses before risky calls. FULL POWER authorizes the whole local computer: all available tools, host paths, arbitrary commands, visible apps, and screen/input control. <code>/yolo</code> is the Full Power shortcut.</div>' +
@@ -2544,16 +3037,27 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       group.addEventListener('toggle', () => { if (group.isConnected) cfOpen.set(group.dataset.cfGroup, group.open); });
     });
     body.querySelectorAll('[data-edit]').forEach(b => b.addEventListener('click', () => {
-      agEdit[b.dataset.edit] = true; sfx('click'); rerender('agents');
+      agEdit[b.dataset.edit] = true; agEditBase[b.dataset.edit] = { id: a && a.id, text: docVal(a, b.dataset.edit) };
+      sfx('click'); rerender('agents');
     }));
     body.querySelectorAll('[data-cancel]').forEach(b => b.addEventListener('click', () => {
-      delete agEdit[b.dataset.cancel]; sfx('click'); rerender('agents');
+      delete agEdit[b.dataset.cancel]; delete agEditBase[b.dataset.cancel]; sfx('click'); rerender('agents');
     }));
     body.querySelectorAll('[data-save]').forEach(b => b.addEventListener('click', () => {
       const key = b.dataset.save, ta = body.querySelector('#cf-ta-' + key);
       const val = ta ? ta.value : '';
+      // STALE-TEXT CHECK: the lead can rewrite this doc from chat (team.configure) while the editor is open. A
+      // blind SAVE would silently undo an edit the lead already reported as saved. First SAVE warns and keeps the
+      // draft; a second SAVE is a deliberate overwrite of the new text.
+      const base = agEditBase[key], liveText = docVal(a, key);
+      if (base && a && base.id === a.id && liveText !== base.text && val !== liveText) {
+        agEditBase[key] = { id: a.id, text: liveText };
+        sfx('bad');
+        notify('This document changed since you opened it (the lead may have edited it from chat). Your draft is kept; SAVE again to replace the new text, or CANCEL to see it.', 'warn');
+        return;
+      }
       if (access.config && access.config.apply) access.config.apply({ [key]: val }, a && a.id);
-      delete agEdit[key]; sfx('click');
+      delete agEdit[key]; delete agEditBase[key]; sfx('click');
       const meta = CONFIG_FILES.find(f => f.key === key);
       notify('saved ' + (meta ? meta.file : key) + ' — your agent runs on it now', 'good');
       rerender('agents');
@@ -2571,7 +3075,14 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       ModelPicker.populate(pickWrap, { current: { model: (a && a.model) || '', provider: (a && a.provider) || '', effort: (a && a.reasoningEffort) || '' } }).catch(() => {});
       // re-fit the effort <select> to the newly-chosen model on every model change (clamps/clears an effort the
       // new model can't do) — without this the effort could stay 'high' on a non-reasoning model and be persisted.
-      ModelPicker.onChange(pickWrap, () => {});
+      ModelPicker.onChange(pickWrap, pick => {
+        // Keep the advanced fallback aligned with a deliberate picker change. In particular,
+        // an empty selection must clear the old pin, not resurrect its model/provider on SAVE.
+        const modelInput = body.querySelector('#ag-model-in');
+        const providerInput = body.querySelector('#ag-prov-in');
+        if (modelInput) modelInput.value = pick.model || '';
+        if (providerInput) providerInput.value = pick.provider || '';
+      });
     }
     const applyModel = (model, provider, effort) => {
       if (!(access.config && access.config.setModel)) { setMMsg('per-agent model unavailable'); return; }
@@ -2702,6 +3213,30 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         sfx('click'); rerender('agents');
       }));
     }
+    // THE THREE ANSWERS (ACCESS card) — the same two write paths the settings rows use (reach first, then asking),
+    // reporting what actually landed; FULL POWER keeps the two-press confirm; the held answer is a no-op.
+    const accWrap = body.querySelector('#ag-access-chips');
+    if (accWrap) {
+      const accMsg = body.querySelector('#ag-access-msg');
+      const held = agentPostureOf(a);
+      accWrap.querySelectorAll('[data-access-posture]').forEach(chip => {
+        const P = STATION_POSTURES.find(x => x.id === chip.dataset.accessPosture);
+        if (!P || (held && held.id === P.id)) return;
+        const apply = () => {
+          if (!(access.config && access.config.setExecutionProfile && access.config.setApproval)) { if (accMsg) accMsg.textContent = 'access change unavailable'; sfx('bad'); return; }
+          chip.disabled = true;
+          Promise.resolve(access.config.setExecutionProfile(a && a.id, P.profile))
+            .then(okP => !!okP && !!access.config.setApproval(a && a.id, P.approval))
+            .catch(() => false)
+            .then(ok => {
+              notify(ok ? ((a && a.name) || 'agent') + ' set to ' + P.label : 'could not change ' + ((a && a.name) || 'agent') + ' — it kept its previous setting', ok ? (P.id === 'open' ? 'warn' : 'good') : 'bad');
+              sfx(ok ? 'click' : 'bad'); rerender('agents');
+            });
+        };
+        if (P.id === 'open') ArmConfirm.wire(chip, { armedLabel: 'SURE? WHOLE COMPUTER', restLabel: P.label, timeoutMs: 4000, onArm: () => sfx('bad'), onConfirm: apply });
+        else chip.addEventListener('click', apply);
+      });
+    }
     body.querySelectorAll('[data-away-open]').forEach(b => { b.onclick = () => { if (window.AutomationWindow) window.AutomationWindow.openAway(a.id); }; });
   }
 
@@ -2783,11 +3318,16 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       // nextRunAt arrives as an ISO string from the cron store — parse, never subtract a string (NaN → "in now")
       const nextAt = j.nextShiftAt ? (Date.parse(j.nextShiftAt) || Number(j.nextShiftAt) || 0) : 0;
       const due = nextAt ? (nextAt - Date.now()) : 0;
-      const next = (j.granted && nextAt)
+      // the station withholds the clock while scheduling is OFF or E-STOPped (shiftsPaused) — say that, never a countdown
+      const next = (j.granted && j.shiftsPaused === 'halted') ? 'shifts paused — the E-STOP is engaged (resume automation to lift it)'
+        : (j.granted && j.shiftsPaused) ? 'shifts paused — scheduling is OFF (AUTOMATE › SCHEDULES › TURN SCHEDULING ON)'
+        : (j.granted && nextAt)
         ? (due <= 60000 ? 'next shift: due now' : 'next shift in ' + rel(due))
-        : (j.granted ? 'shift not scheduled yet' : 'shifts are off (grant above)');
+        : (j.granted ? 'shift not scheduled yet' : 'shifts are off — switch on the queue above');
+      // the station's cadence is minutes ('every 360m'); a whole number of hours reads as hours (UX night 10-25)
+      const every = String(j.shiftEvery || '').replace(/(\d+)m\b/, (m, n) => (+n >= 60 && +n % 60 === 0) ? (+n / 60) + 'h' : m);
       h += '<div class="ws-bl-foot">' +
-        '<span class="dim" style="font-size:11px;">' + esc(next) + (j.shiftEvery ? ' · repeats ' + esc(String(j.shiftEvery).replace(/^every /, 'every ')) : '') + '</span>' +
+        '<span class="dim" style="font-size:11px;">' + esc(next) + (every ? ' · repeats ' + esc(every) : '') + '</span>' +
         (j.granted && items.some(it => it.state === 'queued') ? '<button class="bb sm" id="ag-ws-now">⚒ build now</button>' : '') +
         '</div>';
       const ls = lastShiftLine(j.lastShift);
@@ -2816,9 +3356,13 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       const nowBtn = wsLive.querySelector('#ag-ws-now');
       if (nowBtn) nowBtn.addEventListener('click', () => {
         nowBtn.disabled = true; nowBtn.textContent = 'building…';
-        Harness.api.post('/api/workshop/shift', { agentId: aid })
-          .then(({ j: res }) => {
-            const p = (res && res.payload) || res || {};
+        // the shift is a run: its lines ride the page's ONE run stream (Harness.streamPost) and its outcome is the
+        // workshop.shift.result line at the end — never a connection of its own held for the whole build
+        let shift = null;
+        Harness.streamPost('/api/workshop/shift', { agentId: aid }, { onEvent: (name, payload) => { if (name === 'workshop.shift.result') shift = payload; } })
+          .then(async r => { if (!r.ok) throw new Error((r.j && r.j.error) || 'http ' + r.status); await r.done; return shift; })
+          .then(res => {
+            const p = res || {};
             if (p.reason === 'built') notify('⚒ built — it’s waiting as a new session in your rail', 'gold');
             else if (p.reason === 'no-capability') notify('couldn’t build — no model/key available for unattended runs', 'bad');
             else if (p.reason === 'empty-backlog') notify('nothing queued to build', 'warn');
@@ -2845,6 +3389,10 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
        scrolled the minimum distance leaves the card you asked for hugging the bottom edge. */
     const jumpToConfig = (anchor) => {
       if (anchor === 'ag-workshop-card' && window.AutomationWindow) { window.AutomationWindow.openAway(a.id); return; }
+      // ORG P21: VOICE lands on SETTINGS › LOOK & SOUND with VOICE FOR already on this agent; SKILLS on ABILITIES ›
+      // AGENT SKILLS showing this agent. Both are the existing editors — the strip only routes.
+      if (anchor === 'ag-voice') { sfx('click'); openVoiceFor(a.id); return; }
+      if (anchor === 'ag-skills') { sfx('click'); skillsPick = a.id; openTerm('connectors', 'agent'); return; }
       consoleSection['agents'] = 'config'; sfx('click'); rerender('agents');
       if (!anchor || anchor === '1') return;
       requestAnimationFrame(() => {
@@ -2957,8 +3505,13 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     if (dossierWindow) dossierWindow.classList.add('agent-dossier');
     if (!present.length) {
       // shared empty-state vocabulary rather than a bare paragraph (no agents = nothing to dossier)
-      body.innerHTML = '<div class="empty-state" style="margin:32px auto;"><span class="es-glyph">▯</span>' +
-        '<b>NO AGENTS ON STATION</b><span>Commission one from RECRUITMENT to open its dossier.</span></div>';
+      // org P10: the empty dossier carries the RECRUIT door itself (the same App.openSummonBay the CREW dock's RECRUIT opens)
+      const canRecruit = typeof App !== 'undefined' && !!App.openSummonBay;
+      body.innerHTML = '<div class="empty-state" style="margin:32px auto;">' + NO_AGENTS_MARK +
+        '<b>NO AGENTS ON STATION</b><span>RECRUIT one from the CREW dock.</span>' +
+        (canRecruit ? '<button type="button" class="bb sm" data-act="empty-recruit" style="margin-top:14px;">▸ OPEN RECRUIT</button>' : '') + '</div>';
+      const recruitKey = body.querySelector('[data-act="empty-recruit"]');
+      if (recruitKey) recruitKey.addEventListener('click', () => { sfx('click'); try { App.openSummonBay(); } catch (e) { console.warn('[dossier] recruit door failed:', (e && e.message) || e); } });
       return;
     }
     if (sel >= present.length) sel = 0;
@@ -3063,7 +3616,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         top.innerHTML =
           '<div class="ag-list" role="listbox" aria-label="Agents on station">' +
           present.map((x, i) => '<div class="ag-item ' + (i === sel ? 'sel' : '') + '" data-i="' + i + '" role="option" aria-selected="' + (i === sel ? 'true' : 'false') + '" tabindex="0" style="--ci:' + i + '">' +
-            '<span class="ag-item-dot" style="color:' + x.color + '">●</span>' +
+            '<span class="ag-item-dot" style="color:' + esc(x.color) + '">●</span>' +
             '<span class="ag-item-nm">' + esc(x.name) + '</span>' + hint(x) + '</div>').join('') +
           '</div>';
         const pick = (it) => { sel = +it.dataset.i; delete agEdit['__name']; sfx('click'); rerender('agents'); };
@@ -3124,27 +3677,11 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
        the master 1:1 in the buffer, then integer-NN it into the frame. The frame is sized so the largest
        shipped character (43×46, pikachu) still clears ×2, which means EVERY skin lands on exactly ×2 — the
        roster reads at one consistent size instead of each skin finding its own fractional fit. */
-    const buf = drawPortrait._buf || (drawPortrait._buf = document.createElement('canvas'));
-    const BW = 220, BH = 220; buf.width = BW; buf.height = BH;
-    const bctx = buf.getContext('2d');
-    bctx.clearRect(0, 0, BW, BH);
-    bctx.imageSmoothingEnabled = false;   // the blit below is 1:1; keep it exact
-    bctx.save();
-    bctx.translate(BW / 2, BH - 40);
-    // 1/sc makes drawBody's own `dw = frame.width * sc` resolve to frame.width — an exact, unresampled
-    // 1:1 blit of the master. A missing/zero scale falls back to the old 3× rather than dividing by zero.
-    const sc = (typeof SPRITES.bodyScale === 'function') ? SPRITES.bodyScale({ id: a.id, skin: a.skin }) : 0;
-    bctx.scale(sc > 0 ? 1 / sc : 3, sc > 0 ? 1 / sc : 3);
-    SPRITES.drawBody(bctx, { id: a.id, skin: a.skin, px: 0, py: 0, dir: 'south', color: a.color, state: 'idle', sitting: false, working: false, phase: 0, noShadow: true }, performance.now());
-    bctx.restore();
-    // measure the drawn body's real bounds (alpha > 16), so the fit ignores the master's transparent padding
-    const d = bctx.getImageData(0, 0, BW, BH).data;
-    let minX = BW, minY = BH, maxX = 0, maxY = 0, any = false;
-    for (let y = 0; y < BH; y++) for (let x = 0; x < BW; x++) {
-      if (d[(y * BW + x) * 4 + 3] > 16) { any = true; if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y; }
-    }
-    if (!any) return;
-    const sw = maxX - minX + 1, sh = maxY - minY + 1;
+    // The 1:1 render + measured bounds live in AgentPortraits.renderBody (shared with the Workflow skin thumbs,
+    // so every surface draws the same figure the floor does); this function owns only the frame fit below.
+    const r = (typeof AgentPortraits !== 'undefined' && AgentPortraits.renderBody) ? AgentPortraits.renderBody(a, performance.now()) : null;
+    if (!r) return;
+    const buf = r.canvas, minX = r.minX, minY = r.minY, sw = r.sw, sh = r.sh;
     // INTEGER fit, floored at 1× — a fractional k is the whole defect, and 1× (native) is always honest.
     // Pads are device px so the fit math and the drawn result share one coordinate space.
     const padX = 6 * dev, padTop = 6 * dev, padBot = 6 * dev;
@@ -3226,7 +3763,49 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
      console is height:auto AND CSS-centred, so every tab whose content is a different length re-centres the whole
      window: measured live, the tab strip you just clicked moved between y=236 (CONFIG) and y=387 (RESTORE) — up to
      151px out from under the cursor, on the control you are actively using. The pane scrolls; the chrome holds still. */
+  // DESK SCREEN (deskscreen.js registers the 'desk' window): select THIS agent, then open the window from the dock —
+  // or, when it is already open, restore it and switch it to this agent (a per-agent window, like the dossier)
+  let deskAgentId = null;   // the agent the DESK window shows (openDesk); independent of the dossier's `sel`
+  function openDesk(agentId) {
+    const i = present.findIndex(x => x && x.id === agentId);
+    if (i < 0 || !BUILDERS.desk) return false;
+    /* the desk keeps its OWN target (sweep 2026-10-01): it used to set the shared `sel` the dossier renders from, so
+       opening REX's desk with NOVA's dossier open made the dossier's next rerender (an EDIT, a skin pick, a rename)
+       show REX — and its SAVE wrote to REX. */
+    deskAgentId = String(agentId);
+    if (open.desk) { if (minimized.desk) restoreTerm('desk'); rerender('desk'); } else openTerm('desk');
+    return true;
+  }
   function openAgent(i) { sel = i; if (open.agents) { if (minimized.agents) restoreTerm('agents'); rerender('agents'); } else toggleTerm('agents', 'AGENT DOSSIER', buildAgents, { console: true, className: 'dossier' }); }
+
+  /* SHOW A PLACE (station.show, 2026-10-04 — the agent puts a window in front of the Commander). Opens through the
+     window's own door (openTerm: aliases, the ONE MENU tab swap, a minimized window restored), then RAISES it when
+     another window buries it — openTerm leaves an already-open window where it sits. Returns what is really on screen,
+     so the agent's "it's open" is a read-back, never a hope. */
+  function shown(key) {
+    const w = open[key];
+    if (!w || w._closing) return { open: false, key };
+    if (minimized[key]) restoreTerm(key);
+    w.style.zIndex = U.zTop();
+    return { open: !minimized[key] && w.isConnected, key, title: (BUILDERS[key] || [])[0] || key, section: consoleSection[key] || null };
+  }
+  function showTerm(key, section) {
+    if (key === 'work') key = 'tasks';
+    const al = TERM_ALIAS[key];
+    openTerm(key, section);
+    if (al) key = al.term;
+    return shown(key);
+  }
+  function showAgent(agentId, section, desk) {
+    const i = present.findIndex(x => x && x.id === agentId);
+    if (i < 0) return { open: false, key: desk ? 'desk' : 'agents' };
+    if (desk) return openDesk(agentId) ? shown('desk') : { open: false, key: 'desk' };
+    if (section) consoleSection.agents = section;
+    openAgent(i);
+    const out = shown('agents');
+    out.agent = (present[sel] && present[sel].id) || null;
+    return out;
+  }
 
   /* ============== SKILLS — capability readout (mirrors the sidecar CAP_REGISTRY) ==============
      The agent's real tools come from the OBJECTS at its workstation (object = capability — see
@@ -3260,44 +3839,87 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
      owns the whole "what agents can do" axis. Same two-part lane shape as windows/automation.js
      ({sections, wire}); wire() runs after the shared mountConsole call. */
   function abilitySkillsLane(body) {
-    const a = present[sel];
+    // ORG P21: the skills lane shows ONE agent — the one sent from its dossier's SKILLS row (a one-shot request,
+    // consumed here so a later open from anywhere else follows the dossier again), or the one picked in this same
+    // open window (kept across its own rerenders), else the dossier's selected agent, as before.
+    const sentFrom = skillsPick; skillsPick = null;
+    const keptHere = shownInOpenWindow() ? skillsShown.id : null;
+    const picked = present.find(x => x && x.id === (sentFrom || keptHere));
+    const a = picked || present[sel];
     const agentId = (a && a.id) || 'agent';
+    skillsShown = { id: agentId, win: weakWin(open.connectors) };
+    const agentPicker = present.length
+      ? '<label class="mc-hint" for="sk-agent-pick">Skills of</label><select id="sk-agent-pick" class="ab-agent-pick" aria-label="Show the skills of agent">' +
+        present.map(x => '<option value="' + esc(x.id) + '"' + (x.id === agentId ? ' selected' : '') + '>' + esc(x.name || x.id) + '</option>').join('') + '</select>'
+      : '';
+    // "recipes" here collided with the ❒ RECIPES dock feature (audit finding 2) — these are PROCEDURES: how-to
+    // guides an agent follows mid-task, not launchable jobs. The intro that restated the desc folded into it (UX night 10-25).
     const secLibrary =
-      // "recipes" here collided with the ❒ RECIPES dock feature (audit finding 2) — these are PROCEDURES: how-to
-      // guides an agent follows mid-task, not launchable jobs.
-      '<p class="sk-note sk-lib-intro">Enable skills for the whole station. Agents use them when relevant, with the tools and service access they already have.</p>' +
       '<div id="sk-lib" class="sk-lib"><div class="sk-loading"><span class="loading pulse">loading the skill library…</span></div></div>';
-    const secAgent =
-      '<p class="sk-note sk-lib-intro">Reusable procedures this agent created or learned. These appear as a compact index in future runs; the agent loads the full body only when a task matches.</p>' +
+    const secAgent =   // the agent picker leads the whole SKILLS section now: it steers the library, these skills and the market
+      '<p class="sk-note sk-lib-intro" id="sk-agent-intro">' + skillsIntro(a) + '</p>' +
       '<div id="sk-agent" class="sk-lib"><div class="sk-loading">loading agent skills…</div></div>';
+    // ONE FIELD, ONE BUTTON (UX night 10-26, Andrew: "pretend these users are like 5"): a link and INSPECT are the whole
+    // job, and what INSPECT finds shows right under them. An exported package file and skill registries ("taps") are
+    // power tools: folded under MORE WAYS, every id unchanged, so wireSkillExchange() is untouched.
     const secExchange =
-      '<p class="sk-note sk-lib-intro">Install a complete open skill package from a public HTTPS or GitHub <b>SKILL.md</b>. StarNet freezes the instructions and support files under one SHA-256 before review. Missing, oversized, unsafe, or partial packages are refused.</p>' +
-      '<div class="sk-exchange-form"><label for="sk-exchange-url">SKILL.MD SOURCE</label>' +
+      '<p class="sk-note sk-lib-intro">Paste a link to a skill’s <b>SKILL.md</b> file, for example on GitHub. StarNet checks the whole package and shows you what it does before anything installs; unsafe or broken packages are refused.</p>' +
+      '<div class="sk-exchange-form"><label for="sk-exchange-url">LINK TO A SKILL.md</label>' +
         '<div class="sk-exchange-row"><input id="sk-exchange-url" type="url" autocomplete="off" spellcheck="false" placeholder="https://github.com/owner/repo/blob/main/SKILL.md">' +
-        '<button id="sk-exchange-inspect" class="consent-btn" type="button">INSPECT</button></div>' +
-        '<label class="consent-btn" for="sk-exchange-import">IMPORT EXPORTED PACKAGE</label><input id="sk-exchange-import" type="file" accept=".json,.starnet-skill.json,application/json" hidden></div>' +
-      '<div class="sk-exchange-form"><label for="sk-registry-url">REGISTRY / TEAM TAP</label>' +
-        '<div class="sk-exchange-row"><input id="sk-registry-url" type="url" autocomplete="off" spellcheck="false" placeholder="https://example.com/skills/index.json">' +
-        '<input id="sk-registry-query" type="search" autocomplete="off" placeholder="search or browse all">' +
-        '<button id="sk-registry-search" class="consent-btn" type="button">BROWSE</button>' +
-        '<button id="sk-registry-discover" class="consent-btn" type="button">DISCOVER SITE</button>' +
-        '<button id="sk-registry-save" class="consent-btn" type="button">SAVE TAP</button></div><div id="sk-registry-sources"></div><div id="sk-registry-results"></div></div>' +
-      '<div id="sk-exchange-preview" class="sk-exchange-preview" role="status" aria-live="polite"><div class="sk-loading">Paste a source to inspect its instructions, provenance, and guard verdict.</div></div>';
+        '<button id="sk-exchange-inspect" class="consent-btn" type="button">INSPECT</button></div></div>' +
+      '<div id="sk-exchange-preview" class="sk-exchange-preview" role="status" aria-live="polite"><div class="sk-loading">Paste a link, then INSPECT. You see what the skill does, and whether it is safe, before anything installs.</div></div>' +
+      '<details class="mc-add-fold sk-more-ways"><summary>More ways to add a skill <span class="dim">(advanced)</span></summary>' +
+        '<div class="sk-exchange-form"><label class="consent-btn" for="sk-exchange-import">IMPORT EXPORTED PACKAGE</label><input id="sk-exchange-import" type="file" accept=".json,.starnet-skill.json,application/json" hidden></div>' +
+        '<div class="sk-exchange-form"><label for="sk-registry-url">REGISTRY / TEAM TAP</label>' +
+          '<div class="sk-exchange-row"><input id="sk-registry-url" type="url" autocomplete="off" spellcheck="false" placeholder="https://example.com/skills/index.json">' +
+          '<input id="sk-registry-query" type="search" autocomplete="off" placeholder="search or browse all">' +
+          '<button id="sk-registry-search" class="consent-btn" type="button">BROWSE</button>' +
+          '<button id="sk-registry-discover" class="consent-btn" type="button">DISCOVER SITE</button>' +
+          '<button id="sk-registry-save" class="consent-btn" type="button">SAVE TAP</button></div><div id="sk-registry-sources"></div><div id="sk-registry-results"></div></div>' +
+      '</details>';
     /* Fill the LIVE VOICE section from the sidecar's real voice list and persist the pick.
        Truthful by construction: if the provider has no native voice endpoint we say so rather than
        offering choices that would do nothing, and the note about WHEN a change takes effect is shown
        because a live session cannot switch voice mid-call. */
 
+    // SKILL MARKET (2026-09-29): the curated StarNet catalog, browsed as the same glass card grid the connectors
+    // CATALOG uses. The catalog is fetched when this section loads, never in the background.
+    // the second intro paragraph restated the desc and the shelves' own notes; its one new fact moved into the desc
+    const secMarket =
+      '<div class="cc-filters" id="skm-filters" role="group" aria-label="Filter the skill market">' +
+        '<button type="button" class="cc-filter active" data-skm-filter="all" aria-pressed="true">ALL</button>' +
+        '<button type="button" class="cc-filter" data-skm-filter="originals" aria-pressed="false">STARNET ORIGINALS</button>' +
+        '<button type="button" class="cc-filter" data-skm-filter="community" aria-pressed="false">COMMUNITY</button>' +
+        '<button type="button" class="cc-filter" data-skm-filter="installed" aria-pressed="false">INSTALLED</button>' +
+        '<button type="button" class="cc-filter" data-skm-filter="update" aria-pressed="false">UPDATES</button>' +
+      '</div>' +
+      // the result of the last install/remove, read out once — the card itself also shows it next to its button
+      '<div id="skm-msg" class="sr-only" role="status" aria-live="polite"></div>' +
+      '<div id="skm-list" class="cc-list"><span class="loading pulse">loading the skill market…</span></div>';
+
     const frag = html => (el => { el.innerHTML = html; });
+    // ONE FLAT LIST (UX night 10-26, Andrew: "more like the settings menu where u can see all the different options"):
+    // SKILL EXCHANGE is SKILL MARKET's FROM A LINK block and AGENT SKILLS is the LEARNED block of SKILLS. Every element id
+    // is unchanged, so wire() below runs as before, and the retired section ids land here via SECTION_ALIAS.
+    const block = (id, label) => '<div class="sec" id="' + id + '"><span class="sec-l">' + label + '</span><span class="sec-r"></span><span class="sec-nd"></span></div>';
     const sections = [
-      { id: 'library', label: 'SKILL LIBRARY', glyph: '▤', desc: 'Pre-installed procedures your agents follow when a task matches, grouped by kind.', build: frag(secLibrary) },
-      { id: 'agent', label: 'AGENT SKILLS', glyph: '✎', desc: 'Procedures this agent created or learned itself.', build: frag(secAgent) },
-      { id: 'exchange', label: 'SKILL EXCHANGE', glyph: '⇩', desc: 'Inspect and install open SKILL.md procedures with provenance and guard review.', build: frag(secExchange) }
+      { id: 'market', label: 'SKILL MARKET', glyph: '▦', desc: 'New skills for your crew, from StarNet and the community. Installing one switches it on for every agent.', build: frag(secMarket + block('ab-exchange', 'ADD FROM A LINK') + secExchange) },
+      { id: 'library', label: 'SKILLS', glyph: '▤', desc: 'What your crew knows how to do. Switch a skill on or off; agents use it when a task needs it, with the tools they already have.', build: frag(agentPicker + secLibrary + block('ab-agent-skills', 'LEARNED SKILLS') + secAgent) }
     ];
     function wire() {
+      loadSkillMarket(agentId);
       loadSkillLibrary(agentId);
       loadAgentSkills(agentId);
-      wireSkillExchange(agentId);
+      const pick = document.getElementById('sk-agent-pick');
+      if (pick) pick.addEventListener('change', () => {
+        skillsShown = { id: pick.value, win: weakWin(open.connectors) }; sfx('click');
+        const shown = present.find(x => x && x.id === pick.value);
+        const intro = document.getElementById('sk-agent-intro'); if (intro) intro.innerHTML = skillsIntro(shown);
+        // one agent per lane: the library's "active for <agent>" readout, the market's gear check and an exchange
+        // install all follow the pick, not the agent the window first opened on
+        loadAgentSkills(pick.value); loadSkillLibrary(pick.value); loadSkillMarket(pick.value);
+      });
+      wireSkillExchange(skillsAgentId);
       wireSkillsLive();   // A3: keep the AGENT SKILLS list live while the panel is open (registers once)
     }
     return { sections, wire };
@@ -3305,11 +3927,252 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   window.AbilityLanes = window.AbilityLanes || [];
   window.AbilityLanes.push(abilitySkillsLane);
 
+  /* SKILL MARKET — the curated StarNet catalog as a card grid (the connectors CATALOG's cc-card glass cards, reused
+     so the two catalogs look and behave the same, search included). Every status a card shows comes from the
+     sidecar's /api/skill-market listing: available, installed, built in (our bundled copy IS the published
+     version), update, or tampered (its files changed on disk, so agents are not given it). */
+  // gear is named with the BUILD MODE palette's own labels (SK_OBJ_NAME, shared with SKILL LIBRARY), so a card never
+  // names an object the Commander can't find
+  const skmGear = g => SK_OBJ_NAME[g] || String(g).toUpperCase();
+  let skmFilter = 'all';
+  // CATEGORY FOLDS (UX night 10-25): each shelf lists its categories as one-line folds (102 cards were one ~20,000px
+  // scroll). A fold the Commander opens stays open across the market's re-renders (an install repaints every card).
+  const skmFoldOpen = new Set();
+  const skmBusy = new Map();   // slug -> 'install' | 'uninstall' while a request is in flight (survives re-renders)
+  let skmResult = null;        // { slug, text, ok } — the last install/remove result, shown on that card
+  let skmFocus = '';           // slug whose action button takes focus after the next render
+  // tell the rest of the app the station's skills changed (the chat's "/" palette re-reads its list)
+  const skillsChanged = () => { try { window.dispatchEvent(new CustomEvent('starnet:skills-changed')); } catch (_) {} };
+  // the gear a skill can use for this agent — the SAME reading loadSkillLibrary makes (room objects, shared station
+  // gear, profile / Full Access grants from /api/toolsets), so a market card never calls gear "missing" that the
+  // library would count as present
+  async function skillPlacedTypes(agentId) {
+    let placed = [];
+    try { placed = (typeof World !== 'undefined' && World.heroCaps) ? World.heroCaps(agentId).map(c => c.objectType) : []; } catch (e) {}
+    const shared = (() => { try { return typeof World !== 'undefined' && World.stationCaps ? World.stationCaps().map(c => c.objectType) : []; } catch (_) { return []; } })();
+    let granted = [];
+    try {
+      const view = await Harness.api.get('/api/toolsets?agent=' + encodeURIComponent(agentId) + '&placed=' + encodeURIComponent(placed.join(',')));
+      if (view && view.authority && Array.isArray(view.toolsets)) granted = view.toolsets.filter(r => r.object && (r.placed || r.profileGranted || r.runtimeGranted || view.authority.unrestricted)).map(r => r.object);
+    } catch (_) {}
+    return [...new Set(placed.concat(shared, granted))];
+  }
+  function skmCard(e, i) {
+    const on = e.status === 'installed' && !e.superseded;
+    const missing = (e.missingGear || []);
+    const gear = missing.map(skmGear);
+    const slug = esc(e.slug);
+    const origin = e.shelf === 'originals'
+      ? '<span class="cc-badge cc-official">STARNET ORIGINAL</span>'
+      : '<span class="cc-badge cc-community">community · ' + esc(e.author || 'credited') + '</span>';
+    const btn = (act, text, cls) => {
+      const busy = skmBusy.get(e.slug);
+      return busy ? '<button class="bb ' + (cls || 'xs') + '" disabled>' + (busy === 'install' ? 'INSTALLING…' : 'REMOVING…') + '</button>'
+        : '<button class="bb ' + (cls || 'xs') + '" data-skm-act="' + act + '" data-slug="' + slug + '">' + text + '</button>';
+    };
+    const needs = gear.length ? ' Needs ' + esc(gear.join(', ')) + ' placed to be used.' : '';
+    let action, hint, warn = false;
+    if (e.status === 'installed' && e.superseded) {
+      action = btn('uninstall', 'REMOVE');
+      hint = 'Your built-in copy (v' + esc(e.builtInVersion) + ') is newer, so it is the one agents use. REMOVE clears this older market copy (v' + esc(e.installedVersion) + ').';
+    } else if (e.status === 'installed') {
+      action = btn('uninstall', 'REMOVE'); hint = 'Installed · v' + esc(e.installedVersion || e.version) + '.' + needs;
+    } else if (e.status === 'bundled') {
+      action = '<span class="cc-badge cc-official">BUILT IN</span>';
+      hint = 'Came with StarNet (v' + esc(e.builtInVersion || e.version) + '). Switch it on or off in SKILLS.';
+    } else if (e.status === 'update') {
+      action = btn('install', 'UPDATE');
+      hint = e.builtIn && !e.delisted && e.installedVersion === e.builtInVersion
+        ? 'A newer version than the one built into StarNet: v' + esc(e.builtInVersion) + ' → v' + esc(e.version) + '.'
+        : 'v' + esc(e.installedVersion) + ' → v' + esc(e.version) + '.';
+    } else if (e.status === 'tampered') {
+      action = btn('install', 'REINSTALL'); warn = true;
+      hint = 'Its files changed on disk after install, so agents are not given it. Reinstall to restore it.';
+    } else if (e.status === 'pulled') {
+      warn = true;
+      action = (e.fixVersion ? btn('install', 'UPDATE TO v' + esc(e.fixVersion)) + ' ' : '') + btn('uninstall', 'REMOVE');
+      hint = 'PULLED from the market: ' + esc(e.pulledReason || 'no reason given') + '. ' +
+        (e.fallback === 'bundled' ? 'The version you installed is off; agents use your built-in copy instead.'
+          : e.fixVersion ? 'The version you installed is off; v' + esc(e.fixVersion) + ' replaces it.'
+            : 'It is switched off and agents are not given it.');
+    } else {
+      action = btn('install', '+ INSTALL', 'sm');
+      hint = gear.length ? 'Needs ' + esc(gear.join(', ')) + ' placed to be used.' : 'Ready to use as soon as it is installed.';
+    }
+    // gear an installed or installable skill still needs: the SAME → PLACE shortcut SKILL LIBRARY offers. The
+    // ORCHESTRATOR is not a prop — every run the Commander starts carries it (runtimeGranted) — so it never gets one.
+    const placeable = missing.filter(g => g !== 'orchestrator');
+    const place = placeable.length && (e.status === 'available' || e.status === 'installed' || e.status === 'update')
+      ? '<div class="sk-place-row">' + placeable.map(g => '<button class="sk-place" type="button" data-place="' + esc(g) + '" title="Open BUILD MODE to place ' + skArt(skmGear(g)) + esc(skmGear(g)) + '">→ PLACE ' + esc(skmGear(g)) + '</button>').join('') + '</div>' : '';
+    const result = skmResult && skmResult.slug === e.slug
+      ? '<div class="mc-hint skm-result' + (skmResult.ok ? '' : ' skm-result-bad') + '">' + esc(skmResult.text) + '</div>' : '';
+    const files = (e.files || []).map(f => '<li><code>' + esc(f.path) + '</code> <span class="dim">' + esc(String(f.bytes)) + ' B</span></li>').join('');
+    const upstream = e.upstream && /^https:\/\//.test(String(e.upstream.url || ''))
+      ? '<div class="mc-hint">Adapted from <a class="dim" href="' + esc(e.upstream.url) + '" target="_blank" rel="noopener">the original ↗</a> (' + esc(e.upstream.license || e.license) + ')</div>' : '';
+    const search = [e.category, e.author, e.shelf === 'originals' ? 'starnet original' : 'community'].concat(e.tags || []).join(' ');
+    return '<div class="cc-card' + (on ? ' cc-on' : '') + '" data-skm="' + slug + '" data-shelf="' + esc(e.shelf) + '" data-status="' + esc(e.status) + '" data-installed="' + (e.installedVersion && e.status !== 'available' ? '1' : '') + '" data-search="' + esc(search) + '" style="--ci:' + (i || 0) + '">' +
+      '<div class="cc-head"><span class="cc-brand" aria-hidden="true">' + esc(String(e.name || e.slug).slice(0, 2).toUpperCase()) + '</span>' +
+        '<div class="cc-identity"><b>' + esc(e.name) + '</b><span class="cc-chip">' + esc(e.category) + '</span></div></div>' +
+      (e.description ? '<div class="cc-blurb dim">' + esc(e.description) + '</div>' : '') +
+      '<details class="cc-details"><summary aria-label="Details for ' + esc(e.name) + '">Skill details</summary><div class="cc-details-body">' + origin +
+        '<div class="mc-hint">v' + esc(e.version) + ' · ' + esc(e.license || 'no license') + (e.requires && e.requires.length ? ' · uses ' + esc(e.requires.map(skmGear).join(', ')) : '') + '</div>' +
+        upstream + (files ? '<ul class="skm-files">' + files + '</ul>' : '') + '</div></details>' +
+      '<div class="mc-hint cc-setup-hint' + (warn ? ' skm-warn' : '') + '">' + hint + '</div>' + place + result +
+      '<div class="cc-acts">' + action + '</div></div>';
+  }
+  // INSTALLED = everything this station has (built in or from the market, whatever its state); UPDATES = only the
+  // ones with a newer version waiting. A pulled or tampered skill shows under INSTALLED with its warning.
+  function skmApplyFilter(list) {
+    if (!list || list.dataset.skmOk !== '1') return;   // a failed/refused load has no cards: no filter claims about it
+    const searching = !!list.closest('.con-searching');   // while searching, the console search owns the folds
+    list.querySelectorAll('.cc-group').forEach(g => {
+      let vis = 0;
+      g.querySelectorAll('.cc-card').forEach(c => {
+        const hit = skmFilter === 'all' ? true
+          : skmFilter === 'installed' ? (c.dataset.installed === '1' || c.dataset.status === 'bundled')
+          : skmFilter === 'update' ? c.dataset.status === 'update'
+          : c.dataset.shelf === skmFilter;
+        c.hidden = !hit; if (hit) vis++;
+      });
+      g.hidden = vis === 0;
+      const tag = g.querySelector('.sec-tag'); if (tag) tag.textContent = String(vis);
+      // INSTALLED / UPDATES are already the short list: their categories show their cards; ALL is the index again
+      if (!searching && g.matches('details')) g.open = (skmFilter === 'installed' || skmFilter === 'update') || skmFoldOpen.has(g.dataset.fold);
+    });
+    list.querySelectorAll('.skm-shelf').forEach(s => {
+      const n = s.querySelectorAll('.cc-card:not([hidden])').length;
+      s.hidden = n === 0;
+      const tag = s.querySelector(':scope > .sec .sec-tag'); if (tag) tag.textContent = String(n);
+    });
+    let none = list.querySelector('.cc-nores');
+    const shown = list.querySelectorAll('.cc-card:not([hidden])').length;
+    if (!shown) {
+      if (!none) { none = document.createElement('p'); none.className = 'mc-hint cc-nores'; list.appendChild(none); }
+      none.textContent = skmFilter === 'update' ? 'Everything you have is up to date.' : skmFilter === 'installed' ? 'No skills installed yet.' : 'Nothing on this shelf yet.';
+    } else if (none) none.remove();
+  }
+  function renderSkillMarket(host, d, agentId) {
+    if (!d || !d.ok) {
+      host.dataset.skmOk = '';
+      const err = String((d && d.error) || 'no answer').replace(/[.\s]+$/, '');
+      if (/turned off on this station/.test(err)) {
+        host.innerHTML = '<p class="mc-notice"><b>The skill market is turned off</b>This station was started with the market switched off (STARNET_SKILL_MARKET_URL=off). Skills you already installed keep working.</p>';
+        return;
+      }
+      // a catalog that failed its signature or serial check was reached but REFUSED — say that, not "couldn't reach"
+      const refused = /^the skill market (.+?) was not trusted: (.+)$/.exec(err);
+      // "http 403" / "took too long" come from THIS app talking to its own station, not from the market
+      const local = /^http \d{3}$/i.test(err) ? 'your station didn\'t answer the request (' + err.toUpperCase() + '); reload StarNet and try again'
+        : /took too long/i.test(err) ? 'your station took too long to answer' : '';
+      host.innerHTML = (refused
+        ? '<p class="mc-notice"><b>StarNet refused the skill market\'s ' + esc(refused[1]) + '</b>' + esc(refused[2]) + '. Nothing from it was used, and skills you already installed keep working.</p>'
+        : '<p class="mc-hint">' + (local ? 'Couldn\'t load the skill market: ' + esc(local) : 'Couldn\'t reach the skill market: ' + esc(err)) + '. Skills you already installed keep working.</p>') +
+        '<button class="bb xs" type="button" data-skm-act="retry">TRY AGAIN</button>';
+      return;
+    }
+    const shelves = [['originals', 'StarNet Originals', 'Written by StarNet for your station\'s gear and tools.'], ['community', 'Community picks', 'Open skills by other authors, adapted for StarNet and credited.']];
+    // Originals still lead (DECISIONS: the Skill Market); inside a shelf, its categories in A-Z order, one fold each
+    const html = shelves.map(([id, label, note]) => {
+      const rows = d.entries.filter(e => e.shelf === id);
+      if (!rows.length) return '';
+      const cats = [...new Set(rows.map(e => String(e.category || 'Other')))].sort((a, b) => a.localeCompare(b));
+      return '<div class="skm-shelf" data-shelf="' + esc(id) + '"><div class="sec"><span class="sec-l">' + esc(label) + '</span><span class="sec-tag">' + rows.length + '</span><span class="sec-r"></span><span class="sec-nd"></span></div>' +
+        '<p class="mc-hint">' + esc(note) + '</p>' + cats.map(cat => {
+          const inCat = rows.filter(e => String(e.category || 'Other') === cat), key = id + '/' + cat;
+          return '<details class="cc-group" data-fold="' + esc(key) + '"' + (skmFoldOpen.has(key) ? ' open' : '') + '>' +
+            '<summary class="sec"><span class="sec-l">' + esc(cat) + '</span><span class="sec-tag">' + inCat.length + '</span><span class="sec-r"></span><span class="sec-nd"></span></summary>' +
+            '<div class="cc-grid">' + inCat.map(skmCard).join('') + '</div></details>';
+        }).join('') + '</div>';
+    }).join('');
+    const pulled = d.entries.filter(e => e.status === 'pulled');
+    const banner = pulled.length
+      ? '<p class="mc-notice skm-pulled"><b>' + (pulled.length === 1 ? esc(pulled[0].name) + ' was pulled from the market' : pulled.length + ' of your skills were pulled from the market') + '</b>' +
+        (pulled.length === 1 ? 'It is' : 'They are') + ' switched off; ' + (pulled.length === 1 ? 'its card says' : 'each card says') + ' why and what to do. Find ' + (pulled.length === 1 ? 'it' : 'them') + ' under INSTALLED.</p>'
+      : '';
+    host.dataset.skmOk = html ? '1' : '';
+    host.innerHTML = html ? banner + html : '<p class="mc-hint">The skill market is empty right now.</p>';
+    skmApplyFilter(host);
+    if (skmFocus) {
+      const f = host.querySelector('[data-skm="' + CSS.escape(skmFocus) + '"] .cc-acts button:not([disabled])') || host.querySelector('[data-skm="' + CSS.escape(skmFocus) + '"] .cc-acts');
+      skmFocus = '';
+      // the card's category may have folded in this repaint (a search opened it): open it again before focusing, as the
+      // search's own fold when searching, else as the Commander's (they just acted inside it)
+      const fold = f && f.closest('details.cc-group');
+      if (fold && !fold.open) { fold.open = true; if (host.closest('.con-searching')) fold.dataset.searchOpened = '1'; else skmFoldOpen.add(fold.dataset.fold); }
+      // focus a tick later: while searching, a repainted card's group stays display:none until the caller re-applies the
+      // search (loadSkillMarket, right after this render), and focusing a hidden button silently drops to <body>
+      if (f && f.focus) setTimeout(() => { if (!f.isConnected) return; if (!f.matches('button')) f.setAttribute('tabindex', '-1'); f.focus({ preventScroll: false }); }, 0);
+    }
+  }
+  function loadSkillMarket(agentId, refresh) {
+    const host = $('#skm-list'); if (!host) return;
+    if (!host.dataset.wired) {
+      // a fresh panel starts on ALL, matching its chips (the filter used to survive a reopen while the chips reset)
+      skmFilter = 'all';
+      const f = $('#skm-filters');
+      if (f) f.querySelectorAll('[data-skm-filter]').forEach(x => { const on = x.dataset.skmFilter === 'all'; x.classList.toggle('active', on); x.setAttribute('aria-pressed', on ? 'true' : 'false'); });
+    }
+    host.dataset.agent = agentId;   // ORG P21: the once-wired handler below acts for the agent of the LATEST load
+    const load = ++skillMarketLoad;  // …and only the latest load may land (the picker can reload for another agent mid-fetch)
+    skillPlacedTypes(agentId)
+      .then(placed => Harness.api.get('/api/skill-market?placed=' + encodeURIComponent(placed.join(',')) + (refresh ? '&refresh=1' : '')))
+      .then(d => { if ($('#skm-list') === host && load === skillMarketLoad) { renderSkillMarket(host, d, agentId); const search = host.closest('.term-body')?.querySelector('.con-search-in'); if (search && search.value.trim()) search.dispatchEvent(new Event('input', { bubbles: true })); } })
+      .catch(e => { if ($('#skm-list') === host && load === skillMarketLoad) renderSkillMarket(host, { ok: false, error: e && e.message }, agentId); });
+    if (host.dataset.wired) return;
+    host.dataset.wired = '1';
+    const filters = $('#skm-filters');
+    if (filters) filters.addEventListener('click', ev => {
+      const b = ev.target.closest('[data-skm-filter]'); if (!b) return;
+      skmFilter = b.dataset.skmFilter;
+      filters.querySelectorAll('[data-skm-filter]').forEach(x => { const on = x === b; x.classList.toggle('active', on); x.setAttribute('aria-pressed', on ? 'true' : 'false'); });
+      skmApplyFilter($('#skm-list'));
+    });
+    host.addEventListener('click', async ev => {
+      // the Commander's own fold choice (the click lands before the fold toggles)
+      const head = ev.target.closest('summary'), fold = head && head.parentElement;
+      if (fold && fold.matches('details.cc-group') && fold.dataset.fold) { if (fold.open) skmFoldOpen.delete(fold.dataset.fold); else skmFoldOpen.add(fold.dataset.fold); return; }
+      const place = ev.target.closest('[data-place]');
+      const shownId = host.dataset.agent || agentId;
+      if (place) { sfx('click'); placeGearForSkill(place.dataset.place, (typeof App !== 'undefined' && App.agentName) ? App.agentName(shownId) : ''); return; }
+      const b = ev.target.closest('[data-skm-act]'); if (!b || b.disabled) return;
+      const act = b.dataset.skmAct, slug = b.dataset.slug;
+      if (act === 'retry') { host.innerHTML = '<span class="loading pulse">loading the skill market…</span>'; loadSkillMarket(shownId, true); return; }
+      if (skmBusy.has(slug)) return;
+      const msg = $('#skm-msg');
+      const card = b.closest('[data-skm]');
+      const name = card ? (card.querySelector('.cc-identity b') || {}).textContent : slug;
+      const verb = b.textContent.trim();   // + INSTALL · UPDATE · UPDATE TO vX · REINSTALL · REMOVE — what the Commander clicked
+      skmBusy.set(slug, act === 'install' ? 'install' : 'uninstall');
+      b.disabled = true; b.textContent = act === 'install' ? 'INSTALLING…' : 'REMOVING…';
+      try {
+        const r = await Harness.api.post('/api/skill-market/' + (act === 'install' ? 'install' : 'uninstall'), { slug });
+        if (!r.ok || !r.j || r.j.ok === false) throw new Error((r.j && r.j.error) || 'the station refused');
+        const text = act !== 'install' ? 'Removed ' + name + '.'
+          : /^REINSTALL/.test(verb) ? 'Reinstalled ' + name + '.'
+            : /^UPDATE/.test(verb) ? 'Updated ' + name + ' to v' + (r.j.version || '') + '.'
+              : 'Installed ' + name + ' for the whole crew.';
+        skmResult = { slug, text, ok: true };
+        if (msg) msg.textContent = text;
+        skillsChanged();
+      } catch (e) {
+        const text = String((e && e.message) || 'That did not work').replace(/[.\s]+$/, '') + '.';
+        skmResult = { slug, text, ok: false };
+        if (msg) msg.textContent = text;
+      } finally {
+        // always re-read: even a timed-out request may have finished on the station
+        skmBusy.delete(slug);
+        skmFocus = slug;
+        loadSkillMarket(shownId); loadSkillLibrary(shownId);
+      }
+    });
+  }
+
   // async: fetch the bundled recipe catalog (with THIS agent's placed objects, so the active/locked readout is
   // truthful) and render it into #sk-lib. Mirrors loadMemoryCore — re-query the host after the await so a panel
   // that was closed mid-fetch is a safe no-op. The global fetch wrapper (harness.js) attaches the API token.
   function loadSkillLibrary(agentId) {
     const host = $('#sk-lib'); if (!host) return;
+    const load = ++skillLibLoad;   // ORG P21: the picker can reload for another agent mid-fetch — only the latest load may land
     let placed = [];
     try { placed = (typeof World !== 'undefined' && World.heroCaps) ? World.heroCaps(agentId).map(c => c.objectType) : []; } catch (e) {}
     Harness.api.get('/api/toolsets?agent=' + encodeURIComponent(agentId) + '&placed=' + encodeURIComponent(placed.join(',')))
@@ -3318,13 +4181,13 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         // Match runOnce's skill context: room objects plus profile/Full Access projection and shared station gear.
         // This only explains instruction availability; it does not grant any tools or change skill preferences.
         const shared = typeof World !== 'undefined' && World.stationCaps ? World.stationCaps().map(c => c.objectType) : [];
-        placed = [...new Set(placed.concat(shared, view.toolsets.filter(r => r.object && (r.placed || r.profileGranted || view.authority.unrestricted)).map(r => r.object)))];
+        placed = [...new Set(placed.concat(shared, view.toolsets.filter(r => r.object && (r.placed || r.profileGranted || r.runtimeGranted || view.authority.unrestricted)).map(r => r.object)))];
         return fetch('/api/skills?placed=' + encodeURIComponent(placed.join(',')));
       })
       .then(r => { if (!r.ok) throw Error('Skill library unavailable'); return r.json(); })
       .then(d => {
         const h = $('#sk-lib');
-        if (h === host) {
+        if (h === host && load === skillLibLoad) {
           renderSkillLibrary(h, (d && d.skills) || [], agentId, placed);
           const search = h.closest('.term-body')?.querySelector('.con-search-in');
           if (search && search.value.trim()) search.dispatchEvent(new Event('input', { bubbles:true }));
@@ -3333,18 +4196,18 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       })
       .catch(() => {
         const h = $('#sk-lib');
-        if (h) {
+        if (h && load === skillLibLoad) {
           h.innerHTML = '<div class="sk-loading">Could not load the skill library — is the sidecar running?</div>';
           requestAnimationFrame(() => fitTermInViewport(open.connectors));
         }
       });
   }
 
-  // The gear names here are the REFIT palette's own labels (the cabinet cap's representative prop is the INTEL CAB),
+  // The gear names here are the BUILD MODE palette's own labels (the cabinet cap's representative prop is the INTEL CAB),
   // so a "place a …" nudge names something the Commander can actually find in the palette. skArt keeps the article
   // right for a vowel-initial label ("place an INTEL CAB", not "a INTEL CAB").
   const SK_OBJ_NAME = { cabinet: 'INTEL CAB', dish: 'DISH', workbench: 'WORKBENCH', studio: 'STUDIO', notebook: 'NOTEBOOK', jukebox: 'JUKEBOX', computer: 'COMPUTER', orchestrator: 'ORCHESTRATOR', connector: 'CONNECTOR' };
-  // Each capability objectType → the representative placeable prop (CAP_PROP_MAP) and the REFIT palette category tab
+  // Each capability objectType → the representative placeable prop (CAP_PROP_MAP) and the BUILD MODE palette category tab
   // that holds it. Lets a locked skill's "PLACE" button land the user on the exact gear in the real build surface.
   const skArt = (label) => (/^[AEIOU]/.test(String(label || '')) ? 'an ' : 'a ');
   const SK_PLACE = {
@@ -3354,7 +4217,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     studio:   { prop: 'studio',    cat: 'capability' },
     notebook: { prop: 'core',      cat: 'capability' }
   };
-  // Deep-link a locked skill's missing gear into the REAL placement surface: minimize SKILLS, open REFIT, drive its
+  // Deep-link a locked skill's missing gear into the REAL placement surface: minimize SKILLS, open BUILD MODE, drive its
   // palette to the PROP tool → FUNCTIONAL tier → the missing cap's category tab → its prop tile (so the very next
   // floor-click drops it). Mirrors app.js openDeskPlacement() — the honest path, never a fake auto-place. `objType`
   // is a capability objectType (cabinet/dish/workbench/…); `agentName` is only for the guidance toast.
@@ -3365,18 +4228,18 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       notify('Open ⚒ BUILD and place ' + skArt(label) + label + ' to unlock this skill', 'warn'); return;
     }
     // the caller may sit in the ABILITIES console (skill library PLACE) or the dossier's SKILLS tab
-    // (locked capability card) — clear whichever is open so REFIT isn't buried under it.
+    // (locked capability card) — clear whichever is open so BUILD MODE isn't buried under it.
     try { if (open.connectors) minimizeTerm('connectors'); } catch (_) {}
     try { if (open.agents) minimizeTerm('agents'); } catch (_) {}
     try {
-      if (Build.isOpen && Build.isOpen()) { /* already in REFIT */ }
+      if (Build.isOpen && Build.isOpen()) { /* already in BUILD MODE */ }
       else if (Build.open) Build.open();
       else Build.toggle();
-    } catch (_) { notify('Could not open REFIT — open ⚒ BUILD and place ' + skArt(label) + label, 'warn'); return; }
+    } catch (_) { notify('Could not open BUILD MODE — open ⚒ BUILD and place ' + skArt(label) + label, 'warn'); return; }
     notify('Place ' + skArt(label) + label + ' at ' + (agentName || 'the agent') + '’s desk to unlock this skill', 'good');
-    if (!spot) return;   // no known prop mapping — REFIT is open, the toast named the gear; that's the floor of acceptable
+    if (!spot) return;   // no known prop mapping — BUILD MODE is open, the toast named the gear; that's the floor of acceptable
     // Drive the palette to the PROP tool → FUNCTIONAL tier → the missing cap's category tab → its prop tile so the
-    // very next floor-click drops it. REFIT builds its DOM synchronously in open(), so the FIRST pass runs inline
+    // very next floor-click drops it. BUILD MODE builds its DOM synchronously in open(), so the FIRST pass runs inline
     // (works even where rAF is throttled); a few rAF retries then cover any deferred re-render. Each pass clicks only
     // what isn't already active, so it's idempotent + cheap.
     let tries = 0;
@@ -3410,12 +4273,13 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     return { ready: ready, needsGear: needsGear, off: off };
   }
 
+  let skLibOffOpen = false;   // the TURNED OFF fold, as the Commander last left it
   function renderSkillLibrary(host, skills, agentId, placed) {
     if (!skills.length) { host.innerHTML = '<div class="sk-loading">No skills in the library yet.</div>'; return; }
     const placedSet = {}; (placed || []).forEach(p => placedSet[p] = true);
     const objLabel = (r) => SK_OBJ_NAME[r] || String(r).toUpperCase();
     const active = skills.filter(s => s.enabled && s.available).length;
-    const agentName = (present[sel] && present[sel].name) || agentId;
+    const agentName = ((present.find(x => x && x.id === agentId) || {}).name) || agentId;   // ORG P21: the agent this list was loaded for
     const groups = groupSkillsByState(skills);
     let html = '<div class="sk-lib-sum">' + skills.length + ' skill' + (skills.length === 1 ? '' : 's') +
       ' · <b>' + active + '</b> active for ' + esc(agentName) + '</div>';
@@ -3434,9 +4298,9 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     const reqBadges = (s) => (s.requires || []).length
       ? s.requires.map(r => '<span class="sk-badge ' + (placedSet[r] ? 'have' : 'miss') + '">' + objLabel(r) + '</span>').join('')
       : '<span class="sk-badge free">no gear needed</span>';
-    // one PLACE button per missing object → the real REFIT placement surface (placeGearForSkill).
+    // one PLACE button per missing object → the real BUILD MODE placement surface (placeGearForSkill).
     const placeBtns = (missing) => missing.map(r =>
-      '<button class="sk-place" data-place="' + esc(r) + '" title="Open REFIT to place ' + skArt(objLabel(r)) + esc(objLabel(r)) + '">→ PLACE ' + esc(objLabel(r)) + '</button>').join('');
+      '<button class="sk-place" data-place="' + esc(r) + '" title="Open BUILD MODE to place ' + skArt(objLabel(r)) + esc(objLabel(r)) + '">→ PLACE ' + esc(objLabel(r)) + '</button>').join('');
     let ci = 0;
     const card = (s) => {
       const missing = (s.requires || []).filter(r => !placedSet[r]);
@@ -3454,22 +4318,26 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
           '</div>' +
           '<div class="sk-card-actions"><button class="sk-expand" data-expand="' + esc(s.slug) + '" aria-expanded="false" aria-label="Read instructions for ' + esc(s.name) + '">Read instructions</button>' + switchHTML(s) + '</div>' +
           '<div class="sk-body"><div class="sk-detail-label">Required gear</div><div class="sk-reqs">' + reqBadges(s) + '</div><div class="sk-detail-label">Instructions</div><div class="sk-instructions">' + (typeof Deliverables !== 'undefined' && Deliverables.safeMarkdown ? Deliverables.safeMarkdown(s.body || '') : '<pre>' + esc(s.body || '') + '</pre>') + '</div>' +
-            (s.author ? '<div class="sk-attr">Ported from ' + esc(s.author) + (s.license ? ' · ' + esc(s.license) : '') + '</div>' : '') +
+            (s.market ? '<div class="sk-attr">' + (s.shelf === 'originals' ? 'StarNet Original, installed from the Skill Market' : 'From the Skill Market' + (s.author ? ' · by ' + esc(s.author) : '')) + (s.license ? ' · ' + esc(s.license) : '') + '</div>'
+              : s.author ? '<div class="sk-attr">Ported from ' + esc(s.author) + (s.license ? ' · ' + esc(s.license) : '') + '</div>' : '') +
           '</div>' +
         '</div>';
     };
-    const section = (label, list) => list.length
-      ? '<div class="sec sk-state-sec"><span class="sec-l">' + label + '</span><span class="sec-tag">' + list.length + '</span><span class="sec-r"></span><span class="sec-nd"></span></div>' + list.map(card).join('')
-      : '';
+    const head = (label, list) => '<span class="sec-l">' + label + '</span><span class="sec-tag">' + list.length + '</span><span class="sec-r"></span><span class="sec-nd"></span>';
+    const section = (label, list) => list.length ? '<div class="sec sk-state-sec">' + head(label, list) + '</div>' + list.map(card).join('') : '';
     html += section('READY TO USE', groups.ready);
     html += section('NEEDS GEAR', groups.needsGear);
-    html += section('TURNED OFF', groups.off);
+    // TURNED OFF is one line (UX night 10-25): the library opened on 5 skills in use and then a wall of the 69 that are
+    // not. Opened, it stays open while the Commander switches skills on (every switch repaints the library).
+    if (groups.off.length) html += '<details class="sk-fold"' + (skLibOffOpen ? ' open' : '') + '><summary class="sec sk-state-sec">' + head('TURNED OFF', groups.off) + '</summary>' + groups.off.map(card).join('') + '</details>';
     host.innerHTML = html;
+    const offFold = host.querySelector('details.sk-fold');
+    if (offFold) offFold.querySelector('summary').addEventListener('click', () => { skLibOffOpen = !offFold.open; });
     host.querySelectorAll('[data-toggle]').forEach(btn => btn.addEventListener('click', () => {
       const slug = btn.dataset.toggle, next = btn.dataset.enabled !== 'true';
       btn.classList.add('busy');
       Harness.api.post('/api/skills/toggle', { slug: slug, enabled: next })
-        .then(({ ok, j: res }) => { if (ok && res && res.ok) { sfx('click'); loadSkillLibrary(agentId); } else { btn.classList.remove('busy'); } })
+        .then(({ ok, j: res }) => { if (ok && res && res.ok) { sfx('click'); loadSkillLibrary(agentId); skillsChanged(); } else { btn.classList.remove('busy'); } })
         .catch(() => btn.classList.remove('busy'));
     }));
     host.querySelectorAll('[data-place]').forEach(btn => btn.addEventListener('click', () => {
@@ -3549,28 +4417,29 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     });
   }
 
-  function wireSkillExchange(agentId) {
+  function wireSkillExchange(agentOf) {
+    const shownAgent = () => (typeof agentOf === 'function' ? agentOf() : agentOf);   // ORG P21: the lane's picker can change the agent after wiring
     const input = $('#sk-exchange-url'), button = $('#sk-exchange-inspect'), importer = $('#sk-exchange-import'), host = $('#sk-exchange-preview');
     if (!input || !button || !host || !Harness.skillExchangeInspect) return;
     const inspect = async () => {
       const url = String(input.value || '').trim();
-      if (!url) { host.innerHTML = '<div class="sk-loading">Enter a public HTTPS URL to a SKILL.md file.</div>'; return; }
+      if (!url) { host.innerHTML = '<div class="sk-loading">Paste a link first: a public https:// address of a SKILL.md file.</div>'; return; }
       button.classList.add('busy'); button.textContent = 'INSPECTING…';
-      host.innerHTML = '<div class="sk-loading"><span class="loading pulse">fetching and scanning exact source bytes…</span></div>';
+      host.innerHTML = '<div class="sk-loading"><span class="loading pulse">downloading the skill and checking it…</span></div>';
       const r = await Harness.skillExchangeInspect(url);
       button.classList.remove('busy'); button.textContent = 'INSPECT';
-      if (r && r.ok && r.preview) renderSkillExchangePreview(host, r.preview, agentId);
+      if (r && r.ok && r.preview) renderSkillExchangePreview(host, r.preview, shownAgent());
       else host.innerHTML = '<div class="sk-exchange-note bad">' + esc((r && r.error) || 'That source could not be inspected.') + '</div>';
     };
     button.addEventListener('click', inspect);
     input.addEventListener('keydown', ev => { if (ev.key === 'Enter') { ev.preventDefault(); inspect(); } });
     if (importer && Harness.skillExchangeImport) importer.addEventListener('change', async () => {
       const file = importer.files && importer.files[0]; if (!file) return;
-      host.innerHTML = '<div class="sk-loading"><span class="loading pulse">verifying exported package bytes…</span></div>';
+      host.innerHTML = '<div class="sk-loading"><span class="loading pulse">checking the package file…</span></div>';
       let envelope = ''; try { envelope = await file.text(); } catch (_) {}
       const r = envelope ? await Harness.skillExchangeImport(envelope) : { ok: false, error: 'That file could not be read.' };
       importer.value = '';
-      if (r && r.ok && r.preview) renderSkillExchangePreview(host, r.preview, agentId);
+      if (r && r.ok && r.preview) renderSkillExchangePreview(host, r.preview, shownAgent());
       else host.innerHTML = '<div class="sk-exchange-note bad">' + esc((r && r.error) || 'That package could not be inspected.') + '</div>';
     });
     const registryUrl = $('#sk-registry-url'), registryQuery = $('#sk-registry-query'), registryButton = $('#sk-registry-search'), registryResults = $('#sk-registry-results');
@@ -3610,19 +4479,220 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     });
   }
 
+  let skillPanelLoad = 0;
+  // ORG P21: skillsPick = a ONE-SHOT request from a dossier's SKILLS row (consumed when the lane builds);
+  // skillsShown = the agent the open ABILITIES skills lane shows, tied to that window instance so a fresh open never
+  // inherits an old pick. skillsAgentId() is what every skills action reads at click time.
+  let skillsPick = null;
+  let skillsShown = null;
+  /* …held WEAKLY (night-leak, 2026-10-15): a strong `win` kept the last closed ABILITIES window alive (8,762 elements after a
+     dock sweep) until the next open replaced it. A WeakRef still tells this window instance from a fresh one. */
+  const weakWin = w => (w && typeof WeakRef === 'function') ? new WeakRef(w) : null;
+  function shownInOpenWindow() {
+    const w = skillsShown && skillsShown.win && skillsShown.win.deref();
+    return !!w && w === open.connectors;
+  }
+  let skillLibLoad = 0, skillMarketLoad = 0;
+  function skillsAgentId() {
+    const id = shownInOpenWindow() && present.some(x => x && x.id === skillsShown.id) ? skillsShown.id : null;
+    return id || (present[sel] && present[sel].id) || 'agent';
+  }
+  function skillsIntro(a) {
+    const n = '<b>' + esc((a && (a.name || a.id)) || 'this agent') + '</b>';
+    return 'Reusable procedures ' + n + ' created or learned. These appear as a compact index in ' + n + '’s future runs; it loads the full body only when a task matches.';
+  }
+  // ORG P21: open SETTINGS › LOOK & SOUND with VOICE FOR already on this agent (the existing picker, preselected)
+  // The settings window can be rebuilt right after it opens (the credits re-read rerenders it), which drops a
+  // picker value set from outside and scrolls back to the top. So the wish is kept for a few seconds:
+  // wireLiveVoice preselects it on every (re)build, and land() re-scrolls each NEW picker element it finds.
+  let voiceForWish = null;
+  function voiceForWanted() { return voiceForWish && Date.now() < voiceForWish.until ? voiceForWish.id : ''; }
+  function openVoiceFor(agentId) {
+    voiceForWish = { id: agentId, until: Date.now() + 5000 };
+    openTerm('settings', 'appearance');
+    let landed = null;
+    const land = () => {
+      const w = open.settings; const pick = w && w.querySelector('#set-lv-agent');
+      if (!pick || pick === landed || !pick.isConnected) return;
+      landed = pick;
+      if (pick.value !== agentId && Array.from(pick.options).some(o => o.value === agentId)) {
+        pick.value = agentId; if (typeof pick.onchange === 'function') pick.onchange();
+      }
+      const group = pick.closest('.settings-group') || pick;
+      try { group.scrollIntoView({ block: 'start' }); } catch (_) { /* older engines: the section is already showing */ }
+      pick.focus({ preventScroll: true });
+    };
+    [0, 120, 400, 900, 1800, 3000].forEach(ms => setTimeout(() => requestAnimationFrame(land), ms));
+  }
+  async function skillReviewPost(action, body, opts) {
+    const r = await Harness.api.post('/api/agent-skills/' + action, body, { timeoutMs: (opts && opts.timeoutMs > 0) ? opts.timeoutMs : action === 'evaluate-candidate' ? 180000 : 60000 });
+    if (!r.ok || !r.j || !r.j.ok) throw new Error((r.j && r.j.error) || 'The station refused this change.');
+    return r.j;
+  }
+  // How long the page waits for evaluate-candidate: the suite's waitMs (the station's own clock for it plus a margin,
+  // index.js evaluationSuiteMetadata), else the same rule the station uses (2 runs a case at 90 s each, 2 to 20 min,
+  // plus 30 s), so the page never gives up before the station's answer.
+  function evaluationWaitMs(suite) {
+    if (suite && suite.waitMs > 0) return suite.waitMs;
+    const cases = Number(suite && suite.cases);
+    return (cases > 0 ? Math.min(20 * 60000, Math.max(120000, cases * 2 * 90000)) : 20 * 60000) + 30000;
+  }
   function loadAgentSkills(agentId) {
     const host = $('#sk-agent'); if (!host) return;
+    const load = ++skillPanelLoad;
     if (!(typeof Harness === 'object' && Harness.agentSkills)) {
       host.innerHTML = '<div class="sk-loading">Agent skillbase unavailable.</div>'; return;
     }
-    Harness.agentSkills(agentId, { archived: true, body: true })
-      .then(skills => { const h = $('#sk-agent'); if (h) renderAgentSkills(h, skills || [], agentId); })
-      .catch(() => { const h = $('#sk-agent'); if (h) h.innerHTML = '<div class="sk-loading">Could not load agent skills.</div>'; });
+    Promise.all([
+      Harness.agentSkills(agentId, { archived: true, body: true }),
+      Harness.api.get('/api/agent-skills/candidates?agent=' + encodeURIComponent(agentId) + '&body=1')
+        .catch(e => ({ candidates: [], evaluationSuites: [], error: e.message || 'Could not load proposed revisions.' }))
+    ]).then(([skills, review]) => {
+      const h = $('#sk-agent'); if (h && load === skillPanelLoad) renderAgentSkills(h, skills || [], agentId, review);
+    }).catch(() => { const h = $('#sk-agent'); if (h && load === skillPanelLoad) h.innerHTML = '<div class="sk-loading">Could not load agent skills.</div>'; });
   }
 
-  function renderAgentSkills(host, skills, agentId) {
-    if (!skills.length) {
-      host.innerHTML = '<div class="sk-loading">No agent-created skills yet.</div>'; return;
+  function renderSkillCandidates(host, agentId, review) {
+    const rows = Array.isArray(review.candidates) ? review.candidates : [];
+    const suites = Array.isArray(review.evaluationSuites) ? review.evaluationSuites : [];
+    // A tie: every run finished, nothing regressed and every proposal case passed, yet nothing improved
+    // (a capable baseline already passes). It is the one unproven result the owner may still accept.
+    const candidateTie = r => !!(r && r.status === 'insufficient_evidence' && r.allCandidatePassed === true && Array.isArray(r.regressions) && !r.regressions.length &&
+      Array.isArray(r.cases) && r.cases.length && r.cases.every(c => c && c.before && c.before.completed === true && c.after && c.after.completed === true));
+    const candidateResultText = (r, suite, tie) => {
+      const status = r && r.status;
+      if (status === 'passed') return 'Passed: the proposal passed every check and did better than without it on at least one' + (suite.generic ? ', on a generic check (not specific to this skill).' : '.');
+      // "Without it" holds for a revision (the current version) and a new skill (no skill); owner checks already exist.
+      if (tie) return 'No improvement shown: the proposal passed every check, and so did the run without it, so this suite cannot show what the proposal adds. ' +
+        (suite.generic ? 'Register task checks for this skill to measure it.' : 'Add a check that fails without the proposal to measure the difference.');
+      if (status === 'regression') return 'Regression: the proposal failed a check the current version passed.';
+      if (status === 'failed') return 'Failed: the proposal did not pass every check.';
+      if (status === 'insufficient_evidence') return stoppedText(r);
+      return 'No confirmed result.';
+    };
+    // The runner writes 'policy-denied' for a run the station refused (skill-evaluation-runner.js): a budget limit,
+    // paused spending, the evaluation's time limit, or an earlier run whose cost could not be settled
+    // (skill-evaluation-accounting.js canContinue), which a failed metered run ('error' / 'runner-error') leaves
+    // behind. The card names only what the receipt shows. Runs in order: each case's before, then its after.
+    const stoppedText = r => {
+      const runs = r && Array.isArray(r.cases) ? r.cases.flatMap(c => [c && c.before, c && c.after]).map(x => (x && x.reason) || '') : [];
+      const held = runs.indexOf('policy-denied');
+      if (held < 0) return 'No result: not every run finished.';
+      if (held > 0 && (runs[held - 1] === 'error' || runs[held - 1] === 'runner-error') && runs.slice(held).every(x => x === 'policy-denied'))
+        return 'No result: a run failed and the station held back every run after it, so not every run finished.';
+      return 'No result: the station stopped a run (a budget limit, paused spending, the time limit, or an earlier run whose cost could not be settled), so not every run finished.';
+    };
+    for (const candidate of rows) {
+      const skill = candidate.skill || {};
+      // skills-eval-17: the store lists a pending proposal whose base is no longer the active skill as baseCurrent:false.
+      // The station refuses to evaluate or approve it, so the card offers only Reject. A host that does not send the
+      // field (undefined) keeps the full card.
+      const outdated = candidate.baseCurrent === false;
+      const card = mkEl('div', 'sk-card want open'); host.appendChild(card);
+      card.dataset.skillCandidate = candidate.candidateId;
+      card.innerHTML = '<div class="sk-card-head"><div class="sk-card-main"><div class="sk-name-row"><span class="sk-name">' + esc(skill.name || candidate.name) + '</span>' +
+        (outdated ? '<span class="sk-badge miss">OUTDATED</span></div><div class="sk-desc">The active skill changed after this was proposed. Reject it, or wait for the agent\'s next revision.</div></div></div>'
+          : '<span class="sk-badge want">PROPOSED REVISION</span></div><div class="sk-desc">Any existing active version stays available. This proposal needs a task evaluation and your approval. If a complete evaluation shows no improvement but the proposal passed every check, you can still approve it by confirming that.</div></div></div>') +
+        '<div class="sk-body"><div class="sk-attr">Proposed sharing: ' + esc(skillScopeText(skill.scope, skill.projectRoot)) + ' · revision ' + esc(candidate.revision) + '</div>' +
+        // skills-eval-07: a curator archive moves its steps into another skill, and the station holds it until that skill
+        // carries them, so the card names it
+        (skill.state === 'archived' && skill.absorbedInto ? '<div class="sk-attr">Archives into: ' + esc(skill.absorbedInto) + '</div>' : '') +
+        '<pre>' + esc(skill.body || '') + '</pre>' +
+        '<details><summary>Proposed metadata and package files</summary><pre>' + esc(JSON.stringify({ candidateDigest: candidate.candidateDigest, baseDigest: candidate.baseDigest, summary: skill.summary, description: skill.description, setup: skill.setup, category: skill.category, requires: skill.requires, platforms: skill.platforms, state: skill.state, absorbedInto: skill.absorbedInto, scope: skill.scope, projectRoot: skill.projectRoot, packageFiles: skill.packageFiles }, null, 2)) + '</pre></details>' +
+        (skill.files || []).map(f => '<details><summary>' + esc(f.path) + '</summary><pre>' + esc(f.content || '') + '</pre></details>').join('') +
+        (outdated ? '<div class="sk-attr" data-evaluation-result></div><div class="consent-btns mc-acts"><button class="consent-btn" data-candidate-reject>Reject proposal</button></div></div>' :
+        '<div class="sk-attr">Evaluation checks only the selected task family. A passing result does not prove improvement for every use.</div><div data-evaluation-suites></div>' +
+        '<div class="sk-attr" data-evaluation-result>No evaluation run from this panel yet.</div><div class="consent-btns mc-acts"><button class="consent-btn" data-candidate-approve disabled>Approve evaluated revision</button><button class="consent-btn" data-candidate-acknowledge hidden disabled>Approve without measured improvement</button><button class="consent-btn" data-candidate-reject>Reject proposal</button></div>' +
+        '<details><summary>Register task checks (JSON)</summary><div class="sk-attr">Declare repeatable tasks and exact checks, including a held-out case. The station validates and runs this suite before approval.</div><textarea class="cf-ta mc-edit" data-suite-json spellcheck="false" aria-label="Evaluation suite JSON" placeholder="' + esc(SUITE_EXAMPLE) + '"></textarea><button class="consent-btn" data-suite-register>Register task checks</button></details></div>');
+      const note = card.querySelector('[data-evaluation-result]');
+      const reject = card.querySelector('[data-candidate-reject]');
+      let receipt = null, busy = false;
+      const request = { agentId, candidateId: candidate.candidateId, candidateDigest: candidate.candidateDigest };
+      const doReject = async () => {
+        if (busy) return; busy = true; reject.disabled = true;
+        try { await skillReviewPost('reject-candidate', request); loadAgentSkills(agentId); }
+        catch (e) { note.textContent = e.message; busy = false; reject.disabled = false; }
+      };
+      // Rejecting discards the proposal and whatever evaluation it had: arm, then confirm, like the acknowledgement.
+      if (typeof ArmConfirm !== 'undefined' && ArmConfirm.wire) ArmConfirm.wire(reject, { armedLabel: 'Confirm: reject proposal', onArm: () => sfx('bad'), onConfirm: doReject });
+      else reject.onclick = doReject;
+      if (outdated) continue;
+      const suiteHost = card.querySelector('[data-evaluation-suites]');
+      const approve = card.querySelector('[data-candidate-approve]');
+      const acknowledge = card.querySelector('[data-candidate-acknowledge]');
+      const matching = suites.filter(s => s.skillId === skill.id || (!s.skillId && s.skillName === skill.name));
+      // One result path for a fresh run and for the host's stored receipt of this exact revision.
+      const showResult = (r, suite, lead) => {
+        receipt = r;
+        const tie = candidateTie(r);
+        note.textContent = lead + candidateResultText(r, suite, tie) + ' Approval remains a separate action.';
+        const box = mkEl('details', ''), head = mkEl('summary', ''), raw = mkEl('pre', '');
+        head.textContent = 'Evaluation receipt'; raw.textContent = JSON.stringify(r, null, 2);
+        box.appendChild(head); box.appendChild(raw); note.appendChild(box);
+        approve.disabled = !(r && r.status === 'passed' && r.receiptId);
+        // The station re-checks the receipt; this only offers the owner's "accept it anyway" on a complete tie.
+        acknowledge.hidden = !(tie && r.receiptId); acknowledge.disabled = acknowledge.hidden;
+      };
+      if (!matching.length) suiteHost.textContent = 'No task checks registered for this skill yet.';
+      for (const suite of matching) {
+        const label = mkEl('div', 'sk-attr'); label.textContent = (suite.description || suite.skillName || suite.id) + (suite.generic ? ' · generic check (not specific to this skill)' : ''); suiteHost.appendChild(label);
+        const run = mkEl('button', 'consent-btn'); run.textContent = 'Run these checks'; suiteHost.appendChild(run);
+        run.onclick = async () => {
+          if (busy) return; busy = true; run.disabled = true; approve.disabled = true; acknowledge.disabled = true; acknowledge.hidden = true; receipt = null;
+          note.textContent = 'Running the checks with and without the proposal…';
+          try {
+            const r = await skillReviewPost('evaluate-candidate', Object.assign({}, request, { suiteId: suite.id }), { timeoutMs: evaluationWaitMs(suite) });
+            showResult(r.receipt, suite, '');
+          } catch (e) { note.textContent = e.message; }
+          finally { busy = false; run.disabled = false; }
+        };
+      }
+      // A reload (registering checks, sharing another skill) must not throw away a paid result. Contract:
+      // latestEvaluation is the whole stored receipt row (the same object evaluate-candidate returns), never a
+      // summary; tie and spend-stop are read from its cases. Only a receipt for these exact proposal and active
+      // versions counts, and approval still re-verifies it by id.
+      const last = candidate.latestEvaluation;
+      if (last && last.receiptId && last.candidateDigest === candidate.candidateDigest && last.baselineDigest === candidate.baseDigest)
+        showResult(last, matching.find(s => s.id === last.suiteId) || {}, 'Last evaluation: ');
+      const decide = async extra => {
+        if (busy || !receipt) return; busy = true; approve.disabled = true; acknowledge.disabled = true;
+        try { await skillReviewPost('approve-candidate', Object.assign({}, request, { evaluation: receipt.receiptId }, extra)); loadAgentSkills(agentId); }
+        catch (e) { note.textContent = e.message; busy = false; approve.disabled = receipt.status !== 'passed'; acknowledge.disabled = acknowledge.hidden; }
+      };
+      approve.onclick = () => decide({});
+      // Accepting a revision the evaluation could not show to be better is a deliberate owner decision: arm, then confirm.
+      if (typeof ArmConfirm !== 'undefined' && ArmConfirm.wire) {
+        ArmConfirm.wire(acknowledge, { armedLabel: 'Confirm: approve with no measured improvement', onConfirm: () => decide({ acknowledgeNoImprovement: true }) });
+      }
+      const register = card.querySelector('[data-suite-register]');
+      register.onclick = async () => {
+        if (busy) return;
+        try {
+          const suite = JSON.parse(card.querySelector('[data-suite-json]').value);
+          busy = true; register.disabled = true;
+          await skillReviewPost('evaluation-suite', { agentId, skillId: skill.id, suite }); loadAgentSkills(agentId);
+        } catch (e) { note.textContent = e.message; busy = false; register.disabled = false; }
+      };
+    }
+  }
+
+  // Skill sharing in plain words (skillstore.js isAccessible): agent = only the owning agent; project = any
+  // agent working in that project folder; station = every agent on the station.
+  const SKILL_SCOPE_LABEL = { agent: 'Only this agent', project: 'This project', station: 'Whole station' };
+  const skillScopeText = (scope, root) => (SKILL_SCOPE_LABEL[scope || 'agent'] || String(scope)) + (root ? ' · ' + root : '');
+  const SUITE_EXAMPLE = 'Example:\n{ "id": "owner:weekly-brief", "version": 1, "description": "Weekly brief",\n  "cases": [\n' +
+    '    { "id": "basic", "prompt": "Write brief.json for this week", "writablePaths": ["brief.json"],\n' +
+    '      "checks": [{ "id": "title", "kind": "artifact_json_equal", "path": "brief.json", "expected": { "title": "Week 41" } }] },\n' +
+    '    { "id": "held", "heldOut": true, "prompt": "…", "writablePaths": ["brief.json"], "checks": [ … ] } ] }';
+  // Share to market is a door to the community cloud: it is on the card only while communitymaps.js says sharing is
+  // open (CommunityMaps.live, its COMMUNITY_LIVE switch). Until then the key is not drawn at all.
+  const communityLive = () => typeof CommunityMaps !== 'undefined' && CommunityMaps.live === true;
+  function renderAgentSkills(host, skills, agentId, review) {
+    review = review || {};
+    if (!skills.length && !(review.candidates || []).length && !review.error) {
+      // the agent by name, like the line above it (UX night 10-26)
+      const who = (present.find(x => x && x.id === agentId) || {}).name || 'This agent';
+      host.innerHTML = '<div class="sk-loading">' + esc(who) + ' has not learned any skills yet. Skills it writes or learns while working show up here.</div>'; return;
     }
     const active = skills.filter(s => s.state !== 'archived').length;
     const archived = skills.length - active;
@@ -3630,7 +4700,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     skills.forEach(s => { byId[s.id] = s; });
     const sorted = skills.slice().sort((a, b) =>
       (!!b.pinned - !!a.pinned) || ((a.state === 'archived') - (b.state === 'archived')) || ((b.updatedAt || 0) - (a.updatedAt || 0)));
-    let html = '<div class="sk-lib-sum">' + active + ' active' + (archived ? ' - ' + archived + ' archived' : '') + '</div>';
+    let html = (review.error ? '<div class="sk-attr sk-held">Proposed revisions unavailable: ' + esc(review.error) + '</div>' : '') + '<div class="sk-lib-sum">' + active + ' active' + (archived ? ' - ' + archived + ' archived' : '') + '</div>';
     for (const s of sorted) {
       const state = s.state === 'archived' ? 'off' : (s.state === 'stale' ? 'want' : 'on');
       const when = s.updatedAt ? new Date(s.updatedAt).toLocaleDateString() : 'unknown';
@@ -3675,11 +4745,13 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
             '</div>' +
             '<button class="sk-expand" data-ag-act="expand" title="Read the skill">&gt;</button>' +
           '</div>' +
-          '<div class="sk-body">' + heldBlock + '<pre>' + esc(s.body || '') + '</pre>' + files + absorbed + packageState +
+          '<div class="sk-body">' + heldBlock + '<div class="sk-attr">Shared with: ' + esc(skillScopeText(s.scope, s.projectRoot)) + '</div><pre>' + esc(s.body || '') + '</pre>' + files + absorbed + packageState +
             '<div class="consent-btns mc-acts">' +
               heldBtn +
               packageButtons +
               '<button class="consent-btn" data-ag-act="edit">Edit</button>' +
+              (held || s.createdBy === 'community' || s.sourceUrl || s.sourceAuthor || !communityLive() ? '' : '<button class="consent-btn" data-ag-act="market">Share to market</button>') +
+              '<button class="consent-btn" data-ag-act="sharing">Change sharing</button>' +
               '<button class="consent-btn" data-ag-act="archive">' + (s.state === 'archived' ? 'Restore' : 'Archive') + '</button>' +
             '</div>' +
           '</div>' +
@@ -3694,6 +4766,8 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         const opened = card.classList.toggle('open'); btn.textContent = opened ? 'v' : '>'; sfx('click'); return;
       }
       if (act === 'edit') { editAgentSkill(card, skill, agentId); return; }
+      if (act === 'market') { shareSkillToMarket(card, skill, agentId); return; }
+      if (act === 'sharing') { toggleSkillSharing(card, skill, agentId); return; }
       if (act === 'check') {
         btn.classList.add('busy');
         const r = await Harness.skillExchangeCheck({ agentId, id: skill.id }); btn.classList.remove('busy');
@@ -3737,7 +4811,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       }
       if (act === 'allow' || act === 'revoke') {
         btn.classList.add('busy');
-        const r = await Harness.agentSkillAllow({ agentId, id: skill.id, allow: act === 'allow' });
+        const r = await Harness.agentSkillAllow({ agentId, id: skill.id, digest: skill.guardDigest || skill.contentDigest, allow: act === 'allow' });
         if (r && r.ok) { sfx('click'); loadAgentSkills(agentId); }
         else {
           // Say what the station said. A silently dead button on a security decision is worse
@@ -3757,8 +4831,105 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       const r = await Harness.agentSkillManage({ agentId, action, target: skill.id, force: true });
       if (r && r.ok) { sfx('click'); loadAgentSkills(agentId); } else btn.classList.remove('busy');
     }));
+    renderSkillCandidates(host, agentId, review);
   }
 
+  // Change sharing: a second click closes it, the current choice is marked, and the folder field shows only
+  // for This project (the host refuses a project share without a trusted folder).
+  function toggleSkillSharing(card, skill, agentId) {
+    const body = card.querySelector('.sk-body'); if (!body) return;
+    const shown = body.querySelector('[data-skill-sharing]');
+    if (shown) { shown.remove(); return; }
+    const panel = mkEl('div', ''); panel.dataset.skillSharing = '1'; body.appendChild(panel);
+    const note = mkEl('div', 'sk-attr'); panel.appendChild(note);
+    note.textContent = 'Only this agent: just ' + agentId + ' uses it. This project: any agent working in that project folder. Whole station: every agent.';
+    const row = mkEl('div', 'consent-btns mc-acts'); panel.appendChild(row);
+    const input = mkEl('input', 'key-input'); input.value = skill.projectRoot || ''; input.placeholder = 'Project folder (full path)';
+    input.setAttribute('aria-label', 'Project folder to share with'); input.hidden = (skill.scope || 'agent') !== 'project'; panel.appendChild(input);
+    for (const scope of ['agent', 'project', 'station']) {
+      const current = (skill.scope || 'agent') === scope;
+      const button = mkEl('button', 'consent-btn' + (current ? ' sel' : '')); button.type = 'button';
+      button.textContent = SKILL_SCOPE_LABEL[scope]; button.setAttribute('aria-pressed', current ? 'true' : 'false'); row.appendChild(button);
+      button.onclick = async () => {
+        if (scope === 'project' && input.hidden) {   // ask for the folder first; the next click shares it
+          input.hidden = false; note.textContent = 'Enter the project folder, then click This project again.'; input.focus(); return;
+        }
+        button.disabled = true;
+        try { await skillReviewPost('share', { agentId, target: skill.id, scope, projectRoot: scope === 'project' ? input.value : '' }); loadAgentSkills(agentId); }
+        catch (e) { note.textContent = e.message; button.disabled = false; }
+      };
+    }
+  }
+
+  /* SHARE TO MARKET (2026-10-18): one of this agent's skills, offered to the Skill Market for review. Opens IN the
+     card (like Edit): the market name, the line on its card, a shelf, a license, the credit and the agreement. The
+     sidecar sends the skill exactly as the library holds it; the line it prints is what the market answered. */
+  const MARKET_SHELVES = ['Communication', 'Creative', 'Engineering', 'Marketing', 'Planning', 'Productivity', 'Research', 'Writing'];
+  const SHARE_CREDIT_KEY = 'starnet.communityMapCredit';   // one credit name for everything this Commander shares
+  function shareSkillToMarket(card, skill, agentId) {
+    if (!communityLive()) return;
+    const body = card.querySelector('.sk-body'); if (!body || body.dataset.sharing === '1' || body.dataset.editing === '1') return;
+    body.dataset.sharing = '1';
+    if (!card.classList.contains('open')) card.classList.add('open');
+    const actions = body.querySelector('.consent-btns'); if (!actions) return;
+    const opener = actions.querySelector('[data-ag-act="market"]');
+    const title = String(skill.name || '').replace(/[-_]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).slice(0, 60);
+    const shelf0 = MARKET_SHELVES.find(c => c.toLowerCase() === String(skill.category || '').toLowerCase()) || '';
+    let credit = ''; try { credit = localStorage.getItem(SHARE_CREDIT_KEY) || ''; } catch (_) {}
+    // ids unique to THIS card: two cards sharing at once never point their labels at each other's fields
+    const uid = 'skm-' + String(skill.id || 'skill').replace(/[^A-Za-z0-9_-]/g, '_') + '-' + Date.now().toString(36);
+    const form = mkEl('div', 'sk-share');
+    form.innerHTML =
+      '<label for="' + uid + '-title">NAME ON THE MARKET</label><input id="' + uid + '-title" class="key-input" maxlength="60" autocomplete="off">' +
+      '<label for="' + uid + '-desc">WHAT IT DOES AND WHEN TO USE IT</label><textarea id="' + uid + '-desc" class="cf-ta skm-desc" maxlength="280"></textarea>' +
+      '<span class="skm-label" id="' + uid + '-shelf-l">SHELF</span><div class="skm-chips" role="group" aria-labelledby="' + uid + '-shelf-l" data-skm="shelf">' + MARKET_SHELVES.map(c => '<button type="button" class="consent-btn" aria-pressed="' + (c === shelf0) + '" data-v="' + esc(c) + '">' + esc(c) + '</button>').join('') + '</div>' +
+      '<span class="skm-label" id="' + uid + '-license-l">LICENSE</span><div class="skm-chips" role="group" aria-labelledby="' + uid + '-license-l" data-skm="license"><button type="button" class="consent-btn" aria-pressed="true" data-v="MIT">MIT</button><button type="button" class="consent-btn" aria-pressed="false" data-v="CC-BY-4.0">CC BY 4.0</button></div>' +
+      '<label for="' + uid + '-credit">CREDIT ME AS</label><input id="' + uid + '-credit" class="key-input" maxlength="60" autocomplete="off" placeholder="your name or handle">' +
+      '<label class="skm-agree"><input type="checkbox" id="' + uid + '-agree"> <span>I wrote this skill (or may share it) and publish it under the license above. Anyone may use and adapt it, with credit to me.</span></label>' +
+      '<div class="sk-attr">A person reads every line before it goes on the market. This station must be linked to your StarNet account.</div>' +
+      '<div class="sk-attr skm-result" role="status"></div>';
+    const $f = (k) => form.querySelector('#' + uid + '-' + k);
+    $f('title').value = title;
+    $f('desc').value = String(skill.summary || '').slice(0, 280);
+    $f('credit').value = credit;
+    for (const group of form.querySelectorAll('.skm-chips')) group.addEventListener('click', (e) => {
+      const b = e.target.closest('button[data-v]'); if (!b) return;
+      for (const x of group.querySelectorAll('button')) x.setAttribute('aria-pressed', x === b ? 'true' : 'false');
+    });
+    actions.before(form);
+    actions.innerHTML = '';
+    const send = mkEl('button', 'consent-btn'); send.textContent = 'Send for review'; actions.appendChild(send);
+    const cancel = mkEl('button', 'consent-btn'); cancel.textContent = 'Cancel'; actions.appendChild(cancel);
+    const result = form.querySelector('.skm-result');
+    const picked = (k) => { const b = form.querySelector('[data-skm="' + k + '"] [aria-pressed="true"]'); return b ? b.dataset.v : ''; };
+    // back to the card as it was, with the keyboard on the key that opened the form
+    const done = () => { loadAgentSkills(agentId); requestAnimationFrame(() => { const again = document.querySelector('[data-agent-skill="' + CSS.escape(String(skill.id)) + '"] [data-ag-act="market"]'); if (again) again.focus(); else if (opener && opener.isConnected) opener.focus(); }); };
+    cancel.onclick = done;
+    send.onclick = async () => {
+      const fields = { agentId, id: skill.id, title: $f('title').value.trim(), description: $f('desc').value.trim(),
+        category: picked('shelf'), license: picked('license'), credit: $f('credit').value.trim(), agree: $f('agree').checked };
+      if (!fields.title) { result.textContent = 'Give it a name on the market.'; $f('title').focus(); return; }
+      if (!fields.category) { result.textContent = 'Pick the shelf it belongs on.'; return; }
+      if (!fields.credit) { result.textContent = 'Add the name you want credited on the market.'; $f('credit').focus(); return; }
+      if (!fields.agree) { result.textContent = 'Turn on the agreement to share it: it is the license others use it under.'; $f('agree').focus(); return; }
+      send.disabled = true; send.textContent = 'Sending…'; result.textContent = '';
+      try { localStorage.setItem(SHARE_CREDIT_KEY, fields.credit); } catch (_) {}
+      let r = null;
+      try { r = await (await Harness.apiFetch('/api/skill-market/share', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(fields) })).json(); } catch (_) { r = null; }
+      send.disabled = false; send.textContent = 'Send for review';
+      if (r && r.ok && r.submission) {
+        result.textContent = 'Sent for review as "' + (r.submission.title || fields.title) + '". A person reads it next; your Skills tab on account.starnetos.com shows where it stands.'
+          + (r.referencesLeftOut ? ' ' + r.referencesLeftOut + (r.referencesLeftOut === 1 ? ' support file was' : ' support files were') + ' left out: the market takes up to five plain-text references.' : '');
+        send.remove(); cancel.textContent = 'Done'; cancel.focus(); sfx('click');
+        return;
+      }
+      if (!r) { result.textContent = 'The station is not answering right now. This station cannot tell whether the skill arrived. Check your Skills tab on account.starnetos.com before you send it again.'; return; }
+      if (r.outcome === 'unknown') { result.textContent = (r.error ? r.error + ' ' : '') + 'This station cannot tell whether the skill arrived. Check your Skills tab on account.starnetos.com before you send it again.'; return; }
+      if (r.linked === false) { result.textContent = 'Link this station to your StarNet account first (STORE › LINK STATION). A free account works. Nothing was shared.'; return; }
+      result.textContent = r.code === 'token_rejected' ? r.error : (r.error || 'The market refused it.') + ' Nothing was shared.';
+    };
+    $f('title').focus();
+  }
   function editAgentSkill(card, skill, agentId) {
     const body = card.querySelector('.sk-body'); if (!body || body.dataset.editing === '1') return;
     body.dataset.editing = '1';
@@ -3784,7 +4955,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
      TO DO -> IN PROGRESS the instant a real run fires (Workstreams.appendRun); SHIPPED is only ever a
      deliberate human turn-in (the ✓ SHIP button). The General chat home isn't a project, so it shows
      in the rail but never on this board. App owns persistence + the rail; we drive both via sync(). */
-  const COLS = [['todo', 'TO DO'], ['active', 'IN PROGRESS / REVIEW'], ['shipped', 'COMPLETED']];
+  const COLS = [['todo', 'TO DO'], ['active', 'IN PROGRESS'], ['shipped', 'COMPLETED']];
   const WS = () => (typeof Workstreams === 'object' && Workstreams) ? Workstreams : null;
   function boardStreams() {
     const w = WS(); if (!w) return [];
@@ -3918,21 +5089,23 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       // chat.js's in-band error branch. null (no outcome recorded — legacy save / delegated run) keeps
       // the DONE chip: we only claim FAILED when the failure is provable, never by inference.
       if (s.lastRunOk === false) return '<div class="kb-state failed">✗ RUN FAILED — REVIEW</div>';
-      return '<div class="kb-state done">FINISHED — REVIEW RESULT</div>';
+      if (s.lastRunOk == null && s.lastRunReason) return '<div class="kb-state stopped">■ STOPPED — REVIEW</div>';   // stopped before it finished (noteStopReason)
+      return '<div class="kb-state done">FINISHED — RESULT READY</div>';
     }
     return '';
   }
   function activeAggregate(items) {
-    let running = 0, ready = 0, failed = 0;
+    let running = 0, ready = 0, failed = 0, stopped = 0;
     items.forEach(s => {
       const busy = (typeof Channels !== 'undefined' && Channels.isBusy && Channels.isBusy(s.id));
       if (busy) running++;
-      else if (s.runIds && s.runIds.length) { if (s.lastRunOk === false) failed++; else ready++; }
+      else if (s.runIds && s.runIds.length) { if (s.lastRunOk === false) failed++; else if (s.lastRunOk == null && s.lastRunReason) stopped++; else ready++; }
     });
     const parts = [];
     if (running) parts.push(running + ' RUNNING');
     if (failed) parts.push(failed + ' FAILED');
-    if (ready) parts.push(ready + ' READY TO REVIEW');
+    if (stopped) parts.push(stopped + ' STOPPED');
+    if (ready) parts.push(ready + ' READY TO OPEN');
     return parts.length ? '<small class="kb-col-state">' + parts.join(' · ') + '</small>' : '';
   }
   // the card's bound-agent chip: the workstream's OWN agent (s.agentId) resolved to a name + color from the live
@@ -4006,23 +5179,23 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     const streams = boardStreams();
     const openMenus = live ? Array.from(body.querySelectorAll('.kb-more[open]')).map(d => d.closest('.kb-card').dataset.id) : [];
     body.innerHTML =
-      '<div class="kb-heading"><header class="kb-header"><h2>Your tasks</h2><p>Plan, start, and review your work.</p></header><div class="work-entry"><button type="button" class="bb sm" data-work-to="outbox">OUTBOX</button><button type="button" class="bb sm" data-work-to="deliverables">LIBRARY</button></div></div>' +
-      '<div class="kb-add"><input id="kb-in" aria-label="New task" maxlength="80" placeholder="What would you like to get done?" autocomplete="off">' +
+      '<div class="kb-heading"><header class="kb-header"><p>Plan a task, start it, and open what comes back.</p></header></div>' +   // OUTBOX / DELIVERABLES are this window's MY WORK tabs now (FAMILIES) — no second pair of doors here
+      '<div class="kb-add"><input id="kb-in" data-draft aria-label="New task" maxlength="80" placeholder="What would you like to get done?" autocomplete="off">' +
       '<button class="bb sm" id="kb-add">ADD TASK</button></div><p class="kb-add-note">Adding saves your plan. Start sends the task to its agent.</p>' +
       '<div class="kb-cols">' +
       COLS.map(([lane, label]) => {
         const items = streams.filter(s => s.lane === lane);
         return '<div class="kb-col"><h4>' + label + ' <i>' + items.length + '</i>' +
           (lane === 'active' ? activeAggregate(items) : '') + '</h4>' +
-          '<p class="kb-lane-note">' + ({todo:'Planned tasks, ready when you are.',active:'Ongoing work and results to review.',shipped:'Tasks you marked complete.'}[lane]) + '</p>' +
-          (items.length ? items.map(card).join('') : kbEmpty(lane)) + '</div>';
+          // an empty lane's own empty card already says what goes there; the note above it said it twice (UX night 10-25)
+          (items.length ? '<p class="kb-lane-note">' + ({todo:'Planned tasks, ready when you are.',active:'Ongoing work and results to open.',shipped:'Tasks you marked complete.'}[lane]) + '</p>' + items.map(card).join('') : kbEmpty(lane)) + '</div>';
       }).join('') +
       '</div>' +
       // the dead-end this footnote kills (2026-07-16): "a run finished while you were away" sent users
       // hunting HERE, but this board only holds queued directives — finished routine/away runs are
       // readable sessions in COMMS and collectable on the OUTBOX. Shown only when the board is empty
       // (that's exactly when the hunt strands); openTerm('outbox') is the one-click door.
-      (streams.length ? '' : '<div class="win-note" style="margin-top:8px">This board holds tasks you plan here or launch from Recipes and goals. Chats, routines, and while-away runs live as Sessions in COMMS; finished files wait in the <button type="button" class="lb-tx-btn" id="kb-outbox-link">▸ OUTBOX</button>.</div>');
+      (streams.length ? '' : '<div class="win-note" style="margin-top:8px">This board holds tasks you plan here or launch from Recipes and goals. Chats, routines, and while-away runs live as Sessions in COMMS; finished work waits in <button type="button" class="lb-tx-btn" id="kb-outbox-link">▸ DELIVERABLES</button>.</div>');
     // entrance motion belongs to USER-initiated opens only — a background data poke must not re-animate.
     // (body persists across rebuilds, so the class must be actively toggled both ways.)
     body.classList.toggle('kb-live-refresh', live);
@@ -4141,7 +5314,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     { id: 'perplexity',    name: 'PERPLEXITY',        endpoint: 'api.perplexity.ai',          blurb: 'Sonar API', live: true },
     { id: 'cerebras',      name: 'CEREBRAS',          endpoint: 'api.cerebras.ai/v1',         blurb: 'Cerebras API', live: true },
     { id: 'ollama',        name: 'OLLAMA',            endpoint: '127.0.0.1:11434/v1',         blurb: 'local models', live: true },
-    { id: 'claudecode',    name: 'CLAUDE LOGIN',      endpoint: 'local claude CLI',           blurb: 'your Claude subscription · no key', live: true },
+    { id: 'claude-cli',    name: 'CLAUDE CODE',       endpoint: 'local `claude` command',     blurb: 'your Claude subscription', live: true },
     { id: 'custom',        name: 'CUSTOM',            endpoint: 'any /v1 base URL',           blurb: 'bring your endpoint', live: true }
   ];
   const H = () => (typeof Harness === 'object' && Harness) ? Harness : null;
@@ -4168,9 +5341,33 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     if (h && h.setDesktopConfigured) h.setDesktopConfigured('starnet', !!configured);
     if (typeof ModelDock !== 'undefined' && ModelDock.reflect) ModelDock.reflect();
   }
+  /* ONE READ, NOT ONE PER REPAINT (live walk 10-14: opening SETTINGS › SPENDING LIMITS fired /api/credits 12 times in
+     1.5 s, every one a 404 — each pane repaint re-ran both this card's read and the STORE's). A settled answer is
+     reused for a minute; a 404 is the station's definitive "no cloud account linked" and holds for ten (only a LINK
+     can change it, and LINK forgets it); an outage or timeout is never kept, so RETRY really retries. Callers sharing a
+     read in flight share its one request. LINK / UNLINK / RETRY / REFRESH / the STORE key call forgetCreditsReads(). */
+  const CREDITS_FRESH_MS = 60000;
+  const CREDITS_UNLINKED_MS = 10 * 60000;
+  const _creditsReads = new Map();   // url -> { at, epoch, pending, notLinked, p }
+  function creditsRead(url, opts) {
+    // Harness.creditsEpoch moves on EVERY link/unlink/switch (refreshCreditsConfigured), the connect screen's included
+    const now = Date.now(), epoch = Harness.creditsEpoch ? Harness.creditsEpoch() : 0, hit = _creditsReads.get(url);
+    if (hit && hit.epoch === epoch && (hit.pending || now - hit.at < (hit.notLinked ? CREDITS_UNLINKED_MS : CREDITS_FRESH_MS))) return hit.p;
+    const rec = { at: now, epoch, pending: true, notLinked: false, p: null };
+    rec.p = Harness.api.get(url, opts).then(v => { rec.pending = false; rec.at = Date.now(); return v; }, e => {
+      rec.pending = false; rec.at = Date.now();
+      rec.notLinked = /http 404\b/.test(String((e && e.message) || e));
+      if (!rec.notLinked && _creditsReads.get(url) === rec) _creditsReads.delete(url);   // trouble is not an answer: ask again next time
+      throw e;
+    });
+    _creditsReads.set(url, rec);
+    return rec.p;
+  }
+  function forgetCreditsReads() { _creditsReads.clear(); }
   function refreshCreditsProvider() {
     const prior = creditsProv;
-    return Harness.api.get('/api/credits?history=0').catch(e => ({ configured: false, unavailable: !/http 404\b/.test(String((e && e.message) || e)) }))
+    // the STORE's wait (wireCredits): a read that self-heals the link takes ~16s, past api.get's 15s default
+    return creditsRead('/api/credits?history=0', { timeoutMs: 20000 }).catch(e => ({ configured: false, unavailable: !/http 404\b/.test(String((e && e.message) || e)) }))
       .then(j => {
         if (j && j.configured) {
           publishCreditsConfigured(true);
@@ -4189,7 +5386,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
           return creditsProv;
         }
         if (!(j && j.unavailable)) publishCreditsConfigured(false);   // 404/unlinked is definitive; an outage is not
-        return Harness.api.get('/api/credits/linkable').catch(() => ({ available: false }))
+        return creditsRead('/api/credits/linkable').catch(() => ({ available: false }))
           .then(lk => {
             creditsProv = { state: (lk && lk.available) ? 'linkable' : 'absent', balanceUsd: null, tier: '' };
             return creditsProv;
@@ -4226,10 +5423,22 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   // asynchronously-arriving status feels laggy, and each merged trigger saves a whole pane fan-out.
   const SETTINGS_REPAINT_COALESCE_MS = 120;
   let settingsRepaintQueued = false;
+  /* A BACKGROUND repaint keeps the reader's place (org P03 wiring): a status check / provider probe landing rebuilt the whole
+     console with a fresh .con-pane at scrollTop 0, so a Commander reading a card halfway down AI & MODELS (or a card an
+     error door just landed on) was thrown back to the top 5-15s after opening — a first-open probe may take its full 15s
+     credential check. The same section's pane gets its scroll back; a section change (a tab click) is not a background poke. */
   function scheduleSettingsRepaint() {
     if (settingsRepaintQueued || !open.settings) return;
     settingsRepaintQueued = true;
-    setTimeout(() => { settingsRepaintQueued = false; if (open.settings) rerender('settings'); }, SETTINGS_REPAINT_COALESCE_MS);
+    setTimeout(() => {
+      settingsRepaintQueued = false;
+      const w = open.settings;
+      if (!w) return;
+      const before = w.querySelector('.con-pane'), section = consoleSection.settings, top = before ? before.scrollTop : 0;
+      rerender('settings');
+      const after = open.settings && open.settings.querySelector('.con-pane');
+      if (after && top > 0 && consoleSection.settings === section) after.scrollTop = top;
+    }, SETTINGS_REPAINT_COALESCE_MS);
   }
 
   // the REAL connected providers: OpenRouter from the BYOK store, Codex from sidecar OAuth status.
@@ -4280,12 +5489,14 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       .then(j => {
         // carry the WHOLE truth shape (connected + expired + reason), exactly like codex — a lone bool can't
         // distinguish "never signed in" from the dead-refresh-token death the row must render differently.
-        const next = { connected: !!(j && j.connected), expired: !!(j && j.expired), reason: (j && j.reason) || '' };
+        const next = { connected: !!(j && j.connected), expired: !!(j && j.expired), reason: (j && j.reason) || '', region: (j && j.region) || '' };
+        // kimi (#70): the stored sign-in's region seeds the next sign-in's default (unless the Commander picked one)
+        if (pid === 'kimi' && next.region && typeof KimiRegion !== 'undefined') KimiRegion.noteSignedIn(next.region);
         // Same rule as codex above: compare what the row will actually DRAW, so a cold "not connected" answer
         // that matches the fallback does not force a full pane rebuild (and its fan-out) for nothing.
-        const wasConnected = oauthProvConnected(pid), wasExpired = oauthProvExpired(pid);
+        const wasConnected = oauthProvConnected(pid), wasExpired = oauthProvExpired(pid), wasRegion = oauthStatus[pid] ? oauthStatus[pid].region : '';
         oauthStatus[pid] = next;
-        if (oauthProvConnected(pid) !== wasConnected || oauthProvExpired(pid) !== wasExpired) scheduleSettingsRepaint();
+        if (oauthProvConnected(pid) !== wasConnected || oauthProvExpired(pid) !== wasExpired || next.region !== wasRegion) scheduleSettingsRepaint();
       })
       .catch(() => {})
       .finally(() => { oauthChecking[pid] = false; });
@@ -4321,8 +5532,23 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   }
   // honest one-liner for where a just-saved key was stored. Falls back to the neutral "on this machine" until the
   // probe answers, so we never assert keychain-vs-browser before we actually know it.
-  function keyStoreClause() {
+  // #89: in the browser build a saved key / endpoint / backup pool / REMOVE is also handed to the station for routines
+  // (Harness resolves { engine }). When the station could NOT take that change, say what it means beside the result
+  // (a save: chat still works, unattended runs won't have it; a REMOVE: the station keeps using its copy). One toast
+  // slot, so an endpoint + key saved together never stack two copies of the same warning.
+  function warnIfStationLacksKey(res) {
+    const e = res && res.engine;
+    if (e && e.ok === false && e.error) notify('⚠ ' + e.error, 'warn', undefined, { key: 'engine-key' });
+  }
+  function keyStoreClause(res) {
     if (keychainModeKnown === true) return 'stored in your OS keychain';
+    // #89: the station proved it holds its own copy (presence only) — say both places, and which key routines use
+    const e = res && res.engine;
+    if (e && e.ok === true && !e.skipped && !e.stale) {
+      return e.keySource === 'environment'
+        ? 'stored in this browser and on this station (routines use the API key variable this station was started with)'
+        : 'stored in this browser and on this station, so routines can use it';
+    }
     if (keychainModeKnown === false) return 'stored locally in this browser';
     return 'stored on this machine';
   }
@@ -4342,11 +5568,175 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         scheduleSettingsRepaint();
       });
   }
+  /* CLAUDE CODE card truth: /api/auth/claude-cli/status (the user's own `claude auth status`). undefined = not asked
+     yet, null = the station couldn't answer. The card never says SIGNED IN from anything else. */
+  let claudeCliSt;
+  let claudeCliStPending = false;
+  // The card's in-flight sign-in (ClaudeCliSignIn owns the flow): its last message, the fallback page, and whether
+  // the last attempt failed. Painted from here on every render, so a repaint never strands a running sign-in.
+  // `account` = which sign-in the flow/message belongs to: '' the default one, an id for an extra account, '+' for an
+  // ADD whose account the sidecar has not named yet.
+  const claudeCard = { msg: '', url: '', failed: false, account: '' };
+  /* SUBSCRIPTION STACKING: the extra Claude sign-ins (/api/auth/claude-cli/accounts — each one's own `claude auth
+     status` plus the station's cooldown for it). null = not loaded; claudeCliSt stays the DEFAULT sign-in (account 1). */
+  let claudeAccounts = null;
+  let claudeAccountsMax = 8;
+  // a run just hopped between connected sign-ins: the card's cooldown line is stale — re-ask (keeps the old paint meanwhile)
+  if (typeof U !== 'undefined' && U.bus && U.bus.on) U.bus.on('provider.fallback', p => { if (p && p.toAccount) refreshClaudeCliCard(true); });
+  function paintClaudeCard() {
+    const st = document.getElementById('prov-claude-status');
+    if (st) st.textContent = claudeCard.msg;
+    const open = document.getElementById('prov-claude-open');
+    if (open) open.style.display = claudeCard.url ? '' : 'none';   // .bb sets display, which beats [hidden]
+  }
+  function refreshClaudeCliCard(force) {
+    if (typeof ClaudeCliSignIn === 'undefined' || claudeCliStPending || (!force && claudeCliSt !== undefined)) return;
+    claudeCliStPending = true;
+    ClaudeCliSignIn.accounts()
+      .then(j => {
+        if (!j || !j.accounts.length) { claudeCliSt = null; claudeAccounts = null; return; }
+        claudeCliSt = j.accounts[0];
+        claudeAccounts = j.accounts.slice(1);
+        if (j.max > 0) claudeAccountsMax = j.max;
+      })
+      .catch(() => { claudeCliSt = null; claudeAccounts = null; })
+      .finally(() => { claudeCliStPending = false; scheduleSettingsRepaint(); });
+  }
+  function claudeCliPlan(st) {
+    if (!st) return '';
+    if (st.authMethod === 'api_key' || st.authMethod === 'apiKey') return ' · API KEY';
+    return st.subscription ? ' · ' + String(st.subscription).toUpperCase() : '';
+  }
+  // The sign-in box (open page · cancel · paste a code). ONE flow runs at a time, so ONE box is ever on the page:
+  // under the card for the default sign-in, inside the accounts block for an extra account.
+  function claudeFlowBoxHtml(flowing, show, dismissable) {
+    return '<div class="key-edit codex-inline prov-oauth-inline prov-claude-inline" id="prov-claude-inline"' + (show ? '' : ' hidden') + '>' +
+      '<span class="dim" id="prov-claude-status">' + esc(claudeCard.msg) + '</span>' +
+      (!flowing && dismissable ? '<button class="bb sm" id="prov-claude-dismiss">✕ DISMISS</button>' : '') +
+      (flowing
+        ? '<button class="bb sm" id="prov-claude-open"' + (claudeCard.url ? '' : ' style="display:none"') + '>↗ OPEN SIGN-IN PAGE</button>' +
+          '<button class="bb sm" id="prov-claude-cancel">✕ CANCEL</button>' +
+          '<input type="text" class="key-input" id="prov-claude-code" placeholder="page showed a code? paste it here" autocomplete="off" spellcheck="false">' +
+          '<button class="bb sm" id="prov-claude-code-go">SUBMIT</button>'
+        : '') +
+      '</div>';
+  }
+  /* SUBSCRIPTION STACKING on the ChatGPT / Grok / Kimi cards: the same accounts block as CLAUDE CODE, driven by the
+     device-code engine (OAuthAccounts.for). The list is backend truth (/api/auth/<pid>/accounts: stored tokens, a
+     recorded dead sign-in, the station's cooldown) and is re-read at most every 5s while Settings repaints, so a
+     DISCONNECT or RE-SIGN-IN of the primary elsewhere on this page shows up without its own wiring. */
+  /* KIMI ACCOUNT REGION (#70): a Kimi account lives in ONE deployment — Global (kimi.ai) or China (kimi.com) — and can
+     only sign in there. This strip picks where the NEXT sign-in (⏼ SIGN IN, RE-SIGN-IN, ＋ ADD ACCOUNT) goes and says
+     which region the stored sign-in belongs to (the sidecar's status `region`, never a guess). */
+  function kimiRegionHtml() {
+    if (typeof KimiRegion === 'undefined') return '';
+    const next = KimiRegion.get();
+    const s = oauthStatus.kimi;
+    const stored = s && (s.connected || s.expired) && s.region ? KimiRegion.label(s.region) : '';
+    return '<div class="prov-region" role="group" aria-label="Kimi account region">' +
+      '<span class="dim">ACCOUNT REGION</span>' +
+      KimiRegion.OPTIONS.map(o => '<button class="bb sm' + (o.id === next ? ' active' : '') + '" data-act="kimi-region" data-region="' + esc(o.id) + '" aria-pressed="' + (o.id === next) + '"' +
+        ' title="sign in with a ' + esc(o.host) + ' account">' + esc(o.label + ' · ' + o.host) + '</button>').join('') +
+      '<span class="dim">' + (stored ? 'signed in on ' + esc(stored) + ' · ' : '') + 'pick where your Kimi account lives before you sign in</span>' +
+    '</div>';
+  }
+  const STACKABLE_OAUTH = ['codex', 'grok', 'kimi'];
+  const oauthAccts = {};   // pid -> { list: undefined|null|{accounts,max}, at, pending, box: null|{ account, msg, code, uri, openUri } }
+  function oauthAcctState(pid) { return (oauthAccts[pid] = oauthAccts[pid] || { list: undefined, at: 0, pending: false, box: null }); }
+  function refreshOAuthAccounts(pid, force) {
+    if (typeof OAuthAccounts === 'undefined' || STACKABLE_OAUTH.indexOf(pid) < 0) return;
+    const st = oauthAcctState(pid);
+    if (st.pending || (!force && st.list !== undefined && Date.now() - st.at < 5000)) return;
+    st.pending = true;
+    // repaint only on a REAL change (10-26 window-open lag): every reopen of SETTINGS past the 5s mark re-reads the three
+    // lists, and an unchanged answer rebuilt the whole window anyway — the one data repaint left on a second open
+    const was = st.list === undefined ? undefined : JSON.stringify(st.list);
+    OAuthAccounts.for(pid).accounts().then(j => { st.list = j; }).catch(() => { st.list = null; })
+      .finally(() => { st.pending = false; st.at = Date.now(); if (JSON.stringify(st.list) !== was) scheduleSettingsRepaint(); });
+  }
+  if (typeof U !== 'undefined' && U.bus && U.bus.on) U.bus.on('provider.fallback', p => { if (p && p.toAccount) STACKABLE_OAUTH.forEach(pid => refreshOAuthAccounts(pid, true)); });
+  function stackClock(ms) { try { return new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); } catch (_) { return ''; } }
+  // ONE account row (both blocks): label + email, what the provider proved, the station's cooldown, a same-account
+  // warning (two rows with one email add no usage), and the extra account's own actions.
+  function stackRowHtml(a, i, all, o) {
+    const label = String((a && a.label) || ('account ' + (i + 1))).toUpperCase();
+    const dupAt = o.signedIn && a.email ? all.findIndex(x => x && x.email === a.email && o.isIn(x)) : -1;
+    const state = !o.signedIn ? '<span class="key-stat bad">' + (o.outLabel || '○ NOT SIGNED IN') + '</span>'
+      : a.coolingUntil > Date.now() ? '<span class="key-stat">◐ HIT A LIMIT · NEXT TRY AFTER ' + esc(stackClock(a.coolingUntil)) + '</span>'
+      : '<span class="key-stat on">● SIGNED IN</span>';
+    return '<div class="key-row prov-acct' + (o.signedIn ? '' : ' expired') + '" data-account="' + esc((a && a.account) || '') + '">' +
+      '<span class="conn-dot"></span>' +
+      '<div class="key-main">' +
+        '<div class="key-top"><span class="key-prov">' + esc(label) + (i === 0 ? ' · DEFAULT' : '') + '</span>' +
+        '<code class="key-mask">' + esc(o.signedIn ? (a.email || 'signed in') : (o.outMask || 'not signed in')) + '</code></div>' +
+        '<div class="key-meta">' + state + (o.plan ? '<span class="key-stat">' + esc(o.plan) + '</span>' : '') +
+          (dupAt >= 0 && dupAt < i ? '<span class="key-stat bad">⚠ SAME ACCOUNT AS ' + esc(String(all[dupAt].label || '').toUpperCase()) + ' — ADDS NO USAGE</span>' : '') +
+        '</div>' +
+      '</div>' +
+      (i === 0 ? '' : '<div class="key-acts">' +
+        (!o.signedIn ? '<button class="bb sm" data-act="' + o.signInAct + '" aria-label="Sign in ' + esc(label) + '">⏼ SIGN IN</button>' : '') +
+        '<button class="bb sm danger" data-act="' + o.removeAct + '" aria-label="Remove ' + esc(label) + '">✕ REMOVE</button>' +
+      '</div>') +
+    '</div>';
+  }
+  function oauthAccountsHtml(pid) {
+    const st = oauthAcctState(pid);
+    const j = st.list;
+    if (!j || !j.accounts.length) return '';
+    const all = j.accounts, extras = all.slice(1);
+    if (!all[0].connected && !extras.length && !st.box) return '';   // nothing signed in yet: the card's own ⏼ SIGN IN is the door
+    const isIn = x => !!x.connected;
+    const rows = extras.length ? all.map((a, i) => stackRowHtml(a, i, all, {
+      signedIn: isIn(a), isIn, outLabel: a.expired ? '⚠ SIGN-IN EXPIRED' : '○ NOT SIGNED IN', outMask: a.expired ? 'sign in again' : '',
+      signInAct: 'prov-oauth-acct-signin', removeAct: 'prov-oauth-acct-remove' })).join('') : '';
+    const flowing = OAuthAccounts.for(pid).active();
+    const b = st.box;
+    const box = b ? '<div class="key-edit codex-inline prov-oauth-inline" id="prov-oauth-acct-box-' + esc(pid) + '">' +
+        '<span class="dim">' + esc(b.msg) + '</span>' +
+        (b.code ? '<code class="key-mask">' + esc(b.code) + '</code>' : '') +
+        (b.openUri && flowing ? '<button class="bb sm" data-act="prov-oauth-acct-open">↗ OPEN PAGE</button>' : '') +
+        '<button class="bb sm" data-act="prov-oauth-acct-cancel">' + (flowing ? '✕ CANCEL' : '✕ DISMISS') + '</button>' +
+      '</div>' : '';
+    const canAdd = !flowing && all.length < (j.max || 8);
+    return '<div class="prov-accounts">' + rows + box +
+      '<div class="prov-accounts-add">' +
+        (canAdd ? '<button class="bb sm" data-act="prov-oauth-acct-add" title="sign in another ' + esc(provName(pid)) + ' account">＋ ADD ACCOUNT</button>' : '') +
+        '<span class="dim">' + (extras.length
+          ? 'runs start on the first ready account; when it hits its usage limit they continue on the next'
+          : 'connect more ' + esc(provName(pid)) + ' accounts — when one hits its usage limit, runs continue on the next') + '</span>' +
+      '</div>' +
+    '</div>';
+  }
+  /* SUBSCRIPTION STACKING on the CLAUDE CODE card: every connected sign-in with what its own CLI proved (email, plan,
+     signed in or not) and what the station is doing with it (a cooldown after a limit is REAL credPool state), plus
+     ＋ ADD ACCOUNT. Two rows with one email are the same Claude account: it adds no usage, and the row says so. */
+  function claudeAccountsHtml() {
+    const extras = claudeAccounts || [];
+    const all = [claudeCliSt].concat(extras);
+    const isIn = x => !!(x && x.loggedIn);
+    const row = (a, i) => stackRowHtml(a, i, all, { signedIn: isIn(a), isIn, plan: isIn(a) ? claudeCliPlan(a).replace(/^ · /, '') : '',
+      signInAct: 'prov-claude-acct-signin', removeAct: 'prov-claude-acct-remove' });
+    const flowing = !!claudeCard.account && typeof ClaudeCliSignIn !== 'undefined' && ClaudeCliSignIn.active();
+    const box = claudeCard.account ? claudeFlowBoxHtml(flowing, flowing || !!claudeCard.msg, true) : '';
+    const canAdd = !flowing && 1 + extras.length < claudeAccountsMax;
+    return '<div class="prov-accounts">' +
+      (extras.length ? all.map(row).join('') : '') +
+      box +
+      '<div class="prov-accounts-add">' +
+        (canAdd ? '<button class="bb sm" data-act="prov-claude-add" title="sign in another Claude account — Claude Code keeps each sign-in, StarNet never sees them">＋ ADD ACCOUNT</button>' : '') +
+        '<span class="dim">' + (extras.length
+          ? 'runs start on the first ready account; when it hits its usage limit they continue on the next'
+          : 'connect more Claude accounts — when one hits its usage limit, runs continue on the next') + '</span>' +
+      '</div>' +
+    '</div>';
+  }
   function queueProviderHealthRefresh() {
     const h = H(); if (!h) return;
+    refreshClaudeCliCard(false);
+    STACKABLE_OAUTH.forEach(pid => refreshOAuthAccounts(pid, false));
     for (const p of PROVIDERS) {
       const credentialSaved = !!(h.hasStoredCredential && h.hasStoredCredential(p.id));
-      const endpointConfigured = p.id === 'ollama' || (p.id === 'custom' && !!(h.getBaseUrl && h.getBaseUrl(p.id)));
+      const endpointConfigured = p.id === 'ollama' || p.id === 'claude-cli' || (p.id === 'custom' && !!(h.getBaseUrl && h.getBaseUrl(p.id)));
       if ((credentialSaved || endpointConfigured || p.id === activeProv()) && providerHealth[p.id] === undefined) refreshProviderHealth(p.id);
     }
   }
@@ -4367,20 +5757,24 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         out.push({ provider: pid, key: '', model: activeModel, oauth: true, expired: oauthProvExpired(pid) });
       }
     });
+    // CLAUDE CODE holds no key: the user's own CLI owns the sign-in, so its row rides the CLI's truth (claudeCliSt
+    // from `claude auth status`), never a stored credential. Through addProvider it needed BOTH the active provider
+    // AND a saved key — i.e. it never listed (2026-10-02 report: "signed in, but not in the connected section").
+    if (claudeCliSt && claudeCliSt.loggedIn) out.push({ provider: 'claude-cli', key: '', model: active === 'claude-cli' && h.getModel ? (h.getModel() || '') : '', claude: true });
     // OpenRouter BYOK: desktop keeps the key in the OS keychain (getKey returns ''); configured() reports it's set.
     function addProvider(provider) {
-      if (!provider || isOAuthProvider(provider) || out.some(k => k.provider === provider)) return;
+      if (!provider || provider === 'claude-cli' || isOAuthProvider(provider) || out.some(k => k.provider === provider)) return;
       if (provider === 'ollama' && provider !== active) return;
       // Truthful list: only providers with an ACTUALLY-stored credential show a row/badge (never DEVMODE-fabricated).
       // hasStoredCredential is the honest getter; fall back to the older signals if an old harness lacks it.
       const set = h.hasStoredCredential ? h.hasStoredCredential(provider)
         : ((h.configured && h.configured(provider)) || !!(h.getKey && h.getKey(provider)));
       // A KEYLESS custom endpoint (vLLM / LM Studio / any no-auth OpenAI-compatible server) still earns its row:
-      // the ✎ STATION LINK editor lives ONLY on this row, so gating it on a stored key froze the endpoint at
+      // the ✎ ENDPOINT URL editor lives ONLY on this row, so gating it on a stored key froze the endpoint at
       // whatever onboarding stored — and REMOVE-ing the last custom key stranded a still-active endpoint with no
       // editor. hasStoredCredential('custom') stays false for it (an endpoint is configuration, not a credential).
       const keylessEp = provider === 'custom' && !!(h.getBaseUrl && h.getBaseUrl('custom'));
-      if (set || keylessEp) out.push({ provider, key: h.getKey ? h.getKey(provider) : '', stored: !!set, baseUrl: h.getBaseUrl ? h.getBaseUrl(provider) : '', model: (h.getModel && h.getModel()) || '', local: provider === 'ollama' });
+      if (set || keylessEp) out.push({ provider, key: h.getKey ? h.getKey(provider) : '', stored: !!set, baseUrl: h.getBaseUrl ? h.getBaseUrl(provider) : '', model: (h.getModel && h.getModel()) || '', local: provider === 'ollama' || provider === 'claude-cli' });
     }
     addProvider(active);
     if (active !== 'openrouter') addProvider('openrouter');
@@ -4388,16 +5782,78 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     return out;
   }
   function keysFor(id) { return connectedKeys().filter(x => x.provider === id); }
+  // org P04 wiring: STARNET MANAGED takes no key — its bearer is the linked device token (harness.js providerNeedsKey
+  // excludes it too); its card offers ↗ LINK STATION, never a key field
   function providerAcceptsKey(provider) {
     provider = provider || activeProv();
-    return !isOAuthProvider(provider) && provider !== 'ollama' && provider !== 'claudecode';   // claudecode: the CLI's own login, no key
+    return !isOAuthProvider(provider) && provider !== 'ollama' && provider !== 'claude-cli' && provider !== 'starnet';
+  }
+  /* The selected provider's "not set up yet" line under API KEYS (org P04) names what ITS card is missing: a key for a key
+     provider, the ENDPOINT for CUSTOM (its key is optional; the card reads ○ NO ENDPOINT), the LINK for STARNET MANAGED (the
+     card reads ○ NOT LINKED and offers ↗ LINK STATION). A saved or live StarNet link owes no line — the card says its state. */
+  function selectedSetupLineHtml(pid, name, creditsState) {
+    const what = pid === 'starnet' ? (creditsState === 'linked' || creditsState === 'saved' ? '' : ' isn’t linked yet.')
+      : pid === 'custom' ? ', has no endpoint yet.' : ', has no key yet.';
+    if (!what) return '';
+    const verb = pid === 'starnet' ? 'LINK IT' : pid === 'custom' ? 'SET IT' : 'ADD IT';
+    return '<div class="key-empty key-goto"><p>The selected provider, ' + esc(name) + (pid === 'starnet' ? ',' : '') + what + '</p>'
+      + '<div class="mc-acts"><button type="button" class="bb sm" data-act="to-prov-card" data-provider="' + esc(pid) + '">▸ ' + verb + ' ON THE ' + esc(name) + ' CARD</button></div></div>';
+  }
+  /* A CUSTOM ENDPOINT NEEDS ITS ADDRESS (GitHub #113, confirmed live 2026-10-13): the CUSTOM card promised "any /v1 base
+     URL", but every add form offered only "paste CUSTOM key…" — the endpoint could be set only during onboarding. The
+     add forms now take the endpoint (required) with the key optional; the copy no longer claims a ChatGPT sign-in. */
+  function customEndpointInputHtml(id) {
+    return '<input type="url" class="key-input base-input" id="' + id + '" placeholder="endpoint URL, e.g. http://localhost:1234/v1" autocomplete="off" spellcheck="false" aria-label="Custom endpoint URL">';
+  }
+  // the URL the CUSTOM endpoint is stored as: a bare host gets a scheme (http:// for this machine or the LAN, https:// otherwise)
+  function normEndpoint(raw) {
+    let n = String(raw || '').trim();
+    if (!n) return '';
+    if (!/^https?:\/\//i.test(n)) n = (/^(localhost|127\.|0\.0\.0\.0|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1)/i.test(n) ? 'http://' : 'https://') + n.replace(/^\/+/, '');
+    try { new URL(n); return n; } catch (_) { return null; }
+  }
+  // CUSTOM: store the endpoint (required), then the key if one was given, then PROVE reachability (never claim connected)
+  function saveCustomEndpoint(baseInp, keyInp) {
+    const h = H();
+    const norm = normEndpoint(baseInp ? baseInp.value : '');
+    if (!norm) { sfx('bad'); notify(norm === null ? '✕ that endpoint does not look like a URL' : '✕ enter the endpoint URL (e.g. http://localhost:1234/v1)', 'bad'); if (baseInp) baseInp.focus(); return; }
+    if (!h || !h.setBaseUrl) { sfx('bad'); return; }
+    const key = keyInp ? keyInp.value.trim() : '';
+    Promise.resolve(h.setBaseUrl(norm, 'custom')).then(res => {
+      warnIfStationLacksKey(res);
+      return key ? Promise.resolve(h.validateAndSetKey ? h.validateAndSetKey(key, 'custom') : h.setKey(key, 'custom')) : null;
+    }).then(() => {
+      invalidateProviderHealth('custom');
+      const done = (pr) => {
+        notify(pr && pr.reachable ? '✓ custom endpoint saved — reachable' + (pr.credentialVerified ? ' · credentials verified' : '') : '✓ custom endpoint saved — not reachable yet' + (pr && pr.error ? ' (' + pr.error + ')' : ''), pr && pr.reachable ? 'good' : 'warn');
+        if (typeof ModelDock !== 'undefined' && ModelDock.reflect) ModelDock.reflect();
+        if (typeof KeyCTA !== 'undefined' && KeyCTA.refresh) KeyCTA.refresh();
+        rerender('settings');
+      };
+      if (!h.probeProvider) return done(null);
+      return h.probeProvider('custom').then(pr => { providerHealth.custom = pr || null; done(pr); }, () => done(null));
+    }).catch(err => {
+      notify('✕ ' + ((err && err.message) || 'could not save the custom endpoint'), 'bad');
+      sfx('bad');
+      rerender('settings');
+    });
+  }
+  /* ONE KEY BOX PER PROVIDER (org P04): a provider whose card shows ＋ ADD KEY / ⏼ SIGN IN takes its key THERE — a second
+     "Add a <provider> key" box under API KEYS left users unsure which one counted. This list-side form survives only for a
+     provider with no such card key (cardOffersAdd false), and CUSTOM never gets one: its card's ＋ ADD KEY takes the
+     endpoint URL (#113). */
+  const ADD_ON_CARD = 'Add a key on a provider card above.';
+  function cardOffersAdd(provider) {
+    const p = PROVIDERS.find(x => x.id === provider);
+    return !!(p && p.live && (providerAcceptsKey(provider) || isOAuthProvider(provider)));
   }
   function addKeyHtml(provider, empty) {
     provider = provider || 'openrouter';
+    if (provider === 'custom') return '<div class="key-empty"><p>' + ADD_ON_CARD + '</p></div>';
     return '<div class="key-empty">' +
       '<p>' + (empty
-        ? 'No API keys connected. Paste a key here to reconnect - it stays on this machine.'
-        : 'Add a ' + esc(provName(provider)) + ' key while keeping your ChatGPT sign-in connected.') + '</p>' +
+          ? 'No API keys connected. Paste a key here to reconnect - it stays on this machine.'
+          : 'Add a ' + esc(provName(provider)) + ' key — it stays on this machine.') + '</p>' +
       '<div class="key-edit">' +
       '<input type="password" class="key-input" id="key-in-new" placeholder="paste ' + esc(provName(provider)) + ' key..." autocomplete="off" spellcheck="false">' +
       '<button class="bb sm" data-act="add" data-provider="' + esc(provider) + '">SAVE</button>' +
@@ -4405,13 +5861,38 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   }
 
   function providerLogoHtml(id) {
-    const asset = id === 'starnet' ? 'starnet-wordmark.svg' : 'providers/' + (id === 'codex' ? 'openai' : id === 'claudecode' ? 'anthropic' : id) + '.svg';
+    const asset = id === 'starnet' ? 'starnet-wordmark.svg' : 'providers/' + (id === 'codex' ? 'openai' : id) + '.svg';
     return '<span class="prov-logo' + (id === 'starnet' ? ' prov-logo-starnet' : '') + '" aria-hidden="true" style="--provider-icon:url(&quot;' + esc(new URL('assets/brand/' + asset, document.baseURI).href) + '&quot;)"></span>';
   }
 
+  /* AI & MODELS IN FOUR PLAIN GROUPS (UX night 10-26, Andrew: "pretend these users are like 5"). Nineteen cards stood in
+     one column, each led by an API address ("generativelanguage.googleapis.com/v1beta"). They are the same cards, every
+     one still drawn (the visibleProviders law) and in PROVIDERS order inside its group, under the one question a newcomer
+     can answer: do you have StarNet credits, a subscription, an API key, or your own model server? A card leads with
+     what you need; its address rides the tip. The group with no id list takes every provider the others do not name. */
+  const PROVIDER_GROUPS = [
+    { id: 'credits', label: 'STARNET CREDITS', note: 'link this station once, nothing to paste', ids: ['starnet'] },
+    { id: 'subscription', label: 'A SUBSCRIPTION YOU HAVE', note: 'sign in, no API key', ids: ['codex', 'grok', 'kimi', 'claude-cli'] },
+    { id: 'key', label: 'AN API KEY', note: 'paste a key from the service’s website' },
+    { id: 'own', label: 'YOUR OWN MODELS', note: 'on this computer, or a server you run', ids: ['ollama', 'custom'] }
+  ];
+  const providerGroupOf = id => PROVIDER_GROUPS.find(g => g.ids && g.ids.indexOf(id) >= 0) || PROVIDER_GROUPS.find(g => !g.ids);
+  function groupedProviders() {
+    const shown = visibleProviders();
+    return PROVIDER_GROUPS.reduce((out, g) => out.concat(shown.filter(p => providerGroupOf(p.id) === g)), []);
+  }
+  function providerGroupHead(cards, i) {
+    const g = providerGroupOf(cards[i].id);
+    if (i > 0 && providerGroupOf(cards[i - 1].id) === g) return '';
+    return '<div class="set-sub prov-group" data-group="' + esc(g.id) + '"><span class="set-sub-k">' + esc(g.label) + '</span><span class="set-sub-d">' + esc(g.note) + '</span></div>';
+  }
+  // what the card says under its name: the subscription for a sign-in provider ("ChatGPT subscription"), else the blurb
+  const providerNeed = p => /^OAuth · /.test(p.endpoint) ? p.endpoint.slice('OAuth · '.length) : p.blurb;
   function providersHtml() {
     const active = activeProv();
-    return visibleProviders().map((p, pi) => {
+    const cards = groupedProviders();
+    return cards.map((p, pi) => providerGroupHead(cards, pi) + providerCardHtml(p, pi)).join('');
+    function providerCardHtml(p, pi) {
       // The credits provider has its own card: no key to paste, no sign-in, and a status line that
       // states the BALANCE, because a paid provider reading "connected" at $0.00 would be a lie of
       // exactly the kind this panel exists to avoid.
@@ -4424,25 +5905,39 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       const codexDead = isOAuthProvider(p.id) && oauthExpiredFor(p.id);
       const h = H();
       const credentialSaved = isOAuthProvider(p.id) ? (ks.length > 0 && !codexDead) : !!(h && h.hasStoredCredential && h.hasStoredCredential(p.id));
-      const endpointConfigured = p.id === 'ollama' || (p.id === 'custom' && !!(h && h.getBaseUrl && h.getBaseUrl(p.id)));
+      const endpointConfigured = p.id === 'ollama' || p.id === 'claude-cli' || (p.id === 'custom' && !!(h && h.getBaseUrl && h.getBaseUrl(p.id)));
       const configured = credentialSaved || endpointConfigured;
       const health = providerHealth[p.id];
       // ACTIVE is reserved for a selected model whose endpoint and credential (when applicable) were proven by
       // the no-generation probe. Selection plus a model id is not evidence that a run can leave the station.
-      const runnable = !!(health && health.reachable && health.credentialVerified && p.id === active && h && h.getModel && h.getModel());
-      const cls = codexDead ? 'avail expired' : (configured ? 'conn' : (p.live ? 'avail' : 'soon'));
+      // CLAUDE CODE has no key to verify: its sign-in is proven by the CLI (claudeCliSt) and its catalog by the probe
+      const runnable = !!(health && health.reachable && (health.credentialVerified || (p.id === 'claude-cli' && claudeCliSt && claudeCliSt.loggedIn)) && p.id === active && h && h.getModel && h.getModel());
+      const claudeIn = p.id === 'claude-cli' && !!(claudeCliSt && claudeCliSt.loggedIn);
+      const cls = codexDead ? 'avail expired' : ((p.id === 'claude-cli' ? claudeIn : configured) ? 'conn' : (p.live ? 'avail' : 'soon'));
       // E5: `connected` is KEY PRESENCE, not a verified live connection — a saved key can be revoked,
       // rate-limited, or wrong, and we haven't round-tripped it. Label it "KEY SAVED" (or SIGNED IN for
       // the codex OAuth path, which IS real auth) rather than the over-claiming "CONNECTED". The
       // ACTIVE/runnable badge logic below is unchanged — that already gates on selected provider + model.
       const connLabel = isOAuthProvider(p.id) ? '● SIGNED IN' : '● KEY SAVED';
-      const keyless = p.id === 'ollama' || (p.id === 'custom' && endpointConfigured && !credentialSaved);
+      const keyless = p.id === 'ollama' || p.id === 'claude-cli' || (p.id === 'custom' && endpointConfigured && !credentialSaved);
       const localStat = !endpointConfigured ? '○ NO ENDPOINT' : health === undefined ? '◐ LOCAL ENDPOINT CONFIGURED · CHECKING…'
         : health && health.reachable ? '● LOCAL ENDPOINT CONFIGURED · REACHABLE' : '○ LOCAL ENDPOINT CONFIGURED · OFFLINE';
       const keyStat = health === undefined ? connLabel + ' · CHECKING…'
         : health && health.credentialVerified ? connLabel + ' · VERIFIED' : health && health.reachable ? connLabel + ' · NOT VERIFIED' : connLabel + ' · CHECK FAILED';
+      const isClaude = p.id === 'claude-cli';
+      const claudeStat = claudeCliSt === undefined ? '◐ CHECKING CLAUDE CODE…' : claudeCliSt === null ? '○ COULDN’T CHECK CLAUDE CODE'
+        : !claudeCliSt.installed ? '○ CLAUDE CODE NOT INSTALLED' : !claudeCliSt.loggedIn ? '○ NOT SIGNED IN'
+        : '● SIGNED IN' + claudeCliPlan(claudeCliSt);
       const stat = !p.live ? '○ COMING SOON' : codexDead ? '⚠ SIGN-IN EXPIRED — RECONNECT'
-        : keyless ? localStat : credentialSaved ? keyStat : (isOAuthProvider(p.id) ? '○ NOT SIGNED IN' : (p.id === 'custom' ? '○ NO ENDPOINT' : '○ NO KEY'));
+        : isClaude ? claudeStat : keyless ? localStat : credentialSaved ? keyStat : (isOAuthProvider(p.id) ? '○ NOT SIGNED IN' : (p.id === 'custom' ? '○ NO ENDPOINT' : '○ NO KEY'));
+      // #62: NOT VERIFIED / CHECK FAILED says WHY (the probe's own reason: "credential probe HTTP 401", a station
+      // refusal, a timeout) — a bare verdict left a valid-key user with nothing to act on.
+      // org P03: a probe that gave no reason still says what it saw — never a bare NOT VERIFIED / CHECK FAILED.
+      // a probe with no failure reason (the provider answered, the key was just not confirmed) reads in the amber of
+      // the NOT VERIFIED line it explains; only a real failure (HTTP 401, a refusal, no answer) keeps the error red
+      const statWhy = p.live && !codexDead && credentialSaved && !isClaude && !keyless && health && !health.credentialVerified
+        ? '<span class="prov-stat-why' + (!health.error && health.reachable ? ' soft' : '') + '">' + esc(health.error ? String(health.error).slice(0, 200)
+          : health.reachable ? 'the provider answered but did not confirm this key' : 'the check got no answer from the provider') + '</span>' : '';
       const n = ks.length;
       // NO-KEY cards that accept a key get an inline, collapsible paste-and-save row so the user never has to hunt
       // for where keys live. It reuses the SAME save path (Harness.setKey) as the key list below — no duplicate logic.
@@ -4452,33 +5947,50 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       // ✕ DISCONNECT (or on a machine that never signed in there) this button is the ONLY reachable sign-in —
       // without it the row reads NOT SIGNED IN with zero recovery (the 2026-07-21 user-reported escape).
       // The ⏼ RE-SIGN-IN row below can't cover it: that row only exists once a live/known-dead sign-in exists.
-      const wantsOAuthSignin = p.live && isOAuthProvider(p.id) && !credentialSaved && !codexDead;
-      return '<div class="prov-card ' + cls + '" data-provider="' + esc(p.id) + '" role="group" aria-label="' + esc(p.name) + ' provider" style="--ci:' + pi + '">' +
+      // #92: a KNOWN-dead sign-in (consumed refresh token) gets the same card button, labelled RECONNECT — the
+      // ⏼ RE-SIGN-IN row sits far below under API KEYS, and a user who read only the card had no way back in.
+      // credentialSaved is already false for a dead sign-in, so the dead state needs no clause of its own here.
+      const wantsOAuthSignin = p.live && isOAuthProvider(p.id) && !credentialSaved;
+      const cardFlow = isOAuthProvider(p.id) ? oauthCardFlowView(p.id, wantsOAuthSignin) : null;   // an in-flight card sign-in (survives repaints)
+      const wantsClaudeSignin = p.id === 'claude-cli' && !!(claudeCliSt && claudeCliSt.installed && !claudeCliSt.loggedIn);
+      const wantsClaudeInstall = p.id === 'claude-cli' && !!(claudeCliSt && !claudeCliSt.installed);
+      const claudeFlowing = wantsClaudeSignin && !claudeCard.account && typeof ClaudeCliSignIn !== 'undefined' && ClaudeCliSignIn.active();
+      const claudeBox = wantsClaudeSignin && (claudeFlowing || (claudeCard.failed && !!claudeCard.msg));
+      return '<div class="prov-card ' + cls + '" data-provider="' + esc(p.id) + '" data-configured="' + (configured ? '1' : '0') + '" role="group" aria-label="' + esc(p.name) + ' provider" style="--ci:' + pi + '">' +
         '<button class="prov-select" data-act="prov-select" aria-label="Select ' + esc(p.name) + ' provider">' +
           providerLogoHtml(p.id) +
           '<span class="prov-main">' +
             '<span class="prov-name">' + esc(p.name) + (runnable ? '<span class="prov-badge">ACTIVE</span>' : '') + '</span>' +
-            '<span class="prov-ep">' + esc(p.endpoint) + ' · ' + esc(p.blurb) + '</span>' +
+            '<span class="prov-ep" data-tip="' + esc(p.endpoint + ' · ' + p.blurb) + '">' + esc(providerNeed(p)) + '</span>' +
           '</span>' +
         '</button>' +
-          '<span class="prov-stat"><span class="prov-stat-t">' + stat + (credentialSaved && !isOAuthProvider(p.id) ? '<i>' + n + (n === 1 ? ' key' : ' keys') + '</i>' : '') + '</span></span>' +
+          '<span class="prov-stat"><span class="prov-stat-t">' + stat + statWhy + (credentialSaved && !isOAuthProvider(p.id) ? '<i>' + n + (n === 1 ? ' key' : ' keys') + '</i>' : '') + '</span></span>' +   // org P03: the reason sits right under the verdict it explains, above the key count
         (wantsInline ? '<button class="bb sm prov-addkey" data-act="prov-add-toggle" data-provider="' + esc(p.id) + '" aria-label="Add a ' + esc(p.name) + ' key" title="paste a ' + esc(p.name) + ' key without leaving this card">＋ ADD KEY</button>' : '') +
-        (wantsOAuthSignin ? '<button class="bb sm prov-addkey" data-act="prov-oauth-signin" data-provider="' + esc(p.id) + '" aria-label="Sign in to ' + esc(p.name) + '" title="device-code sign-in — no API key needed">⏼ SIGN IN</button>' : '') +
+        (wantsClaudeSignin && !claudeFlowing && !(typeof ClaudeCliSignIn !== 'undefined' && ClaudeCliSignIn.active()) ? '<button class="bb sm prov-addkey" data-act="prov-claude-signin" aria-label="Sign in with Claude" title="opens Claude in your browser — Claude Code keeps the sign-in, StarNet never sees it">' + (claudeCard.failed ? '⏼ TRY AGAIN' : '⏼ SIGN IN') + '</button>' : '') +
+        (wantsClaudeInstall ? '<button class="bb sm prov-addkey" data-act="prov-claude-install" aria-label="Get Claude Code" title="Claude Code needs a Pro, Max, Team or Enterprise plan">↗ GET CLAUDE CODE</button>' : '') +
+        (wantsOAuthSignin ? '<button class="bb sm prov-addkey" data-act="prov-oauth-signin" data-provider="' + esc(p.id) + '" aria-label="Sign in to ' + esc(p.name) + '" title="device-code sign-in — no API key needed">' + (codexDead ? '⏼ RECONNECT' : '⏼ SIGN IN') + '</button>' : '') +
         (wantsInline
           ? '<div class="key-edit prov-key-edit" id="prov-key-edit-' + esc(p.id) + '" hidden>' +
-            '<input type="password" class="key-input" id="prov-key-in-' + esc(p.id) + '" placeholder="paste ' + esc(p.name) + ' key…" autocomplete="off" spellcheck="false">' +
+            (p.id === 'custom' ? customEndpointInputHtml('prov-base-in-custom') : '') +
+            '<input type="password" class="key-input" id="prov-key-in-' + esc(p.id) + '" placeholder="paste ' + esc(p.name) + ' key' + (p.id === 'custom' ? ' (optional)' : '') + '…" autocomplete="off" spellcheck="false">' +
             '<button class="bb sm" data-act="prov-add-save" data-provider="' + esc(p.id) + '">SAVE</button>' +
             '</div>'
           : '') +
-        (wantsOAuthSignin
-          ? '<div class="key-edit codex-inline prov-oauth-inline" id="prov-oauth-inline-' + esc(p.id) + '" hidden>' +
-            '<span class="dim" id="prov-oauth-status-' + esc(p.id) + '"></span>' +
-            '<code class="key-mask" id="prov-oauth-code-' + esc(p.id) + '" hidden></code>' +
-            '<button class="bb sm" id="prov-oauth-open-' + esc(p.id) + '" hidden>↗ OPEN PAGE</button>' +
+        (wantsClaudeSignin && !claudeCard.account ? claudeFlowBoxHtml(claudeFlowing, claudeBox) : '') +
+        (isClaude && claudeCliSt && claudeCliSt.installed ? claudeAccountsHtml() : '') +
+        (p.id === 'kimi' && p.live ? kimiRegionHtml() : '') +
+        (STACKABLE_OAUTH.indexOf(p.id) >= 0 ? oauthAccountsHtml(p.id) : '') +
+        // the card's device-code box is drawn FROM oauthCardFlow, so a Settings repaint mid-sign-in (a status check
+        // landing, the first-open probes) redraws the code the Commander still has to type instead of losing it
+        (wantsOAuthSignin || cardFlow
+          ? '<div class="key-edit codex-inline prov-oauth-inline" id="prov-oauth-inline-' + esc(p.id) + '"' + (cardFlow ? '' : ' hidden') + '>' +
+            '<span class="dim" id="prov-oauth-status-' + esc(p.id) + '">' + (cardFlow ? cardFlow.statusHtml : '') + '</span>' +
+            '<code class="key-mask" id="prov-oauth-code-' + esc(p.id) + '"' + (cardFlow && cardFlow.code ? '>' + esc(cardFlow.code) : ' hidden>') + '</code>' +
+            '<button class="bb sm" id="prov-oauth-open-' + esc(p.id) + '"' + (cardFlow && cardFlow.openUri ? '' : ' hidden') + '>↗ OPEN PAGE</button>' +
             '</div>'
           : '') +
         '</div>';
-    }).join('');
+    }
   }
   // The STARNET MANAGED card. Same shape as every other provider row so it reads as one of them, but its
   // action routes to the STORE rather than owning a second copy of the pairing flow.
@@ -4496,7 +6008,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         providerLogoHtml(p.id) +
         '<span class="prov-main">' +
           '<span class="prov-name">' + esc(p.name) + (runnable ? '<span class="prov-badge">ACTIVE</span>' : '') + '</span>' +
-          '<span class="prov-ep">' + esc(p.endpoint) + ' · ' + esc(p.blurb) + '</span>' +
+          '<span class="prov-ep" data-tip="' + esc(p.endpoint) + '">' + esc(providerNeed(p)) + '</span>' +
         '</span>' +
       '</button>' +
         '<span class="prov-stat"><span class="prov-stat-t">' + stat + '</span></span>' +
@@ -4532,19 +6044,27 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       '<button class="bb sm" data-act="' + esc(pid) + '-resign">⏼ RE-SIGN-IN</button>' +
       '<button class="bb sm danger" data-act="' + esc(pid) + '-logout">✕ DISCONNECT</button>' +
       '</div></div>' +
-      // the inline device-code surface the RE-SIGN-IN action fills (same engine as codex: OAuthSignIn.for(pid)
-      // → code + verification URL here, poll until the sidecar reports connected).
-      '<div class="key-edit codex-inline" id="' + esc(pid) + '-inline-signin" hidden>' +
-      '<span class="dim" id="' + esc(pid) + '-inline-status"></span>' +
-      '<code class="key-mask" id="' + esc(pid) + '-inline-code" hidden></code>' +
-      '<button class="bb sm" id="' + esc(pid) + '-inline-open" hidden>↗ OPEN PAGE</button>' +
+      // the inline device-code surface the RE-SIGN-IN action fills — drawn from the ONE card-flow state (oauthRowFlowHtml)
+      oauthRowFlowHtml(pid);
+  }
+  /* ONE SIGN-IN, ONE CODE (org P03 wiring): the API KEYS row's ⏼ RE-SIGN-IN and the card's ⏼ SIGN IN / RECONNECT door drive
+     the SAME engine (OAuthSignIn.for(pid); codex = CodexSignIn), and a start silently cancels the flow before it. The row
+     used to keep its own DOM-only box: the card then went on showing a superseded code nobody polled, and a Settings
+     repaint wiped the row's code. Both boxes are now views of oauthCardFlow[pid] (startCardSignin owns it), each redrawn
+     by paintOAuthCardFlow, so every box on screen shows the one code the engine is polling for. */
+  function oauthRowFlowHtml(pid) {
+    const v = oauthCardFlowView(pid, true);
+    return '<div class="key-edit codex-inline" id="' + esc(pid) + '-inline-signin"' + (v ? '' : ' hidden') + '>' +
+      '<span class="dim" id="' + esc(pid) + '-inline-status">' + (v ? v.statusHtml : '') + '</span>' +
+      '<code class="key-mask" id="' + esc(pid) + '-inline-code"' + (v && v.code ? '>' + esc(v.code) : ' hidden>') + '</code>' +
+      '<button class="bb sm" data-act="oauth-row-open" data-provider="' + esc(pid) + '" id="' + esc(pid) + '-inline-open"' + (v && v.openUri ? '' : ' hidden') + '>↗ OPEN PAGE</button>' +
       '</div>';
   }
   function keysHtml() {
     const keys = connectedKeys(), active = activeProv();
     const addProvider = active === 'codex' ? 'openrouter' : active;
     const hasAddProvider = keys.some(k => k.provider === addProvider);
-    if (!keys.length) return providerAcceptsKey(addProvider) ? addKeyHtml(addProvider, true) : '<div class="key-empty"><p>No API keys connected.</p></div>';
+    if (!keys.length) return (cardOffersAdd(addProvider) || !providerAcceptsKey(addProvider)) ? '<div class="key-empty"><p>' + ADD_ON_CARD + '</p></div>' : addKeyHtml(addProvider, true);
 /*
     if (!keys.length) {
       // reachable in-session via REMOVE — let the user reconnect right here, no CONNECT-screen round-trip.
@@ -4562,9 +6082,22 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       // but ACTIVE is reserved for a selected model whose endpoint/credential probe proved it can run.
       const health = providerHealth[k.provider];
       const selected = k.provider === active && !!k.model;
-      const runnable = !!(selected && health && health.reachable && health.credentialVerified);
+      // CLAUDE CODE has no key to verify: its row exists only while the CLI proves the sign-in (same rule as its card)
+      const runnable = !!(selected && health && health.reachable && (health.credentialVerified || k.claude));
       const runState = runnable ? '<span class="key-stat on">ACTIVE</span>'
         : selected ? '<span class="key-stat">SELECTED</span>' : '<span class="key-stat">idle</span>';
+      if (k.claude) {
+        const plan = claudeCliPlan(claudeCliSt).replace(/^ · /, '');
+        return '<div class="key-row">' +
+          '<span class="conn-dot"></span>' +
+          '<div class="key-main">' +
+          '<div class="key-top"><span class="key-prov">' + esc(provName(k.provider)) + '</span>' +
+          '<code class="key-mask" title="signed in through Claude Code, which keeps the sign-in; StarNet never holds it">' + esc(claudeCliSt.email || 'Claude sign-in') + '</code></div>' +
+          '<div class="key-meta">model <b>' + esc(k.model || '—') + '</b> · ' + runState +
+          (plan ? ' · <span class="key-stat">' + esc(plan) + '</span>' : '') +
+          ' · <span class="key-stat">no API key needed</span></div>' +
+          '</div></div>';
+      }
       // grok/kimi (the other keyless device-code sign-ins) render through the SHARED oauth row below — same
       // semantics as codex, parameterized by provider id, so the codex block is not copy-pasted per provider.
       if (k.oauth && k.provider !== 'codex') return oauthKeyRow(k, runState);
@@ -4591,13 +6124,8 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
           '<button class="bb sm" data-act="codex-resign">⏼ RE-SIGN-IN</button>' +
           '<button class="bb sm danger" data-act="codex-logout">✕ DISCONNECT</button>' +
           '</div></div>' +
-          // the inline device-code surface the RE-SIGN-IN action fills (same engine as the brain screen:
-          // CodexSignIn.start → code + verification URL here, poll until the sidecar reports connected).
-          '<div class="key-edit codex-inline" id="codex-inline-signin" hidden>' +
-          '<span class="dim" id="codex-inline-status"></span>' +
-          '<code class="key-mask" id="codex-inline-code" hidden></code>' +
-          '<button class="bb sm" id="codex-inline-open" hidden>↗ OPEN PAGE</button>' +
-          '</div>';
+          // the inline device-code surface the RE-SIGN-IN action fills — drawn from the ONE card-flow state (oauthRowFlowHtml)
+          oauthRowFlowHtml('codex');
       }
       if (k.local) {
         return '<div class="key-row">' +
@@ -4610,13 +6138,13 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
           ' · <span class="key-stat">no API key needed</span></div>' +
           '</div></div>';
       }
-      // STATION LINK / base-URL edit (post-onboarding, EL-11 #12): a custom OpenAI-compatible endpoint carries an
+      // ENDPOINT URL / base-URL edit (post-onboarding, EL-11 #12): a custom OpenAI-compatible endpoint carries an
       // editable base URL. Onboarding is the only other place Harness.setBaseUrl is called; without this control the
       // endpoint was frozen at whatever onboarding stored. Only the 'custom' provider uses a base URL, so gate on it.
       const isCustomEp = k.provider === 'custom';
       const poolCount = H() && H().keyPoolSize ? H().keyPoolSize(k.provider) : 0;
       const baseBtn = isCustomEp
-        ? '<button class="bb sm" data-act="baseurl-edit" data-i="' + i + '" title="change this station link / endpoint URL without re-onboarding">✎ STATION LINK</button>'
+        ? '<button class="bb sm" data-act="baseurl-edit" data-i="' + i + '" data-tip="change this endpoint URL without re-onboarding">✎ ENDPOINT URL</button>'
         : '';
       const baseBlock = isCustomEp
         ? '<div class="key-edit" id="base-edit-' + i + '" hidden>' +
@@ -4635,7 +6163,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         '</div>' +
         '<div class="key-acts">' +
         '<button class="bb sm" data-act="edit" data-i="' + i + '">✎ UPDATE</button>' +
-        '<button class="bb sm" data-act="pool-edit" data-i="' + i + '">↻ BACKUPS' + (poolCount ? ' (' + poolCount + ')' : '') + '</button>' +
+        '<button class="bb sm" data-act="pool-edit" data-i="' + i + '">↻ SPARE KEYS' + (poolCount ? ' (' + poolCount + ')' : '') + '</button>' +
         baseBtn +
         '<button class="bb sm danger" data-act="rm" data-i="' + i + '">✕ REMOVE</button>' +
         '</div></div>' +
@@ -4644,14 +6172,23 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         '<button class="bb sm" data-act="save" data-i="' + i + '">SAVE</button>' +
         '</div>' +
         '<div class="key-edit" id="pool-edit-' + i + '" hidden>' +
-        '<input type="password" class="key-input" id="pool-in-' + i + '" placeholder="paste backup keys, separated by commas…" autocomplete="off" spellcheck="false">' +
-        '<button class="bb sm" data-act="pool-save" data-i="' + i + '">REPLACE POOL</button>' +
-        '<button class="bb sm danger" data-act="pool-clear" data-i="' + i + '">CLEAR POOL</button>' +
-        '<span class="dim">up to 8 · scoped only to ' + esc(provName(k.provider)) + ' · failed saves restore the prior pool or report an incomplete rollback</span>' +
+        '<input type="password" class="key-input" id="pool-in-' + i + '" placeholder="paste spare keys, separated by commas…" autocomplete="off" spellcheck="false">' +
+        // org P04: the save/clear pair is one unit — side by side at equal widths, or stacked full width when the pane is narrow
+        '<div class="key-edit-pair">' +
+        '<button class="bb sm" data-act="pool-save" data-i="' + i + '">SAVE SPARE KEYS</button>' +
+        '<button class="bb sm danger" data-act="pool-clear" data-i="' + i + '">CLEAR SPARE KEYS</button>' +
+        '</div>' +
+        '<span class="dim">up to 8 · scoped only to ' + esc(provName(k.provider)) + ' · a failed save keeps your previous spare keys or reports an incomplete rollback</span>' +
         '</div>' +
         baseBlock;
     });
-    if (providerAcceptsKey(addProvider) && !hasAddProvider) rows.push(addKeyHtml(addProvider, false));
+    if (providerAcceptsKey(addProvider) && !hasAddProvider && !cardOffersAdd(addProvider)) rows.push(addKeyHtml(addProvider, false));
+    // org P04: the selected provider's card holds its ＋ ADD KEY, but API KEYS still says the selected provider has no key yet
+    // (only when addProvider IS the selection: under CHATGPT it is the openrouter stand-in, which is not selected).
+    // (g4 final round) "its card above" pointed at whatever card sat above (CLAUDE CODE, OPENROUTER): the line is a real DOOR —
+    // its key lands ON that provider's card (focusProvider: scrolls to it and marks it), in reading-size words
+    // (wiring) the line names what that card is missing — a key, CUSTOM's endpoint, STARNET MANAGED's link (selectedSetupLineHtml)
+    else if (addProvider === active && (providerAcceptsKey(addProvider) || addProvider === 'starnet') && !hasAddProvider) rows.push(selectedSetupLineHtml(addProvider, provName(addProvider), creditsProv.state));
     return rows.join('');
   }
   // edit-in-place / guarded remove for a stored key. Mirrors the CLEAR arm/confirm pattern
@@ -4663,39 +6200,15 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         if (act !== 'rm') sfx('click');   // destructive REMOVE owns its own 'bad' cue (matches the CLEAR control)
         // ---- ChatGPT (Codex) OAuth row actions — no Harness store involved; they drive the sidecar's
         //      device-flow endpoints through the SAME shared engine as the brain screen (codexsignin.js). ----
-        if (act === 'codex-resign') {
-          if (typeof CodexSignIn === 'undefined') return;
-          const box = body.querySelector('#codex-inline-signin');
-          const st = body.querySelector('#codex-inline-status');
-          const code = body.querySelector('#codex-inline-code');
-          const open = body.querySelector('#codex-inline-open');
-          if (box) box.hidden = false;
-          CodexSignIn.start({
-            onRequesting: () => { if (st) st.textContent = 'requesting a sign-in code…'; },
-            onError: msg => { if (st) st.textContent = msg; sfx('bad'); },
-            onTimeout: () => { if (st) st.textContent = 'sign-in timed out — hit RE-SIGN-IN to start again'; },
-            onCode: c => {
-              if (code) { code.textContent = c.user_code; code.hidden = false; }
-              // DISPLAY the bare address, OPEN the code-carrying one (open_uri) — see codexsignin.js.
-              if (st) st.innerHTML = 'enter this code at <b>' + esc(c.verification_uri) + '</b> (opening it now)…';
-              if (open) { open.hidden = false; open.onclick = () => { sfx('click'); openExternal(c.open_uri || c.verification_uri); }; }
-              openExternal(c.open_uri || c.verification_uri);
-            },
-            onConnected: () => {
-              // the sidecar just exchanged + persisted fresh tokens — that POLL answer is backend truth.
-              codexStatusKnown = { connected: true, expired: false, reason: '' };
-              if (typeof Harness !== 'undefined' && Harness.setDesktopConfigured) Harness.setDesktopConfigured('codex', true);   // desktop map learns mid-session (genesis feeds it; Settings must too)
-              notify('✓ reconnected ChatGPT — your agents can run on your subscription again', 'good');
-              if (typeof ModelDock !== 'undefined' && ModelDock.reflect) ModelDock.reflect();
-              if (typeof KeyCTA !== 'undefined' && KeyCTA.refresh) KeyCTA.refresh();
-              refreshCodexConnectionStatus();   // re-read the durable status (persistError etc.) behind the repaint
-              rerender('settings');
-            }
-          });
+        if (act === 'codex-resign') { startCardSignin('codex', '⏼ RE-SIGN-IN'); return; }   // the ONE card flow (oauthRowFlowHtml)
+        // the row box's ↗ OPEN PAGE reopens the page the shared flow's code belongs to
+        if (act === 'oauth-row-open') {
+          const f = oauthCardFlow[b.dataset.provider];
+          if (f && f.openUri) openExternal(f.openUri);
           return;
         }
         if (act === 'codex-logout') {
-          if (typeof CodexSignIn !== 'undefined') CodexSignIn.cancel();
+          if (typeof CodexSignIn !== 'undefined') CodexSignIn.cancel(); delete oauthCardFlow.codex;   // the cancelled flow's code leaves every box
           const drop = (typeof CodexSignIn !== 'undefined') ? CodexSignIn.logout() : Harness.api.post('/api/auth/codex/logout').catch(() => {});
           Promise.resolve(drop).then(() => {
             codexStatusKnown = { connected: false, expired: false, reason: '' };   // the sidecar just confirmed the drop
@@ -4714,39 +6227,9 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         if (oauthAct) {
           const pid = oauthAct[1];
           const engine = (typeof OAuthSignIn !== 'undefined') ? OAuthSignIn.for(pid) : null;
-          if (oauthAct[2] === 'resign') {
-            if (!engine) return;
-            const box = body.querySelector('#' + pid + '-inline-signin');
-            const st = body.querySelector('#' + pid + '-inline-status');
-            const code = body.querySelector('#' + pid + '-inline-code');
-            const open = body.querySelector('#' + pid + '-inline-open');
-            if (box) box.hidden = false;
-            engine.start({
-              onRequesting: () => { if (st) st.textContent = 'requesting a sign-in code…'; },
-              onError: msg => { if (st) st.textContent = msg; sfx('bad'); },
-              onTimeout: () => { if (st) st.textContent = 'sign-in timed out — hit RE-SIGN-IN to start again'; },
-              onCode: c => {
-                if (code) { code.textContent = c.user_code; code.hidden = false; }
-                // DISPLAY the bare address, OPEN the code-carrying one — kimi's page REQUIRES ?user_code=.
-                if (st) st.innerHTML = 'enter this code at <b>' + esc(c.verification_uri) + '</b> (opening it now)…';
-                if (open) { open.hidden = false; open.onclick = () => { sfx('click'); openExternal(c.open_uri || c.verification_uri); }; }
-                openExternal(c.open_uri || c.verification_uri);
-              },
-              onConnected: () => {
-                // the sidecar just exchanged + persisted fresh tokens — that POLL answer is backend truth.
-                oauthStatus[pid] = { connected: true, expired: false, reason: '' };
-                if (typeof Harness !== 'undefined' && Harness.setDesktopConfigured) Harness.setDesktopConfigured(pid, true);   // desktop map learns mid-session (genesis feeds it; Settings must too)
-                notify('✓ reconnected ' + provName(pid) + ' — your agents can run on your subscription again', 'good');
-                if (typeof ModelDock !== 'undefined' && ModelDock.reflect) ModelDock.reflect();
-                if (typeof KeyCTA !== 'undefined' && KeyCTA.refresh) KeyCTA.refresh();
-                refreshOAuthStatus(pid);   // re-read the durable status (persistError etc.) behind the repaint
-                rerender('settings');
-              }
-            });
-            return;
-          }
+          if (oauthAct[2] === 'resign') { if (engine) startCardSignin(pid, '⏼ RE-SIGN-IN'); return; }   // the ONE card flow
           // logout
-          if (engine) engine.cancel();
+          if (engine) engine.cancel(); delete oauthCardFlow[pid];
           const drop = engine ? engine.logout() : Harness.api.post('/api/auth/' + pid + '/logout').catch(() => {});
           Promise.resolve(drop).then(() => {
             oauthStatus[pid] = { connected: false, expired: false, reason: '' };   // the sidecar just confirmed the drop
@@ -4768,9 +6251,10 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
           // success UI waits for the PROVEN store: on desktop setKey resolves only after the keychain write lands
           // (browser localStorage resolves immediately). The old fire-and-forget toasted "✓ stored in your OS
           // keychain" over a rejected write — a keyless station that claimed connected with no re-entry hint.
-          Promise.resolve(h.validateAndSetKey ? h.validateAndSetKey(v, provider) : h.setKey(v, provider)).then(() => {
+          Promise.resolve(h.validateAndSetKey ? h.validateAndSetKey(v, provider) : h.setKey(v, provider)).then(res => {
             invalidateProviderHealth(provider);
-            notify('✓ connected ' + provName(provider) + ' API key — ' + keyStoreClause(), 'good');
+            notify('✓ connected ' + provName(provider) + ' API key — ' + keyStoreClause(res), 'good');
+            warnIfStationLacksKey(res);
             if (typeof ModelDock !== 'undefined' && ModelDock.reflect) ModelDock.reflect();   // clear the dock's no-key warning the instant a key lands
             if (typeof KeyCTA !== 'undefined' && KeyCTA.refresh) KeyCTA.refresh();             // …and the world's keyless-brain banner
             rerender('settings');
@@ -4792,11 +6276,13 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         } else if (act === 'pool-save' || act === 'pool-clear') {
           const inp = body.querySelector('#pool-in-' + i);
           const keys = act === 'pool-clear' ? [] : String((inp && inp.value) || '').split(/[\n,;]+/).map(v => v.trim()).filter(Boolean);
-          if (act === 'pool-save' && !keys.length) { notify('paste at least one backup key, or use CLEAR POOL', 'bad'); sfx('bad'); return; }
-          Promise.resolve(h.validateAndSetKeyPool ? h.validateAndSetKeyPool(keys, row.provider) : h.setKeyPool(keys, row.provider)).then(count => {
-            notify(count ? ('✓ ' + count + ' verified backup key' + (count === 1 ? '' : 's') + ' active only for ' + provName(row.provider)) : ('cleared backup keys for ' + provName(row.provider)), count ? 'good' : 'warn');
+          if (act === 'pool-save' && !keys.length) { notify('paste at least one spare key, or use CLEAR SPARE KEYS', 'bad'); sfx('bad'); return; }
+          Promise.resolve(h.validateAndSetKeyPool ? h.validateAndSetKeyPool(keys, row.provider) : h.setKeyPool(keys, row.provider)).then(res => {
+            const count = (res && typeof res === 'object') ? Number(res.count) || 0 : res;   // { count, engine } (#89); a bare count from older hosts
+            notify(count ? ('✓ ' + count + ' verified spare key' + (count === 1 ? '' : 's') + ' active only for ' + provName(row.provider)) : ('cleared spare keys for ' + provName(row.provider)), count ? 'good' : 'warn');
+            warnIfStationLacksKey(res);   // #89: …and whether the station's copy for routines followed
             rerender('settings');
-          }).catch(err => { notify('✕ ' + ((err && err.message) || 'could not update backup keys'), 'bad'); sfx('bad'); });
+          }).catch(err => { notify('✕ ' + ((err && err.message) || 'could not update spare keys'), 'bad'); sfx('bad'); });
         } else if (act === 'baseurl-edit') {
           const ed = body.querySelector('#base-edit-' + i);
           if (ed) { ed.hidden = !ed.hidden; if (!ed.hidden) { const inp = body.querySelector('#base-in-' + i); if (inp) inp.focus(); } }
@@ -4814,7 +6300,8 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
           if (inp) inp.value = norm;
           sfx('click');
           setMsg('saved — probing endpoint…', '');
-          Promise.resolve(h.setBaseUrl ? h.setBaseUrl(norm, row.provider) : null).then(() => {
+          Promise.resolve(h.setBaseUrl ? h.setBaseUrl(norm, row.provider) : null).then(res => {
+            warnIfStationLacksKey(res);   // #89: the endpoint saved, but the station could not keep its copy for routines
             invalidateProviderHealth(row.provider);
             // HONEST reachability check against the REAL endpoint — never claim connected without proof. probeProvider
             // round-trips /api/providers/probe; the same probe result feeds the provider card badge cache.
@@ -4830,9 +6317,10 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
           const v = inp ? inp.value.trim() : '';
           if (!v) { sfx('bad'); return; }
           // same proven-store contract as the add path: no success toast over a rejected keychain write.
-          Promise.resolve(h.validateAndSetKey ? h.validateAndSetKey(v, row.provider) : h.setKey(v, row.provider)).then(() => {
+          Promise.resolve(h.validateAndSetKey ? h.validateAndSetKey(v, row.provider) : h.setKey(v, row.provider)).then(res => {
             invalidateProviderHealth(row.provider);
-            notify('✓ updated ' + provName(row.provider) + ' API key — ' + keyStoreClause(), 'good');
+            notify('✓ updated ' + provName(row.provider) + ' API key — ' + keyStoreClause(res), 'good');
+            warnIfStationLacksKey(res);
             if (typeof ModelDock !== 'undefined' && ModelDock.reflect) ModelDock.reflect();   // keep the dock's no-key warning honest after an edit
             if (typeof KeyCTA !== 'undefined' && KeyCTA.refresh) KeyCTA.refresh();
             rerender('settings');
@@ -4846,8 +6334,8 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
           // otherwise the armed confirm would "remove" nothing and the row would immortally re-render.
           const keylessCustomRm = row.provider === 'custom' && !row.key && !!row.baseUrl;
           if (b.dataset.armed) {
-            if (keylessCustomRm && h.setBaseUrl) { h.setBaseUrl('', 'custom'); notify('removed the custom endpoint — add it again anytime from the CUSTOM card', 'warn'); }
-            else { if (h.setKey) h.setKey('', row.provider); notify('removed ' + provName(row.provider) + ' key — paste a new one here to reconnect', 'warn'); }
+            if (keylessCustomRm && h.setBaseUrl) { Promise.resolve(h.setBaseUrl('', 'custom')).then(warnIfStationLacksKey); notify('removed the custom endpoint — add it again anytime from the CUSTOM card', 'warn'); }
+            else { if (h.setKey) Promise.resolve(h.setKey('', row.provider)).then(warnIfStationLacksKey); notify('removed ' + provName(row.provider) + ' key — paste a new one here to reconnect', 'warn'); }
             invalidateProviderHealth(row.provider); if (typeof ModelDock !== 'undefined' && ModelDock.reflect) ModelDock.reflect(); if (typeof KeyCTA !== 'undefined' && KeyCTA.refresh) KeyCTA.refresh(); sfx('bad'); rerender('settings'); return;
           }
           // Arm: make the destructive state impossible to miss — filled --bad button + pulse, red hairline on the row,
@@ -4875,15 +6363,17 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   function wireProviderActions(body) {
     // save a pasted key from a NO-KEY card's inline row, reusing the SAME store path as the key list (Harness.setKey).
     const saveInline = (provider) => {
+      if (provider === 'custom') return saveCustomEndpoint(body.querySelector('#prov-base-in-custom'), body.querySelector('#prov-key-in-custom'));
       const h = H();
       const inp = body.querySelector('#prov-key-in-' + provider);   // provider ids are simple slugs — safe to interpolate
       const v = inp ? inp.value.trim() : '';
       if (!v) { sfx('bad'); if (inp) inp.focus(); return; }
       if (!h || !h.setKey) { sfx('bad'); return; }
       // same proven-store contract as the key-list paths: success UI only after setKey resolves.
-      Promise.resolve(h.validateAndSetKey ? h.validateAndSetKey(v, provider) : h.setKey(v, provider)).then(() => {
+      Promise.resolve(h.validateAndSetKey ? h.validateAndSetKey(v, provider) : h.setKey(v, provider)).then(res => {
         invalidateProviderHealth(provider);
-        notify('✓ connected ' + provName(provider) + ' API key — ' + keyStoreClause(), 'good');
+        notify('✓ connected ' + provName(provider) + ' API key — ' + keyStoreClause(res), 'good');
+        warnIfStationLacksKey(res);
         if (typeof ModelDock !== 'undefined' && ModelDock.reconcile) ModelDock.reconcile().catch(() => ModelDock.reflect && ModelDock.reflect());
         else if (typeof ModelDock !== 'undefined' && ModelDock.reflect) ModelDock.reflect();
         if (typeof KeyCTA !== 'undefined' && KeyCTA.refresh) KeyCTA.refresh();
@@ -4895,12 +6385,29 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         rerender('settings');
       });
     };
+    const toServiceKeys = body.querySelector('[data-act="to-service-keys"]');
+    if (toServiceKeys) toServiceKeys.addEventListener('click', () => { sfx('click'); openTerm('connectors', 'keys'); });
+    // org P04 (g4 final round): API KEYS' no-key line lands ON the selected provider's card — the error doors' own landing
+    body.querySelectorAll('[data-act="to-prov-card"][data-provider]').forEach(b => b.addEventListener('click', () => { sfx('click'); focusProvider(b.dataset.provider); }));
     body.querySelectorAll('.prov-card[data-provider]').forEach(card => {
       const activate = () => {
         const h = H();
         const p = card.dataset.provider;
         if (!h || !p || !h.setProv) return;
+        /* LOOKING IS NOT SWITCHING (live walkthrough 2026-10-13): one click on the CUSTOM card — to see where its URL goes —
+           made an unconfigured endpoint the station's brain; every later run failed "the CUSTOM endpoint has no base URL"
+           while the model badge still read CLAUDE HAIKU 4.5. A provider that is not set up opens its own setup instead;
+           the brain only switches to one that can run. */
+        if (card.dataset.configured === '0' && p !== activeProv()) {
+          const ed = card.querySelector('.prov-key-edit');
+          if (ed) { ed.hidden = false; const f = ed.querySelector('input'); if (f) f.focus(); }
+          notify(provName(p) + ' is not set up yet — ' + (ed ? 'add it here first' : 'sign in on its card first') + '. Your agents stay on ' + provName(activeProv()) + '.', 'warn');
+          sfx('click');
+          return;
+        }
         h.setProv(p);
+        // the station default (the Overseer's pin) follows the pick, so unpinned agents do too (#24 follow-up)
+        if (typeof App !== 'undefined' && App.setStationProvider) App.setStationProvider(p);
         if (typeof KeyCTA !== 'undefined' && KeyCTA.refresh) KeyCTA.refresh();
         // MODEL RECONCILE (subscription providers): the model slug is GLOBAL, so switching to codex/grok/kimi
         // with the previous provider's model (e.g. anthropic/claude-…) streams a foreign id to the new endpoint
@@ -4931,47 +6438,184 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         sfx('click');
         rerender('settings');
       };
+      // CLAUDE CODE: SIGN IN WITH CLAUDE right on the card (the ClaudeCliSignIn engine — the CLI's own login, the
+      // browser does the rest) and a way to get Claude Code when it isn't installed. stopPropagation: a card click selects.
+      const claudeSignin = card.querySelector('[data-act="prov-claude-signin"]');
+      const claudeBoxEl = card.querySelector('#prov-claude-inline');
+      if (claudeBoxEl) claudeBoxEl.addEventListener('click', e2 => e2.stopPropagation());
+      const claudeCodeIn = card.querySelector('#prov-claude-code');
+      const claudeSubmit = async () => {
+        const code = claudeCodeIn ? claudeCodeIn.value.trim() : '';
+        if (!code) return;
+        sfx('click');
+        const r = await ClaudeCliSignIn.submitCode(code);
+        if (r.ok && claudeCodeIn) claudeCodeIn.value = '';
+        claudeCard.msg = r.ok ? 'checking the code with Claude…' : r.error;
+        paintClaudeCard();
+      };
+      const claudeCancel = card.querySelector('#prov-claude-cancel');
+      if (claudeCancel) claudeCancel.onclick = async e2 => {
+        e2.stopPropagation(); sfx('click');
+        await ClaudeCliSignIn.cancel();
+        claudeCard.msg = ''; claudeCard.url = ''; claudeCard.failed = false; claudeCard.account = '';
+        claudeCliSt = undefined; refreshClaudeCliCard(true); rerender('settings');
+      };
+      const claudeDismiss = card.querySelector('#prov-claude-dismiss');
+      if (claudeDismiss) claudeDismiss.onclick = e2 => {
+        e2.stopPropagation(); sfx('click');
+        claudeCard.msg = ''; claudeCard.url = ''; claudeCard.failed = false; claudeCard.account = '';
+        rerender('settings');
+      };
+      const claudeGo = card.querySelector('#prov-claude-code-go');
+      if (claudeGo) claudeGo.onclick = e2 => { e2.stopPropagation(); claudeSubmit(); };
+      if (claudeCodeIn) claudeCodeIn.onkeydown = e2 => { if (e2.key === 'Enter' && !e2.isComposing) { e2.preventDefault(); claudeSubmit(); } };
+      const claudeOpen = card.querySelector('#prov-claude-open');
+      if (claudeOpen) claudeOpen.onclick = e2 => { e2.stopPropagation(); sfx('click'); if (claudeCard.url) openExternal(claudeCard.url); };
+      /* ONE starter for every Claude sign-in on this card: the default one (⏼ SIGN IN), a NEW account
+         (＋ ADD ACCOUNT → opts.add) and an extra account that is signed out (its row's ⏼ SIGN IN → opts.account). */
+      const startClaudeFlow = (btn, opts) => {
+        opts = opts || {};
+        claudeCard.msg = 'starting Claude sign-in…'; claudeCard.url = ''; claudeCard.failed = false;
+        claudeCard.account = opts.add ? '+' : String(opts.account || '');
+        const started = ClaudeCliSignIn.start({
+          onPending: pend => {
+            if (opts.add || opts.account) claudeCard.account = pend.account || claudeCard.account;
+            claudeCard.msg = opts.add || opts.account
+              ? 'in the browser window Claude Code just opened, sign in with a DIFFERENT Claude account — if it goes straight through, switch accounts on claude.ai first'
+              : 'finish signing in in the browser window Claude Code just opened…';
+            claudeCard.url = pend.url || '';
+            rerender('settings');   // the box (CANCEL, paste-a-code) renders from the now-active flow
+          },
+          onError: msg => {
+            claudeCard.msg = msg; claudeCard.url = ''; claudeCard.failed = true;
+            if (claudeCard.account === '+') claudeCard.account = '-';   // an ADD that failed: its message stays in the accounts block
+            sfx('bad'); refreshClaudeCliCard(true); rerender('settings');
+          },
+          onConnected: res => {
+            const extra = !!(res && res.account);
+            claudeCard.msg = ''; claudeCard.url = ''; claudeCard.failed = false; claudeCard.account = '';
+            if (!extra) claudeCliSt = Object.assign({ installed: true, loggedIn: true }, res);
+            notify(extra
+              ? '✓ another Claude account connected' + (res.email ? ' (' + res.email + ')' : '') + ' — runs continue on it when an account hits its limit'
+              : activeProv() === 'claude-cli'
+                ? '✓ signed in to Claude — your agents can run on your subscription'
+                : '✓ signed in to Claude — click the CLAUDE CODE card to make it your active brain', 'good');
+            if (typeof ModelDock !== 'undefined' && ModelDock.reflect) ModelDock.reflect();
+            refreshClaudeCliCard(true); invalidateProviderHealth('claude-cli'); rerender('settings');
+          }
+        }, opts);
+        // until the sidecar answers, the button itself says what is happening (a double press would restart the flow)
+        if (btn) { btn.disabled = true; btn.textContent = '◐ STARTING…'; }
+        Promise.resolve(started).catch(() => {});
+      };
+      if (claudeSignin && typeof ClaudeCliSignIn !== 'undefined') claudeSignin.addEventListener('click', ev => {
+        ev.stopPropagation(); sfx('click');
+        startClaudeFlow(claudeSignin, {});
+      });
+      const claudeAcctsEl = card.querySelector('.prov-accounts');
+      if (claudeAcctsEl && typeof ClaudeCliSignIn !== 'undefined') {
+        claudeAcctsEl.addEventListener('click', e2 => e2.stopPropagation());   // a card click selects the provider
+        const addBtn = claudeAcctsEl.querySelector('[data-act="prov-claude-add"]');
+        if (addBtn) addBtn.onclick = () => { sfx('click'); startClaudeFlow(addBtn, { add: true }); };
+        claudeAcctsEl.querySelectorAll('.prov-acct').forEach(rowEl => {
+          const id = rowEl.dataset.account;
+          if (!id) return;
+          const label = (rowEl.querySelector('.key-prov') || {}).textContent || 'account';
+          const inBtn = rowEl.querySelector('[data-act="prov-claude-acct-signin"]');
+          if (inBtn) inBtn.onclick = () => { sfx('click'); startClaudeFlow(inBtn, { account: id }); };
+          const rmBtn = rowEl.querySelector('[data-act="prov-claude-acct-remove"]');
+          if (rmBtn && typeof ArmConfirm !== 'undefined' && ArmConfirm.wire) {
+            ArmConfirm.wire(rmBtn, {
+              armedLabel: '✕ REMOVE — sure?', timeoutMs: 4000,
+              onArm: () => sfx('bad'),
+              onConfirm: async () => {
+                rmBtn.disabled = true; rmBtn.textContent = '◐ SIGNING OUT…';
+                const r = await ClaudeCliSignIn.remove(id);
+                notify(r.ok ? '✓ ' + label.toLowerCase() + ' signed out and removed' : 'couldn’t remove ' + label.toLowerCase() + ' — try again', r.ok ? 'good' : 'bad');
+                refreshClaudeCliCard(true); rerender('settings');
+              }
+            });
+          }
+        });
+      }
+      // SUBSCRIPTION STACKING on a ChatGPT / Grok / Kimi card: ＋ ADD ACCOUNT, an extra account's ⏼ SIGN IN and ✕ REMOVE,
+      // all through the device-code engine (OAuthAccounts.for). The box state lives in oauthAccts, so a repaint keeps it.
+      const acctPid = card.dataset.provider;
+      const oauthAcctsEl = STACKABLE_OAUTH.indexOf(acctPid) >= 0 ? card.querySelector('.prov-accounts') : null;
+      if (oauthAcctsEl && typeof OAuthAccounts !== 'undefined') {
+        oauthAcctsEl.addEventListener('click', e2 => e2.stopPropagation());   // a card click selects the provider
+        const eng = OAuthAccounts.for(acctPid);
+        const st = oauthAcctState(acctPid);
+        const flow = (btn, account) => {
+          st.box = { account: account || '+', msg: 'requesting a sign-in code…', code: '', openUri: '' };
+          if (btn) { btn.disabled = true; btn.textContent = '◐ STARTING…'; }
+          const cb = {
+            onError: msg => { st.box = { account: '', msg, code: '', openUri: '' }; sfx('bad'); rerender('settings'); },
+            onTimeout: () => { st.box = { account: '', msg: 'sign-in timed out — start it again', code: '', openUri: '' }; rerender('settings'); },
+            onCode: c => {
+              st.box = { account: account || '+', code: c.user_code, openUri: c.open_uri || c.verification_uri,
+                msg: 'enter this code at ' + c.verification_uri + ' — sign in with a DIFFERENT ' + provName(acctPid) + ' account' };
+              openExternal(c.open_uri || c.verification_uri);
+              rerender('settings');
+            },
+            onConnected: () => {
+              st.box = null;
+              notify('✓ another ' + provName(acctPid) + ' account connected — runs continue on it when an account hits its limit', 'good');
+              refreshOAuthAccounts(acctPid, true); rerender('settings');
+            }
+          };
+          Promise.resolve(account ? eng.signIn(account, cb) : eng.add(cb)).catch(() => {});
+        };
+        const addBtn = oauthAcctsEl.querySelector('[data-act="prov-oauth-acct-add"]');
+        if (addBtn) addBtn.onclick = () => { sfx('click'); flow(addBtn, ''); };
+        const openBtn = oauthAcctsEl.querySelector('[data-act="prov-oauth-acct-open"]');
+        if (openBtn) openBtn.onclick = () => { sfx('click'); if (st.box && st.box.openUri) openExternal(st.box.openUri); };
+        const cancelBtn = oauthAcctsEl.querySelector('[data-act="prov-oauth-acct-cancel"]');
+        if (cancelBtn) cancelBtn.onclick = () => { sfx('click'); eng.cancel(); st.box = null; rerender('settings'); };
+        oauthAcctsEl.querySelectorAll('.prov-acct').forEach(rowEl => {
+          const id = rowEl.dataset.account;
+          if (!id) return;
+          const label = (rowEl.querySelector('.key-prov') || {}).textContent || 'account';
+          const inBtn = rowEl.querySelector('[data-act="prov-oauth-acct-signin"]');
+          if (inBtn) inBtn.onclick = () => { sfx('click'); flow(inBtn, id); };
+          const rmBtn = rowEl.querySelector('[data-act="prov-oauth-acct-remove"]');
+          if (rmBtn && typeof ArmConfirm !== 'undefined' && ArmConfirm.wire) {
+            ArmConfirm.wire(rmBtn, {
+              armedLabel: '✕ REMOVE — sure?', timeoutMs: 4000,
+              onArm: () => sfx('bad'),
+              onConfirm: async () => {
+                rmBtn.disabled = true;
+                const r = await eng.remove(id);
+                notify(r.ok ? '✓ ' + label.toLowerCase() + ' removed' : 'couldn’t remove ' + label.toLowerCase() + ' — try again', r.ok ? 'good' : 'bad');
+                refreshOAuthAccounts(acctPid, true); rerender('settings');
+              }
+            });
+          }
+        });
+      }
+      const claudeInstall = card.querySelector('[data-act="prov-claude-install"]');
+      if (claudeInstall) claudeInstall.addEventListener('click', ev => { ev.stopPropagation(); sfx('click'); openExternal('https://code.claude.com/docs/en/setup'); });
+      // KIMI ACCOUNT REGION (#70): the pick rides the NEXT sign-in's start body; it never touches the stored sign-in.
+      card.querySelectorAll('[data-act="kimi-region"]').forEach(btn => btn.addEventListener('click', ev => {
+        ev.stopPropagation();
+        if (typeof KimiRegion === 'undefined' || !KimiRegion.set(btn.dataset.region)) return;
+        sfx('click');
+        rerender('settings');
+      }));
       // FIRST sign-in for a keyless device-code provider (grok/kimi) — the card-local twin of the key-row's
       // ⏼ RE-SIGN-IN, driving the SAME shared engine (OAuthSignIn.for). stopPropagation: the card click selects.
       const oauthSignin = card.querySelector('[data-act="prov-oauth-signin"]');
       if (oauthSignin) oauthSignin.addEventListener('click', ev => {
         ev.stopPropagation();
         sfx('click');
-        const pid = card.dataset.provider;
-        const engine = (typeof OAuthSignIn !== 'undefined') ? OAuthSignIn.for(pid) : null;
-        if (!engine) return;
-        const box = card.querySelector('#prov-oauth-inline-' + pid);
-        const st = card.querySelector('#prov-oauth-status-' + pid);
-        const code = card.querySelector('#prov-oauth-code-' + pid);
-        const open = card.querySelector('#prov-oauth-open-' + pid);
-        if (box) { box.hidden = false; box.addEventListener('click', e2 => e2.stopPropagation()); }
-        engine.start({
-          onRequesting: () => { if (st) st.textContent = 'requesting a sign-in code…'; },
-          onError: msg => { if (st) st.textContent = msg; sfx('bad'); },
-          onTimeout: () => { if (st) st.textContent = 'sign-in timed out — hit ⏼ SIGN IN to start again'; },
-          onCode: c => {
-            if (code) { code.textContent = c.user_code; code.hidden = false; }
-            // DISPLAY the bare address, OPEN the code-carrying one — kimi's page REQUIRES ?user_code=.
-            if (st) st.innerHTML = 'enter this code at <b>' + esc(c.verification_uri) + '</b> (opening it now)…';
-            if (open) { open.hidden = false; open.onclick = e2 => { e2.stopPropagation(); sfx('click'); openExternal(c.open_uri || c.verification_uri); }; }
-            openExternal(c.open_uri || c.verification_uri);
-          },
-          onConnected: () => {
-            // the sidecar just exchanged + persisted fresh tokens — that POLL answer is backend truth.
-            // codex keeps its own literal status state (source-lock pinned); grok/kimi live in the shared cache.
-            if (pid === 'codex') { codexStatusKnown = { connected: true, expired: false, reason: '' }; refreshCodexConnectionStatus(); }
-            else { oauthStatus[pid] = { connected: true, expired: false, reason: '' }; refreshOAuthStatus(pid); }
-            if (typeof Harness !== 'undefined' && Harness.setDesktopConfigured) Harness.setDesktopConfigured(pid, true);   // desktop map learns mid-session (genesis feeds it; Settings must too)
-            // honest claim: runs ride the ACTIVE provider. A sign-in on a non-active card must say the extra
-            // step, not promise "your agents can run on your subscription" while runs continue elsewhere.
-            notify(activeProv() === pid
-              ? '✓ signed in to ' + provName(pid) + ' — your agents can run on your subscription'
-              : '✓ signed in to ' + provName(pid) + ' — click its card to make it your active brain', 'good');
-            if (typeof ModelDock !== 'undefined' && ModelDock.reflect) ModelDock.reflect();
-            if (typeof KeyCTA !== 'undefined' && KeyCTA.refresh) KeyCTA.refresh();
-            rerender('settings');
-          }
-        });
+        startCardSignin(card.dataset.provider, oauthSignin.textContent.trim());
+      });
+      // the device-code box: its clicks never select the provider; ↗ OPEN PAGE reopens the page the code belongs to
+      const oauthBox = card.querySelector('#prov-oauth-inline-' + card.dataset.provider);
+      if (oauthBox) oauthBox.addEventListener('click', e2 => {
+        e2.stopPropagation();
+        const f = oauthCardFlow[card.dataset.provider];
+        if (f && f.openUri && e2.target.closest('#prov-oauth-open-' + card.dataset.provider)) { sfx('click'); openExternal(f.openUri); }
       });
       // clicks on the inline key controls must NOT bubble up to provider-select — they toggle/save the key row.
       const inlineToggle = card.querySelector('[data-act="prov-add-toggle"]');
@@ -4993,7 +6637,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         const host = body.querySelector('#credits-store');
         if (host && host.scrollIntoView) host.scrollIntoView({ behavior: 'smooth', block: 'center' });
         // Re-read rather than trust the last paint: the user may have linked or unlinked in another window.
-        wireCredits(body);
+        forgetCreditsReads(); wireCredits(body);
         const btn = host && host.querySelector('#credits-link');
         if (btn && btn.focus) btn.focus();
       });
@@ -5005,6 +6649,91 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       // interactive descendants of a role=button card (invalid accessibility tree / conflicting activation).
       const providerSelect = card.querySelector('[data-act="prov-select"]');
       if (providerSelect) providerSelect.addEventListener('click', activate);
+    });
+  }
+
+  /* The CARD's device-code sign-in (codex/grok/kimi): one driver for the card's ⏼ SIGN IN / ⏼ RECONNECT key and for an
+     error door's sign-in press (focusProvider). Its state lives HERE, not in the card's DOM: Settings repaints whenever a
+     background check lands (the first open of a session starts several), and a repaint replaces the card — a code
+     written into the old card's box was lost while the browser page still waited for it. The card render draws the
+     box from oauthCardFlow; each callback updates the state and repaints just that box in whatever card is live. */
+  const oauthCardFlow = {};   // pid -> { phase: 'requesting'|'code'|'ended', msg, code, uri, openUri }
+  // keepEnded: the card still offers its own sign-in key, so a failed/timed-out attempt's message stays beside it. A card
+  // that offers none (an error door reconnecting a sign-in the station still lists) keeps that message for a minute.
+  function oauthCardFlowView(pid, keepEnded) {
+    const f = oauthCardFlow[pid];
+    if (!f) return null;
+    if (f.phase === 'ended' && !keepEnded && Date.now() - f.endedAt > 60000) return null;
+    const engine = (typeof OAuthSignIn !== 'undefined') ? OAuthSignIn.for(pid) : null;
+    // a code is only worth showing while the engine still polls for it (a sign-in started elsewhere supersedes it)
+    if (f.phase === 'code' && !(engine && engine.active())) { delete oauthCardFlow[pid]; return null; }
+    return {
+      statusHtml: f.phase === 'code' ? 'enter this code at <b>' + esc(f.uri) + '</b>' + (f.fresh ? ' (opening it now)…' : '') : esc(f.msg),
+      code: f.phase === 'code' ? f.code : '',
+      openUri: f.phase === 'code' ? f.openUri : ''
+    };
+  }
+  function paintOAuthCardFlow(pid) {
+    paintOAuthRowFlow(pid);
+    const w = open.settings;
+    const box = w && w.querySelector('#prov-oauth-inline-' + pid);
+    if (!box) return;   // the card isn't drawn right now — its next render draws the box from the state
+    const v = oauthCardFlowView(pid, true);
+    box.hidden = !v;
+    const st = box.querySelector('#prov-oauth-status-' + pid), code = box.querySelector('#prov-oauth-code-' + pid), openBtn = box.querySelector('#prov-oauth-open-' + pid);
+    if (st) st.innerHTML = v ? v.statusHtml : '';
+    if (code) { code.textContent = v ? v.code : ''; code.hidden = !(v && v.code); }
+    if (openBtn) openBtn.hidden = !(v && v.openUri);
+  }
+  // the API KEYS row's box is the same flow's second view (oauthRowFlowHtml) — absent while the provider has no row
+  function paintOAuthRowFlow(pid) {
+    const w = open.settings;
+    const box = w && w.querySelector('#' + pid + '-inline-signin');
+    if (!box) return;
+    const v = oauthCardFlowView(pid, true);
+    box.hidden = !v;
+    const st = box.querySelector('#' + pid + '-inline-status'), code = box.querySelector('#' + pid + '-inline-code'), openBtn = box.querySelector('#' + pid + '-inline-open');
+    if (st) st.innerHTML = v ? v.statusHtml : '';
+    if (code) { code.textContent = v ? v.code : ''; code.hidden = !(v && v.code); }
+    if (openBtn) openBtn.hidden = !(v && v.openUri);
+  }
+  function startCardSignin(pid, retryLabel) {
+    const engine = (typeof OAuthSignIn !== 'undefined') ? OAuthSignIn.for(pid) : null;
+    if (!engine) return;
+    const retry = retryLabel || '⏼ RE-SIGN-IN';
+    const mine = oauthCardFlow[pid] = { phase: 'requesting', msg: 'requesting a sign-in code…', code: '', uri: '', openUri: '' };
+    const mineNow = () => oauthCardFlow[pid] === mine;   // a newer start (or a finished one) owns the box now
+    // the box the RECONNECT door starts on a card that shows no sign-in key exists only while a flow is shown
+    if (open.settings && !open.settings.querySelector('#prov-oauth-inline-' + pid)) scheduleSettingsRepaint();
+    paintOAuthCardFlow(pid);
+    engine.start({
+      onRequesting: () => { if (mineNow()) paintOAuthCardFlow(pid); },
+      onError: msg => { if (!mineNow()) return; mine.phase = 'ended'; mine.endedAt = Date.now(); mine.msg = msg; paintOAuthCardFlow(pid); sfx('bad'); },
+      onTimeout: () => { if (!mineNow()) return; mine.phase = 'ended'; mine.endedAt = Date.now(); mine.msg = 'sign-in timed out — hit ' + retry + ' to start again'; paintOAuthCardFlow(pid); },
+      onCode: c => {
+        if (!mineNow()) return;
+        // DISPLAY the bare address, OPEN the code-carrying one — kimi's page REQUIRES ?user_code=.
+        Object.assign(mine, { phase: 'code', code: c.user_code, uri: c.verification_uri, openUri: c.open_uri || c.verification_uri, fresh: true });
+        paintOAuthCardFlow(pid);
+        mine.fresh = false;
+        openExternal(c.open_uri || c.verification_uri);
+      },
+      onConnected: () => {
+        if (mineNow()) delete oauthCardFlow[pid];
+        // the sidecar just exchanged + persisted fresh tokens — that POLL answer is backend truth.
+        // codex keeps its own literal status state (source-lock pinned); grok/kimi live in the shared cache.
+        if (pid === 'codex') { codexStatusKnown = { connected: true, expired: false, reason: '' }; refreshCodexConnectionStatus(); }
+        else { oauthStatus[pid] = { connected: true, expired: false, reason: '' }; refreshOAuthStatus(pid); }
+        if (typeof Harness !== 'undefined' && Harness.setDesktopConfigured) Harness.setDesktopConfigured(pid, true);   // desktop map learns mid-session (genesis feeds it; Settings must too)
+        // honest claim: runs ride the ACTIVE provider. A sign-in on a non-active card must say the extra
+        // step, not promise "your agents can run on your subscription" while runs continue elsewhere.
+        notify(activeProv() === pid
+          ? '✓ signed in to ' + provName(pid) + ' — your agents can run on your subscription'
+          : '✓ signed in to ' + provName(pid) + ' — click its card to make it your active brain', 'good');
+        if (typeof ModelDock !== 'undefined' && ModelDock.reflect) ModelDock.reflect();
+        if (typeof KeyCTA !== 'undefined' && KeyCTA.refresh) KeyCTA.refresh();
+        rerender('settings');
+      }
     });
   }
 
@@ -5077,7 +6806,10 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     host.innerHTML = '<p class="set-about" role="status">Checking your account connection…</p>';
     // /api/credits 404s when credits are unconfigured — that is the honesty law, not an error, and
     // api.get throws on any non-2xx. Catching to {configured:false} keeps the 404 on the normal path.
-    return Harness.api.get('/api/credits').catch(error => {
+    // The wait outlasts the sidecar's worst case for this FULL read: a link self-heal (/v1/whoami 8s + one /v1/balance
+    // 8s), then the activity history on the healed adapter (8s) = 24s. api.get's 15s default gave up first and painted
+    // "could not check" over a funded account that was about to answer (E29, 10-07).
+    return creditsRead('/api/credits', { timeoutMs: 26000 }).catch(error => {
       if (/http 404\b/.test(String(error && error.message || error))) return { configured: false };
       throw error;
     })
@@ -5087,7 +6819,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         if (j && j.configured) return renderCreditsConfigured(body, host, j);
         // unconfigured → is this station LINKABLE (STARNET_CLOUD_URL wired)? If so, offer LINK STATION. Otherwise
         // render NOTHING (honesty law: a bare BYOK install shows no STORE surface at all).
-        return Harness.api.get('/api/credits/linkable')
+        return creditsRead('/api/credits/linkable')
           .then(lk => {
             if (!current()) return;
             if (lk && lk.available === true) renderCreditsLinkCard(body, host,
@@ -5111,7 +6843,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       creditsUnlinkErrorMarkup() +
       '<p class="set-about" role="alert">Could not check your account connection. Retry to load your balance or linking options.</p>' +
       '<button class="bb sm" id="credits-retry">↻ RETRY</button>';
-    host.querySelector('#credits-retry').addEventListener('click', () => { sfx('click'); wireCredits(body); });
+    host.querySelector('#credits-retry').addEventListener('click', () => { sfx('click'); forgetCreditsReads(); wireCredits(body); });
   }
 
   // A ledger entry's own name for itself. The backend sends `label` for rows that are not model calls
@@ -5162,14 +6894,14 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       const kind = esc(creditEntryLabel(e));
       const amt = (e && e.usd != null) ? fmtUsd(e.usd) : '';
       return '<div class="mc-row"><div class="mc-top"><b>' + kind + '</b> <span class="dim">' + esc(when) + '</span></div>' +
-        '<div class="mc-url dim">' + esc(amt) + (e && e.runId ? ' · run ' + esc(String(e.runId).slice(0, 8)) : '') + '</div></div>';
+        '<div class="mc-url dim">' + esc(amt) + (e && e.runId ? ' · ' + esc(creditRunTag(e.runId)) : '') + '</div></div>';
     }).join('') : '<div class="fb-empty">No credit activity yet.</div>';
     // A LINKED station is somebody's own subscription; an env-configured one is an operator's prepaid pool.
     // Same balance, completely different sentence — describing a subscriber's own account as something "the
     // operator tops up" is just wrong on the surface that is supposed to be the truthful one.
     const about = j.linkSaved
-      ? 'This station runs on <b>your StarNet credits</b> — agents work without you bringing a provider key. Each run reserves up to your <b>PER RUN</b> budget and refunds whatever it doesn’t spend. You can always switch to your own key under API KEYS above.'
-      : 'This station runs on <b>managed credits</b> — a prepaid balance the operator tops up, so your agents can work without you bringing your own provider key. Each run reserves up to your <b>PER RUN</b> budget and refunds whatever it doesn’t spend. You can always switch to your own key under API KEYS above.';
+      ? 'This station runs on <b>your StarNet credits</b> — agents work without you bringing a provider key. Each run reserves up to your <b>PER RUN</b> budget and refunds whatever it doesn’t spend. You can always switch to your own key: add it on a provider card above, then select that card.'
+      : 'This station runs on <b>managed credits</b> — a prepaid balance the operator tops up, so your agents can work without you bringing your own provider key. Each run reserves up to your <b>PER RUN</b> budget and refunds whatever it doesn’t spend. You can always switch to your own key: add it on a provider card above, then select that card.';
     host.innerHTML =
       '<h4 class="ms-h">STORE <span class="dim">— managed credits</span></h4>' +
       creditsUnlinkErrorMarkup() +
@@ -5194,7 +6926,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     const manage = host.querySelector('#credits-manage');
     if (manage) manage.addEventListener('click', () => { sfx('click'); openExternal(j.manageUrl || j.purchaseUrl); });
     const ref = host.querySelector('#credits-refresh');
-    if (ref) ref.addEventListener('click', () => { sfx('click'); wireCredits(body); });
+    if (ref) ref.addEventListener('click', () => { sfx('click'); forgetCreditsReads(); wireCredits(body); });
     // UNLINK gives up a money-spending credential, so it is destructive → the house two-step
     // arm/confirm, same idiom as key remove and permission revoke. It used to raise a native
     // window.confirm, which the OS paints: a grey system dialog over the CRT, and the one thing
@@ -5227,7 +6959,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         })
         // Symmetric to the link path: a station that just gave up its credential must stop reporting
         // that it can run on credits, or STARNET stays selectable and every run fails at admission.
-        .then(() => (H() && H().refreshCreditsConfigured) ? H().refreshCreditsConfigured() : null)
+        .then(() => { forgetCreditsReads(); return (H() && H().refreshCreditsConfigured) ? H().refreshCreditsConfigured() : null; })   // the account just changed: every read below is afresh
         .then(() => refreshCreditsProvider())
         .then(() => { _creditsUnlinkPending = false; scheduleSettingsRepaint(); wireCredits(body); })
         .catch(() => {
@@ -5238,7 +6970,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
               ? 'Could not confirm that unlink completed. Refresh the account connection, then retry UNLINK if it is still linked.'
               : 'Unlink completed, but the account display could not refresh. Retry to load the linking options.';
           scheduleSettingsRepaint();
-          wireCredits(body);
+          forgetCreditsReads(); wireCredits(body);
         });
     };
     if (unlink) {
@@ -5290,10 +7022,17 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     const btn = host.querySelector('#credits-link');
     if (btn) btn.disabled = true;
     if (state) state.innerHTML = '<div class="set-row dim">Requesting a link code…</div>';
+    // Same failure facts as the genesis LINK (app.js startStarnetLink): a dead local engine is never "the link service".
+    const startFail = info => Object.assign(new Error('start failed'), { linkStart: info });
     Harness.api.post('/api/credits/link/start', { deviceName: 'StarNet Station' })
-      .then(r => { if (generation !== _creditsLinkGeneration) return null; if (!r.ok) throw new Error('start failed'); return r.j; })
+      .then(r => { if (generation !== _creditsLinkGeneration) return null; if (!r || !r.ok) throw startFail({ status: r && r.status, j: r && r.j }); return r.j; },
+        () => { throw startFail({ local: true }); })
       .then(j => { if (generation !== _creditsLinkGeneration) return; if (!j || !j.code) throw new Error('no code'); showCreditsLinkCode(body, host, j); })
-      .catch(() => { if (generation === _creditsLinkGeneration) renderCreditsLinkCard(body, host, 'Could not reach the link service — try again.'); });
+      .catch(e => {
+        if (generation !== _creditsLinkGeneration) return;
+        const why = (typeof Friendly !== 'undefined' && Friendly.linkStartFailure) ? Friendly.linkStartFailure(e && e.linkStart) : 'could not reach the link service — try again';
+        renderCreditsLinkCard(body, host, why.charAt(0).toUpperCase() + why.slice(1) + '.');
+      });
   }
 
   // Show the STAR-XXXX code prominently (VT323/CRT), open the verify page, and poll every 2s until linked/expired.
@@ -5334,7 +7073,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
             // Tell Harness the credential now exists: configured('starnet') is what resume and the
             // model dock gate on, and it was probed at boot when this station was NOT yet linked.
             adoptCreditsToken()
-              .then(() => (H() && H().refreshCreditsConfigured) ? H().refreshCreditsConfigured() : null)
+              .then(() => { forgetCreditsReads(); return (H() && H().refreshCreditsConfigured) ? H().refreshCreditsConfigured() : null; })   // the account just changed: every read below is afresh
               .then(() => refreshCreditsProvider())
               .then(() => { scheduleSettingsRepaint(); wireCredits(body); });
             return;
@@ -5352,6 +7091,14 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   // BUDGET panel — read the live caps + real spend from the sidecar, fill the four inputs, wire SAVE / RESET.
   // Caps persist server-side and apply live; this is the ONLY UI for money limits (previously env-var-only).
   const BG_KEYS = ['perRun', 'perAgent', 'perDay', 'global'];
+  // How a run is named in the STORE's RECENT ACTIVITY and in an unsettled row's tip — the same words on both, so the
+  // Commander can match a charge to its row. A skill evaluation run id is 'skill-eval-<evaluation>-<n>-<phase>-<digest>'
+  // (skill-evaluation-runner.js), so its first 8 chars are the same for every one: name its evaluation, serial and phase.
+  function creditRunTag(runId) {
+    const s = String(runId == null ? '' : runId);
+    const m = /^skill-eval-(.+)-(\d+)-([a-z]+)-[A-Za-z0-9]+$/.exec(s);
+    return m ? 'skill eval ' + m[1].slice(0, 8) + '-' + m[2] + '-' + m[3] : 'run ' + s.slice(0, 8);
+  }
   function wireBudget(body) {
     const form = body.querySelector('#budget-form');
     if (!form) return;
@@ -5363,6 +7110,9 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     // .msg is red by default; the `ok` modifier turns it gold. So a success passes ok=true, an error passes nothing.
     const setMsg = (t, ok) => { if (msgEl) { msgEl.textContent = t || ''; msgEl.className = 'msg' + (ok ? ' ok' : ''); } };
     let loaded = false;
+    // what each input was last painted with (+ whether that value was saved here) and the env defaults: SAVE posts only
+    // what the Commander changed — a posted untouched field became a SAVED cap, and a saved PER DAY is strict.
+    let painted = {}, paintedEnv = {};
     const enable = value => { if (saveBtn) saveBtn.disabled = !value; if (resetBtn) resetBtn.disabled = !value; };
     enable(false);
     // paint the inputs + spend readout + reset visibility from a /api/budget/status payload.
@@ -5372,6 +7122,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       const caps = st.caps;
       const saved = (st && st.saved) || {};
       const envd = (st && st.envDefaults) || {};
+      painted = {}; paintedEnv = envd;
       BG_KEYS.forEach(k => {
         const el = inputOf(k); if (!el) return;
         // show the EFFECTIVE cap (persisted-or-env). An empty string can't represent "0 = no cap", so always fill.
@@ -5387,6 +7138,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         // hover title. Truthful precedence: a saved value WINS here (env is only the fallback default, never an
         // override that silences a saved cap), so the badge says "environment default" — not "ignored".
         const savedHere = Object.prototype.hasOwnProperty.call(saved, k);
+        painted[k] = { v: Number(v), saved: savedHere };
         el.title = savedHere ? 'saved on this machine' : 'environment default (not yet saved here)';
         const badge = body.querySelector('#bg-src-' + k);
         if (badge) {
@@ -5397,16 +7149,136 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
           badge.hidden = false;
         }
       });
+      // Issue #53: "0 = no cap" is not the whole truth on StarNet credits — a managed run with PER RUN at 0 stops
+      // at the default the sidecar reports (null when no managed credits are wired: then say nothing).
+      const managedHint = body.querySelector('#bg-managed-hint');
+      if (managedHint) {
+        const md = st && st.managedRunDefaultUsd;
+        const showManaged = typeof md === 'number' && Number.isFinite(md) && md > 0;
+        managedHint.textContent = showManaged
+          ? 'On StarNet credits, a run with PER RUN at 0 still stops at ' + fmtUsd(md) + ', so one prompt can’t use up your balance. Set a per-run cap above 0 to use your own limit instead.'
+          : '';
+        managedHint.hidden = !showManaged;
+      }
       const anySaved = BG_KEYS.some(k => Object.prototype.hasOwnProperty.call(saved, k));
       if (resetBtn) resetBtn.style.display = anySaved ? '' : 'none';
-      if (spendEl && st.accounting && (!st.accounting.complete || !st.accounting.durable)) {
-        spendEl.textContent = 'Spend history unavailable — spending limits cannot be verified. Restore the ledger and restart StarNet.';
+      const acc = st.accounting;
+      if (spendEl && acc && (!acc.complete || !acc.durable)) {
+        // name the cause and the fix that works for it: a restart replays a failed save, never an interrupted run
+        const open = Array.isArray(st.unsettled) ? st.unsettled.length : 0;
+        // a skill evaluation row (kind 'evaluation') may have finished: what it lacks is a price, so it is never counted
+        // as an interrupted run; a mix of both kinds gets the wording that is true of each
+        const evals = open ? st.unsettled.filter(r => r && r.kind === 'evaluation').length : 0;
+        // an unreadable line of the spend record (kind 'damaged') is not a run: say what it is
+        const damagedLines = open ? st.unsettled.filter(r => r && r.kind === 'damaged').length : 0;
+        const missing = damagedLines === open
+          ? (open === 1 ? 'a line of your spend record is damaged (what it recorded is unknown)' : open + ' lines of your spend record are damaged (what they recorded is unknown)')
+          : evals === open
+          ? (open === 1 ? 'a skill evaluation run has no recorded price' : open + ' skill evaluation runs have no recorded price')
+          : damagedLines ? open + ' items in your spend history have no recorded charge'
+          : evals ? open + ' runs never recorded what they spent'
+            : (open === 1 ? 'an interrupted run never recorded what it spent' : open + ' interrupted runs never recorded what they spent');
+        const floor = (st.atLeast && typeof st.atLeast.today === 'number') ? ' At least ' + fmtUsd(st.atLeast.today) + ' today.' : '';
+        spendEl.textContent = acc.writeError
+          ? 'Spend history unavailable — it could not be saved to disk, so your spending limits can’t be checked. Restart StarNet to recover it.'
+          : (acc.readError === 'UNSETTLED_SPEND' && open)
+            ? 'Spend history unavailable — ' + missing +
+              ', so your spending limits can’t be checked. Settle ' + (open === 1 ? 'it' : 'each') + ' below.' + floor
+            : 'Spend history unavailable — the spend record could not be read, so your spending limits can’t be checked. Restart StarNet; if this stays, the spend files in your workspaces folder are damaged.';
       } else if (spendEl) {
         const today = fmtUsd(st && st.spentToday), life = fmtUsd(st && st.lifetime);
         const runs = (st && typeof st.runs === 'number') ? st.runs : 0;
         spendEl.innerHTML = 'SPENT TODAY <b>' + today + '</b> &nbsp;·&nbsp; LIFETIME <b>' + life + '</b> <span class="dim">(' + runs + ' run' + (runs === 1 ? '' : 's') + ')</span>';
       }
+      paintUnsettled(st);
       paintPools(st);
+    };
+    // INTERRUPTED RUNS — a run that stopped before its spend was booked leaves that spend unknown, and a limit the
+    // Commander chose refuses every paid run until it is known. One row per run (/api/budget/status `unsettled`, only
+    // runs found at boot), settled ONLY by the amount the Commander enters from the provider dashboard, or — when the run
+    // started under a per-run limit — counted at that limit. Never a guessed figure (DECISIONS.md "Strict vs soft").
+    const unsettledEl = body.querySelector('#budget-unsettled');
+    const whenOf = ts => {
+      if (!(typeof ts === 'number' && ts > 0)) return 'time unknown';
+      try { return new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }); } catch (_) { return new Date(ts).toISOString(); }
+    };
+    const settleRun = (r, payload, btns) => {
+      btns.forEach(b => { b.disabled = true; }); setMsg('settling…');
+      Harness.api.post('/api/budget/settle', Object.assign({ runId: r.runId }, payload))
+        .then(({ ok, j }) => {
+          if (!ok) {
+            setMsg((j && j.error) || 'could not settle that run'); sfx('bad'); btns.forEach(b => { b.disabled = false; });
+            // a failed settle still changed the server (a failed write drops the run and turns accounting into a write
+            // error; a 404 means it was already settled or gone): repaint the rows + spend line from the server's truth
+            refresh();
+            return;
+          }
+          paint(j); setMsg('✓ ' + (r.kind === 'evaluation' ? 'skill evaluation run' : r.kind === 'damaged' ? 'damaged record line' : 'interrupted run') + ' settled — its spend is in your history', true); sfx('click');
+        })
+        .catch(() => { setMsg('could not reach the sidecar'); sfx('bad'); btns.forEach(b => { b.disabled = false; }); });
+    };
+    const paintUnsettled = (st) => {
+      if (!unsettledEl) return;
+      unsettledEl.textContent = '';
+      const list = (st && Array.isArray(st.unsettled)) ? st.unsettled : [];
+      for (const r of list) {
+        if (!r || !r.runId) continue;
+        const row = document.createElement('div');
+        row.className = 'set-row bg-unsettled';
+        const where = [r.provider, r.model].filter(Boolean).join(' · ');
+        // WHERE the charge is: a run on StarNet credits (receipt managed:true) was billed to the managed account, so its
+        // charge is in the STORE's RECENT ACTIVITY (AI & MODELS), which lists each charge with its run id — on a linked
+        // station and an operator (env) one alike — not on a provider dashboard the user never had.
+        const managed = r.managed === true, byok = r.managed === false;
+        const chargedBy = managed ? 'what StarNet charged' : byok ? 'what your provider charged' : 'the verified charge';
+        // A skill evaluation run (budgetUnsettledRuns tags it kind 'evaluation' from its runId, which survives a restart)
+        // may well have finished: what it lacks is a recorded price, so it reads UNPRICED, never INTERRUPTED.
+        const evaluation = r.kind === 'evaluation';
+        // a DAMAGED record line (sidecar ledgerIo): one line of the spend record could not be read, so its charge is
+        // unknown. It is never rewritten or deleted; settling it books the verified charge once and history is whole again.
+        const damaged = r.kind === 'damaged';
+        if (damaged) row.setAttribute('data-tip', 'One line of your spend record could not be read (an older crash can leave a torn line), so what it recorded is unknown' +
+          (r.model ? ' (it names ' + r.model + ')' : '') + '. Match it to StarNet Recent Activity or your provider billing records, then enter only its verified charge: StarNet books it once, keeps the damaged line untouched, and your spending limits can be checked again.');
+        else row.setAttribute('data-tip', (evaluation ? 'This skill evaluation run has no recorded price: its provider usage came back without one, or the call failed or was cut off'
+          : 'This run stopped before StarNet recorded what it spent') +
+          (managed ? ' (it ran on your StarNet credits' + (r.model ? ', ' + r.model : '') + ')' : (where ? ' (it started on ' + where + ')' : '')) +
+          (managed ? '. Enter what StarNet charged for it — SETTINGS → AI & MODELS › STORE › RECENT ACTIVITY lists those charges as ' + creditRunTag(r.runId)
+            : byok ? '. Enter the charge your provider dashboard shows for it' : '. The billing source was not recorded. Match this run to StarNet Recent Activity or the original provider billing records, then enter only its verified charge') + ': StarNet books it once and your spending limits can be checked again.');
+        const what = document.createElement('span');
+        what.className = 'bg-un-what';
+        const name = document.createElement('b');
+        name.textContent = String(r.title || r.agentId || 'a run').slice(0, 80);
+        what.appendChild(document.createTextNode(damaged ? 'DAMAGED RECORD — ' : evaluation ? 'UNPRICED — ' : 'INTERRUPTED — '));
+        what.appendChild(name);
+        what.appendChild(document.createTextNode(' · ' + whenOf(r.ts)));
+        if (!managed && !byok && !damaged) what.appendChild(document.createTextNode(' · BILLING SOURCE UNKNOWN'));
+        const usd = document.createElement('input');
+        usd.className = 'key-input bg-cap bg-un-usd';
+        usd.type = 'number'; usd.min = '0'; usd.step = '0.01'; usd.placeholder = '$ charged';
+        usd.setAttribute('inputmode', 'decimal'); usd.setAttribute('autocomplete', 'off');
+        usd.setAttribute('aria-label', chargedBy + ' for this run, in USD');
+        const btn = document.createElement('button');
+        btn.className = 'bb sm'; btn.textContent = 'SETTLE';
+        btn.setAttribute('data-tip', 'book the amount you entered as this run’s spend');
+        const btns = [btn];
+        let capBtn = null;
+        if (typeof r.runCapUsd === 'number' && Number.isFinite(r.runCapUsd) && r.runCapUsd > 0) {
+          capBtn = document.createElement('button');
+          capBtn.className = 'bb xs'; capBtn.textContent = 'COUNT AS ' + fmtUsd(r.runCapUsd);
+          capBtn.setAttribute('data-tip', 'book it at the ' + fmtUsd(r.runCapUsd) + ' per-run limit it started with — its last call can run past that limit, so ' + (managed ? 'the STORE’s RECENT ACTIVITY has the exact charge' : byok ? 'your provider dashboard has the exact charge' : 'verify the exact charge in the original billing records'));
+          btns.push(capBtn);
+        }
+        btn.addEventListener('click', () => {
+          const raw = String(usd.value).trim();
+          const n = raw === '' ? NaN : Number(raw);
+          if (!Number.isFinite(n) || n < 0) { setMsg('enter ' + chargedBy + ' for that run (a number ≥ 0)'); sfx('bad'); if (usd.focus) usd.focus(); return; }
+          settleRun(r, { usd: n }, btns);
+        });
+        if (capBtn) capBtn.addEventListener('click', () => settleRun(r, { mode: 'limit' }, btns));
+        row.appendChild(what); row.appendChild(usd); row.appendChild(btn);
+        if (capBtn) row.appendChild(capBtn);
+        unsettledEl.appendChild(row);
+      }
     };
     // Soft-pool truth + the one-click RESUME. /api/budget/status carries the governor's live pool reads
     // (day/global: {usd, cap, base} — null when ungoverned). A pool is HIT when spend reached its session cap;
@@ -5452,11 +7324,18 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       for (const k of BG_KEYS) {
         const el = inputOf(k); if (!el) continue;
         const raw = String(el.value).trim();
-        if (raw === '') { payload[k] = 0; continue; }   // blank -> "no cap" (0), matching the placeholder semantics
-        const n = Number(raw);
+        const n = raw === '' ? 0 : Number(raw);   // blank -> "no cap" (0), matching the placeholder semantics
         if (!isFinite(n) || n < 0) { setMsg(k + ': enter a number ≥ 0 (leave blank or 0 for no cap)'); sfx('bad'); el.focus(); return; }
+        const was = painted[k];
+        // Only a value the Commander CHANGED is a choice. Saving an untouched field turned the shipped soft day rail
+        // into a strict saved cap (fail-closed whenever spend history is uncertain — DECISIONS.md "Strict vs soft").
+        if (was && n === was.v) continue;
+        // Typing the environment default back into a SAVED limit clears the override, so "back to default" is the real
+        // default (the day rail soft again), not a saved copy of it.
+        if (was && was.saved && typeof paintedEnv[k] === 'number' && n === paintedEnv[k]) { payload[k] = null; continue; }
         payload[k] = n;
       }
+      if (!Object.keys(payload).length) { setMsg('no changes to save', true); return; }
       setMsg('saving…');
       Harness.api.post('/api/budget/caps', payload)
         .then(({ ok, j }) => {
@@ -5637,6 +7516,82 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     });
   }
 
+  // VOICE CHAT MODEL — the model a spoken reply runs on. Saves on the change (no SAVE button: the pick IS the verb).
+  // The model list is the ACTIVE provider's live catalog, like the tier pins; a saved model on another provider
+  // stays listed under its own provider so reopening never silently re-points it.
+  function wireVoiceChatModel(body) {
+    const form = body.querySelector('#vcm-form');
+    if (!form) return;
+    const modelSel = body.querySelector('#vcm-model');
+    const effortSel = body.querySelector('#vcm-effort');
+    const hintEl = body.querySelector('#vcm-hint');
+    const msgEl = body.querySelector('#vcm-msg');
+    const setMsg = (t, ok) => { if (msgEl) { msgEl.textContent = t || ''; msgEl.className = 'msg' + (ok ? ' ok' : ''); } };
+    const active = Harness.getProv ? Harness.getProv() : 'openrouter';
+    let setting = { provider: '', model: '', reasoningEffort: 'none' }, configured = null, catalog = null;
+    const optVal = (provider, model) => model ? (provider || active) + '|' + model : '';
+    const paint = () => {
+      if (modelSel) {
+        const want = optVal(setting.provider, setting.model);
+        modelSel.replaceChildren();
+        const same = document.createElement('option'); same.value = ''; same.textContent = '(same as the agent)'; modelSel.appendChild(same);
+        const seen = new Set();
+        (catalog || []).forEach(m => {
+          if (!m || !m.id || seen.has(m.id)) return;
+          seen.add(m.id);
+          const o = document.createElement('option'); o.value = optVal(active, m.id);
+          o.textContent = (m.name && m.name !== m.id) ? (m.name + '  ·  ' + m.id) : m.id;
+          modelSel.appendChild(o);
+        });
+        if (want && !Array.from(modelSel.options).some(o => o.value === want)) {
+          const o = document.createElement('option'); o.value = want;
+          o.textContent = setting.model + '  ·  ' + (setting.provider && setting.provider !== active ? 'via ' + setting.provider : (catalog ? '(not in catalog)' : '(catalog unverified)'));
+          modelSel.appendChild(o);
+        }
+        modelSel.value = want;
+      }
+      if (effortSel) {
+        const e = String(setting.reasoningEffort == null ? 'none' : setting.reasoningEffort);
+        if (!Array.from(effortSel.options).some(o => o.value === e)) { const o = document.createElement('option'); o.value = e; o.textContent = e.toUpperCase(); effortSel.appendChild(o); }
+        effortSel.value = e;
+      }
+      if (hintEl) {
+        hintEl.textContent = !setting.model ? 'Spoken replies use the agent’s own model.'
+          : configured === false ? '⚠ ' + (setting.provider || active) + ' isn’t connected — spoken replies stay on the agent’s model until it is.'
+          : 'Spoken replies run on ' + setting.model + ' via ' + (setting.provider || active) + '.';
+      }
+    };
+    const apply = (st) => {
+      if (st && st.setting) setting = st.setting;
+      configured = st ? st.configured : null;
+      paint();
+    };
+    if (hintEl) hintEl.textContent = 'reading the voice chat model…';
+    Harness.api.get('/api/voice/chat-model').then(apply)
+      .catch(() => { if (hintEl) hintEl.textContent = 'voice chat model unavailable — sidecar unreachable'; });
+    const baseUrl = active === 'custom' && Harness.getBaseUrl ? Harness.getBaseUrl(active) : '';
+    Harness.api.get('/api/models/' + encodeURIComponent(active) + (baseUrl ? '?baseUrl=' + encodeURIComponent(baseUrl) : '')).then(j => {
+      if (!j || j.error || !Array.isArray(j.models)) throw new Error('catalog unavailable');
+      catalog = j.models.slice().sort((a, b) => String(a.id).localeCompare(String(b.id)));
+      paint();
+    }).catch(() => { paint(); });
+    const post = () => {
+      const v = modelSel ? String(modelSel.value || '') : '';
+      const cut = v.indexOf('|');
+      const next = { provider: cut > 0 ? v.slice(0, cut) : '', model: cut > 0 ? v.slice(cut + 1) : '', reasoningEffort: effortSel ? String(effortSel.value) : 'none' };
+      setMsg('saving…');
+      Harness.api.post('/api/voice/chat-model', next)
+        .then(({ ok, j }) => {
+          if (!ok) { setMsg((j && j.error) || 'could not save the voice chat model'); sfx('bad'); paint(); return; }
+          apply(j);
+          setMsg('✓ ' + (next.model ? 'spoken replies will use ' + next.model : 'spoken replies use the agent’s model'), true); sfx('click');
+        })
+        .catch(() => { setMsg('could not reach the sidecar'); sfx('bad'); paint(); });
+    };
+    if (modelSel) modelSel.addEventListener('change', post);
+    if (effortSel) effortSel.addEventListener('change', post);
+  }
+
   // P1-8 NOTIFICATION PREFS — persist per-category on/off + sound to store.settings.notifyPrefs (localStorage);
   // notify() reads it live at emit time, so a toggle takes effect on the very next notification with no rerender.
   function wireNotifyPrefs(body) {
@@ -5655,11 +7610,37 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   // saved overrides. Precedence (env > saved > default) is enforced + reported by the sidecar; the UI just shows
   // whether a field is env-locked (read-only + a note) or a saved override.
   const ADV_FIELDS = [
-    { key: 'maxIters', label: 'MAX ITERATIONS', hint: 'optional tool-turn ceiling for one run. 0 = unlimited (default).', min: 0, max: 200, step: 1 },
-    { key: 'maxConcurrentAgents', label: 'MAX CONCURRENT AGENTS', hint: 'optional simultaneous-agent ceiling. 0 = unlimited (default).', min: 0, max: 32, step: 1 },
-    { key: 'consentTimeoutMs', label: 'CONSENT TIMEOUT (MS)', hint: 'how long a permission prompt waits for your answer before auto-denying (so a run never hangs).', min: 5000, max: 600000, step: 1000 },
-    { key: 'cronTickMs', label: 'ROUTINE TICK (MS)', hint: 'how often the scheduler checks for due routines.', min: 5000, max: 600000, step: 1000 }
+    { key: 'maxIters', label: 'MAX ITERATIONS', hint: 'the most tool steps one run may take. 0 = no limit (default).', min: 0, max: 200, step: 1 },
+    { key: 'maxConcurrentAgents', label: 'MAX CONCURRENT AGENTS', hint: 'the most agents working at the same time. 0 = no limit (default).', min: 0, max: 32, step: 1 },
+    { key: 'consentTimeoutMs', label: 'CONSENT TIMEOUT (MS)', hint: 'how long an approval card waits for your answer before it says no for you (so a run never hangs).', min: 5000, max: 600000, step: 1000 },
+    { key: 'cronTickMs', label: 'ROUTINE TICK (MS)', hint: 'how often the scheduler checks for due routines.', min: 5000, max: 600000, step: 1000 },
+    { key: 'maxSubscriptionTokens', label: 'CLAUDE CODE TOKEN CEILING', hint: 'tokens one run may use on a Claude subscription sign-in (cache re-reads count 1/10). 0 = no ceiling. Applies from the next run.', min: 0, max: 100000000, step: 100000 },
+    // issue #135: the ceiling on a model StarNet can't price (a custom provider's model) was env-only. Both token ceilings
+    // apply from the next run (the sidecar re-resolves them into CAPS on save); the other rows wait for a restart.
+    { key: 'maxUnpricedTokens', label: 'UNPRICED MODEL TOKEN CEILING', hint: 'tokens one run may use on a model StarNet has no price for. 0 = no ceiling. Applies from the next run.', min: 0, max: 100000000, step: 100000 }
   ];
+  /* the STANDING APPROVALS heading's tip (org P02): when an ask nobody answers is denied, in minutes, and where to change
+     it. The number is the deadline the sidecar ENFORCES now (GET /api/runtime/knobs consentTimeoutMs.live — frozen at
+     boot) and its ack bound (liveAckMs: an ask whose card is on screen waits 5× as long, capped at 15 min). A CONSENT
+     TIMEOUT saved (or cleared) since boot is not enforced yet: the tip says it changes after a restart, never states it as the
+     deadline. Unknown → no number. */
+  function consentMinutes(ms) { const m = Math.round(Number(ms) / 6000) / 10; return (m >= 10 ? Math.round(m) : m) + ' min'; }
+  function consentTipText(ms, ackMs, nextMs) {
+    const where = ' · change it in APP & BACKUP › Runtime limits';
+    if (!(Number(ms) > 0)) return 'unanswered asks are denied on a timer' + where;
+    const seen = Number(ackMs) > 0 ? Number(ackMs) : Math.min(Number(ms) * 5, 900000);
+    const next = Number(nextMs) > 0 && Number(nextMs) !== Number(ms) ? ' · changes to ' + consentMinutes(nextMs) + ' after a restart' : '';
+    return 'unanswered asks are denied after ' + consentMinutes(ms) + ' (' + consentMinutes(seen) + ' once the card is on screen)' + next + where;
+  }
+  function paintConsentTip(host) {
+    const h = host && host.querySelector ? host.querySelector('#perm-standing-h') : null;
+    if (!h || typeof Harness === 'undefined' || !Harness.api || !Harness.api.get) return;
+    Harness.api.get('/api/runtime/knobs').then(st => {
+      const f = st && st.fields && st.fields.consentTimeoutMs;
+      // only the enforced (boot-frozen) deadline is stated; a sidecar that does not report it keeps the numberless tip
+      if (f && Number(f.live) > 0) h.setAttribute('data-tip', consentTipText(f.live, f.liveAckMs, f.effective));
+    }).catch(e => { if (typeof console !== 'undefined') console.warn('[permissions] consent timeout tip unavailable', e); });   // the numberless tip stays
+  }
   function wireAdvanced(body) {
     const form = body.querySelector('#adv-form');
     const msgEl = body.querySelector('#adv-msg');
@@ -5740,19 +7721,18 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     btn.addEventListener('click', () => {
       if (typeof Diag === 'undefined' || !Diag.copy) { setMsg('diagnostics unavailable', false); return; }
       btn.disabled = true; sfx('click');
-      Diag.copy({ notify: false }).then(ok => {
+      Diag.copy({ notify: false, onDone: (ok, text) => {
         btn.disabled = false;
         // Name the support address only when one is really configured (Diag.supportEmail() gates out the unset/
         // placeholder case); otherwise just confirm the copy — never point a user at a fake/placeholder address.
         const diagDest = (typeof Diag !== 'undefined' && Diag.supportEmail) ? Diag.supportEmail() : '';
-        setMsg(ok ? (diagDest ? ('✓ copied — paste it into an email to ' + diagDest) : '✓ copied — paste it into a bug report') : 'copy failed — try again', ok);
-        // Clipboard-failure fallback: if Lane A's on-screen renderer is present, show the report block so the user can
-        // select-and-copy it by hand. Defensive: the helper may not exist in this build yet — keep current behavior then.
-        // (Orchestrator reconciles the exact API at merge.)
+        setMsg(ok ? (diagDest ? ('✓ copied — paste it into an email to ' + diagDest) : '✓ copied — paste it into a bug report') : (text ? 'copy blocked — report shown below' : 'could not read diagnostics — try again'), ok);
+        // Clipboard-failure fallback: show the report the failed copy already read (onDone's text — no second fetch)
+        // as a selectable block, so the user can select-and-copy it by hand.
         if (!ok && typeof Diag !== 'undefined' && typeof Diag.showBlock === 'function') {
-          try { Diag.showBlock(body.querySelector('#diag-block') || body); } catch (_) {}
+          try { Diag.showBlock(body.querySelector('#diag-block') || body, { text }); } catch (_) {}
         }
-      });
+      } });
     });
 
     // LIVE DOCTOR: explicit second consent, then one bounded host request. Results stay visible and copyable;
@@ -5808,25 +7788,18 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         sessionRow: store.settings.sessionRow,
         flicker: store.settings.flicker, crtGlass: store.settings.crtGlass,
         staticLevel: store.settings.staticLevel,
-        sound: store.settings.sound, keepComputerAwake: store.settings.keepComputerAwake
+        sound: store.settings.sound, hints: store.settings.hints, keepComputerAwake: store.settings.keepComputerAwake
       }, notifyPrefs: Object.assign({}, store.settings.notifyPrefs || notifyDefaults()) };
       try { if (typeof AutonomyStore !== 'undefined' && AutonomyStore.exportState) out.autonomy = AutonomyStore.exportState(); } catch (_) {}
       return out;
     };
+    // #134: the line names WHERE the file went, as far as the app can know it — the desktop sidecar writes it and
+    // returns the real path; a browser is only handed it (Backup.exportStation owns both + the honest fallback).
     if (exportBtn) exportBtn.addEventListener('click', () => {
       setMsg('building export…');
-      Harness.api.post('/api/config/export', { sections: browserSections() })
-        .then(({ ok, status, j: env }) => {   // never download an error body as a "backup"
-          if (!ok) throw new Error('http ' + status);
-          const blob = new Blob([JSON.stringify(env, null, 2)], { type: 'application/json' });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          const stamp = new Date().toISOString().slice(0, 10);
-          a.href = url; a.download = 'starnet-station-' + stamp + '.json';
-          document.body.appendChild(a); a.click(); a.remove();
-          setTimeout(() => URL.revokeObjectURL(url), 2000);
-          setMsg('✓ exported (secrets excluded — re-enter keys after importing)', true); sfx('sale');
-        }).catch(() => { setMsg('export failed'); sfx('bad'); });
+      Backup.exportStation({ sections: browserSections(), post: Harness.api.post, desktop: !!tauriInvoke() })
+        .then(r => { setMsg(r.line, r.ok); sfx(r.ok ? 'sale' : 'bad'); })
+        .catch(() => { setMsg('export failed'); sfx('bad'); });
     });
     if (importBtn && fileIn) {
       importBtn.addEventListener('click', () => fileIn.click());
@@ -5837,7 +7810,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
           let env; try { env = JSON.parse(String(reader.result || '')); } catch (_) { setMsg('that is not a valid StarNet backup file'); sfx('bad'); fileIn.value = ''; return; }
           setMsg('importing…');
           Harness.api.post('/api/config/import', { envelope: env })
-            .then(({ ok, j }) => {
+            .then(async ({ ok, j }) => {
               fileIn.value = '';
               if (!ok) {
                 const partial = j && Array.isArray(j.applied) && j.applied.length ? ' (already applied: ' + j.applied.join(', ') + ')' : '';
@@ -5845,10 +7818,13 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
               }
               // restore the browser-owned slices locally.
               const b = (j && j.browser) || {};
-              if (b.settings) { Object.assign(store.settings, b.settings); }
+              if (b.settings) { Object.assign(store.settings, b.settings); store.settings.roomLighting = resolveRoomLighting(store.settings.roomLighting); }
               if (b.notifyPrefs) { store.settings.notifyPrefs = Object.assign(notifyDefaults(), b.notifyPrefs); }
               save(); applySettings();
-              try { if (b.autonomy && typeof AutonomyStore !== 'undefined' && AutonomyStore.importState) AutonomyStore.importState(b.autonomy); } catch (_) {}
+              if (b.autonomy && typeof AutonomyStore !== 'undefined' && AutonomyStore.importState) {
+                const restored = await AutonomyStore.importState(b.autonomy);
+                if (!restored.ok) { setMsg('Backup partly imported. ' + restored.error); sfx('bad'); return; }
+              }
               // GROWTH Tier 3: an import is a NON-DIAL posture writer — reconcile the earned-rung record against
               // the imported rung (a diverged record is retired; user override wins), so a stale earned record can
               // never later demote FROM a rung the dial isn't even at (the silent-escalation blocker).
@@ -5895,7 +7871,14 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       '<div class="prov-list">' + providersHtml() + '</div>' +
       '<h4 class="ms-h">API KEYS</h4>' +
       '<div class="key-list">' + keysHtml() + '</div>' +
-      '<p class="set-about">Credentials are saved locally and used to authenticate with the selected service. Saved keys stay masked. Desktop storage uses the OS keychain when available.</p>' +
+      '<p class="set-about">Your keys stay on this computer, always masked; the desktop app keeps them in the system keychain when it can.</p>' +
+      // org P05: model keys live here; a SERVICE key lives in CONNECT › ABILITIES › CONNECTED › API KEYS — one door, the
+      // places.js api-connections target (live walk 10-14: the door used to open the catalog, so no key reached the place the
+      // sentence named). Gmail and Notion are SIGN IN catalog connectors (sidecar/mcp/catalog.js authType 'oauth') that an
+      // API key cannot connect, so the line says they connect from APPS — the neighbouring section of the window this key
+      // opens. The key sits OUTSIDE the .set-about prose: that paragraph's 0.55 reading-dim greyed it into a disabled-looking key.
+      '<p class="set-about">A key for any other service goes in CONNECT › ABILITIES › CONNECTED › API KEYS; Gmail, Notion and other sign-in services connect from APPS beside it.</p>' +
+      '<div class="mc-acts"><button type="button" class="bb sm" data-act="to-service-keys">▸ CONNECT › API KEYS</button></div>' +
       // STORE / MANAGED CREDITS — rendered ONLY when the sidecar reports a configured credits backend (/api/credits).
       // When credits aren't wired this stays an empty node (no dead card, no fake balance — the honesty law). wireCredits
       // fetches the real balance + history and the external purchase link; buying opens a browser tab, never an in-app form.
@@ -5912,18 +7895,22 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
          labels of the dials did not read as labels at all. `.set-sub` splits the name from its gloss —
          the name carries the phosphor, the gloss stays dim — and is shared with NIGHT SHIFT / the other
          panes so every settings sub-label looks the same. Pure presentation; no ids or handlers move. */
-      '<div class="set-sub"><span class="set-sub-k">INITIATIVE</span><span class="set-sub-d">does it start work on its own</span></div>' +
+      /* ONE QUESTION UP FRONT (2026-10-04, "make it less confusing"): what does it do on its own? The other two
+         dials (how far, how often) and DIRECTION (where) are tuning, so they share ONE fold below — they used to
+         be three equal rows plus a fold, which read as four questions a newcomer had to answer. */
+      '<div class="set-sub"><span class="set-sub-k">ON ITS OWN</span><span class="set-sub-d">what it does while you are away</span></div>' +
       '<div class="set-themes" id="auto-init">' +
-        '<button class="set-theme" data-init="wait" title="nothing runs unless you ask">WAIT</button>' +
-        '<button class="set-theme" data-init="propose" title="lines up suggestions you approve — never acts on its own">SUGGEST</button>' +
-        '<button class="set-theme" data-init="leash" title="does a few small grounded jobs a day on its own">BUILD</button>' +
-        '<button class="set-theme" data-init="free" title="picks &amp; does work toward your goals while you’re away">FREE</button>' +
+        // rung names come from INITIATIVE_RUNGS (the ONE table trust offers and PERMISSIONS notices read too)
+        INITIATIVE_RUNGS.map(r => '<button class="set-theme" data-init="' + r.id + '" data-tip="' + esc(r.tip) + '">' + esc(r.label) + '</button>').join('') +
       '</div>' +
+      '<p class="mc-hint">The three answers in PERMISSIONS set this too.</p>' +
+      '<details class="cf-group set-fold" id="auto-direction-fold"><summary><h4 class="ms-h">FINE-TUNE <span class="dim">— how far, how often, and where</span></h4></summary>' +
       '<div class="set-sub"><span class="set-sub-k">REACH</span><span class="set-sub-d">how far an unattended action may go</span></div>' +
       '<div class="set-themes" id="auto-reach">' +
-        '<button class="set-theme" data-reach="observe" title="read / research only — writes nothing">OBSERVE</button>' +
-        '<button class="set-theme" data-reach="sandbox" title="build &amp; write locally — nothing leaves the machine">SANDBOX</button>' +
-        '<button class="set-theme" data-reach="reach" title="the highest rung: unattended actions may leave the machine — send, publish, or contact external services">SEND &amp; PUBLISH</button>' +
+        '<button class="set-theme" data-reach="observe" data-tip="read / research only — writes nothing">OBSERVE</button>' +
+        // LOCAL ONLY (org pass 10-14): "sandbox" read as a restriction, not as "stays on this machine"; the stored value is unchanged
+        '<button class="set-theme" data-reach="sandbox" data-tip="build &amp; write locally — nothing leaves the machine">LOCAL ONLY</button>' +
+        '<button class="set-theme" data-reach="reach" data-tip="the highest rung: unattended actions may leave the machine — send, publish, or contact external services">SEND &amp; PUBLISH</button>' +
       '</div>' +
       '<div class="set-sub"><span class="set-sub-k">PACE</span><span class="set-sub-d">how many unattended jobs per day</span></div>' +
       '<div class="set-themes" id="auto-pace">' +
@@ -5933,11 +7920,13 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         '<button class="set-theme" data-pace="12" title="as much as it&#39;s allowed — up to 12 jobs a day">MAX</button>' +
       '</div>' +
       // DIRECTION (autonomy-tuning 2026-07-17) — the dial says HOW MUCH it may run on its own; this block says
-      // WHERE that work should go. Same server truth the Night Shift panel reads (GET/POST/DELETE
+      // WHERE that work should go. Same server truth the away status below reads (GET/POST/DELETE
       // /api/nightshift/focus + POST/DELETE /api/nightshift/avoid) — one directive, surfaced where the user tunes
       // autonomy, so "tune it" and "aim it" live together. Every line maps to a route field; the cold states are
       // honest, never an invented priority or a fake learned profile.
-      '<h4 class="ms-h">DIRECTION <span class="dim">— where its unattended work should go</span></h4>' +
+      // QUIETER (front doors, 2026-10-01): DIRECTION is set once and rarely revisited — it folds closed under its own
+      // heading. Every control and id is unchanged; settings search opens the fold when a match is inside.
+      '<div class="set-sub"><span class="set-sub-k">DIRECTION</span><span class="set-sub-d">where its unattended work should go</span></div>' +
       '<div class="set-sub"><span class="set-sub-k">FOCUS</span><span class="set-sub-d" id="auto-focus">…</span></div>' +
       '<div class="set-row ns-steer"><input id="auto-steer" class="key-input" type="text" autocomplete="off" placeholder="Project folder, thread:&lt;id&gt;, or goal"><button class="bb xs" id="auto-steer-set">SET FOCUS</button><button class="bb xs" id="auto-steer-clear" style="display:none">CLEAR</button></div>' +
       '<div class="mc-hint">a steer outranks learned evidence (~7 days, or until cleared). It only redirects the unattended priority — no new access.</div>' +
@@ -5947,12 +7936,19 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       '<div class="mc-hint">off-limits holds until you remove it. You can still work there yourself — it only stops the station choosing it unattended.</div>' +
       '<div class="set-sub"><span class="set-sub-k">LEARNED INTERESTS</span><span class="set-sub-d">what it thinks you keep coming back to</span></div>' +
       '<div class="key-list" id="auto-interests"><p class="set-about">reading interests…</p></div>' +
+      '</details>' +
       // LIVE HELPERS — the real background sub-agents (team.spawn) running RIGHT NOW, from GET /api/subagents
       // (server truth; the floor's ghost sprites are the same ledger). STOP rides POST /api/subagents/interrupt —
       // before this row a runaway helper could not be stopped from anywhere in the UI.
-      '<div class="set-sub"><span class="set-sub-k">LIVE HELPERS</span><span class="set-sub-d">background sub-agents running now</span></div>' +
-      '<div class="key-list" id="auto-helpers"><p class="set-about">reading helpers…</p></div>';
-    const secNightShift =
+      // shown only while helpers are actually running (paintHelpers toggles it) — an empty "no helpers" row was noise
+      '<div class="set-sub" id="auto-helpers-sub" hidden><span class="set-sub-k">LIVE HELPERS</span><span class="set-sub-d">background sub-agents running now</span></div>' +
+      '<div class="key-list" id="auto-helpers" hidden></div>';
+    /* ONE WORD: AUTONOMY (2026-09-29, Andrew: "should simply be autonomy"). What the Commander saw as two things —
+       the AUTONOMY dial and a separate NIGHT SHIFT section — is one thing: the dial, and what it did while they were
+       away. This block (status, decision trail, last report) now renders INSIDE the AUTONOMY section, under the dial
+       it reports on. "Night shift" stays only as the internal name of the server-side driver (routes, ids, files). */
+    const secAwayActivity =
+      '<h4 class="ms-h">WHILE YOU’RE AWAY <span class="dim">— what autonomy did, and why</span></h4>' +
       // NIGHT SHIFT — the honest live status of the server-owned night shift (NS-4). Every line maps to a field of
       // GET /api/nightshift/status + /api/autonomy/ledger; painted live from the routes (never invented). The
       // decision trail is the scrollable recent act/decline log. Loading/error states are honest, never fake-zero.
@@ -5981,14 +7977,10 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       '</div>' +
       '<p class="set-about ns-note" id="ns-why"></p>' +
       '<p class="set-about ns-note" id="ns-readiness"></p>' +
-      // FOCUS (NS-5b) — what the night will chase, and the STEER that lets the Commander redirect it. The readout
-      // maps to status.focus (server truth); the steer rides GET/POST/DELETE /api/nightshift/focus. A steer only
-      // re-ranks the night's ONE priority — it grants nothing and reaches nothing new (route-enforced).
-      '<h4 class="ms-h">FOCUS</h4>' +
-      '<div class="set-row ns-focus-row"><span id="ns-focus" class="dim">…</span></div>' +
-      '<div class="set-row ns-steer"><input id="ns-steer" class="key-input" type="text" autocomplete="off" placeholder="point it at a project folder, or type what to focus on"><button class="bb xs" id="ns-steer-set">SET FOCUS</button><button class="bb xs" id="ns-steer-clear" style="display:none">CLEAR</button></div>' +
-      '<div class="mc-hint">a steer outranks learned evidence (~7 days, or until cleared). It only redirects the night’s one priority — no new access.</div>' +
-      '<h4 class="ms-h">RECENT DECISIONS</h4>' +
+      // FOCUS lives ONCE, in DIRECTION above (same GET/POST/DELETE /api/nightshift/focus route, same status.focus
+      // truth) — the second SET FOCUS box this section used to carry was the same control twice. The ns-focus /
+      // ns-steer wiring below is null-guarded, so it simply finds nothing to paint.
+      '<div class="set-sub"><span class="set-sub-k">RECENT DECISIONS</span><span class="set-sub-d">each time it acted or held back</span></div>' +
       '<div class="key-list" id="ns-trail"><p class="set-about">reading the decision trail…</p></div>' +
       // LAST REPORT (NS visibility 2026-07-13) — the morning-report beat is one-shot (fired=true spends it even on
       // dismiss, and vanish() loses the digest). This re-composes the most recent night's digest ON DEMAND from the
@@ -5996,74 +7988,38 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       '<div class="set-row"><button class="bb sm" id="ns-report-btn">▤ LAST REPORT</button></div>' +
       '<div id="ns-report"></div>';
     const secPermissions =
-      /* PERMISSIONS — THREE TIERS, general → specific → rare (2026-08-07, round 3).
-         The pane was four numbered blocks of in-house vocabulary with two separate crew tables and no
-         summary (547 words to set up ONE agent). Round 2 put three postures out front and folded
-         everything else away, which over-corrected: per-agent reach is the pane's most useful control
-         and a posture can only set every agent the SAME way. So it now steps down by how often you
-         touch a thing, never by how advanced it is:
-           AT A GLANCE      — what the station is allowed to do right now, COUNTED from the live roster.
-           TIER 1 · POSTURE — three station-wide buttons. One click and a newcomer is done.
-           TIER 2 · CREW    — one row per agent, the "except this one" override of tier 1.
-           then the rest of the PERMISSIONS, all visible: SKIP EVERY PROMPT (it outranks every row
-           above it, so it is the last thing that should hide) · WHILE YOU'RE AWAY · STANDING
-           APPROVALS (a revocation you cannot find is not revocable).
-           ADVANCED (closed) — idle Safe Cell cleanup, and ONLY that. Maintenance is the one thing
-           here that earns a fold; ONE fold, never a fold inside a fold.
+      /* PERMISSIONS — ONE QUESTION (2026-10-04, Andrew: "make it less confusing").
+         Round 3 (08-07) left every permission visible, which made the pane honest but long: three postures,
+         then a crew table, two sweep buttons that repeated the postures, a master override, a second copy of
+         the AUTONOMY ladder and the approvals ledger — five ways to answer one question.
+         Now the pane answers it once and steps down only where an answer can differ:
+           AT A GLANCE   — what the station is allowed to do right now, COUNTED from the live roster.
+           THE QUESTION  — three postures. One click and you are done.
+           EACH CREW MEMBER — the SAME three answers per agent (the "except this one" override); the exact
+                           reach ladder / ask-or-not / sandbox for that agent fold under its own row.
+           ALWAYS-YES    — the standing approvals ledger. A revocation you cannot find is not revocable,
+                           so it stays on screen.
+           ADVANCED (closed) — the whole-station Full Power override + Safe Cell maintenance. The override
+                           is reported in the glance AND on every crew row whenever it is ON, so folding the
+                           switch never hides its EFFECT.
+         The four-rung unattended ladder lives in AUTONOMY only; a posture still sets it (one click, one truth).
          No inner "PERMISSIONS" h4 — the console section head already prints it (the PROVIDERS rule). */
-      // ── AT A GLANCE — the pane's answer to "what is my station allowed to do RIGHT NOW", in one
-      // ordinary sentence, computed from the live roster + the server's bypass truth. Beginners opened
-      // this pane and met four numbered blocks of vocabulary with no summary; this is the summary. It
-      // asserts nothing the harness can't prove — every clause counts real agent records.
       '<div id="perm-glance" class="perm-glance"><p class="pg-line">reading your crew…</p></div>' +
-      // ── THE FRONT DOOR — three postures. One click sets reach, asks-first and unattended together for
-      // the whole station, so a newcomer answers ONE question instead of composing four dials. Painted by
-      // paintPostures(): a card highlights only when every component matches the live state.
+      // ── THE QUESTION — three postures. One click sets reach, asks-first and the unattended level together for
+      // the whole station. Painted by paintPostures(): a card highlights only when every component matches.
       '<div class="perm-postures" id="perm-postures"><p class="set-about">reading your station…</p></div>' +
-      '<div class="perm-tier-rule"></div>' +
-      // ── TIER 2 · EACH CREW MEMBER — VISIBLE, directly under the buttons that sweep it. Folding this
-      // away was over-correcting: per-agent reach is the pane's most useful control, and a posture only
-      // sets every agent the SAME way. The postures answer "most of the time"; this answers "except…".
-      // ONE row per agent carrying BOTH per-agent axes. These used to be two separate lists, ~40 rows
-      // apart, each re-listing the whole crew: to set up one agent you scrolled between two tables and
-      // matched names by eye. Independent settings, same subject — so, one row.
-      '<h4 class="ms-h">EACH CREW MEMBER <span class="dim">— override the setting above for one agent</span></h4>' +
+      // ── EACH CREW MEMBER — visible, directly under the cards it overrides. One collapsed row per agent.
+      '<h4 class="ms-h">EACH CREW MEMBER <span class="dim">— give one agent a different answer</span></h4>' +
       '<div class="perm-list" id="perm-crew"></div>' +
-      '<div class="mc-acts perm-allacts">' +
-        '<button class="bb sm" id="perm-ask-all">EVERYONE ASKS FIRST</button>' +
-        '<button class="bb sm danger" id="perm-full-all">FULL POWER — WHOLE STATION</button>' +
-      '</div>' +
-      '<div class="mc-hint">Each crew member either <b>ASKS</b> within the selected reach profile or has <b>FULL POWER</b> over the whole local computer. Full Power applies watched or unattended and includes available tools, host files, arbitrary commands, visible apps, and screen/input control. <code>/yolo</code> is the shortcut.</div>' +
-      // The master switch — it overrides the ASKS FIRST setting on every row above, so it sits directly
-      // under them. Visible: it is a permission, and a switch that silently outranks the rows above it
-      // is the last thing that should be hidden behind a disclosure.
-      '<h4 class="ms-h">FULL POWER — WHOLE STATION <span class="dim">— one switch grants host-wide authority to every agent</span></h4>' +
-      '<div id="perm-bypass" class="perm-master"><p class="perm-m-desc">checking the bypass switch…</p></div>' +
-      // ONE ladder, one vocabulary (UX sweep 2026-07-15): these four rungs ARE the AUTONOMY dial's rungs
-      // (Permissions.PLANS maps 1:1 onto the dial presets) — so they carry the SAME primary words the
-      // dial uses. Stored data-level values are unchanged. FULLY AUTONOMOUS stays in the label (it says
-      // the stakes plainly). Plain-language line first, house vocabulary second.
-      '<h4 class="ms-h">WHILE YOU’RE AWAY <span class="dim">— how much it starts on its own</span></h4>' +
-      '<p class="set-about perm-lede">Whether it begins anything at all when you are not here. The same WAIT / SUGGEST / BUILD / FREE ladder as AUTONOMY — change it in either place.</p>' +
-      '<p class="set-about perm-lede" id="perm-desc"></p>' +
+      // ── ALWAYS-YES — what you already said ALWAYS to. Visible: a revocation you cannot find is not revocable.
+      // its tip says what happens to an ask nobody answers (org P02), filled from the sidecar's own timeout (consentTipText)
+      '<h4 class="ms-h" id="perm-standing-h" data-tip="' + esc(consentTipText(null)) + '">STANDING APPROVALS <span class="dim">— things you said ALWAYS to</span></h4>' +
       '<p class="set-about perm-lede" id="perm-status" aria-live="polite">checking standing approvals…</p>' +
-      '<div class="set-themes" id="perm-level">' +
-        '<button class="set-theme" data-level="never" title="does nothing on its own — you drive everything">WAIT</button>' +
-        '<button class="set-theme" data-level="suggest" title="lines up ideas you approve — never acts on its own">SUGGEST</button>' +
-        '<button class="set-theme" data-level="draft" title="acts on its own and leaves drafts — writes no files">BUILD (DRAFTS)</button>' +
-        '<button class="set-theme" data-level="full" title="acts AND writes real files on its own — logged &amp; reversible">FREE (FULLY AUTONOMOUS)</button>' +
-      '</div>' +
-      // STANDING APPROVALS — a review surface, not a setup one, but still a PERMISSION: it is the list of
-      // things already blessed, and a revocation you cannot find is not really revocable. Visible.
-      // (The "answer ALWAYS and it lands here" teaching is the ledger's own empty state; repeating it in
-      // a lede printed the same sentence twice on a fresh station.)
-      '<h4 class="ms-h">STANDING APPROVALS <span class="dim">— what you already said yes to, for good</span></h4>' +
       '<div class="key-list perm-grants" id="perm-grants"></div>' +
-      // ── ADVANCED — station-wide Docker housekeeping, and ONLY that. Everything else on this pane is a
-      // permission somebody might genuinely need to find; this is maintenance, so it is the one thing
-      // that earns a fold. ONE fold, never a fold inside a fold.
+      // ── ADVANCED — ONE fold, never a fold inside a fold. The override's EFFECT is never hidden (glance + rows).
       '<details class="perm-fold" id="perm-advanced">' +
-        '<summary>Safe Cell maintenance</summary>' +
+        '<summary>Advanced — whole-station override &amp; Safe Cell</summary>' +
+        '<div id="perm-bypass" class="perm-master"><p class="perm-m-desc">checking the Full Power override…</p></div>' +
         '<div id="perm-exec-policy"></div>' +
       '</details>';
     const secBudget =
@@ -6072,10 +8028,12 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       '<h4 class="ms-h">Spending limits <span class="dim">— in USD</span></h4>' +
       '<p class="set-about">Limits apply to recorded agent spending. <b>Blank or 0 means no cap.</b> Changes take effect when you save; unsaved limits follow their environment defaults.</p>' +
       '<div id="budget-spend" class="set-row dim">reading spend…</div>' +
+      '<div id="budget-unsettled"></div>' +   // interrupted runs whose charge is unknown + their SETTLE (only rendered when one exists)
       '<div id="budget-pools"></div>' +   // soft-pool cap state + the one-click RESUME (only rendered when a pool is actually hit)
       '<div class="mc-form" id="budget-form">' +
         '<div class="set-row"><label for="bg-perRun">PER RUN <span class="src-badge" id="bg-src-perRun" hidden></span></label><input id="bg-perRun" class="key-input bg-cap" type="number" min="0" step="0.01" inputmode="decimal" autocomplete="off" placeholder="blank or 0 = no cap"></div>' +
         '<div class="mc-hint">Hard ceiling for a single agent run. The run stops the moment it would exceed this.</div>' +
+        '<div class="mc-hint" id="bg-managed-hint" hidden></div>' +   // #53: the StarNet-credit default, painted from /api/budget/status
         '<div class="set-row"><label for="bg-perAgent">PER AGENT <span class="src-badge" id="bg-src-perAgent" hidden></span></label><input id="bg-perAgent" class="key-input bg-cap" type="number" min="0" step="0.01" inputmode="decimal" autocomplete="off" placeholder="blank or 0 = no cap"></div>' +
         '<div class="mc-hint">Lifetime cap on any one agent’s total spend across all its runs.</div>' +
         '<div class="set-row"><label for="bg-perDay">PER DAY <span class="src-badge" id="bg-src-perDay" hidden></span></label><input id="bg-perDay" class="key-input bg-cap" type="number" min="0" step="0.01" inputmode="decimal" autocomplete="off" placeholder="blank or 0 = no cap"></div>' +
@@ -6092,12 +8050,15 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       // MODELS — the ordered FALLBACK CHAIN (P0-3). The primary model is chosen live in the COMMS model dock; this
       // sets what the loop tries NEXT if that model fails mid-run. Persisted server-side + applied live to every run
       // path (browser, cron, channels); env SKYNET_FALLBACK_MODELS is the default until you save one here.
-      '<h4 class="ms-h">Backup models <span class="dim">— tried in order if your primary model fails</span></h4>' +
-      '<p class="set-about">Choose your primary model in COMMS. If it fails mid-run because of availability, authentication, billing, or rate limits, StarNet tries this list from top to bottom. Saved models use your OpenRouter connection, or your StarNet connection when StarNet is the primary provider. <b>An empty list disables fallback.</b> Model changes appear in COMMS and the logbook.</p>' +
+      '<h4 class="ms-h">FALLBACK MODELS <span class="dim">— tried in order if your primary model fails</span></h4>' +
+      // plain first (UX night 10-26): what it is for, then the one rule; which connection runs a fallback model stays said;
+      // the four real trigger classes stay named (errorClass: availability, authentication, billing, rate limits), and the word
+      // is FALLBACK, never "backup" (org P04: STATION BACKUP is a different thing)
+      '<p class="set-about">If your model fails mid-run because it is unavailable, its key or sign-in is refused, it is out of credit, or it hits rate limits, StarNet tries these models, top to bottom. You pick your main model in COMMS. <b>An empty list means no fallback.</b> Fallback models run on your OpenRouter key, or on StarNet credits when StarNet is your provider; COMMS and the logbook say when one takes over.</p>' +
       '<div class="mc-form" id="fbc-form">' +
         '<div id="fbc-list" class="mc-list-fb"><div class="dim">reading chain…</div></div>' +
         '<div class="set-row"><select id="fbc-add" class="fbc-sel"><option value="">＋ add a model from the catalog…</option></select></div>' +
-        '<div class="mc-hint">Order is the retry order — the loop walks it top-to-bottom. Up to <span id="fbc-max">8</span> models. Unknown ids are allowed (the catalog can be stale) but flagged.</div>' +
+        '<div class="mc-hint">Up to <span id="fbc-max">8</span> models. A model id the catalog does not know still saves, marked unknown.</div>' +
         '<div class="mc-acts">' +
           '<button class="bb sm" id="fbc-save">SAVE CHAIN</button>' +
           '<button class="bb xs" id="fbc-reset" title="clear the saved chain so it follows the environment default again" style="display:none">RESET TO DEFAULT</button>' +
@@ -6109,14 +8070,26 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       // at "(station default)" a tier inherits the model dock's primary, so this is purely opt-in. Saved per-machine
       // (localStorage) and read live by the summon path (app.resolveTierModel) — no rerun/rebuild needed.
       '<h4 class="ms-h">New agent defaults <span class="dim">— model choice by class tier</span></h4>' +
-      '<p class="set-about">Choose the model used when recruiting each class tier. <b>Station default</b> follows your primary model in COMMS. Existing agents keep their model; you can change an individual agent in its dossier.</p>' +
+      '<p class="set-about">The model a NEW agent starts with, by its class tier. <b>(station default)</b> uses your main model from COMMS. Agents you already have keep theirs; change one in its dossier.</p>' +
       '<div class="mc-form" id="tm-form">' +
         '<div class="set-row"><label for="tm-reasoning">◆◆◆ DEEP</label><select id="tm-reasoning" class="fbc-sel" data-tier="reasoning"><option value="">(station default)</option></select></div>' +
         '<div class="set-row"><label for="tm-balanced">◆◆ BALANCED</label><select id="tm-balanced" class="fbc-sel" data-tier="balanced"><option value="">(station default)</option></select></div>' +
         '<div class="set-row"><label for="tm-fast">◆ FAST</label><select id="tm-fast" class="fbc-sel" data-tier="fast"><option value="">(station default)</option></select></div>' +
-        '<div class="mc-hint">A pin applies to the next agent you summon of that tier. Empty = follow the model dock. This never overrides a model you set on a specific agent.</div>' +
+        '<div class="mc-hint">A pick here never changes a model you set on one agent.</div>' +
       '</div>' +
-      '<div id="tm-msg" class="msg"></div>';
+      '<div id="tm-msg" class="msg"></div>' +
+      // VOICE CHAT MODEL (Hermes parity auxiliary.voice_chat) — the model a SPOKEN reply runs on. Server-persisted
+      // (/api/voice/chat-model) and read by the sidecar per voice turn; only that turn moves (sidecar/voice-chat-route.js).
+      '<h4 class="ms-h">Voice chat model <span class="dim">— answers spoken replies</span></h4>' +
+      '<p class="set-about">A faster model just for spoken replies (with the speaker on, or to a Telegram voice note). Typed chat keeps the agent’s own model, and so does any spoken reply this model can’t give.</p>' +
+      '<div class="mc-form" id="vcm-form">' +
+        '<div class="set-row"><label for="vcm-model">MODEL</label><select id="vcm-model" class="fbc-sel"><option value="">(same as the agent)</option></select></div>' +
+        '<div class="set-row"><label for="vcm-effort">REASONING</label><select id="vcm-effort" class="fbc-sel">' +
+          '<option value="none">OFF (fastest)</option><option value="low">LOW</option><option value="medium">MEDIUM</option><option value="high">HIGH</option><option value="">SAME AS TYPED</option>' +
+        '</select></div>' +
+        '<div class="mc-hint" id="vcm-hint"></div>' +
+      '</div>' +
+      '<div id="vcm-msg" class="msg"></div>';
     const customSw = deriveCustomTheme(s.themeHue, s.themeSat, 100)['--ph'];   // swatch tint for the CUSTOM chip
     /* LIVE VOICE — which of the provider's voices speaks in hands-free mode. This lived only in a console
        call, which is not a setting. The list is fetched from the sidecar (status().voices) rather than
@@ -6128,7 +8101,17 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         present.map(a => '<option value="' + esc(a.id) + '">' + esc(a.name || a.id) + '</option>').join('') + '</select></div>' +
       '<button class="bb sm" id="set-lv-inherit" hidden>USE STATION DEFAULT</button>' +
       '<p id="set-lv-msg" class="msg" aria-live="polite"></p>' +
-      '<div class="set-themes" id="set-lv-voices"><span class="dim">reading the built-in voice list…</span></div>';
+      '<div class="set-themes" id="set-lv-voices"><span class="dim">reading the built-in voice list…</span></div>' +
+      // EFFECT — what the voice is played through. One choice for every voice; AUTO lets each wear its own.
+      '<h4 class="ms-h">VOICE EFFECT</h4>' +
+      '<div class="set-themes" id="set-lv-effect">' +
+        [['', 'AUTO', 'Each voice wears its own effect: built-in voices sound natural, the Ultron station voice keeps its machine shell.'],
+         ['natural', 'NATURAL', 'The voice itself, with a light room around it.'],
+         ['comms', 'COMMS', 'A subtle station comms-channel colour.'],
+         ['machine', 'MACHINE', 'The Ultron machine shell: metallic, digitized, robotic.']]
+          .map(([v, label, tip]) => '<button type="button" class="set-theme" data-lv-effect="' + v + '" aria-pressed="false" title="' + esc(tip) + '">' + label + '</button>').join('') +
+      '</div>' +
+      '<p id="set-lv-effect-msg" class="msg" aria-live="polite"></p>';
 
     const secAppearance =
       '<h4 class="ms-h">PHOSPHOR THEME</h4><div class="set-themes">' +
@@ -6138,18 +8121,14 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       // CUSTOM PHOSPHOR — hue + saturation derive a full palette live (moving either switches to CUSTOM);
       // GLOW is independent and scales the bloom on EVERY theme, presets included. All instant-save.
       '<h4 class="ms-h">CUSTOM PHOSPHOR <span class="dim">— dial in any colour</span></h4>' +
-      '<p class="set-about">Hue and saturation create a custom color. Glow controls the light around text; brightness lightens the panel glass. Changes preview and save immediately.</p>' +
+      '<p class="set-about">Hue and saturation create a custom color. Glow controls the light around text; brightness takes the panel glass darker (left) or lighter (right). Changes preview and save immediately.</p>' +
       '<label class="set-slider"><span class="set-slider-name">HUE</span><input type="range" id="set-hue" class="set-hue-track" min="0" max="359" step="1" value="' + clampN(s.themeHue, 0, 359, 35) + '"><span class="set-slider-val" id="set-hue-val">' + clampN(s.themeHue, 0, 359, 35) + '°</span></label>' +
       '<label class="set-slider"><span class="set-slider-name">SATURATION</span><input type="range" id="set-sat" min="0" max="100" step="1" value="' + clampN(s.themeSat, 0, 100, 100) + '"><span class="set-slider-val" id="set-sat-val">' + clampN(s.themeSat, 0, 100, 100) + '%</span></label>' +
       '<label class="set-slider"><span class="set-slider-name">GLOW</span><input type="range" id="set-glow" min="0" max="150" step="5" value="' + clampN(s.themeGlow, 0, 150, 100) + '"><span class="set-slider-val" id="set-glow-val">' + clampN(s.themeGlow, 0, 150, 100) + '%</span></label>' +
-      '<label class="set-slider"><span class="set-slider-name">BRIGHTNESS</span><input type="range" id="set-bright" min="0" max="100" step="5" value="' + clampN(s.panelBright, 0, 100, 0) + '"><span class="set-slider-val" id="set-bright-val">' + clampN(s.panelBright, 0, 100, 0) + '%</span></label>' +
+      '<label class="set-slider"><span class="set-slider-name">BRIGHTNESS</span><input type="range" id="set-bright" min="-100" max="100" step="5" value="' + clampN(s.panelBright, -100, 100, 0) + '"><span class="set-slider-val" id="set-bright-val">' + clampN(s.panelBright, -100, 100, 0) + '%</span></label>' +
       '<h4 class="ms-h" id="set-lighting-label">ROOM LIGHTING</h4>' +
-      '<p class="set-about">Choose the brightness across your rooms. LOW is softly lit; MEDIUM and HIGH make the whole room brighter.</p>' +
-      '<div class="set-themes" id="set-lighting" role="group" aria-labelledby="set-lighting-label">' +
-      ROOM_LIGHTING_STEPS.map(([v, name]) => {
-        const on = resolveRoomLighting(s.roomLighting) === v;
-        return '<button type="button" class="set-theme ' + (on ? 'sel' : '') + '" aria-pressed="' + on + '" data-lighting="' + v + '">' + name + '</button>';
-      }).join('') + '</div>' +
+      '<p class="set-about">Drag right to light your rooms brighter. All the way left is the standard station lighting.</p>' +
+      '<div id="set-lighting"><label class="set-slider"><span class="set-slider-name">ROOM LIGHT</span><input type="range" id="set-room-light" aria-labelledby="set-lighting-label" min="0" max="100" step="1" value="' + resolveRoomLighting(s.roomLighting) + '"><span class="set-slider-val" id="set-room-light-val">' + resolveRoomLighting(s.roomLighting) + '%</span></label></div>' +
       // THE BACKDROP — what the station floats in. Swatches are painted by the REAL backdrop
       // renderer below (SpaceBG.paintSample), never by a stand-in gradient, so a preview can
       // not promise a sky the station won't deliver — the same law the deck/wall swatches follow.
@@ -6186,6 +8165,17 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         return '<button class="set-theme ' + (cur === v ? 'sel' : '') + '" aria-pressed="' + (cur === v ? 'true' : 'false') + '" data-srow="' + v + '" title="' + why + '">' + name + '</button>';
       }).join('') +
       '</div>' +
+      // STATION DOCK (systems.js) — GROW WITH ME adds dock buttons as the station is used; SHOW EVERYTHING puts every
+      // system in the dock now. Either way every window opens from every other door; this only shapes the dock.
+      '<div class="set-row"><span class="dim">STATION DOCK — GROW WITH ME adds a dock button the first time you need it; SHOW EVERYTHING puts every system in the dock now</span></div>' +
+      '<div class="set-themes" id="set-stationdock">' +
+      [['staged', 'GROW WITH ME'], ['all', 'SHOW EVERYTHING']].map(([v, name]) => {
+        const cur = (typeof Systems !== 'undefined' && Systems.staged && Systems.staged()) ? 'staged' : 'all';
+        return '<button class="set-theme ' + (cur === v ? 'sel' : '') + '" aria-pressed="' + (cur === v ? 'true' : 'false') + '" data-sdock="' + v + '">' + name + '</button>';
+      }).join('') +
+      '</div>' +
+      // HINTS (hint.js) — the glossary bubble on hover; once the station's words are familiar it can go quiet.
+      '<label class="set-row"><input type="checkbox" id="set-hints" ' + (s.hints ? 'checked' : '') + '> HINTS <span class="dim">— explain station terms when you hover them</span></label>' +
       // CRT — its own section, and a LEVEL rather than a named mode. Framing this as an
       // accessibility fix ("easy read") tells the people who like the tube that they are enduring
       // something, which is not what most of them report. There is no OFF: the station is a CRT.
@@ -6208,7 +8198,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     const secNotifs =
       // NOTIFICATIONS — per-category on/off + a notification sound toggle (P1-8). Each is HONORED at emit time in
       // notify(): a muted category is dropped before it ever reaches the panel/toast (not decorative).
-      '<h4 class="ms-h">NOTIFICATIONS <span class="dim">— what pings you, and whether it chimes</span></h4>' +
+      '<h4 class="ms-h">NOTIFICATIONS</h4>' +
       '<p class="set-about">Choose which events appear in the notification panel and as pop-up alerts. Changes save immediately.</p>' +
       '<label class="set-row"><input type="checkbox" id="ntp-runComplete"' + (npf('runComplete') ? ' checked' : '') + '> RUN COMPLETE <span class="dim">— a run saved or made something</span></label>' +
       '<label class="set-row"><input type="checkbox" id="ntp-needsApproval"' + (npf('needsApproval') ? ' checked' : '') + '> NEEDS APPROVAL <span class="dim">— an agent is waiting on your yes/no</span></label>' +
@@ -6233,7 +8223,10 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       // ADVANCED — env-only runtime knobs, now editable + persisted server-side (P1-9). PRECEDENCE is spelled out
       // in the card: an explicit environment variable ALWAYS wins over a value saved here (a deploy stays in control).
       '<h4 class="ms-h">Runtime limits <span class="dim">— optional ceilings and timeouts</span></h4>' +
-      '<p class="set-about">StarNet does not limit agent concurrency or run iterations by default. Set a positive value only when you want a ceiling. Saved here on this machine and read by the sidecar at boot. <b>An environment variable always overrides a value saved here</b>. Blank a field to clear the override.</p>' +
+      // R30 (0.14.1 readiness review): say what the code does. Some fields HAVE defaults (CONSENT TIMEOUT 120000, ROUTINE TICK
+      // 60000, both token ceilings 2,000,000 in index.js resolveKnob), and a cleared box saves null = back to that default,
+      // never "no limit" (0 is what switches a ceiling off).
+      '<p class="set-about">Optional. Each box shows the value in use, marked default until you save your own; type a number to change it, or clear the box to go back to its default. By default nothing caps the steps in a run or the agents working at once, and the two token ceilings stop a run at 2,000,000 tokens (0 switches one off). Most take effect after a restart; each line says when it differs. <b>An environment variable always overrides a value saved here</b>.</p>' +
       '<div class="mc-form" id="adv-form"><div class="dim" id="adv-loading">reading runtime settings…</div></div>' +
       '<div id="adv-msg" class="msg"></div>' +
       // DATA / STATION BACKUP — export the whole station config to one JSON file, import it back, reset a section.
@@ -6267,8 +8260,9 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       // fail-open pressure: per-tag swallowed-error counts since boot, from report.swallowed. Painted in wireDiagnostics().
       '<div id="diag-swallowed" class="dim" style="margin-top:6px;font-size:11px">swallowed errors: reading…</div>' +
       '<h4 class="ms-h">LIVE DOCTOR <span class="dim">— opt-in runtime proof</span></h4>' +
-      '<p class="set-about">Runs one tiny response through the selected model, a harmless sentinel through the effective execution profile, an initialize/list round-trip for each enabled MCP server, and safe authentication/status checks for messaging channels. It sends no channel messages and exports no secrets.</p>' +
-      '<label class="set-check"><input type="checkbox" id="diag-live-consent"> I understand this performs real network and execution probes and may spend one tiny model response.</label>' +
+      // plain first (UX night 10-26); every probe it runs is still named
+      '<p class="set-about">Checks, for real, that StarNet works: one tiny reply from your model, one harmless test command, a hello to each connected service, and a status check of each chat channel. It sends no chat messages and shares no secrets.</p>' +
+      '<label class="set-check"><input type="checkbox" id="diag-live-consent"> I understand this makes real requests and may spend one tiny model reply.</label>' +
       '<div class="set-save"><button class="bb sm" id="diag-live-run">RUN LIVE DOCTOR</button><button class="bb sm" id="diag-live-copy" hidden>⧉ COPY RECEIPT</button></div>' +
       '<div id="diag-live-msg" class="msg"></div>' +
       '<pre id="diag-live-out" class="diag-pre" tabindex="0" hidden style="white-space:pre-wrap;overflow:auto;max-height:40vh"></pre>' +
@@ -6277,7 +8271,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       '<div id="diag-build" class="dim" style="margin-top:6px;font-size:11px" hidden></div>' +
       // CLEAR NOTIFICATIONS moved to the NOTIFICATIONS section (where it belongs); this is now just the about note.
       '<h4 class="ms-h">ABOUT</h4>' +
-      '<p class="set-about">STARNET — gamified AI-agent harness.<br>Theme, display & audio preferences are saved locally on this machine. Manage planned tasks on the TASK BOARD and saved conversations under SESSIONS in COMMS.</p>';
+      '<p class="set-about">STARNET — gamified AI-agent harness.<br>Theme, display & audio preferences are saved locally on this machine. Manage planned tasks under MY WORK › TASKS and saved conversations under SESSIONS in COMMS.</p>';
 
     // Keep every control mounted and reachable; group existing nodes without replacing their IDs.
     function arrangeSettingsPane(el) {
@@ -6370,7 +8364,31 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       };
       target.onchange = () => { message.textContent = ''; refresh(); };
       inherit.onclick = () => save('');
+      const wish = voiceForWanted();   // a dossier VOICE door that just opened this window (openVoiceFor)
+      if (wish && Array.from(target.options).some(o => o.value === wish)) target.value = wish;
       refresh();
+      const effects = host.querySelector('#set-lv-effect');
+      const effectMsg = host.querySelector('#set-lv-effect-msg');
+      const paintEffect = () => {
+        const cur = (typeof Voice !== 'undefined' && Voice.voiceEffect) ? Voice.voiceEffect() : '';
+        effects.querySelectorAll('[data-lv-effect]').forEach(btn => {
+          const on = btn.getAttribute('data-lv-effect') === cur;
+          btn.classList.toggle('sel', on); btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+        });
+      };
+      if (effects) {
+        effects.querySelectorAll('[data-lv-effect]').forEach(btn => {
+          btn.onclick = () => {
+            try {
+              Voice.setVoiceEffect(btn.getAttribute('data-lv-effect'));
+              effectMsg.textContent = 'Effect saved. Applies to the next spoken reply.';
+              try { SFX.click(); } catch (_) {}
+            } catch (_) { effectMsg.textContent = 'Effect could not be saved. Please try again.'; }
+            paintEffect();
+          };
+        });
+        paintEffect();
+      }
     }
 
     /* the backdrop swatches are painted by the REAL world renderer, which costs a full sky/ground build
@@ -6379,23 +8397,38 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     let paintBackdropSwatches = () => {};
 
     const sections = [
-      { id: 'providers', label: 'PROVIDERS', glyph: '⌁', desc: 'Connect an AI service and manage its saved credentials.', build: frag(secProviders) },
-      { id: 'autonomy', label: 'AUTONOMY', glyph: '◈', desc: 'Choose when agents start work, what they can do, and how often.', build: frag(secAutonomy) },
-      { id: 'nightshift', label: 'NIGHT SHIFT', glyph: '☾', desc: 'See unattended activity, its current focus, and recent decisions.', build: frag(secNightShift) },
+      { id: 'providers', label: 'AI & MODELS', glyph: '⌁', desc: 'The AI your agents think with. Connect one below: StarNet credits, a subscription you have, an API key, or your own models. Everything under API KEYS is optional.', build: frag(secProviders + secModels) },
+      // ONE WORD: AUTONOMY — the dial and what it did while you were away are one section (the old NIGHT SHIFT
+      // section folded in; openTerm maps its id here so an old deep link still lands).
+      { id: 'autonomy', label: 'AUTONOMY', glyph: '◈', desc: 'Choose when agents work on their own, where that work goes, and see what they did while you were away.', build: frag(secAutonomy + secAwayActivity) },
       { id: 'permissions', label: 'PERMISSIONS', glyph: '⊘', desc: 'Set access and approval rules for the station or individual agents.', build: frag(secPermissions) },
       { id: 'budget', label: 'SPENDING LIMITS', glyph: '$', desc: 'Set spending limits and review recorded usage.', build: frag(secBudget) },
-      { id: 'models', label: 'MODEL DEFAULTS', glyph: '⇄', desc: 'Choose backup models and defaults for new agents.', build: frag(secModels) },
       // build, not frag: the pane is created lazily when the section is opened, so wiring at MOUNT time
       // ran before this element existed and left the list stuck on its placeholder. Paint it when it is born.
-      { id: 'livevoice', label: 'LIVE VOICE', glyph: '◍', desc: 'Built-in voices for your agents and hands-free conversations.', build: el => { el.innerHTML = secLiveVoice; arrangeSettingsPane(el); wireLiveVoice(el); } },
-      { id: 'appearance', label: 'APPEARANCE', glyph: '☀', desc: 'Room lighting, phosphor colour, CRT effects, and terminal sound.', build: frag(secAppearance), onShow: () => paintBackdropSwatches() },
+      { id: 'appearance', label: 'LOOK & SOUND', glyph: '☀', desc: 'Text size, room lighting, phosphor colour, CRT effects, terminal sound, and your agents’ spoken voices.', build: el => { el.innerHTML = secAppearance + secLiveVoice; arrangeSettingsPane(el); wireLiveVoice(el); }, onShow: () => paintBackdropSwatches() },
       // NAV CONDENSE (2026-08-04) — two label renames, ids untouched (remembered-section keys + wiring
       // bind to the id): 'NOTIFICATIONS' collided with the SYSTEM-dock NOTIFICATIONS panel (inbox vs
       // preferences — same word, two doors), and a 'SYSTEM' section inside SETTINGS inside the SYSTEM
       // dock read as a loop.
       { id: 'notifs', label: 'ALERTS', glyph: '◔', desc: 'What pings you while you work, and whether it chimes.', build: frag(secNotifs) },
-      { id: 'system', label: 'APP & BACKUP', glyph: '⚙', desc: 'Startup, runtime limits, backups, updates, and troubleshooting.', build: frag(secSystem) }
+      // STARNET REMOTE: pair a phone and drive the station from anywhere (app/remote-devices.js owns the pane)
+      { id: 'remote', label: 'REMOTE', glyph: '▯', desc: 'Pair your phone and control this station from anywhere.', build: el => { if (typeof RemoteDevices !== 'undefined') RemoteDevices.mount(el, arrangeSettingsPane); else el.textContent = 'Remote is not available in this build.'; } },
+      // BROWSER: where the station browser lives — built-in / a Chrome window (YOUR CHROME is not offered yet; app/outputbrowser.js owns the pane)
+      { id: 'browser', label: 'BROWSER', glyph: '◎', desc: 'Where the station browser runs: inside StarNet, or as its own Chrome window.', build: el => {
+        if (typeof OutputBrowser !== 'undefined' && OutputBrowser.mountSettings) OutputBrowser.mountSettings(el, arrangeSettingsPane);
+        // SAVED SIGN-INS: STEP-IN is no longer a standing dock button, so the sign-ins it keeps get a door here
+        const row = mkEl('div', 'set-row');
+        row.appendChild(mkEl('span', 'dim', 'SAVED SIGN-INS — the browser sign-ins your agents reuse, from times you took the wheel '));
+        const b = mkEl('button', 'bb sm', 'OPEN SAVED SIGN-INS'); b.type = 'button'; b.id = 'set-open-signins';
+        b.addEventListener('click', () => { sfx('click'); openTerm('stepin'); });
+        row.appendChild(b); el.appendChild(row);
+        // #61 RESET STATION BROWSER (app/datareset.js owns it)
+        if (typeof DataReset !== 'undefined' && DataReset.mountBrowserReset) DataReset.mountBrowserReset(el);
+      } },
+      { id: 'system', label: 'APP & BACKUP', glyph: '⚙', desc: 'Startup, runtime limits, backups, updates, and troubleshooting.', build: el => { frag(secSystem)(el); if (typeof DataReset !== 'undefined' && DataReset.mountErase) DataReset.mountErase(el); } }   // #65 ERASE EVERYTHING (app/datareset.js)
     ];
+    // ONE PLAIN LIST (Andrew 10-02): no intent-group buttons — a few natural pairs share a page instead (AI & MODELS,
+    // LOOK & SOUND); every old section id still lands through SETTINGS_ALIAS in openTerm.
     const host = mountConsole(body, 'settings', sections, { search: true, searchPlaceholder: 'search settings…' });
 
     wireProviderActions(host);
@@ -6407,13 +8440,16 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     (() => {
       const was = creditsProv.state + ':' + creditsProv.balanceUsd + ':' + creditsProv.tier;
       refreshCreditsProvider().then(() => {
-        if (was !== creditsProv.state + ':' + creditsProv.balanceUsd + ':' + creditsProv.tier) rerender('settings');
+        // through the coalescer (10-26): two builds in flight (the open + a status repaint) both saw the old balance and
+        // each rebuilt the whole window when the one shared answer landed — twice, 70 ms apart, at the reader's scroll 0
+        if (was !== creditsProv.state + ':' + creditsProv.balanceUsd + ':' + creditsProv.tier) scheduleSettingsRepaint();
       }).catch(() => {});
     })();
     wireCredits(host);
     wireBudget(host);
     wireFallbackChain(host);
     wireTierModels(host);
+    wireVoiceChatModel(host);
     wireNotifyPrefs(host);
     wireAdvanced(host);
     wireBackup(host);
@@ -6454,21 +8490,15 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     wireSlider(hueIn, v => { s.theme = 'custom'; s.themeHue = clampN(v, 0, 359, 35); sliderVal('#set-hue-val', s.themeHue + '°'); selCustom(); syncCustomChip(); });
     wireSlider(satIn, v => { s.theme = 'custom'; s.themeSat = clampN(v, 0, 100, 100); sliderVal('#set-sat-val', s.themeSat + '%'); selCustom(); syncCustomChip(); });
     wireSlider(glowIn, v => { s.themeGlow = clampN(v, 0, 150, 100); sliderVal('#set-glow-val', s.themeGlow + '%'); });
-    wireSlider(brightIn, v => { s.panelBright = clampN(v, 0, 100, 0); sliderVal('#set-bright-val', s.panelBright + '%'); });
+    wireSlider(brightIn, v => { s.panelBright = clampN(v, -100, 100, 0); sliderVal('#set-bright-val', s.panelBright + '%'); });
     wireSlider(host.querySelector('#set-static'), v => { s.staticLevel = clampN(v, 0, 200, 100); sliderVal('#set-static-val', s.staticLevel + '%'); });
     const bind = (id, key) => host.querySelector(id).addEventListener('change', ev => { s[key] = ev.target.checked; applySettings(); save(); flashSaved(appMsg()); });
-    bind('#set-flicker', 'flicker'); bind('#set-sound', 'sound');
-    const lightingChips = host.querySelectorAll('#set-lighting [data-lighting]');
-    lightingChips.forEach(b => b.addEventListener('click', () => {
-      s.roomLighting = resolveRoomLighting(b.dataset.lighting);
-      applyRoomLighting(s.roomLighting); save(); sfx('click');
-      lightingChips.forEach(x => {
-        const on = x.dataset.lighting === s.roomLighting;
-        x.classList.toggle('sel', on);
-        x.setAttribute('aria-pressed', String(on));
-      });
-      flashSaved(appMsg());
-    }));
+    bind('#set-flicker', 'flicker'); bind('#set-sound', 'sound'); bind('#set-hints', 'hints');
+    const roomLightIn = host.querySelector('#set-room-light');
+    if (roomLightIn) {
+      roomLightIn.addEventListener('input', ev => { s.roomLighting = resolveRoomLighting(ev.target.value); applyRoomLighting(s.roomLighting, true); sliderVal('#set-room-light-val', s.roomLighting + '%'); });
+      roomLightIn.addEventListener('change', () => { commitRoomLighting(() => store.settings.roomLighting); save(); sfx('click'); flashSaved(appMsg()); });
+    }
     // CRT GLASS chips — same instant-apply + persist idiom as TEXT SIZE below.
     const glChips = host.querySelectorAll('#set-crtglass [data-glass]');
     const syncGlass = () => glChips.forEach(x => {
@@ -6493,6 +8523,16 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       s.sessionRow = resolveSessionRow(b.dataset.srow);
       applySettings(); save(); sfx('click');
       syncSessionRow(); flashSaved(appMsg());
+    }));
+    // STATION DOCK chips — the mode lives in systems.js (its own store); switching never takes a button away
+    const sdChips = host.querySelectorAll('#set-stationdock [data-sdock]');
+    sdChips.forEach(b => b.addEventListener('click', () => {
+      if (typeof Systems === 'undefined') return;
+      if (b.dataset.sdock === 'all') Systems.showEverything(); else Systems.growWithMe();
+      sfx('click');
+      const cur = Systems.staged() ? 'staged' : 'all';
+      sdChips.forEach(x => { const on = x.dataset.sdock === cur; x.classList.toggle('sel', on); x.setAttribute('aria-pressed', on ? 'true' : 'false'); });
+      flashSaved(appMsg());
     }));
     // TEXT SIZE chips — instant-apply + persist, same idiom as the theme row above.
     const tsChips = host.querySelectorAll('#set-textsize [data-ts]');
@@ -6597,7 +8637,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
             const why = (v.reasons && v.reasons.length) ? v.reasons.join(', ') : 'armed background work';
             lifeDesc.textContent = 'Right now, closing the window KEEPS the station running in the background (' + why + '). Quit fully from the tray icon. Otherwise closing would fully quit.';
           } else {
-            lifeDesc.textContent = 'Right now, nothing is armed — closing the window fully quits StarNet (no background process). Arm a routine, connect a channel, or turn on the night shift to keep it running while closed.';
+            lifeDesc.textContent = 'Right now, nothing is armed — closing the window fully quits StarNet (no background process). Arm a routine, connect a channel, or set ON ITS OWN to ' + initiativeLabel('leash') + ' or ' + initiativeLabel('free') + ' in SETTINGS › AUTONOMY to keep it running while closed.';
           }
         }).catch(() => { lifeDesc.textContent = 'Closing the window keeps the station running only when armed work needs it — otherwise it fully quits.'; });
       };
@@ -6641,7 +8681,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       wireLifecyclePreference(closeToTrayToggle, Lifecycle.setCloseToTray, 'Close to tray', 'closeToTray');
     }
     // PERMISSIONS panel repaint hook — set by the permissions block below; called whenever the granular dial
-    // changes so the level highlight + #perm-desc stay in sync with the posture. No-op until that block wires it.
+    // changes so the posture cards stay in sync with the dial. No-op until that block wires it.
     let syncPerm = function () {};
     repaintAutonomyDial = null;   // GROWTH Tier 3: re-armed per settings render (the closure below owns the live DOM)
     repaintPermAgents = null;     // same contract: the PERMISSIONS block below re-arms it against THIS render's DOM
@@ -6678,32 +8718,34 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       };
       const paintAuto = () => {
         const a = AutonomyStore.summary() || {};
-        if (initWrap) initWrap.querySelectorAll('[data-init]').forEach(x => x.classList.toggle('sel', x.dataset.init === a.initiative));
-        if (reachWrap) reachWrap.querySelectorAll('[data-reach]').forEach(x => x.classList.toggle('sel', x.dataset.reach === a.reach));
-        if (paceWrap) paceWrap.querySelectorAll('[data-pace]').forEach(x => x.classList.toggle('sel', Number(x.dataset.pace) === a.leashPerDay));
-        if (autoDesc) autoDesc.textContent = AutonomyStore.describe();
+        const sync = AutonomyStore.status();
+        if (initWrap) initWrap.querySelectorAll('[data-init]').forEach(x => x.classList.toggle('sel', sync.loaded && x.dataset.init === a.initiative));
+        if (reachWrap) reachWrap.querySelectorAll('[data-reach]').forEach(x => x.classList.toggle('sel', sync.loaded && x.dataset.reach === a.reach));
+        if (paceWrap) paceWrap.querySelectorAll('[data-pace]').forEach(x => x.classList.toggle('sel', sync.loaded && Number(x.dataset.pace) === a.leashPerDay));
+        for (const wrap of [initWrap, reachWrap, paceWrap]) if (wrap) wrap.querySelectorAll('button').forEach(x => { x.disabled = sync.pending; });
+        if (autoDesc) { autoDesc.setAttribute('role', 'status'); autoDesc.textContent = sync.pending ? 'Confirming autonomy settings…' : (sync.error ? sync.error.replace(/([^.!?…])s*$/, '$1.') + (sync.loaded ? ' Current setting: ' + AutonomyStore.describe() : ' Reopen this panel to retry.') : sync.loaded ? AutonomyStore.describe() : 'Autonomy settings have not been confirmed.'); }
         try { paintEarned(a); } catch (_) {}   // GROWTH Tier 3: the EARNED badge on an earned rung
         try { syncPerm(); } catch (_) {}   // keep the permissions level highlight + blurb in step with the dial
       };
       // a MANUAL set retires the earned record (the user override wins, recorded as such) BEFORE the dial writes —
       // so a set above an earned rung reads as a plain user grant, a set below as a user override (no badge either way).
-      if (initWrap) initWrap.querySelectorAll('[data-init]').forEach(b => b.addEventListener('click', () => { try { if (typeof TrustStore !== 'undefined' && TrustStore.onManualInitiative) TrustStore.onManualInitiative(b.dataset.init); } catch (_) {} AutonomyStore.setInitiative(b.dataset.init); paintAuto(); sfx('click'); }));
-      if (reachWrap) reachWrap.querySelectorAll('[data-reach]').forEach(b => b.addEventListener('click', () => { AutonomyStore.setReach(b.dataset.reach); paintAuto(); sfx('click'); }));
-      if (paceWrap) paceWrap.querySelectorAll('[data-pace]').forEach(b => b.addEventListener('click', () => { AutonomyStore.setLeash(Number(b.dataset.pace)); paintAuto(); sfx('click'); }));
+      if (initWrap) initWrap.querySelectorAll('[data-init]').forEach(b => b.addEventListener('click', async () => { const write = AutonomyStore.setInitiative(b.dataset.init); paintAuto(); const result = await write; if (result.ok) { try { if (typeof TrustStore !== 'undefined' && TrustStore.onManualInitiative) TrustStore.onManualInitiative(b.dataset.init); } catch (_) {} } paintAuto(); sfx(result.ok ? 'click' : 'bad'); }));
+      if (reachWrap) reachWrap.querySelectorAll('[data-reach]').forEach(b => b.addEventListener('click', async () => { const write = AutonomyStore.setReach(b.dataset.reach); paintAuto(); const result = await write; paintAuto(); sfx(result.ok ? 'click' : 'bad'); }));
+      if (paceWrap) paceWrap.querySelectorAll('[data-pace]').forEach(b => b.addEventListener('click', async () => { const write = AutonomyStore.setLeash(Number(b.dataset.pace)); paintAuto(); const result = await write; paintAuto(); sfx(result.ok ? 'click' : 'bad'); }));
       repaintAutonomyDial = paintAuto;   // GROWTH Tier 3: let an accepted trust offer repaint the open panel's EARNED badge live
+      AutonomyStore.refresh().then(paintAuto);
       paintAuto();
     }
     // DIRECTION (autonomy-tuning) — focus/steer/off-limits/learned-interests, every value painted from a route's
-    // response (server truth, never an optimistic local flip). Shares the Night Shift panel's directive routes so
-    // both surfaces always tell the SAME story; interests ride GET /api/scout (evidence-cited or honestly empty).
+    // response (server truth, never an optimistic local flip). Rides the away driver's directive routes — the ONE
+    // focus/off-limits control (the old NIGHT SHIFT section's duplicate steer is gone); interests ride GET /api/scout (evidence-cited or honestly empty).
     {
       const dFocus = host.querySelector('#auto-focus'), dSteer = host.querySelector('#auto-steer'),
             dSteerSet = host.querySelector('#auto-steer-set'), dSteerClear = host.querySelector('#auto-steer-clear'),
             dAvoid = host.querySelector('#auto-avoid'), dAvoidRef = host.querySelector('#auto-avoid-ref'),
             dAvoidAdd = host.querySelector('#auto-avoid-add'), dInterests = host.querySelector('#auto-interests');
       const dMsg = (t) => { if (dFocus) dFocus.textContent = t; };
-      // "thread:<id>" and the literal "goal" select their kinds; anything else is a project path (the same grammar
-      // as the Night Shift steer box, so the two inputs never disagree).
+      // "thread:<id>" and the literal "goal" select their kinds; anything else is a project path.
       const parseRef = (raw) => {
         if (raw.toLowerCase() === 'goal') return { ref: 'goal', kind: 'goal' };
         if (/^thread:/i.test(raw)) return { ref: raw.slice(7).trim(), kind: 'thread' };
@@ -6819,10 +8861,14 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     // /api/subagents/interrupt; the list repaints from the ROUTE after every action (never an optimistic flip).
     {
       const list = host.querySelector('#auto-helpers');
+      const helpersSub = host.querySelector('#auto-helpers-sub');
       const paintHelpers = (rows) => {
         if (!list) return;
+        // visible only while something is running (or the ledger can't be read — that is worth saying)
+        const show = !Array.isArray(rows) || rows.length > 0;
+        list.hidden = !show; if (helpersSub) helpersSub.hidden = !show;
         if (!Array.isArray(rows)) { list.innerHTML = '<p class="set-about">helpers unreachable right now.</p>'; return; }
-        if (!rows.length) { list.innerHTML = '<p class="set-about">no background helpers running.</p>'; return; }
+        if (!rows.length) { list.innerHTML = ''; return; }
         list.textContent = '';
         for (const r of rows) {
           const row = document.createElement('div');
@@ -6899,9 +8945,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       const nsAwayRule = host.querySelector('#ns-awayrule'),
             nsState = host.querySelector('#ns-state'), nsWhy = host.querySelector('#ns-why'), nsLeash = host.querySelector('#ns-leash'),
             nsLast = host.querySelector('#ns-last'), nsNext = host.querySelector('#ns-next'), nsTrail = host.querySelector('#ns-trail'),
-            nsMode = host.querySelector('#ns-mode'), nsReadiness = host.querySelector('#ns-readiness'),
-            nsFocus = host.querySelector('#ns-focus'), nsSteer = host.querySelector('#ns-steer'),
-            nsSteerSet = host.querySelector('#ns-steer-set'), nsSteerClear = host.querySelector('#ns-steer-clear');
+            nsMode = host.querySelector('#ns-mode'), nsReadiness = host.querySelector('#ns-readiness');   // FOCUS + its steer live once, in DIRECTION above (ONE WORD: AUTONOMY)
       const tz = () => { try { return -new Date().getTimezoneOffset(); } catch (_) { return 0; } };
       const setDim = (el, txt) => { if (el) el.textContent = txt; };
       const paintPanel = (status) => {
@@ -6913,7 +8957,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         if (!m.reachable) {
           setDim(nsState, m.stateText);        // "station telemetry unreachable" — never a fake 0/3
           setDim(nsAwayRule, ''); setDim(nsWhy, ''); setDim(nsLeash, '—'); setDim(nsLast, '—'); setDim(nsNext, '—');
-          setDim(nsMode, '—'); setDim(nsReadiness, ''); setDim(nsFocus, '—');
+          setDim(nsMode, '—'); setDim(nsReadiness, '');
           return;
         }
         setDim(nsAwayRule, m.awayRuleText || '');
@@ -6927,60 +8971,14 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         setDim(nsLeash, m.leashText + ' · ' + m.presence);
         setDim(nsLast, m.lastBeatText);
         setDim(nsNext, m.nextEligibleText);
-        paintFocus(status);
       };
-      // FOCUS readout + steer visibility — every claim maps to status.focus (nightFocusView: {ref,label,why,source,
-      // steered} or null). Null renders the honest cold state, never an invented priority.
-      const paintFocus = (status) => {
-        if (!nsFocus) return;
-        const f = status && status.focus;
-        // f.steered is the LIVE steer bit (a durable steer is currently set); f.source is only the focus's
-        // provenance — after a CLEAR the focus record lingers with source:'steer' until the next re-resolve,
-        // so claiming "you steered this" (or offering CLEAR) off source alone overstates the live state.
-        if (f && (f.label || f.ref)) {
-          const why = Array.isArray(f.why) ? f.why.filter(Boolean).join('; ') : '';
-          nsFocus.textContent = String(f.label || f.ref) + (f.steered ? ' · you steered this' : '') + (why ? ' — ' + why : '');
-        } else {
-          nsFocus.textContent = 'none declared — the night improvises from evidence';
-        }
-        if (nsSteerClear) nsSteerClear.style.display = (f && f.steered) ? '' : 'none';
-      };
-      // STEER — POST/DELETE /api/nightshift/focus; the readout repaints from the ROUTE's response (server truth,
-      // never an optimistic local flip). "thread:<id>" and the literal "goal" select their kinds; else project.
-      const steerMsg = (t) => { if (nsFocus) nsFocus.textContent = t; };
-      if (nsSteerSet) nsSteerSet.addEventListener('click', () => {
-        const raw = nsSteer ? String(nsSteer.value).trim() : '';
-        if (!raw) { steerMsg('enter a blessed project path, thread:<id>, or goal'); sfx('bad'); return; }
-        let ref = raw, kind;
-        if (raw.toLowerCase() === 'goal') { kind = 'goal'; }
-        else if (/^thread:/i.test(raw)) { kind = 'thread'; ref = raw.slice(7).trim(); }
-        steerMsg('steering…');
-        fetch('/api/nightshift/focus', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(kind ? { ref, kind } : { ref }) })
-          .then(r => r.json().then(j => ({ ok: r.ok, j })))
-          .then(({ ok, j }) => {
-            if (!ok || !j || j.ok === false) { steerMsg((j && j.error) || 'could not steer'); sfx('bad'); return; }
-            if (nsSteer) nsSteer.value = '';
-            sfx('click'); refreshPanel();   // repaint FOCUS from the status route's truth
-          })
-          .catch(() => { steerMsg('could not reach the sidecar'); sfx('bad'); });
-      });
-      if (nsSteerClear) nsSteerClear.addEventListener('click', () => {
-        steerMsg('clearing…');
-        fetch('/api/nightshift/focus', { method: 'DELETE' })
-          .then(r => r.json().then(j => ({ ok: r.ok, j })))
-          .then(({ ok, j }) => {
-            if (!ok || !j || j.ok === false) { steerMsg((j && j.error) || 'could not clear the steer'); sfx('bad'); return; }
-            sfx('click'); refreshPanel();
-          })
-          .catch(() => { steerMsg('could not reach the sidecar'); sfx('bad'); });
-      });
       const paintTrail = (entries) => {
         if (!nsTrail) return;
         // COLLAPSED trail (clarity fix 2026-07-15): the driver records one decision per ~minute, so raw rows were
         // twelve identical "declined · you were here" lines — pure noise. trailLines groups consecutive same-reason
         // rows into "4:26–4:37 PM · declined ×12 · …" (every row still derives from real ledger entries).
         const lines = NightReport.trailLines(Array.isArray(entries) ? entries : [], tz()).slice(0, 12);
-        if (!lines.length) { nsTrail.innerHTML = '<p class="set-about">no night-shift decisions yet — nothing has run unattended.</p>'; return; }
+        if (!lines.length) { nsTrail.innerHTML = '<p class="set-about">no autonomy decisions yet — nothing has run unattended.</p>'; return; }
         nsTrail.innerHTML = lines.map(t => '<div class="set-row"><span class="dim">' + esc(t) + '</span></div>').join('');
       };
       // paint honest "reading…" first, then replace with the live truth (or an honest unreachable/error state).
@@ -7012,8 +9010,19 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
           const ledger = (ledgerRes && Array.isArray(ledgerRes.entries)) ? ledgerRes.entries : [];
           const drafts = (draftsRes && Array.isArray(draftsRes.drafts)) ? draftsRes.drafts : [];
           let rep; try { rep = NightReport.compose({ status, ledger, drafts, awaySince, nowMs: now, tzOffsetMin: tzMin() }); } catch (_) { rep = null; }
+          // the exact readiness counts (call #57): the awakening readout gives one plain reason, so the N-of-M numbers
+          // live HERE — straight from the same status read, '' once the station is hot (never an invented line).
+          const readyText = NightReport.readinessText ? NightReport.readinessText(status && status.readiness) : '';
+          // ONE PANEL, ONE COPY (org pass P09-b): #ns-readiness under the status grid just above already paints this exact
+          // line from the same status route — repeating it under LAST REPORT read as the same sentence twice. It is kept
+          // only when the grid could not show it (status unreachable there, or a different reading by now).
+          const shownAbove = !!(readyText && nsReadiness && nsReadiness.textContent.trim() === readyText.trim());
+          const readyLine = shownAbove ? '' : readyText;
           if (!rep || !rep.hasReport) {
-            nsReport.innerHTML = '<p class="set-about">no report to show — the night shift recorded no acts or declines in the last 24h.</p>';
+            // the still-learning line is a second sentence of the SAME grey status paragraph style, full stop and all —
+            // an amber .dim row under a grey status read louder than the status it qualifies
+            nsReport.innerHTML = '<p class="set-about">no report to show — autonomy recorded no acts or declines in the last 24h.</p>' +
+              (readyLine ? '<p class="set-about">' + esc(readyLine.replace(/[.\s]*$/, '.')) + '</p>' : '');
             return;
           }
           const lines = [];
@@ -7022,6 +9031,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
           for (const l of (rep.actLines || [])) lines.push(l);
           for (const l of (rep.declineLines || [])) lines.push(l);
           if (rep.idleReason) lines.push(rep.idleReason);
+          if (readyLine) lines.push(readyLine);
           nsReport.innerHTML = lines.map(l => '<div class="set-row"><span class="dim">' + esc(l) + '</span></div>').join('');
           // surfaced → mark the drafts seen so the live unseen-drafts nudge won't re-announce them.
           try {
@@ -7033,29 +9043,27 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         });
       };
       if (nsReportBtn) nsReportBtn.addEventListener('click', () => { renderLastReport(); sfx('click'); });
-      // Re-setting the dial / a LEVEL click is the (silent) act that LIFTS a durable E-STOP halt
-      // (handleAutonomyPosture → clearHalt) — re-read the status shortly after so the ⛔ HALTED card clears
-      // (or appears) from the ROUTE's truth, never from an optimistic guess.
-      host.querySelectorAll('#auto-init [data-init], #auto-reach [data-reach], #auto-pace [data-pace], #perm-level [data-level]')
+      // An ON ITS OWN rung or a PERMISSIONS posture click LIFTS a durable E-STOP halt (handleAutonomyPosture → clearHalt;
+      // REACH and PACE never do, org P06) and AutonomyStore says "Automation resumed" when the route reports haltLifted —
+      // re-read the status shortly after so the ⛔ HALTED card clears (or appears) from the ROUTE's truth, never a guess.
+      host.querySelectorAll('#auto-init [data-init], #auto-reach [data-reach], #auto-pace [data-pace]')
         .forEach(b => b.addEventListener('click', () => { setTimeout(refreshPanel, 600); }));
+      // a PERMISSIONS posture sets the level too (the old level row's job) — its cards are repainted wholesale, so
+      // listen on the stable host rather than on cards that will be replaced.
+      const postureHost = host.querySelector('#perm-postures');
+      if (postureHost) postureHost.addEventListener('click', e => { if (e.target.closest('[data-posture]')) setTimeout(refreshPanel, 600); });
     }
     // PERMISSIONS panel — the never→fully-autonomous LEVEL chooser + the OS-style standing-grant list
     // (permissionsstore). Grants live server-side, so paint from cache now, refresh from the sidecar, repaint. A
     // level click sets BOTH posture + the write grant (so it repaints the dial); the dial syncs back via syncPerm.
     if (typeof PermissionsStore !== 'undefined' && PermissionsStore.snapshot) {
-      const levelWrap = host.querySelector('#perm-level'), grantsWrap = host.querySelector('#perm-grants'),
-            permDesc = host.querySelector('#perm-desc'), permStatus = host.querySelector('#perm-status');
-      const pdesc = (lvl) => (typeof Permissions !== 'undefined' && Permissions.describeLevel) ? Permissions.describeLevel(lvl) : '';
+      // (the four-rung unattended ladder that used to sit here lives in AUTONOMY only; a posture still sets it)
+      const grantsWrap = host.querySelector('#perm-grants'), permStatus = host.querySelector('#perm-status');
+      paintConsentTip(host);
       const plabel = (k) => (typeof Permissions !== 'undefined' && Permissions.catalogLabel) ? Permissions.catalogLabel(k) : k;
       const pcurated = () => (typeof Permissions !== 'undefined' && Permissions.grantableKeys) ? Permissions.grantableKeys() : [];
       const repaintDial = () => {
-        if (typeof AutonomyStore === 'undefined' || !AutonomyStore.summary) return;
-        const a = AutonomyStore.summary() || {};
-        const iw = host.querySelector('#auto-init'), rw = host.querySelector('#auto-reach'), pw = host.querySelector('#auto-pace'), ad = host.querySelector('#auto-desc');
-        if (iw) iw.querySelectorAll('[data-init]').forEach(x => x.classList.toggle('sel', x.dataset.init === a.initiative));
-        if (rw) rw.querySelectorAll('[data-reach]').forEach(x => x.classList.toggle('sel', x.dataset.reach === a.reach));
-        if (pw) pw.querySelectorAll('[data-pace]').forEach(x => x.classList.toggle('sel', Number(x.dataset.pace) === a.leashPerDay));
-        if (ad && AutonomyStore.describe) ad.textContent = AutonomyStore.describe();
+        if (repaintAutonomyDial) repaintAutonomyDial();
       };
       // the agent's LIVE placed caps (cabinet→files …) — so a granted-but-inert capability is shown honestly with a
       // "place a cabinet" nudge instead of a silent "writes files" lie (object=capability: the grant is consent, the
@@ -7090,7 +9098,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
               const pv = eg && eg.provenance;
               if (pv) earnedTxt = ' <span class="dim">— ◈ earned' + (pv.runs ? ' after ' + esc(String(pv.runs)) + ' tasks' : '') + (pv.confidence ? ' at ' + esc(String(pv.confidence)) + '%' : '') + '</span>';
             } catch (_) {}
-            rows.push('<div class="set-row"><span>✓ ' + esc(plabel(k)) + (hint ? ' <span class="dim">— ' + esc(hint) + '</span>' : '') + ' <span class="dim">— ' + esc(pwhen(snap, k)) + '</span>' + earnedTxt + '</span> <button class="bb sm danger" data-perm-revoke="' + esc(k) + '">✕ REVOKE</button></div>');
+            rows.push('<div class="set-row"><span class="perm-label">✓ ' + esc(plabel(k)) + (hint ? ' <span class="dim">— ' + esc(hint) + '</span>' : '') + ' <span class="dim">— ' + esc(pwhen(snap, k)) + '</span>' + earnedTxt + '</span> <button class="bb sm danger" data-perm-revoke="' + esc(k) + '">✕ REVOKE</button></div>');
           });
           held.filter(k => curated.indexOf(k) < 0).forEach(k => {
             // A raw danger key (`path:C:\…`, `mcp:<id>`) is truthful but asks the reader to know the grammar on
@@ -7098,7 +9106,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
             // meaning AND the exact key — never one without the other.
             const r = (typeof Permissions !== 'undefined' && Permissions.grantRow) ? Permissions.grantRow(k) : { title: k, detail: '', note: '' };
             const head = r.detail ? (esc(r.title) + ' <span class="dim">' + esc(r.detail) + '</span>') : esc(r.title);
-            rows.push('<div class="set-row"><span>' + head +
+            rows.push('<div class="set-row"><span class="perm-label">' + head +
               (r.note ? ' <span class="dim">— ' + esc(r.note) + '</span>' : '') +
               ' <span class="dim">— ' + esc(pwhen(snap, k)) + '</span></span>' +
               ' <button class="bb sm danger" data-perm-revoke="' + esc(k) + '">✕ REVOKE</button></div>');
@@ -7114,7 +9122,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         if (offers.length) {
           rows.push('<div class="set-row"><span class="dim">— pre-approve a capability —</span></div>');
           offers.forEach(k => {
-            rows.push('<div class="set-row"><span>' + esc(plabel(k)) + '</span> <button class="bb sm" data-perm-grant="' + esc(k) + '">GRANT</button></div>');
+            rows.push('<div class="set-row"><span class="perm-label">' + esc(plabel(k)) + '</span> <button class="bb sm" data-perm-grant="' + esc(k) + '">GRANT</button></div>');
           });
         }
         return rows.join('');
@@ -7164,10 +9172,6 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         const n = present.length;
         const noPrompt = present.filter(a => a && a.approvalMode === 'full').length;
         const asks = n - noPrompt;
-        const broadest = present.reduce((best, a) => {
-          const p = executionProfileOf(executionProfileId(a));
-          return (!best || p.reach > best.p.reach) ? { p: p, a: a } : best;
-        }, null);
         // Whole sentences per branch rather than glued fragments — a concatenated subject and verb
         // disagree the moment the crew count is 1 ("Your one crew member stops and ask you").
         const everyone = (verbSingular, verbPlural) => n === 1
@@ -7179,16 +9183,14 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         else if (!noPrompt) head = everyone('stops and asks', 'stop and ask') + ' you before anything risky.';
         else if (!asks) head = everyone('runs', 'run') + ' without stopping to ask you.';
         else head = asks + ' of your ' + n + ' crew ask before anything risky; ' + noPrompt + ' run' + (noPrompt === 1 ? 's' : '') + ' without asking.';
-        // the PLAIN name leads here too — the glance is the first thing a newcomer reads, and the house
-        // name ("STATION GEAR") teaches them nothing at the moment they most need to understand it.
-        const reachLine = broadest
-          ? 'Furthest reach on the station: <b>' + esc(broadest.p.plainLabel) + '</b> (' + esc(broadest.a.name || broadest.a.id) + ') — ' + esc(broadest.p.plain)
-          : '';
+        // The host-wide meaning of FULL POWER is stated only when someone actually HOLDS it — on a station where
+        // everyone asks, the warning was a paragraph about a state that did not exist. When the whole-station
+        // override is the reason, the glance says where to turn it off (it lives in the ADVANCED fold).
         glanceWrap.classList.toggle('loud', bypassOn);
         glanceWrap.innerHTML =
           '<p class="pg-line">' + esc(head) + '</p>' +
-          (reachLine ? '<p class="pg-reach">' + reachLine + '</p>' : '') +
-          '<p class="pg-floor">FULL POWER is host-wide: it may use protected files, arbitrary commands, visible apps, and screen/input control. ASK and narrower reach modes retain their listed restrictions.</p>';
+          ((bypassOn || noPrompt) ? '<p class="pg-floor">FULL POWER is host-wide: it may use protected files, arbitrary commands, visible apps, and screen/input control. Full Power applies watched or unattended.' +
+            (bypassOn && !snap.envFullAccess ? ' Turn the whole-station override off under <b>Advanced</b> below.' : '') + '</p>' : '');
       };
       /* ── THE POSTURE FRONT DOOR ────────────────────────────────────────────────────────────────────
          A posture is a SHORTCUT FOR SETTING VALUES, never a badge. It highlights only when every one of
@@ -7209,7 +9211,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         const can = !!(access.config && access.config.setApproval && access.config.setExecutionProfile);
         postureWrap.innerHTML =
           '<div class="pp-head"><span class="pp-q">HOW MUCH SHOULD YOUR CREW DO ON ITS OWN?</span>' +
-            '<span class="pp-state' + (on ? ' matched' : '') + '">' + (on ? 'SET TO ' + esc(on.label) : 'CUSTOM — your own mix of the settings below') + '</span></div>' +
+            '<span class="pp-state' + (on ? ' matched' : '') + '">' + (on ? 'SET TO ' + esc(on.label) : 'CUSTOM — your crew have different answers, see below') + '</span></div>' +
           '<div class="pp-cards">' + STATION_POSTURES.map(P =>
             '<button class="pp-card' + (on && on.id === P.id ? ' sel' : '') + (P.id === 'open' ? ' danger' : '') + '" data-posture="' + P.id + '"' +
               ' data-name="' + esc(P.label) + '" aria-pressed="' + (on && on.id === P.id ? 'true' : 'false') + '"' + (can ? '' : ' disabled') + '>' +
@@ -7217,7 +9219,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
               '<span class="pp-blurb">' + esc(P.blurb) + '</span>' +
               '<span class="pp-who">' + esc(P.who) + '</span>' +
             '</button>').join('') + '</div>' +
-          '<p class="pp-foot">Pick one and you are done — everything below is optional.</p>';
+          '<p class="pp-foot">Pick one and you are done. Everything below is optional.</p>';
         // Applying: count what ACTUALLY changed and report that number. setApproval returns false for an
         // agent deleted from another surface mid-click, and setExecutionProfile can be refused by the
         // station — a blanket "posture applied" over a partly-failed sweep is the app asserting a state
@@ -7330,25 +9332,39 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
              reach — so the list READS without opening anything; opening is for CHANGING.
              <details> rather than a hand-rolled toggle: free keyboard + screen-reader semantics, and it is
              the same idiom `.mc-adv` / `.exec-ssh` already use in this file. */
+          /* THE ROW = the same three answers as the cards above, for this one agent. Its SUMMARY says which
+             answer it holds (or CUSTOM — a hand-set mix of reach + asking that no card names) and what that
+             means; opening it offers the three answers; the exact reach ladder, ask-or-not and sandbox fold
+             under MORE OPTIONS for the rare case a card is not enough. The badge reports the EFFECTIVE state:
+             under the whole-station override every row reads FULL POWER, and the stored answer stays visible. */
+          const AP = agentPostureOf(a);
+          const badge = effFull ? 'FULL POWER' : (AP ? AP.label : 'CUSTOM');
+          // under the override the clause leads with what the agent returns to: the collapsed row ellipses it at ~40 characters,
+          // and "whole-station override is ON · returns to FU…" cut off the one fact it is there for (the badge says FULL POWER)
+          const stateLine = overridden
+            ? (AP ? 'returns to ' + AP.label : 'returns to its custom mix') + ' when the whole-station override is off'
+            : (AP ? AP.agentBlurb : full ? 'full power · the whole local computer' : 'asks first · ' + p.short);
+          const postureChips = STATION_POSTURES.map(P =>
+            '<button class="ov-vchip pc-posture' + (AP && AP.id === P.id ? ' sel' : '') + (P.id === 'open' ? ' danger' : '') + '" data-agent-posture="' + P.id + '" data-agent="' + esc(String(a.id)) + '"' +
+              ' title="' + esc(P.agentBlurb) + '" aria-pressed="' + (AP && AP.id === P.id ? 'true' : 'false') + '"' + (can && canAsk ? '' : ' disabled') + '>' + esc(P.label) + '</button>').join('');
           return '<details class="perm-agent perm-crew-row' + (effFull ? ' full' : '') + (overridden ? ' overridden' : '') + '" data-profile-agent="' + esc(String(a.id)) + '" data-ssh-configured="' + (sshConfigured ? '1' : '0') + '"' +
               (permCrewOpen.has(String(a.id)) ? ' open' : '') + '>' +
             '<summary class="pc-head">' +
               '<span class="pa-name">' + esc(a.name || a.id) + '</span>' +
-              // WORDING from trunk's host-wide Full Power lane (`7b35f70e8`), STRUCTURE from this one.
-              // Their side is an honesty claim about what the posture actually authorizes — it is the
-              // newer, deliberate copy and must not be reverted by a layout change; my side only turns
-              // the row into a <summary> and adds the caret. Taking either side whole would have
-              // silently dropped the other's work, which is why this conflict was resolved by hand.
-              '<span class="pa-mode">' + (effFull ? 'FULL POWER' : 'ASKS') + '</span>' +
-              '<span class="pa-state">' + (effFull ? 'whole local computer · never stops to ask you' : (esc(p.short) + ' · stops before it writes, runs, or reaches out')) + '</span>' +
+              '<span class="pa-mode">' + esc(badge) + '</span>' +
+              '<span class="pa-state">' + esc(stateLine) + '</span>' +
               '<span class="pc-caret" aria-hidden="true">▸</span>' +
             '</summary>' +
+            '<div class="ov-vchips pc-chips pc-posture-chips">' + postureChips + '</div>' +
+            (AP ? '' : '<p class="pc-plain">A custom mix — ' + (full
+              // approvalMode 'full' is the whole local computer (unrestrictedHostNow): the saved reach limits nothing, so it is never named as a limit
+              ? 'it has <b>full power</b> over the whole local computer; the saved reach below does not limit it'
+              : 'it reaches <b>' + esc(p.plainLabel.toLowerCase()) + '</b> and asks before risky steps') + '. Pick an answer above to reset it, or fine-tune below.</p>') +
+            '<details class="mc-adv pc-exact"' + (permExactOpen.has(String(a.id)) || id === 'remote-ssh' ? ' open' : '') + ' data-exact-agent="' + esc(String(a.id)) + '"><summary>More options — exact reach, asking, sandbox</summary>' +
             '<div class="pc-axis">' +
               '<span class="pc-q">CAN REACH</span>' +
-              // `pc-reach-chips` lays the five rungs out as an EVEN grid rather than a flex-wrap. Wrapping
-              // by content width made a ladder of five different-width lozenges break 4 + 1, with the
-              // orphan under a wide hole — the one thing on the pane that is an ORDERED SCALE was also
-              // the only thing you could not read as one. (CSS-only; the chips themselves are unchanged.)
+              // `pc-reach-chips` lays the five rungs out as an EVEN grid rather than a flex-wrap (an ordered scale
+              // must read as one). (CSS-only; the chips themselves are unchanged.)
               (can ? '<div class="ov-vchips pc-chips pc-reach-chips">' + reachChips + '</div>' : '<span class="pc-plain">' + esc(p.label) + '</span>') +
               '<p class="pc-plain">' + (effFull ? 'Full Power currently overrides this stored reach profile; the profile applies again when Full Power is turned off.' : esc(p.plain)) + '</p>' +
               '<p class="mc-hint pc-truth">' + sandboxChip(row) + 'routes next command to <b>' + esc(routed) + '</b> · availability <b>' + esc(availability) + '</b> · files: ' + esc(p.files) + ' · tools: ' + esc(p.tools) + ' · desktop ' + esc(p.desktop) + '</p>' +
@@ -7365,6 +9381,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
                   : 'Before it writes a file, runs a command, or reaches outside, it stops and waits for your yes.') + '</p>' +
             '</div>' +
             (cell || ssh ? '<div class="pc-more">' + cell + ssh + '</div>' : '') +
+            '</details>' +
             '</details>';
         }).join('');
         wireCrew();
@@ -7380,6 +9397,32 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
             if (!id) return;
             if (row.open) permCrewOpen.add(id); else permCrewOpen.delete(id);
           });
+        });
+        crewList.querySelectorAll('.pc-exact[data-exact-agent]').forEach(box => box.addEventListener('toggle', () => {
+          const id = String(box.dataset.exactAgent || '');
+          if (box.open) permExactOpen.add(id); else permExactOpen.delete(id);
+        }));
+        /* THE THREE ANSWERS, per agent. One click writes BOTH halves of the answer through the same two paths the
+           cards use (setExecutionProfile, then setApproval) and reports what ACTUALLY landed — a refused profile
+           change leaves asking untouched rather than half-applying. FULL POWER keeps the house two-press confirm;
+           an answer the agent already holds does nothing. */
+        crewList.querySelectorAll('[data-agent-posture]').forEach(b => {
+          const P = STATION_POSTURES.find(x => x.id === b.getAttribute('data-agent-posture'));
+          const id = b.getAttribute('data-agent');
+          if (!P || b.disabled || b.classList.contains('sel')) return;
+          const agentName = () => { const a = present.find(x => String(x.id) === id); return a ? (a.name || a.id) : id; };
+          const apply = () => {
+            b.disabled = true;
+            Promise.resolve(access.config.setExecutionProfile(id, P.profile))
+              .then(okP => !!okP && !!access.config.setApproval(id, P.approval))
+              .catch(() => false)
+              .then(ok => {
+                notify(ok ? agentName() + ' set to ' + P.label : 'could not change ' + agentName() + ' — it kept its previous setting', ok ? (P.id === 'open' ? 'warn' : 'good') : 'bad');
+                refreshExecutionProfiles();
+              });
+          };
+          if (P.id === 'open') ArmConfirm.wire(b, { armedLabel: 'SURE? WHOLE COMPUTER', restLabel: P.label, timeoutMs: 4000, onArm: () => sfx('bad'), onConfirm: () => { sfx('bad'); apply(); } });
+          else b.addEventListener('click', () => { sfx('click'); apply(); });
         });
         crewList.querySelectorAll('[data-ssh-save]').forEach(button => button.addEventListener('click', () => {
           const box = button.closest('[data-exec-agent]'); if (!box) return;
@@ -7472,37 +9515,6 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       paintCrew();
       paintPolicy(null);
       refreshExecutionProfiles();
-      // WHOLE-STATION switches. Both COUNT what actually changed and report that number: a blanket
-      // "whole station on FULL ACCESS" toast over an empty roster, or over a partly-failed sweep, is
-      // the app asserting a state the harness never reached (the truthful-telemetry law).
-      const sweepApproval = (mode) => {
-        if (!(access.config && access.config.setApproval)) return null;
-        let done = 0;
-        present.forEach(a => { if (access.config.setApproval(a.id, mode)) done++; });
-        paintCrew();
-        return { done: done, of: present.length };
-      };
-      const fullAll = host.querySelector('#perm-full-all'), askAll = host.querySelector('#perm-ask-all');
-      if (fullAll) ArmConfirm.wire(fullAll, {
-        armedLabel: 'SURE? EVERY AGENT, FULL POWER', restLabel: 'FULL POWER — WHOLE STATION', timeoutMs: 4000,
-        onArm: () => sfx('bad'),
-        onConfirm: () => {
-          const r = sweepApproval('full');
-          if (!r) return;
-          sfx('bad');
-          notify(r.done
-            ? r.done + ' agent' + (r.done === 1 ? '' : 's') + ' now have FULL POWER over the local computer without approval prompts'
-            : 'no crew to change — summon an agent first', r.done ? 'warn' : 'bad');
-        }
-      });
-      if (askAll) askAll.addEventListener('click', () => {
-        const r = sweepApproval('ask');
-        if (!r) return;
-        sfx('click');
-        notify(r.done
-          ? r.done + ' agent' + (r.done === 1 ? '' : 's') + ' will ask before risky moves again'
-          : 'no crew to change — summon an agent first', r.done ? 'good' : 'bad');
-      });
       // A SUMMON / DELETE while the panel sits open must refresh this list (a panel painted from the roster
       // owes a repaint hook — otherwise the pane offers a reach flip for an agent that no longer exists).
       repaintPermAgents = paintCrew;
@@ -7531,6 +9543,10 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       const paintBypass = (snap) => {
         if (!bypassWrap) return;
         bypassWrap.classList.toggle('on', !!(snap.loaded && (snap.masterBypass || snap.envFullAccess)));
+        // the override lives in the ADVANCED fold, but an ON override is never tucked away: the fold opens itself
+        // so the switch that is outranking every crew row is on screen next to the rows it outranks.
+        const advFold = bypassWrap.closest('details');
+        if (advFold && snap.loaded && (snap.masterBypass || snap.envFullAccess)) advFold.open = true;
         if (!snap.loaded) { bypassWrap.innerHTML = '<p class="perm-m-desc">The bypass switch is unavailable until the local permission service confirms it.</p>'; return; }
         // the card: title + live state chip · one description paragraph · the control on its OWN line ·
         // a hairline-separated floor note. The button never sits inside the prose (it read as part of
@@ -7584,8 +9600,6 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         // The glance sentence AND every crew row name the override state, so both must move WITH the
         // switch — a flip that repainted only the card left the rows claiming "ASKS" under an ON override.
         paintCrew();
-        if (permDesc) permDesc.textContent = pdesc(snap.level);
-        if (levelWrap) levelWrap.querySelectorAll('[data-level]').forEach(x => x.classList.toggle('sel', x.dataset.level === snap.level));
         if (permStatus) {
           if (snap.error) permStatus.textContent = '⚠ ' + snap.error + (snap.loaded ? ' — showing the last confirmed approvals; changes were not applied.' : ' — standing approvals could not be verified; no changes are available.');
           else permStatus.textContent = snap.loaded ? '' : 'checking standing approvals…';
@@ -7596,7 +9610,6 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         }
       };
       syncPerm = repaintPerm;
-      if (levelWrap) levelWrap.querySelectorAll('[data-level]').forEach(b => b.addEventListener('click', () => { Promise.resolve(PermissionsStore.setLevel(b.dataset.level)).then(() => { repaintPerm(); repaintDial(); }); sfx('click'); }));
       repaintPerm();
       if (PermissionsStore.refresh) Promise.resolve(PermissionsStore.refresh()).then(repaintPerm).catch(() => {});
     }
@@ -7641,17 +9654,92 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   // a recovery can never leave a stale red outage card on screen. transient (notification diet, 2026-08-18)
   // shows the toast but skips the persistent NOTIFICATIONS record — for one-tap confirmations of an action
   // the Commander just performed ("copied", "archived"): confirming NOW is useful, filing it in the bell as
-  // unread history is clutter. Everything else remains history.
+  // unread history is clutter.
+  // NOTIFICATIONS THAT MEAN SOMETHING (Andrew 10-02: "keep the notifications, but actually make it more useful
+  // instead of meaningless"): the bell keeps only what you'd want AFTER the moment — kind 'needs' (an agent is
+  // waiting on you), 'result' (work finished while you were elsewhere) and 'alert' (something stopped or broke).
+  // A caller opts in with opts.kind (or a category, which implies one); every other call is a toast and nothing
+  // more — the ~270 "✓ saved / pick a schedule first" confirmations never pile up as unread history again.
+  // opts.go = where the entry leads ({ ws } a session, or { term, section } a window) — every kept entry is a
+  // door, not a dead line. opts.key folds a repeat of the same condition into ONE entry, and settleNotifs(key)
+  // marks it handled when the wait ends (answered, run over), so NEEDS YOU never shows a question already gone.
+  const NOTIF_KIND_OF = { needsApproval: 'needs', runComplete: 'result', cronDigest: 'result' };
+  /* A desk approval / question waits on a run that lives with THIS page (a desk run dies with its socket). An entry raised
+     in an earlier page life (before a reload or a restart) can never be answered or settled any more, so it leaves NEEDS
+     YOU as handled instead of lighting the badge for good. Entries without a prompt (a question in a finished reply, a
+     loop result, an extension to approve) are re-judged by their own watchers. */
+  const NOTIF_LIFE = uid('life');
+  let notifLivesReaped = false;
+  function reapDeadPrompts() {
+    if (notifLivesReaped) return;
+    notifLivesReaped = true;
+    let n = 0;
+    store.notifs.forEach(r => { if (r && r.kind === 'needs' && !r.done && r.prompt && r.life !== NOTIF_LIFE) { r.done = true; r.read = true; n++; } });
+    if (n) save();
+  }
+  // the keys of entries still waiting on you (a watcher settles the ones whose wait it knows is over)
+  function waitingNotifKeys(prefix) {
+    return store.notifs.filter(r => r && r.kind === 'needs' && !r.done && r.key && (!prefix || r.key.indexOf(prefix) === 0)).map(r => r.key);
+  }
   function notify(text, cls, category, opts) {
     const pref = notifyPrefOf(category);
     if (!pref.show) return;   // this category is muted — honored here, at the real emit point (not decorative)
-    if (!(opts && opts.transient)) {
-      store.notifs.push({ id: uid('n'), t: Date.now(), txt: String(text || ''), cls: cls || '', read: false });
+    const kind = (opts && opts.kind) || NOTIF_KIND_OF[category] || '';
+    const go = (opts && opts.go) || null;
+    let rec = null;
+    if (kind && !(opts && opts.transient)) {
+      const key = (opts && opts.key) || '';
+      if (key) store.notifs = store.notifs.filter(n => !(n.key === key && !n.done));   // one entry per live condition
+      // the same ask filed again is still waiting (after a reload, reapDeadPrompts marks the earlier life's entry handled,
+      // then the snapshot re-files the background worker's ask it belongs to): the stale entry goes, so one ask never reads
+      // both Handled and Waiting on you
+      if (opts && opts.prompt) store.notifs = store.notifs.filter(n => !(n.done && n.kind === 'needs' && n.prompt === String(opts.prompt)));
+      rec = { id: uid('n'), t: Date.now(), txt: String(text || ''), cls: cls || '', read: false, kind };
+      if (go) rec.go = go;
+      if (key) rec.key = key;
+      if (opts && opts.prompt) { rec.prompt = String(opts.prompt); rec.life = NOTIF_LIFE; }
+      store.notifs.push(rec);
       if (store.notifs.length > 60) store.notifs = store.notifs.slice(-60);
       save(); badges();
       if (open.notifs) rerender('notifs');
     }
-    toast(String(text || ''), cls || '', pref.sound, opts);
+    // quiet: re-file the bell entry without a toast or sound — the same wait, still waiting (answering one of two asks
+    // used to re-pop and chime the one you had not touched)
+    if (opts && opts.quiet && rec) return;
+    let tOpts = opts;
+    if (go && !(opts && opts.onClick)) tOpts = Object.assign({}, opts, { onClick: () => openNotif(rec, go) });
+    // opts.silent: a receipt for a press the user JUST made (a model/effort pick) — the press already sounded, a bell on top is noise
+    toast(String(text || ''), cls || '', (opts && opts.silent) ? false : pref.sound, tOpts);
+  }
+  function goToNotif(go) {
+    if (!go) return false;
+    if (go.ws && typeof Workstreams !== 'undefined' && Workstreams.get && !Workstreams.get(go.ws)) { toast('that session was deleted', 'warn'); return false; }   // the bell stays: it opened nothing
+    if (go.ws && typeof App !== 'undefined' && App.openWorkstream) { App.openWorkstream(go.ws); if (open.notifs) workConversation('notifs'); return true; }   // the session is the point: step the bell aside, keep a way back
+    if (go.term) { openTerm(go.term, go.section); return true; }
+    return false;
+  }
+  function openNotif(rec, go) {
+    if (rec && !rec.read) { rec.read = true; save(); badges(); if (open.notifs) rerender('notifs'); }
+    return goToNotif(go || (rec && rec.go));
+  }
+  // The wait is over (answered, denied, the run ended): the entry stays in the history as handled, leaves NEEDS YOU.
+  function settleNotifs(key) {
+    if (!key) return;
+    let n = 0;
+    store.notifs.forEach(r => { if (r.key === key && !r.done) { r.done = true; r.read = true; n++; } });
+    if (n) { save(); badges(); if (open.notifs) rerender('notifs'); }
+  }
+  // Opening a session reads everything that pointed at it (the notification WAS the session; you're in it now). A question
+  // its finished reply asked you (a stored wait with no prompt behind it) waited for exactly this — you came to read it — so
+  // it settles too, and leaves NEEDS YOU (org P01); an approval or a live question (a prompt) waits on until it is answered.
+  function seenSession(wsId) {
+    if (!wsId) return;
+    let n = 0;
+    store.notifs.forEach(r => {
+      if (!r.read && r.go && r.go.ws === wsId) { r.read = true; n++; }
+      if (r.kind === 'needs' && !r.done && !r.prompt && r.go && r.go.ws === wsId) { r.done = true; r.read = true; r.opened = true; n++; }
+    });
+    if (n) { save(); badges(); if (open.notifs) rerender('notifs'); }
   }
   // A caller that leads with an ALL-CAPS token + colon ("MODEL: gpt / high") is naming a READOUT,
   // not writing a sentence — that prefix becomes the card's engraved label and the rest becomes the
@@ -7680,6 +9768,16 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
      SIZE flip dispatches a synthetic resize, so that path is covered too).
      Fail open, never closed: a screen that isn't the station — or a frame mid-boot — leaves the
      CSS fallbacks alone rather than seating the rack against a degenerate rect. */
+  /* WHERE A DOCK MENU'S TOP WILL REST (review of rc walk #29): its pop-in (panelchrome pc-menu-in) starts 5px low and a hair
+     small, so the first rect overstates the top and a raised toast overlapped the opening menu by ~2px until animationend.
+     The menu's LAYOUT box ignores transforms: offsetTop against its positioned dock group, scaled by that group's own
+     visual/local ratio (so the text-size zoom is never guessed). Falls back to the painted rect when the layout can't be read. */
+  function menuRestTop(menu, mr) {
+    const g = menu && menu.offsetParent;
+    const gr = g && g.getBoundingClientRect ? g.getBoundingClientRect() : null;
+    if (!gr || !(gr.height > 0) || !(g.offsetHeight > 0) || typeof menu.offsetTop !== 'number') return mr.top;
+    return Math.min(mr.top, gr.top + menu.offsetTop * (gr.height / g.offsetHeight));
+  }
   function seatToastRack(stack) {
     if (!stack || typeof document === 'undefined') return;
     const game = document.getElementById('screen-game');
@@ -7703,13 +9801,22 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       ? coach.getBoundingClientRect() : null;
     let floor = window.innerHeight - stage.bottom;
     if (cr && cr.height > 0) floor = Math.max(floor, window.innerHeight - cr.top + 6);
+    /* AN OPEN DOCK MENU IS NEVER COVERED (rc walk #29: an approval toast landed on the open BUILD menu, over CONNECT / NEW APP).
+       The rack stacks above a dock popover that reaches into its column, the way it stacks above the coach; navdock re-seats
+       it when a menu opens or closes. */
+    const rackW = Math.min(356, cap > 0 ? cap : 356) * z;   // the rack's own column, visual px (its CSS width cap, #toast-stack)
+    document.querySelectorAll('#bottombar .bb-group.open .bb-menu').forEach(menu => {
+      const mr = menu.getBoundingClientRect ? menu.getBoundingClientRect() : null;
+      if (mr && mr.height > 0 && mr.left < bar.left + rackW && mr.right > bar.left) floor = Math.max(floor, window.innerHeight - menuRestTop(menu, mr) + 6);
+    });
     stack.style.setProperty('--toast-x', (bar.left / z) + 'px');
     stack.style.setProperty('--toast-b', (floor / z) + 'px');
     if (cap > 0) stack.style.setProperty('--toast-cap', cap + 'px');
   }
   // a card that is already up must follow the cabinet too — its seat is measured, not declarative,
   // so the resize path re-runs it (a TEXT SIZE flip dispatches a synthetic resize, so that is covered).
-  function reseatToasts() { try { seatToastRack(document.getElementById('toast-stack')); } catch (_) {} }
+  // an empty rack is invisible and is seated again when its next card is emitted: no layout read for a menu click with no card up
+  function reseatToasts() { try { const st = document.getElementById('toast-stack'); if (st && st.childElementCount) seatToastRack(st); } catch (_) {} }
   // transient on-screen toast — a station readout card that seats in, holds for its dwell, then leaves.
   // The persistent record still lives in the NOTIFICATIONS panel (buildNotifs); this is the
   // ephemeral heads-up so a result isn't silent when that panel is closed.
@@ -7721,10 +9828,14 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     let stack = document.getElementById('toast-stack');
     if (!stack) { stack = mkEl('div'); stack.id = 'toast-stack'; document.body.appendChild(stack); }
     const toastKey = String((opts && opts.key) || '').slice(0, 120);
+    // ONE CARD PER KEY, UPDATED IN PLACE (live walk 10-14: four quick effort presses stacked four MODEL cards over the CREW
+    // column). The replacement takes the prior card's seat without the slide-in, so a keyed readout reads as one card
+    // whose value changed; its text still decodes and its dwell starts over.
+    let swapSeat = null, swapped = false;
     if (toastKey) {
       // Avoid selector escaping entirely: keys may contain channel instance punctuation.
       const prior = Array.prototype.find.call(stack.children, n => n.dataset && n.dataset.toastKey === toastKey);
-      if (prior) { prior._killed = true; prior.remove(); }
+      if (prior) { swapped = !prior._killed; swapSeat = prior.nextSibling; prior._killed = true; prior.remove(); }
     }
     seatToastRack(stack);   // re-read the cabinet before the card is visible — a rail drag or a breakpoint may have moved the seam
     const sev = severityOf(cls);
@@ -7735,7 +9846,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     const hasAction = !!(opts && typeof opts.onClick === 'function');
     const dwell = hasAction ? 10000 : sev === 'bad' ? 6500 : 4200;
     const cut = splitToastLabel(text);
-    const t = mkEl('div', 'toast' + (cls ? ' ' + cls : '') + ' sev-' + sev + (cut.label ? ' labeled' : ''));
+    const t = mkEl('div', 'toast' + (cls ? ' ' + cls : '') + ' sev-' + sev + (cut.label ? ' labeled' : '') + (swapped ? ' swap' : ''));
     if (toastKey) t.dataset.toastKey = toastKey;
     // The dwell rail drains over exactly `dwell` — the card SHOWS how long it has left rather than
     // vanishing without warning; --dwell is read by the CSS animation so the two can never disagree.
@@ -7750,7 +9861,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       '</div>' +
       '<span class="toast-ts">' + clock(Date.now()) + '</span>' +
       '<span class="toast-dwell" aria-hidden="true"></span>';
-    stack.appendChild(t);
+    if (swapSeat && swapSeat.parentNode === stack) stack.insertBefore(t, swapSeat); else stack.appendChild(t);
     // ASCII-motion (asciifx.js): the toast message DECODES out of glyph-static as it slides in — the same
     // signal-resolving language as the window titles. Short (toasts are frequent); reduced-motion no-op.
     try { if (typeof AsciiFX !== 'undefined') AsciiFX.scramble(t.querySelector('.toast-txt'), { duration: 420 }); } catch (_) {}
@@ -7777,43 +9888,161 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     else body.innerHTML = '<div class="fb-empty">UPDATE CENTER UNAVAILABLE.<br><span>Restart the desktop app and try again.</span></div>';
   }
   let notifView = 'all';
+  // Entries from before 10-02 carry no kind: they were the toast-shaped confirmations the bell no longer keeps.
+  function pruneLegacyNotifs() {
+    const before = store.notifs.length;
+    store.notifs = store.notifs.filter(n => n && n.kind);
+    if (store.notifs.length !== before) save();
+  }
+  const isWaiting = n => n.kind === 'needs' && !n.done;
+  /* ONE NEEDS YOU (org P01): NOTIFICATIONS › NEEDS YOU renders the rail's live list (needsyou.js NeedsYou.items — every ask,
+     approval, STEP-IN, extension, build decision, quest confirmation, loop review and failure, each read from its own
+     source), so its count, Dismiss and OPEN are the rail's. A stored entry whose wait a live row already shows (an
+     approval or question by its prompt, STEP-IN, extensions, loop reviews) is not listed or counted twice; every other
+     stored wait (a finished reply that asked a question) is itself a row of that list (storedWaits below) until it
+     settles. So no wait is ever in the history below while it waits, and each is counted on the bell once. */
+  const liveNeeds = () => (typeof NeedsYou !== 'undefined' && NeedsYou.items) ? NeedsYou : null;
+  const liveCovered = n => isWaiting(n) && !!(n.prompt || n.key === 'extensions-pending' || n.key === 'loops-review' || /^stepin-/.test(String(n.key || '')));
+  const shownInHistory = n => !isWaiting(n);
+  // the stored waits no live source covers, for NeedsYou to list (copies: the list never edits the record)
+  function storedWaits() {
+    let backfilled = false;
+    const out = store.notifs.filter(n => n && isWaiting(n) && !liveCovered(n)).map(n => {
+      if (!n.id) { n.id = uid('n'); backfilled = true; }
+      return { id: n.id, t: n.t, txt: n.txt, cls: n.cls || '', key: n.key || '', go: n.go ? Object.assign({}, n.go) : null };
+    });
+    if (backfilled) save();
+    return out;
+  }
+  // a stored wait settled from NEEDS YOU: its conversation was opened there, or it had none and was dismissed. The entry
+  // stays in the history as one that asked you (never "Handled": nobody answered it).
+  function settleStoredWait(id) {
+    const r = id ? store.notifs.find(x => x && x.id === String(id) && isWaiting(x) && !liveCovered(x)) : null;
+    if (!r) return false;
+    r.done = true; r.read = true; r.opened = true;
+    save(); badges(); if (open.notifs) rerender('notifs');
+    return true;
+  }
   function buildNotifs(body) {
+    pruneLegacyNotifs();
+    reapDeadPrompts();
     let backfilled = false;
     store.notifs.forEach(n => { if (!n.id) { n.id = uid('n'); backfilled = true; } });
     if (backfilled) save();
-    const unread = store.notifs.filter(n => !n.read).length;
-    const rows = store.notifs.slice().reverse().filter(n => notifView !== 'unread' || !n.read);
-    body.innerHTML = '<header class="utility-head"><h2>Station updates</h2><p>Run results, saved outputs, and updates from your crew.</p></header>' +
+    // NEEDS YOU first (an agent is waiting on you — stays until it's answered or the run ends), then everything
+    // that finished or went wrong, newest first. Every entry with a destination is a door: click = go there.
+    const NY = liveNeeds();
+    const live = NY ? NY.items() : [];
+    const waiting = NY ? [] : store.notifs.filter(isWaiting).reverse();   // (no live list on this page: the stored entries)
+    const nWaiting = NY ? live.length : waiting.length;
+    const rest = store.notifs.filter(shownInHistory);
+    const unread = rest.filter(n => !n.read).length;
+    const rows = rest.slice().reverse().filter(n => notifView !== 'unread' || !n.read);
+    const row = (n, i) => {
+      const sev = severityOf(n.cls);
+      const door = !!(n.go && (n.go.ws || n.go.term));
+      /* a stored wait under the NEEDS YOU heading (no live list on this page) is tagged NEEDS YOU. In the history every wait
+         is over: answered / its run ended (Handled), or a question you went and read without answering — its conversation
+         opened, or dismissed with no conversation left — which says what it was: the agent asked you */
+      const tag = n.kind === 'needs' ? (!n.done ? 'NEEDS YOU' : n.opened ? 'Asked you' : 'Handled') : (n.kind === 'result' ? 'Finished' : 'Alert');
+      return '<div class="nf ' + esc(n.cls || '') + ' sev-' + sev + ' nf-k-' + esc(n.kind || 'alert') + (n.read ? ' read' : '') + (door ? ' nf-door' : '') + '" style="--ci:' + i + '" data-nid="' + esc(n.id) + '"' +
+        (door ? ' role="button" tabindex="0" title="Open where this happened"' : '') + '>' +
+        '<span class="nf-sev" aria-hidden="true">' + esc(SEV_GLYPH[sev]) + '</span>' +
+        '<div class="nf-copy"><div class="nf-meta"><span class="nf-kind">' + tag + '</span><span class="nf-ts">' + notifStamp(n.t) + '</span>' +
+        (!n.read ? '<span class="nf-unread">New</span>' : '') + '</div><span class="nf-txt">' + esc(n.txt) + '</span>' +
+        (door ? '<span class="nf-go">OPEN ▸</span>' : '') + '</div>' +
+        '<button class="nf-x" data-nid="' + esc(n.id) + '" title="Dismiss notification" aria-label="Dismiss ' + esc(n.txt) + '">✕</button></div>';
+    };
+    // a live NEEDS YOU row: the rail's own line, its OPEN, and Dismiss only where the rail has one (failed work). Its lamp
+    // tells the kinds apart as the stored entries did: STEP-IN and a build decision gold ★, a quest said done and loop results
+    // to review ✓, failed work ✗, an approval / question / extension ⚠
+    const LIVE_SEV = { stepin: 'gold', build: 'gold', attest: 'good', loop: 'good', failed: 'bad', routine: 'bad' };
+    const liveRow = (it, i) => {
+      // (a stored wait whose conversation is gone has no door: no OPEN, only its Dismiss)
+      const dis = NY.canDismiss(it), sev = LIVE_SEV[it.kind] || 'warn', door = !it.noDoor;
+      const line = (it.who ? it.who + ' ' : '') + NY.lineOf(it);
+      return '<div class="nf ' + sev + ' sev-' + sev + ' nf-k-needs' + (door ? ' nf-door' : '') + ' nf-live" style="--ci:' + i + '" data-ny-key="' + esc(it.key) + '"' + (door ? ' role="button" tabindex="0" data-tip="Open where this waits"' : '') + '>' +
+        '<span class="nf-sev" aria-hidden="true">' + esc(SEV_GLYPH[sev]) + '</span>' +
+        // the tag says WHERE it waits (every row here is under the NEEDS YOU heading: repeating that told nothing), and the
+        // line is who + what. A wait with no time (extensions: the sidecar's pending list carries none) shows no stamp.
+        '<div class="nf-copy"><div class="nf-meta"><span class="nf-kind">in ' + esc(it.where) + '</span>' + (it.since ? '<span class="nf-ts">' + notifStamp(it.since) + '</span>' : '') + '</div>' +
+        '<span class="nf-txt">' + esc(line) + '</span>' + (door ? '<span class="nf-go">OPEN ▸</span>' : '') + '</div>' +
+        (dis ? '<button class="nf-x" data-ny-dismiss="' + esc(it.key) + '" data-tip="Dismiss: it leaves NEEDS YOU here and on the rail" aria-label="Dismiss ' + esc(line) + '">✕</button>' : '') + '</div>';
+    };
+    const needsRows = NY ? live.map(liveRow) : waiting.map(row);
+    const needsHtml = needsRows.length ? '<section class="nf-needs"><h4 class="ms-h">NEEDS YOU <span class="dim">— ' + needsRows.length + ' waiting</span></h4><div class="nf-list nf-list-needs">' + needsRows.join('') + '</div></section>' : '';
+    body.innerHTML = '<header class="utility-head"><h2>Notifications</h2><p>What needs you, and what finished or went wrong while you were elsewhere. Click one to go there.</p></header>' +
+      needsHtml +
       '<div class="nf-toolbar"><div class="utility-tabs" role="group" aria-label="Show notifications">' +
-      '<button type="button" data-nf-view="all" aria-pressed="' + (notifView === 'all') + '">All · ' + store.notifs.length + '</button>' +
-      '<button type="button" data-nf-view="unread" aria-pressed="' + (notifView === 'unread') + '">Unread · ' + unread + '</button></div>' +
+      // the counts include NEEDS YOU (shown above, in both views): "New" is the bell badge's own number, never fewer than the
+      // rows on screen (self-driving lane 5 — it read "All · 0" with waiting rows listed, and New disagreed with the bell)
+      '<button type="button" data-nf-view="all" aria-pressed="' + (notifView === 'all') + '">All · ' + (rest.length + nWaiting) + '</button>' +
+      '<button type="button" data-nf-view="unread" aria-pressed="' + (notifView === 'unread') + '">New · ' + (unread + nWaiting) + '</button></div>' +
       '<button class="bb sm" id="nf-clear"' + (!unread ? ' disabled' : '') + '>MARK ALL READ</button></div>' +
-      '<div class="nf-list">' + (rows.length ? rows.map((n, i) => {
-        const sev = severityOf(n.cls);
-        return '<div class="nf ' + esc(n.cls || '') + ' sev-' + sev + (n.read ? ' read' : '') + '" style="--ci:' + i + '">' +
-          '<span class="nf-sev" aria-hidden="true">' + esc(SEV_GLYPH[sev]) + '</span>' +
-          '<div class="nf-copy"><div class="nf-meta"><span class="nf-ts">' + notifStamp(n.t) + '</span>' +
-          (!n.read ? '<span class="nf-unread">Unread</span>' : '') + '</div><span class="nf-txt">' + esc(n.txt) + '</span></div>' +
-          '<button class="nf-x" data-nid="' + esc(n.id) + '" title="Dismiss notification" aria-label="Dismiss ' + esc(n.txt) + '">✕</button></div>';
-      }).join('') : '<div class="empty-state"><span class="es-glyph">▮</span><b>' + (notifView === 'unread' ? 'You’re all caught up' : 'No notifications yet') + '</b><span>' + (notifView === 'unread' ? 'Switch to All to see earlier updates.' : 'Updates appear here as you use the station.') + '</span></div>') + '</div>';
+      '<div class="nf-list">' + (rows.length ? rows.map(row).join('') : '<div class="empty-state"><span class="es-glyph" aria-hidden="true"><svg viewBox="0 0 16 16" focusable="false"><path d="M4 11V7a4 4 0 0 1 8 0v4l1.5 1.5h-11zM6.5 14.5h3"/></svg></span><b>' + (notifView === 'unread' ? 'You’re all caught up' : 'Nothing yet') + '</b><span>' + (notifView === 'unread' ? 'Switch to All to see earlier ones.' : 'When an agent needs your OK, or work finishes while you’re elsewhere, it lands here.') + '</span></div>') + '</div>';
     body.querySelectorAll('[data-nf-view]').forEach(b => b.addEventListener('click', () => {
       notifView = b.dataset.nfView; buildNotifs(body);
       const selected = body.querySelector('[data-nf-view="' + notifView + '"]'); if (selected) selected.focus();
     }));
     body.querySelector('#nf-clear').addEventListener('click', () => {
-      store.notifs.forEach(n => n.read = true); save(); rerender('notifs'); badges(); sfx('click');
+      store.notifs.forEach(n => { if (!isWaiting(n)) n.read = true; }); save(); rerender('notifs'); badges(); sfx('click');
     });
-    // Records carry no destination; do not imply an unsupported click-through.
-    body.querySelectorAll('.nf-x').forEach(b => b.addEventListener('click', ev => {
+    body.querySelectorAll('.nf.nf-live.nf-door').forEach(el => {
+      // a session door (a conversation, or a build's own keep/discard session) steps NOTIFICATIONS aside with a way back (as a
+      // stored entry's go.ws does); a window door (STEP-IN, EXTENSIONS, QUESTS, GOAL LOOPS, and DELIVERABLES for a build whose
+      // session cannot be had) only opens its window and keeps the focus there (as go.term does)
+      const go = () => { sfx('click'); const did = NY && NY.openKey(el.dataset.nyKey); if (did && did.conversation && open.notifs) workConversation('notifs'); };
+      el.addEventListener('click', go);
+      el.addEventListener('keydown', ev => { if (ev.target === el && (ev.key === 'Enter' || ev.key === ' ')) { ev.preventDefault(); go(); } });
+    });
+    body.querySelectorAll('[data-ny-dismiss]').forEach(b => b.addEventListener('click', ev => {
+      ev.stopPropagation();
+      if (NY && NY.dismissKey(b.dataset.nyDismiss)) { badges(); rerender('notifs'); sfx('click'); }
+    }));
+    body.querySelectorAll('.nf.nf-door:not(.nf-live)').forEach(el => {
+      const go = () => { const n = store.notifs.find(x => x.id === el.dataset.nid); if (n) { sfx('click'); openNotif(n); } };
+      el.addEventListener('click', go);
+      el.addEventListener('keydown', ev => { if (ev.target === el && (ev.key === 'Enter' || ev.key === ' ')) { ev.preventDefault(); go(); } });
+    });
+    body.querySelectorAll('.nf-x[data-nid]').forEach(b => b.addEventListener('click', ev => {
       ev.stopPropagation();
       store.notifs = store.notifs.filter(x => x.id !== b.dataset.nid);
       save(); badges(); rerender('notifs'); sfx('click');
     }));
   }
+  // The bell counts what's worth looking at: everyone still waiting on you + anything new that finished or broke.
+  /* NOTIFICATIONS FROM CHAT (station.control notifications.read / notifications.clear, 2026-10-05): the MARK ALL READ and
+     CLEAR NOTIFICATIONS keys' own effect — except that an agent can NEVER read or clear a NEEDS YOU entry, so an agent can
+     never hide the approval it is waiting on. `saved` is the localStorage write's own answer, never assumed. */
+  function notifsMarkRead() {
+    let marked = 0;
+    store.notifs.forEach(n => { if (!isWaiting(n) && !n.read) { n.read = true; marked++; } });
+    const saved = save(); rerender('notifs'); badges();
+    return { marked, waiting: liveWaitingCount(), saved };
+  }
+  function notifsClear() {
+    const keep = store.notifs.filter(isWaiting), cleared = store.notifs.length - keep.length;
+    store.notifs = keep;
+    const saved = save(); badges(); rerender('notifs');
+    return { cleared, waiting: liveWaitingCount(), saved };
+  }
+  // what is waiting on the Commander right now: the NEEDS YOU list (its stored waits are rows of it), else, on a page
+  // without the live list, the stored entries
+  function liveWaitingCount() {
+    const NY = liveNeeds();
+    return NY ? NY.items().length : store.notifs.filter(isWaiting).length;
+  }
+  let lastLiveShape = null;
+  // The bell counts unread finished/alert entries AND adds the NEEDS YOU count — never one in place of the other. With the
+  // live list every wait is one of its rows (a stored one too), so a stored wait is counted there, once.
   function badges() {
-    const n = store.notifs.filter(x => !x.read).length;
+    reapDeadPrompts();
+    const NY = liveNeeds();
+    const n = store.notifs.filter(x => x && x.kind && !(NY && isWaiting(x)) && (isWaiting(x) || !x.read)).length + (NY ? NY.items().length : 0);
+    // the open NOTIFICATIONS window follows the live list (an ask answered on the rail, a STEP-IN handed back)
+    if (NY && NY.listShape) { const sh = NY.listShape(); if (lastLiveShape !== null && sh !== lastLiveShape && open.notifs) rerender('notifs'); lastLiveShape = sh; }
     const b = $('#nf-badge');
-    if (b) { b.textContent = n || ''; b.style.display = n ? 'inline-block' : 'none'; }
+    if (b) { const t = n ? String(n) : ''; if (b.textContent !== t) b.textContent = t; const d = n ? 'inline-block' : 'none'; if (b.style.display !== d) b.style.display = d; }
   }
 
   /* ============== periodic + save dot ============== */
@@ -7825,7 +10054,10 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     if (typeof CtxGauge === 'undefined') return;
     const cs = access.context ? access.context() : ((typeof Harness !== 'undefined' && Harness.contextState) ? Harness.contextState() : null);
     if (!cs) return;
-    const s = CtxGauge.compute(cs.used, cs.limit, { measured: cs.measured !== false, projected: !!cs.projected });
+    // measured against the window a RUN works in (cs.runWindow: the model's window stopped at a long-context price tier,
+    // final-polish 10-23), the one a run folds in, as /compress does; never the 1M a 200k-tier run folds inside
+    const tier = cs.runWindow > 0 && cs.limit > 0 && cs.runWindow < cs.limit;
+    const s = CtxGauge.compute(cs.used, tier ? cs.runWindow : cs.limit, { measured: cs.measured !== false, projected: !!cs.projected });
     g.dataset.level = s.level;
     // ASCII cell bar (asciifx.js): the gauge ticks in whole ▮/▯ cells instead of sliding — deliberate,
     // chunky, CRT-honest. Same real numbers (CtxGauge.compute), only the presentation is quantized;
@@ -7839,6 +10071,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       // window meant one notch per 20k tokens — the bar sat on one cell from 5% to 14% and read as stuck.
       // Driven off s.frac, not the rounded s.pct, so the extra resolution is real and not re-quantised.
       const frac = s.known ? s.frac : 0;
+      g.style.setProperty('--ctx-fill', String(Math.max(0, Math.min(1, +frac || 0))));   // cabinet-clean.css draws the cells as one thin bar
       const b = (typeof AsciiFX !== 'undefined' && AsciiFX.barCells)
         ? AsciiFX.barCells(frac, N)
         : { full: 0, half: false, off: N };
@@ -7876,7 +10109,10 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
          (s.projected
            ? ', estimated for this chat’s next message from a real measurement of this model. It becomes exact the moment the agent replies.'
            : ', measured on this chat’s last request.') +
-         ' How much of this conversation the model can still hold; when it fills, older turns are folded into a summary automatically.')
+         (tier
+           ? ' The model can hold ' + CtxGauge.fmtTokens(cs.limit) + ', but it bills a higher rate for a prompt over ' + CtxGauge.fmtTokens(cs.runWindow) + ' tokens, so a run works in ' + CtxGauge.fmtTokens(cs.runWindow) + '.'
+           : '') +
+         ' How much of this conversation a run can still hold; when it nears full, older turns are folded into a summary automatically.')
       : (s.limit ? 'measuring… send a message and this fills in' : 'measuring this model’s memory size…'));
     // This runs every second. Writing `title` here would recreate the OS tooltip after Tooltip.adopt()
     // removed it, while the pointer was already resting on the gauge (no second pointerover to re-adopt).
@@ -7959,22 +10195,99 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   // flip the dot to a distinct amber/warn state + explain it in the title. NO new window, NO nag — just
   // an honest dot state. Never asserts durability the harness can't prove (truthful-telemetry law).
   let degradedNotified = false;   // ONE persistent notice per session for the degraded workspace (the dot carries the ongoing state)
+  let seededNotified = false;     // bug 5c019483: ONE notice when this window's copy re-seeded a missing station file
+  // PRESERVED SESSIONS AT BOOT (support report 2026-10-21): a window's refused save stays on the station after that window
+  // is gone. When the newest one still holds sessions this station lacks (the sidecar counts them), say so once and
+  // offer to bring them back. Nothing shows when the station cannot say, or when nothing would come back.
+  // NOT NOW STICKS (review 10-23 #3a, r2 #6): a watermark, the newest dismissed copy's time, kept in this page's UI store.
+  // No copy saved at or before it is offered again (an OLDER copy holding the very sessions just declined included); a copy
+  // written after it (a newer one, or the same file written again) is.
+  function dismissedPreservedAt() { const t = Number(store && store.preservedDismissedAt); return Number.isFinite(t) && t > 0 ? t : 0; }
+  function dismissPreserved(offer) {
+    store.preservedDismissedAt = Math.max(dismissedPreservedAt(), Math.floor(Number(offer.savedAt) || 0));
+    save();
+  }
+  // the station reads preserved copies under a time budget and says `more` when it stopped before finding one: ask again
+  // (a short pause between asks keeps the station free), until it finds one or has read them all
+  const preservedPause = ms => new Promise(r => (typeof setTimeout === 'function' ? setTimeout(r, ms) : r()));
+  async function offerPreservedSaves() {
+    if (typeof CloudSave === 'undefined' || !CloudSave.conflicts || document.getElementById('save-conflict-notice')) return;
+    let offer = null;
+    for (let ask = 0; ask < 25 && !offer; ask++) {
+      if (ask) await preservedPause(800);
+      const list = await CloudSave.conflicts(dismissedPreservedAt());
+      offer = list.find(c => c && c.file && Number(c.restorable) > 0) || null;
+      if (!list.more) break;
+    }
+    // a live conflict is offered on its own banner (Restore this window's sessions), even before that banner is drawn
+    const live = (() => { try { const h = CloudSave.health && CloudSave.health(); return !!(h && h.conflict); } catch (_) { return false; } })();
+    if (!offer || live || document.getElementById('save-conflict-notice') || document.getElementById('save-preserved-notice')) return;
+    const n = Number(offer.restorable);
+    const when = offer.savedAt ? new Date(offer.savedAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }) : 'earlier';
+    const banner = document.createElement('div'); banner.id = 'save-preserved-notice'; banner.setAttribute('role', 'alert');
+    banner.style.cssText = 'position:fixed;top:8px;left:10%;right:10%;z-index:100000;padding:16px;background:#281e12;color:#fff;border:2px solid #e8b35c';
+    const label = document.createElement('p');
+    label.textContent = 'A window’s save preserved on the station (' + when + ') holds work in ' + n + (n === 1 ? ' session' : ' sessions') + ' that this station doesn’t have. Restoring brings it into the station; nothing in the station is removed, and the station file is copied aside first.';
+    const restore = document.createElement('button'); restore.className = 'bb'; restore.textContent = 'Restore ' + n + (n === 1 ? ' session' : ' sessions');
+    restore.onclick = async () => { restore.disabled = true; try { await CloudSave.restoreConflict(offer.file); } catch (e) { label.textContent = e.message; restore.disabled = false; } };
+    const later = document.createElement('button'); later.className = 'bb'; later.textContent = 'Not now'; later.onclick = () => { dismissPreserved(offer); banner.remove(); };
+    banner.append(label, restore, later); document.body.append(banner);
+  }
+  /* WHY the newest save is not in the station file, from the cause CloudSave recorded for the last failed attempt
+     (CloudSaveCore.causeOf: what the station answered, or that it did not answer). The disk is named ONLY when the station
+     said ENOSPC (diskFull) or EPERM/EACCES (diskDenied) — every failure streak used to read "check disk space / folder
+     permissions" on machines with plenty of disk (10-26 audit, gh#121). */
+  function saveCauseWords(h) {
+    // one table (CloudSaveCore.describeCause), shared with the update drain's words
+    return (typeof CloudSaveCore !== 'undefined' && CloudSaveCore.describeCause) ? CloudSaveCore.describeCause(h && h.cause) : 'the station file has not confirmed it';
+  }
   function refreshSaveDurability(d) {
     d = d || $('#save-dot'); if (!d) return;
     let h = null;
     try { h = (typeof CloudSave !== 'undefined' && CloudSave.health) ? CloudSave.health() : null; } catch (_) { h = null; }
     d.classList.remove('stale', 'degraded');
+    if (h && h.seeded && !seededNotified) {
+      seededNotified = true;
+      try { notify('The station file on this computer was missing, so this window’s copy of your station was saved back to it.', 'warn'); } catch (_) {}
+    }
     if (h && h.conflict) {
       d.classList.add('degraded');
-      d.title = 'Another window saved newer station changes. Your work from this window was preserved separately on the station. Download a copy or reload the current station.';
+      // a reset refusal is NOT another window: this computer's station was erased or started fresh after the station this
+      // window holds was founded, so the station file stays empty and this window's copy was only set aside
+      const reset = h.conflict.reset === true;
+      // a re-seed refusal is not "newer" either: the station file went missing and ANOTHER window's copy was saved back
+      // first; which of the two copies holds more work is unknown, so neither is called newer
+      const reseeded = !reset && h.conflict.reseeded === true;
+      // this window's OWN copy re-seeded the missing station file and is still the station's newest save, but its
+      // acknowledgement never arrived, so its later saves are behind its own write (review 10-23 #6): never blamed on another
+      // window. Said without naming a cause the page cannot see (r2, proofE: no restart is implied)
+      const ownSeed = !reset && !reseeded && h.conflict.ownSeed === true;
+      // a copy from before this computer's station was reset, while the station is from after it: erased work, which the
+      // station refuses to restore, so no Restore key is offered (review 10-23 #5)
+      const erased = !reset && h.conflict.predatesReset === true;
+      d.title = reset
+        ? 'This computer’s station was reset (erased, or set aside for a fresh start) after the station in this window was founded, so it was not restored. This window’s copy was kept separately on the station. Download a copy or open the fresh station.'
+        : erased
+        ? 'This window holds a station from before this computer’s station was reset, so its changes were not saved into the current station. This window’s copy was kept separately on the station. Download a copy or reload the current station.'
+        : reseeded
+        ? 'The station file on this computer was missing, and another window’s copy of this station was saved back to it first. This window’s copy was kept separately on the station. Download a copy or reload the current station.'
+        : ownSeed
+        ? 'The station file on this computer was missing, and this window’s copy was saved back to it, but this window never heard back that it was. This window’s later changes were kept separately on the station. Download a copy or reload the current station.'
+        : 'Another window saved newer station changes. Your work from this window was preserved separately on the station. Download a copy or reload the current station.';
       if (!document.getElementById('save-conflict-notice')) {
         const banner = document.createElement('div'); banner.id = 'save-conflict-notice'; banner.setAttribute('role', 'alert');
         banner.style.cssText = 'position:fixed;top:8px;left:10%;right:10%;z-index:100000;padding:16px;background:#281e12;color:#fff;border:2px solid #e8b35c';
         const label = document.createElement('p'); label.textContent = d.title;
         const exportButton = document.createElement('button'); exportButton.className = 'bb'; exportButton.textContent = 'Download this window’s save';
         exportButton.onclick = () => { const blob = new Blob([JSON.stringify(CloudSave.localSnapshot() || {})], { type: 'application/json' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'starnet-conflicting-save.json'; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); };
-        const reload = document.createElement('button'); reload.className = 'bb'; reload.textContent = 'Reload current station'; reload.onclick = async () => { try { await CloudSave.reloadCurrent(); } catch (e) { label.textContent = e.message; } };
-        banner.append(label, exportButton, reload); document.body.append(banner);
+        const reload = document.createElement('button'); reload.className = 'bb'; reload.textContent = reset ? 'Open the fresh station' : 'Reload current station'; reload.onclick = async () => { try { await CloudSave.reloadCurrent(); } catch (e) { label.textContent = e.message; } };
+        // the preserved copy's sessions go INTO the station (added, never removing any), then this window reloads onto it
+        // never after a RESET, and never for erased work: the station was erased on purpose, and this copy is from before it
+        // (the station refuses that restore, so the key is never shown for it)
+        const file = h.conflict.recovery;
+        const restore = document.createElement('button'); restore.className = 'bb'; restore.textContent = 'Restore this window’s sessions';
+        restore.onclick = async () => { restore.disabled = true; try { await CloudSave.restoreConflict(file); } catch (e) { label.textContent = e.message; restore.disabled = false; } };
+        banner.append(label); if (file && !reset && !erased && CloudSave.restoreConflict) banner.append(restore); banner.append(exportButton, reload); document.body.append(banner);
       }
       return;
     }
@@ -7987,15 +10300,43 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         degradedNotified = true;
         try { notify('This station’s data was written by a newer StarNet — update the app. Until you do, your changes are NOT being backed up.', 'bad'); } catch (_) {}
       }
+    } else if (h && h.cause === 'tooLarge' && (h.consecutiveFailures || 0) > 0) {
+      // a save over the station file's 16 MiB cap (a named 413): retrying cannot land it, so it says so on the FIRST refusal,
+      // never "check disk space"
+      d.classList.add('degraded');
+      // a station over 16 MiB is over the browser cache's cap too: then the latest change is held ONLY in this window's memory,
+      // and closing it loses it (the cacheFailed warning, review 10-27) — never "local play continues" alone
+      d.title = 'too large to save — this station is larger than the 16 MiB the station file takes, so your latest change is NOT saved.'
+        + (h.cacheFailed ? ' The browser cache could not hold it either: it is only in this window, and closing this window loses it.' : ' Local play continues; retrying will not land it.');
+    } else if (h && h.cacheFailed) {
+      // #121: the browser cache is full (its per-site cap), so every change rides on the station file alone. The words
+      // follow the station file's confirmation of the NEWEST save, never the cache: amber while it is confirmed or on
+      // its way, red once a write to the station file has failed and the latest change is held only in this window.
+      // "full" only when the browser reported its quota; any other refusal is named as a refusal
+      const cache = /quota/i.test(String(h.cacheFailedReason || '')) ? 'browser cache full' : 'browser cache refused the save';
+      if (h.cacheFailedConfirmed) {
+        d.classList.add('stale');
+        d.title = cache + ' — saving to the station file only. Your latest change is confirmed in the station file.';
+      } else if ((h.consecutiveFailures || 0) > 0) {
+        d.classList.add('degraded');
+        d.title = cache + ' and the station file has not confirmed your latest change (' + saveCauseWords(h) + ') — it is NOT saved. Keep StarNet open; it keeps retrying.';
+      } else {
+        d.classList.add('stale');
+        d.title = cache + ' — your latest change is NOT saved yet; it is on its way to the station file.';
+      }
     } else if (h && h.stale) {
       d.classList.add('stale');
       const since = h.lastPushOkAt ? new Date(h.lastPushOkAt).toLocaleString() : 'never';
-      d.title = 'world is saved locally; the durable backup copy hasn’t synced since ' + since;
+      d.title = 'world is saved locally; the durable backup copy hasn’t synced since ' + since + ' (' + saveCauseWords(h) + ')';
     } else if (h && h.warn) {
       // EL-11 FIX 4: a live streak of failed pushes (3+) warns IMMEDIATELY — no 60-minute blind window while
-      // POST /api/save errors (disk full / EPERM / refused). Same amber vocabulary as stale, advising title.
+      // POST /api/save errors. Same amber vocabulary as stale; the words name the cause the station gave (saveCauseWords).
       d.classList.add('stale');
-      d.title = 'saves are failing — check disk space / folder permissions (' + (h.consecutiveFailures || 0) + ' failed attempts in a row). Local play continues; the durable backup is not confirming writes.';
+      d.title = 'saves are failing — ' + saveCauseWords(h) + ' (' + (h.consecutiveFailures || 0) + ' failed attempts in a row). Local play continues; the durable backup is not confirming writes.';
+    } else if (h && h.merging) {
+      // another window saved past this one: this window's saves are merged into the station file (cloudsave `merging`), and its
+      // view does not show the other window's changes until it is reloaded — said, never implied by a plain "autosave"
+      d.title = 'autosave — merged into the station file with another window’s changes; reload this window to see them';
     } else {
       d.title = 'autosave';
     }
@@ -8149,8 +10490,16 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         el.appendChild(mkEl('p', 'cd-privacy', 'Saved locally. Your profile briefing is shared with your agents’ configured models when they work.'));
         addCards(['identity', 'stack', 'people'])(el);
       } },
-      { id: 'goals', label: 'GOALS', glyph: '↗', desc: 'What you want to achieve and where you need help.', build: addCards(['goals', 'pain', 'ambition']) },
-      { id: 'preferences', label: 'PREFERENCES', glyph: '≡', desc: 'How you like to work, your standing instructions, and your schedule.', build: addCards(['style', 'standing_orders', 'schedule']) },
+      // GOALS IN ONE PLACE (front doors, 2026-10-01): goals with plans and steps live in QUESTS › Goals; this tab is what the
+      // agents KNOW about your aims and pain points (briefing notes) — named for that, with one door to the real goals.
+      { id: 'goals', label: 'AIMS', glyph: '↗', desc: 'What your agents know about your aims and where you need help. Goals with plans and steps live in QUESTS › Goals.', build: el => {
+        const door = mkEl('p', 'cd-privacy', 'Planning a goal with steps? It lives in QUESTS › Goals. ');
+        const go = mkEl('button', 'bb xs', 'OPEN QUESTS › GOALS'); go.type = 'button';
+        go.addEventListener('click', () => { sfx('click'); openTerm('quests', 'goals'); });
+        door.appendChild(go); el.appendChild(door);
+        addCards(['goals', 'pain', 'ambition'])(el);
+      } },
+      { id: 'preferences', label: 'PREFERENCES', glyph: '≡', desc: 'How you like to work, your standing orders (every agent follows these), and your schedule.', build: addCards(['style', 'standing_orders', 'schedule']) },
       { id: 'briefing', label: 'AGENT BRIEFING', glyph: '▤', desc: 'See the exact profile text included in your agents’ briefing.', build: el => {
         el.appendChild(mkEl('p', 'cd-privacy', 'Your profile is stored locally. Its briefing is sent to each agent’s configured model when it works; relevant summaries may also be used for suggestions.'));
         el.appendChild(cdBriefing(ds));
@@ -8198,7 +10547,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     const foot = mkEl('div', 'cd-brief-foot');
     const flows = mkEl('div', 'cd-flows',
       '<span class="cd-flow" title="composeSystemPrompt folds this block into the system prompt of every agent on the station — including a freshly-summoned one">▸ every agent’s briefing</span>' +
-      '<span class="cd-flow" title="mirrored to the sidecar so autonomous scheduled runs (cron, night shift) that compose their own persona still know who they serve">▸ autonomous &amp; scheduled runs</span>' +
+      '<span class="cd-flow" title="mirrored to the sidecar so autonomous scheduled runs (routines, autonomy) that compose their own persona still know who they serve">▸ autonomous &amp; scheduled runs</span>' +
       '<span class="cd-flow" title="the pitch engine and recruitment matcher read your goals, pain points and ambitions to propose work and crew">▸ pitches &amp; recruitment</span>' +
       '<span class="cd-flow" title="the quest board turns still-blank dimensions into get-to-know-you quests">▸ quest board</span>');
     foot.appendChild(flows);
@@ -8271,13 +10620,28 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     return card;
   }
 
+  // THE PER-DETAIL CAP, SHOWN WHILE TYPING (releases#8). A detail holds Dossier.TEXT_CHARS characters: the editor's
+  // maxLength stopped typing — and clipped a paste — at that cap with nothing on screen saying so, while the briefing
+  // meter's "806 / 1600" read as room left. The count rides the editor in the dossier's own meter style and warns at
+  // the cap; maxLength reads the same constant the engine clips with, so the two can never drift apart.
+  const cdTextMax = () => (typeof Dossier !== 'undefined' && Dossier.TEXT_CHARS) || 280;
+  function cdCount(ta) {
+    const max = cdTextMax();
+    const c = mkEl('span', 'cd-brief-meter cd-count');
+    c.title = 'a detail holds up to ' + max + ' characters — add the rest as another detail';
+    c.sync = () => { const n = ta.value.length; c.textContent = n + ' / ' + max + ' chars'; c.classList.toggle('warn', n >= max); };
+    ta.addEventListener('input', c.sync); c.sync();
+    return c;
+  }
+
   // inline edit (mirrors the Memory Core editor): swap the body for a textarea + Save/Cancel.
   function cdEdit(card, txt, btns, dim, b) {
-    const ta = mkEl('textarea', 'cd-edit'); ta.value = b.text; ta.spellcheck = false; ta.maxLength = 280; ta.setAttribute('aria-label', 'Edit ' + dim.replace(/_/g, ' ') + ' detail');
+    const ta = mkEl('textarea', 'cd-edit'); ta.value = b.text; ta.spellcheck = false; ta.maxLength = cdTextMax(); ta.setAttribute('aria-label', 'Edit ' + dim.replace(/_/g, ' ') + ' detail');
     card.replaceChild(ta, txt); ta.focus(); try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch (_) {}
     btns.innerHTML = '';
     const save = mkEl('button', 'consent-btn'); save.textContent = 'Save'; btns.appendChild(save);
     const cancel = mkEl('button', 'consent-btn'); cancel.textContent = 'Cancel'; btns.appendChild(cancel);
+    btns.appendChild(cdCount(ta));
     let saving = false;
     save.onclick = () => { if (saving) return; const v = ta.value.trim(); if (!v) { ta.focus(); return; } saving = true; CDS().upsert(dim, { id: b.id, text: v }); sfx('click'); rerender('commander'); };
     cancel.onclick = () => rerender('commander');
@@ -8321,15 +10685,17 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       // identical rows read as a bug. Covers BOTH entries: an inline chip tap and the plain "+ add".
       try { const sib = row.parentElement && row.parentElement.querySelector(':scope > .cd-starters'); if (sib) sib.style.display = 'none'; } catch (_) {}
       row.innerHTML = '';
-      const ta = mkEl('textarea', 'cd-edit'); ta.placeholder = 'What should your agents know?'; ta.spellcheck = false; ta.maxLength = 280; ta.setAttribute('aria-label', 'New ' + dim.replace(/_/g, ' ') + ' detail');
-      const chips = cdStarterChips(dim, s => { ta.value = s; ta.focus(); try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch (_) {} });
+      const ta = mkEl('textarea', 'cd-edit'); ta.placeholder = 'What should your agents know?'; ta.spellcheck = false; ta.maxLength = cdTextMax(); ta.setAttribute('aria-label', 'New ' + dim.replace(/_/g, ' ') + ' detail');
+      const count = cdCount(ta);
+      const chips = cdStarterChips(dim, s => { ta.value = s; count.sync(); ta.focus(); try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch (_) {} });
       if (chips) row.appendChild(chips);
       row.appendChild(ta);
-      if (starter) ta.value = starter;
+      if (starter) { ta.value = starter; count.sync(); }
       ta.focus(); try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch (_) {}
       const btns = mkEl('div', 'consent-btns cd-acts'); row.appendChild(btns);
       const save = mkEl('button', 'consent-btn'); save.textContent = 'Save'; btns.appendChild(save);
       const cancel = mkEl('button', 'consent-btn'); cancel.textContent = 'Cancel'; btns.appendChild(cancel);
+      btns.appendChild(count);
       let saving = false;
       save.onclick = () => { if (saving) return; const v = ta.value.trim(); if (!v) { ta.focus(); return; } saving = true; CDS().upsert(dim, { text: v, source: 'commander' }); sfx('click'); rerender('commander'); };
       cancel.onclick = () => rerender('commander');
@@ -8383,13 +10749,13 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     }
   }
   // §C — the GO destination token for a quest that has a real, already-existing openable surface (never a new
-  // window). null → no GO button. dossier → the Commander dossier; work/build → the TASK BOARD; a floor gap → REFIT.
+  // window). null → no GO button. dossier → the Commander dossier; work/build → the TASK BOARD; a floor gap → BUILD MODE.
   /* WHERE A QUEST IS ACTUALLY DONE. A build/work quest used to send the Commander to the TASK BOARD — a
      board of OTHER work, where the quest itself does not appear and nothing tells you what to do next. The
      work happens in a conversation with an agent, so that is where the button goes: its OWN session, opened
      on the quest, with the ask already typed. The other two destinations were already right and are
-     unchanged: a dossier question is answered in the dossier, a floor gap is fixed in REFIT. */
-  const GO_LABEL = { commander: '▶ ANSWER IT', session: '▶ START QUEST', refit: '▶ OPEN REFIT', recruit: '▶ OPEN RECRUITMENT' };
+     unchanged: a dossier question is answered in the dossier, a floor gap is fixed in BUILD MODE. */
+  const GO_LABEL = { commander: '▶ ANSWER IT', session: '▶ START QUEST', refit: '▶ OPEN BUILD MODE', recruit: '▶ OPEN RECRUITMENT' };
   /* A one-word badge naming WHICH KIND of thing a card is. The log mixes six genuinely different sources —
      a personalized ledger quest, a goal-arc step, a capability gap on your floor, an accepted build, a
      recurring maintenance cause, a dossier question, a milestone — and rendering them identically is what
@@ -8428,6 +10794,11 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
      duplicate build). The composer is PREFILLED, never sent — the Commander's words stay theirs to edit, and
      no turn is fabricated on their behalf (the OUTBOX ⊕ NEW SESSION precedent). Returns false honestly when
      the workstream seam is unavailable, so the caller can say so instead of dead-clicking. */
+  /* USER-STUDY LOOP (2026-09-28, Andrew's call): START QUEST on a quest the AGENT executes now STARTS the work —
+     the Commander's click on START is the instruction, exactly like "Start this step" on a goal milestone
+     (GoalStore.acceptMilestone → launchDirective). It sends once, only into the quest's brand-new session and
+     only when COMMS is free; a return visit, a busy COMMS, or a quest the Commander performs (commander /
+     together → "HELP ME PREPARE") keeps the prefill-and-edit path, so nothing is ever sent twice or behind their back. */
   function questSessionTitle(q) { return ('quest: ' + String((q && q.title) || 'a quest')).slice(0, 80); }
   function questOpenSession(q) {
     const w = WS();
@@ -8446,13 +10817,20 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     if (!sid) return false;
     if (typeof App !== 'undefined' && App.openWorkstream) App.openWorkstream(sid);
     // The ask names the quest and the honest completion condition, so the agent starts on the real objective
-    // rather than a title fragment. Left in the composer for the Commander to edit or send.
-    if (typeof Chat !== 'undefined' && Chat.prefill) {
+    // rather than a title fragment.
+    if (typeof Chat !== 'undefined') {
       const cw = questCompletesWhen(q);
-      Chat.prefill('Help me with this quest: ' + String(q.title || '').trim()
+      const ask = 'Help me with this quest: ' + String(q.title || '').trim()
         + (q.desc ? ' — ' + String(q.desc).trim() : '')
-        + (cw ? '\n\nIt counts as done when: ' + cw : '') + '\n\n');
-      notify('Conversation prepared. Edit and send it when you are ready.', 'good');
+        + (cw ? '\n\nIt counts as done when: ' + cw : '');
+      const startsWork = !existing && q.executionMode === 'agent' && Chat.send && !(Chat.isBusy && Chat.isBusy());
+      if (startsWork) {
+        Chat.send(ask);
+        notify('Quest started — the work is running in its own session.', 'good');
+      } else if (Chat.prefill) {
+        Chat.prefill(ask + '\n\n');
+        notify('Conversation prepared. Edit and send it when you are ready.', 'good');
+      }
     }
     return true;
   }
@@ -8507,7 +10885,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         + '<span class="sub dim">' + (latest.source === 'commander' ? 'You reported this action' : 'Recorded work completion') + ' · ' + esc(qrRel(latest.doneAt)) + '</span>' : '<p>This is a step you chose toward ' + esc(goal.text) + '.</p>')
       + (latest ? '<div class="q-return-actions">' + jump('progress', 'VIEW PROGRESS')
         + (latestWork && latestWork.runId ? '<button class="consent-btn q-step-outputs" data-run="' + esc(latestWork.runId) + '" data-label="' + esc(latest.text) + '">OPEN THIS STEP’S OUTPUTS</button>'
-          : latest.source !== 'commander' ? '<button class="consent-btn q-go" data-dest="deliverables">OPEN OUTPUT LIBRARY</button>' : '') + '</div>' : '') + '</details>';
+          : latest.source !== 'commander' ? '<button class="consent-btn q-go" data-dest="deliverables">OPEN DELIVERABLES</button>' : '') + '</div>' : '') + '</details>';
     const action = next && !brief.inFlight
       ? '<button class="consent-btn q-arc-accept" data-gid="' + esc(goal.id) + '" data-mid="' + esc(next.id) + '">START THIS STEP</button>' : '';
     return '<section class="q-return-card" aria-label="Your next move"><span class="q-ns-eyebrow">YOUR NEXT MOVE · ' + brief.progress.done + ' / ' + brief.progress.total + ' PLANNED STEPS</span>'
@@ -8517,6 +10895,92 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       + '<div class="q-return-actions">' + action + jump('goals', next ? 'REVIEW PLAN' : 'REVIEW MY OUTCOME') + '</div>'
       + (action ? '<p class="sub dim">Starts work with your crew using your current model and permissions.</p>' : '')
       + proof + '</section>';
+  }
+
+  /* ============== THE PASS — the quest log as a battle pass (2026-10-19) ==============
+     Andrew: "it should feel like a Fortnite battle pass, except the goals are based off the user's actual goals."
+     BattlePass.build (pure, battlepass.js) projects the sidecar's OWN Commander progression — level = tier, achievement
+     points = pass pts, achievement timestamps = the streak + this week's challenges — so every number here is one the
+     journey ledger already proves. Rewards are cosmetic and applied on the spot (a rank title, an ASCII frame every
+     five tiers); CLAIM is a per-viewer acknowledgement with a sting, never a gate. Drawn in plain ASCII so VT323 owns
+     every glyph. */
+  const BP_KEY = 'starnet.battlepass.v1';
+  function bpClaimed() { try { const r = JSON.parse(localStorage.getItem(BP_KEY) || 'null'); return r && Number(r.claimedTier) || 0; } catch (_) { return 0; } }
+  function bpSetClaimed(t) { try { localStorage.setItem(BP_KEY, JSON.stringify({ claimedTier: t })); } catch (_) {} }
+  function bpModel() {
+    if (typeof BattlePass === 'undefined' || !BattlePass.build) return null;
+    const j = typeof JourneyStore !== 'undefined' && JourneyStore.status ? JourneyStore.status() : null;
+    if (!j || !j.progression) return null;
+    const g = typeof GoalStore !== 'undefined' && GoalStore.activeGoal ? GoalStore.activeGoal() : null;
+    const pr = g && typeof Goals !== 'undefined' && Goals.progress ? Goals.progress(g) : { done: 0, total: 0 };
+    const registered = !!(g && Array.isArray(j.goals) && j.goals.some(x => x && x.id === g.id));
+    const metric = g && Array.isArray(j.metrics) ? j.metrics.find(m => m && m.goalId === g.id) : null;
+    return BattlePass.build({ progression: j.progression, goal: g ? { id: g.id, text: g.text, done: pr.done, total: pr.total } : null,
+      goalRegistered: registered, goalSaved: !!(g && g.successCondition), metric, claimedTier: bpClaimed(), now: Date.now() });
+  }
+  function bpRule(frame, label) {
+    const run = frame.run.repeat(240);
+    return '<div class="bp-rule" aria-hidden="true"><span>' + esc(frame.corner) + esc(frame.run.repeat(2)) + '</span>'
+      + (label ? '<span class="bp-rule-label"> ' + esc(label) + ' </span>' : '')
+      + '<span class="bp-rule-run">' + esc(run) + '</span><span>' + esc(frame.corner) + '</span></div>';
+  }
+  function passHtml() {
+    const m = bpModel();
+    if (!m) return '<div class="q-journal-empty"><span aria-hidden="true">◇</span><h3>Pass offline</h3><p>Your Commander progression has not loaded yet. It appears here as soon as the station reports it.</p></div>';
+    const f = m.frame, pad = n => String(n).padStart(2, '0');
+    const s = m.streak;
+    // the sidecar went quiet: these are the last VERIFIED numbers, not live ones — say so (sweep 10-20; the PROGRESS view
+    // and the topbar's "Lv N · saved" already do). CLAIM still works: it only marks tiers the ledger already proved.
+    let stale = false; try { const st = JourneyStore.state && JourneyStore.state(); stale = !!(st && st.stale); } catch (_) {}
+    const staleHtml = stale ? '<div class="sub warn bp-stale">[ OFFLINE ] showing your last verified pass — points and streak refresh when the station reconnects.</div>' : '';
+    // the flame: lit while the streak is alive, an ember when it is at risk, cold ash at zero.
+    const flame = s.current > 0
+      ? (s.atRisk ? '   .   \n  ( )  \n (   ) \n  \'-\'  ' : '   (   \n  ) )  \n ( ( ( \n  \'-\'  ')
+      : '       \n       \n   .   \n  \'-\'  ';
+    const weekRow = s.week.map(d => '<span class="bp-day' + (d.active ? ' on' : '') + (d.today ? ' today' : '') + (d.future ? ' future' : '') + '">'
+      + '<i>' + d.label + '</i>' + (d.active ? '[#]' : d.future ? ' · ' : '[ ]') + '</span>').join('');
+    const streakLine = s.current > 0
+      ? (s.atRisk ? 'earn points today to keep it alive' : 'today counted — come back tomorrow')
+      : (m.empty ? 'a day counts when you earn pass points' : 'earn points today to start a new streak');
+    const nodes = m.track.map((t, i) => {
+      const box = '.------.\n| T ' + pad(t.tier) + ' |\n\'------\'';
+      const need = Math.max(0, (t.tier - 1) * m.perTier - m.points);
+      const foot = t.claimable ? '<button class="bp-claim" data-tier="' + t.tier + '">[ CLAIM ]</button>'
+        : t.state === 'now' ? '<span class="bp-here">^ YOU ARE HERE</span>'
+        : t.state === 'done' ? '<span class="bp-got">CLAIMED</span>'
+        : '<span class="bp-need">' + need + ' PTS</span>';
+      const link = i < m.track.length - 1 ? '<span class="bp-link bp-link-' + (t.state === 'ahead' ? 'ahead' : t.state === 'now' ? 'now' : 'done') + '" aria-hidden="true">' + (t.state === 'done' ? '==' : t.state === 'now' ? '>>' : '--') + '</span>' : '';
+      return '<li class="bp-node bp-' + t.state + (t.claimable ? ' bp-claimable' : '') + '" aria-label="Tier ' + t.tier + ', ' + esc(t.title) + ', ' + (t.claimable ? 'earned, ready to claim' : t.state === 'now' ? 'your current tier' : t.state === 'done' ? 'claimed' : need + ' points away') + '"><pre class="bp-box" aria-hidden="true">' + box + '</pre>'
+        + '<span class="bp-node-title">' + esc(t.title) + '</span>'
+        + (t.frame ? '<span class="bp-node-frame">+ FRAME: ' + esc(t.frame) + '</span>' : '')
+        + foot + '</li>' + link;
+    }).join('');
+    const claimAll = m.claimable.length
+      ? '<div class="bp-claimbar"><span>' + m.claimable.length + ' tier' + (m.claimable.length === 1 ? '' : 's') + ' earned and waiting</span><button class="consent-btn bp-claim-all" data-tier="' + m.tier + '">CLAIM ALL</button></div>' : '';
+    const chal = m.challenges.map(c => '<li class="bp-chal' + (c.done ? ' done' : '') + '">'
+      + '<span class="bp-check" aria-hidden="true">' + (c.done ? '[x]' : '[ ]') + '</span>'
+      + '<span class="bp-chal-main"><span class="bp-chal-title">' + esc(c.title) + '</span>'
+      + '<span class="bp-chal-meter"><span class="bp-mini">' + esc(BattlePass.bar(c.have / c.need * 100, Math.min(12, c.need * 4))) + '</span> ' + c.have + '/' + c.need
+      + ' <span class="bp-pts">' + esc(c.pts) + '</span></span></span>'
+      + (c.done ? '<span class="bp-done-tag">DONE</span>' : '<button class="consent-btn bp-go" data-view="' + esc(c.go.view) + '"' + (c.go.category ? ' data-category="' + esc(c.go.category) + '"' : '') + '>GO</button>') + '</li>').join('');
+    return '<section class="bp bp-frame-' + esc(f.name.toLowerCase().replace(/\s+/g, '-')) + '" aria-label="Battle pass">'
+      + bpRule(f, 'SEASON ' + m.season.no + ' · ' + m.season.name + ' · ' + m.season.daysLeft + 'D LEFT') + staleHtml
+      + '<div class="bp-hero">'
+      + '<pre class="bp-tier" aria-hidden="true"> .--------.\n |  TIER  |\n |   ' + pad(m.tier) + '   |\n \'--------\'</pre>'
+      + '<div class="bp-hero-main"><span class="bp-eyebrow">RANK</span><b class="bp-rank">' + esc(m.rank) + '</b>'
+      + '<div class="bp-xp"><span class="bp-bar bp-bar-l" aria-hidden="true">' + esc(BattlePass.bar(m.pct, 24)) + '</span><span class="bp-bar bp-bar-s" aria-hidden="true">' + esc(BattlePass.bar(m.pct, 10)) + '</span> <b>' + m.into + '</b>/' + m.perTier + ' PTS</div>'
+      + '<div class="sub">' + m.toNext + ' pts to TIER ' + (m.tier + 1) + ' · ' + esc(m.nextRank) + ' &nbsp;·&nbsp; season +' + m.season.pts + ' pts</div></div>'
+      + '<div class="bp-streak' + (s.current > 0 ? ' lit' : '') + (s.atRisk ? ' risk' : '') + '"><pre class="bp-flame" aria-hidden="true">' + flame + '</pre>'
+      + '<div><b class="bp-streak-n">' + s.current + '</b> DAY STREAK<div class="sub">' + esc(streakLine) + '</div><div class="sub dim">BEST ' + s.best + '</div></div>'
+      + '<div class="bp-week" aria-label="Last seven days">' + weekRow + '</div></div>'
+      + '</div>'
+      + bpRule(f, 'TIER TRACK') + claimAll
+      + '<ol class="bp-track">' + nodes + '</ol>'
+      + bpRule(f, 'WEEKLY CHALLENGES') + '<div class="sub bp-reset">resets in ' + esc(m.week.resetsIn.toLowerCase()) + '</div>'
+      + '<ul class="bp-chals">' + chal + '</ul>'
+      + '<p class="sub dim bp-law">Points come only from real progress on your goals: +10 for each goal quest you confirm, planned step you finish, or metric checkpoint you pass, and +100 when you confirm a goal is achieved. Station, profile, and build quests earn no points. Tiers give titles and frames only. Every tool works at every tier.</p>'
+      + bpRule(f, '')
+      + '</section>';
   }
 
   function questTrackHtml(arcs) {
@@ -8687,7 +11151,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     }
     // LAST OUTCOME — the most recent honest attempt (minted/none/rejected/skipped/error) the refresher recorded.
     const last = s && s.ledger && s.ledger.length ? s.ledger[s.ledger.length - 1] : null;
-    const OUTCOME_LABEL = { minted: 'added a quest', none: 'nothing new needed', rejected: 'nothing passed', skipped: 'skipped', error: 'error' };
+    const OUTCOME_LABEL = { minted: 'added a quest', advanced: 'step finished', none: 'nothing new needed', rejected: 'nothing passed', skipped: 'skipped', error: 'error' };
     // The engine's own reason is kept verbatim on the row; these say what it MEANS for the Commander. A
     // rejected cycle is the confusing one — it reads as a failure when it is the station refusing to invent
     // a quest it cannot ground, so it says that outright rather than leaving "rejected" to be guessed at.
@@ -8729,8 +11193,53 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       + lastHtml + disabledNote + '</div>';
   }
 
+  /* STATION SYSTEMS (systems.js) — the dock's map, at the top of QUESTS › Progress. On a growing station it shows
+     what is online and how the rest comes online; every tile opens its system (an offline one comes online as it
+     opens — reveal, never lock). Tiles copy the constellation's star recipe: glyph + name + ONE short stat, the
+     description lives in the hover tip. Counts read Systems.snapshot(), i.e. the dock's real state. */
+  function systemsHtml() {
+    if (typeof Systems === 'undefined' || !Systems.snapshot) return '';
+    const s = Systems.snapshot();
+    const staged = s.mode === 'staged';
+    const pct = s.total ? Math.round(s.online * 100 / s.total) : 0;
+    // the tile wears the SAME icon as its dock button (our own static markup — an SVG instrument icon, or a glyph)
+    const glyphOf = id => {
+      const def = Systems.LIST.find(x => x.id === id);
+      const b = def && def.sel ? document.querySelector('#bottombar ' + def.sel + ' .bb-i') : null;
+      if (!b) return '◇';
+      const svg = b.querySelector('svg');
+      return svg ? svg.outerHTML : esc(b.textContent || '◇');
+    };
+    return '<div class="q-systems q-constellation" id="q-systems"><div class="gx-sec"><span class="gx-title">STATION SYSTEMS</span><span class="gx-tag">'
+      + s.online + ' OF ' + s.total + ' ONLINE</span></div>'
+      + (staged ? '<div class="arc-bar q-bar"><div class="q-bar-fill" style="width:' + pct + '%"></div></div>' : '')
+      + '<div class="q-star-map q-sys-map">' + s.list.map(x =>
+        '<button type="button" class="q-star q-sys' + (x.online ? ' q-star-reached' : ' q-sys-off') + (x.fresh ? ' q-sys-fresh' : '') + '" data-sys="' + esc(x.id) + '" data-tip="'
+        + esc(x.tip + (x.online ? '' : ' — it already works; open it now and it joins your dock')) + '">'
+        + '<span class="q-star-glyph" aria-hidden="true">' + glyphOf(x.id) + '</span><span>' + esc(x.label) + '</span><small>'
+        + (x.online ? (x.fresh ? 'NEW · ' : '') + esc(x.group.toUpperCase()) + ' DOCK' : esc(x.how || 'not in your dock yet')) + '</small></button>').join('')
+      + '</div>'
+      + (staged ? '<p class="sub dim">Your dock grows as you use the station. Every system already works: open any of them here.</p>'
+        + '<div class="q-journey-actions"><button type="button" class="bb sm q-sys-all">SHOW EVERYTHING</button></div>' : '')
+      + '</div>';
+  }
+  function wireSystems(root) {
+    if (!root) return;
+    root.querySelectorAll('.q-sys').forEach(b => b.addEventListener('click', () => { sfx('click'); Systems.openSystem(b.dataset.sys); }));
+    const all = root.querySelector('.q-sys-all');
+    if (all) all.addEventListener('click', () => { sfx('click'); Systems.showEverything(); notify('Every station system is in your dock now. SETTINGS › LOOK & SOUND › STATION DOCK switches it back.', '', undefined, { transient: true }); });
+  }
+  // repaint ONLY the systems block of an open quest log — never the whole window (drafts live there)
+  function refreshSystems() {
+    const w = open.quests; if (!w) return;
+    const cur = w.querySelector('#q-systems'); if (!cur) return;
+    const tmp = mkEl('div'); tmp.innerHTML = systemsHtml();
+    const next = tmp.firstElementChild; if (!next) return;
+    cur.replaceWith(next); wireSystems(next);
+  }
+
   // The three progression tracks stay deliberately separate:
-  //   AGENT GROWTH = explicit feedback XP (the existing meter below)
+  //   STATION XP = explicit feedback XP, station-wide (stationPrestigeHtml; each agent's own share lives in its dossier's GROWTH)
   //   COMMANDER JOURNEY = real-world goal metrics + verified outcomes
   //   STATION EVOLUTION = expressive history of distinct goals reached, never a capability gate
   function journeyHtml() {
@@ -8903,7 +11412,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
           + '<ol class="q-history-line">' + (events.length ? events.map(e => '<li><span class="q-ns-eyebrow">' + esc(e.label.toUpperCase()) + '</span><time>' + esc(e.at ? new Date(e.at).toLocaleDateString() : '') + '</time><p>' + esc(e.text) + '</p></li>').join('') : '<li>The plan is saved. Results and reflections will appear as you work.</li>') + '</ol>'
           + '<button class="consent-btn q-goal-review" data-gid="' + esc(g.id) + '">REFLECT WITH MY CREW</button></details>';
       }).join('')
-      + '<div class="q-journey-actions"><button class="consent-btn q-journey-export">EXPORT JOURNEY NOTES</button><button class="consent-btn q-go" data-dest="deliverables">OPEN OUTPUT LIBRARY</button></div><p class="sub dim">Plans, possibilities, and reflections are saved on this device. Export includes those notes; output files remain in your library.</p></div>';
+      + '<div class="q-journey-actions"><button class="consent-btn q-journey-export">EXPORT JOURNEY NOTES</button><button class="consent-btn q-go" data-dest="deliverables">OPEN DELIVERABLES</button></div><p class="sub dim">Plans, possibilities, and reflections are saved on this device. Export includes those notes; output files remain in your library.</p></div>';
   }
 
   // Stores can repaint synchronously during a write. Resolve submitted fields by their stable ids,
@@ -8957,7 +11466,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     if (QSS && QSS.sync) { try { QSS.sync(); } catch (_) {} }   // never render a stale diff — the log always reflects the memory it just folded
     const v = (typeof QuestStore !== 'undefined' && QuestStore.view) ? QuestStore.view() : null;
     if (!v) { body.innerHTML = '<p class="dim">Quest log unavailable.</p>'; return; }
-    const m = v.meter, all = Array.isArray(v.quests) ? v.quests : [];
+    const all = Array.isArray(v.quests) ? v.quests : [];
     const qs = (QSS && QSS.visible) ? QSS.visible(all) : all;   // dismissed = gone forever (degrades to the raw list if the store is absent)
     /* THE GOAL ARC IS RENDERED AS A TRACK, NOT AS CARDS. Its header + milestone steps are pulled out of the
        card grid here and drawn by questTrackHtml as one continuous path at the top of the panel. They are
@@ -9023,7 +11532,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         ? '<button class="q-queue" data-qid="' + esc(q.id) + '" title="Build this while I’m away — queue it for the sandbox">◈</button>'
         : '';
       // §C — a GO affordance where a real, openable destination exists (never invents a window): dossier asks →
-      // the Commander dossier; work/build → the TASK BOARD; a floor gap → REFIT. Absent target → no button.
+      // the Commander dossier; work/build → the TASK BOARD; a floor gap → BUILD MODE. Absent target → no button.
       const goDest = questGoDest(q);
       const goBtn = goDest ? '<button class="q-go" data-dest="' + esc(goDest) + '" data-qid="' + esc(q.id) + '" title="Open where you do this next">' + esc(q.executionMode === 'commander' || q.executionMode === 'together' ? '▶ HELP ME PREPARE' : (GO_LABEL[goDest] || 'GO')) + '</button>' : '';
       // §C — EVERY open row answers "what do I do next": the honest completion condition in words.
@@ -9069,9 +11578,8 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         + '<div class="sub">' + esc(q.status === 'done' ? ('▸ ' + q.reward) : q.desc) + '</div>'
         + cwHtml + (q.status === 'done' ? '' : rewardHtml) + attestHtml + declineHtml + actionRow + lifeActions + '</div>';
     };
-    const meterHtml = m
-      ? '<div class="gx-sec"><span class="gx-title">AGENT GROWTH</span> <span class="gx-tag">Lv ' + m.level + ' &middot; ' + m.pct + '% to next &middot; ' + esc(String(m.confLabel) + ' ' + String(m.band)) + '</span></div>'
-      : '';
+    // (org pass 10-14, P28: the 'AGENT GROWTH Lv N' meter that sat here was Xp.compute(stationStats) — the SAME number as
+    // STATION XP above it, under a second, false name. It is gone; each agent's own growth stays in its dossier's GROWTH.)
     // G4 feature 2 — PROPOSALS: pending autojob proposals the agent pinned to the MISSION BOARD. A distinct
     // amber card with APPROVE (→ the real POST /api/cron) / DECLINE (→ dropped forever). Rendered above OPEN so
     // the "the agent wants to run this for you" ask reads first. Only shown when the ledger has cards.
@@ -9090,7 +11598,9 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       : '';
     const milestoneDone = milestones.filter(q => q.status === 'done').length;
     const milestonesHtml = milestones.length
-      ? '<details class="q-milestones q-progress-section"><summary><span>Station milestones</span><span class="q-section-count">' + milestoneDone + ' / ' + milestones.length + '</span></summary>'
+      // folded, with the TROPHY CASE door on the summary row itself so it is reachable without unfolding (org pass 10-14, P28)
+      ? '<details class="q-milestones q-progress-section"><summary><span>Station milestones</span><span class="q-section-count">' + milestoneDone + ' / ' + milestones.length + '</span>'
+        + '<button type="button" class="bb xs q-trophy-door" data-open-trophies>OPEN THE TROPHY CASE</button></summary>'
         + '<div class="q-section-body"><div class="gx-tros q-grid q-milestone-grid">' + milestones.map(tro).join('') + '</div></div></details>'
       : '';
     // Selection is presentation state only. Keep it on the stable window body across background data pokes;
@@ -9125,10 +11635,11 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         + (open.length ? 'Choose another category to find your next action.' : 'Set a direction or refresh your quests when you are ready for what comes next.') + '</p></div>')
       + '</section></div>';
     const questViews = [
-      ['available', 'Now', 'Your next move, open work, and station quests.'],
-      ['goals', 'Goals', 'Define what you want to achieve long term, then choose a goal to focus on. Its plan breaks the goal into smaller steps.'],
-      ['progress', 'Progress', 'Your recorded progress across all goals: planned steps, tracked metrics, and earned achievements.'],
-      ['completed', 'History', 'Your goals, results, reflections, and changes of direction.']
+      ['pass', 'PASS', 'Your battle pass: every point comes from real progress on your goals. Tiers give titles and frames only, never tools.'],
+      ['available', 'NOW', 'Your next move, open work, and station quests.'],
+      ['goals', 'GOALS', 'Define what you want to achieve long term, then choose a goal to focus on. Its plan breaks the goal into smaller steps.'],
+      ['progress', 'PROGRESS', 'Your recorded progress across all goals: planned steps, tracked metrics, and earned achievements.'],
+      ['completed', 'HISTORY', 'Your goals, results, reflections, and changes of direction.']
     ];
     body.classList.add('quests-content');
     body.innerHTML = '<div class="gx gx-quests">'
@@ -9138,6 +11649,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         '<button type="button" role="tab" id="q-tab-' + v[0] + '" data-quest-view="' + v[0] + '" aria-controls="q-view-' + v[0] + '">' + v[1]
         + '</button>').join('') + '</div>'
       + '<p class="q-view-description"></p>'
+      + '<section id="q-view-pass" class="q-view-panel q-journal-pass" role="tabpanel" aria-labelledby="q-tab-pass">' + passHtml() + '</section>'
       + '<section id="q-view-available" class="q-view-panel" role="tabpanel" aria-labelledby="q-tab-available">'
       + questBriefingHtml() + proposalsHtml + filtersHtml + journalHtml
       + (deferred.length ? '<details class="q-deferred"><summary>Saved for later / blocked (' + deferred.length + ')</summary><div class="gx-tros q-grid">' + deferred.map(tro).join('') + '</div></details>' : '')
@@ -9145,7 +11657,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       + '</section><section id="q-view-goals" class="q-view-panel q-journal-planning" role="tabpanel" aria-labelledby="q-tab-goals">'
       + questTrackHtml(arcs) + lifeGoalsHtml() + '<details class="q-refresh-options"><summary>Quest suggestions <span class="q-section-note">Direction &amp; refresh</span></summary>' + questRefreshHtml() + '</details>'
       + '</section><section id="q-view-progress" class="q-view-panel q-journal-progress" role="tabpanel" aria-labelledby="q-tab-progress">'
-      + journeyHtml() + milestonesHtml + meterHtml
+      + systemsHtml() + journeyHtml() + stationPrestigeHtml() + milestonesHtml
       + '</section><section id="q-view-completed" class="q-view-panel q-journal-history" role="tabpanel" aria-labelledby="q-tab-completed">'
       + journeyChaptersHtml() + '<div class="gx-tros q-grid q-done">' + (done.map(tro).join('') || '<div class="q-journal-empty"><h3>No completed quests yet</h3><p>Finished quests and their results will appear here.</p></div>') + '</div></section></div>';
     // Stable field identities keep a background refresh from transplanting a draft into another chapter.
@@ -9181,10 +11693,35 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         ev.preventDefault(); viewButtons[next].click(); viewButtons[next].focus();
       });
     });
+    // a deep link (openTerm('quests', 'progress') — the top-bar COMMANDER gauge, NEW SYSTEM ONLINE) lands on its view once
+    if (consoleSection.quests) { body.dataset.questView = consoleSection.quests; delete consoleSection.quests; }
     selectQuestView(body.dataset.questView);
+    wireSystems(body.querySelector('#q-systems'));
     body.querySelectorAll('.q-step-outputs').forEach(b => b.addEventListener('click', () => {
       questOpenOutputs(b.dataset.run, b.dataset.label);
     }));
+    // THE PASS: CLAIM acknowledges tiers already earned (a sting + the per-viewer mark — nothing is unlocked by it),
+    // and a challenge's GO jumps to the view where that kind of progress is actually made.
+    body.querySelectorAll('.bp-claim, .bp-claim-all').forEach(b => b.addEventListener('click', () => {
+      const t = Number(b.dataset.tier) || 0;
+      if (!(t > bpClaimed())) return;   // already claimed (a double-click or a stale button): no second sting (sweep 10-20)
+      bpSetClaimed(t);
+      try { if (typeof SFX === 'object' && SFX.level) SFX.level(); } catch (_) {}
+      body.dataset.bpFlash = String(t);
+      rerender('quests');
+    }));
+    body.querySelectorAll('.bp-go').forEach(b => b.addEventListener('click', () => {
+      // a challenge that names a NOW category (goal quests → Missions) lands on that filter — the category list is built
+      // at render, so set both and repaint; a view-only GO just switches the tab.
+      if (b.dataset.category) { body.dataset.questView = b.dataset.view; body.dataset.questCategory = b.dataset.category; body.dataset.questSelected = ''; rerender('quests'); }
+      else selectQuestView(b.dataset.view);
+      body.scrollTop = 0;
+    }));
+    if (body.dataset.bpFlash) {
+      const lit = body.querySelectorAll('.bp-node.bp-done, .bp-node.bp-now');
+      lit.forEach(n => n.classList.add('bp-flash'));
+      delete body.dataset.bpFlash;
+    }
     body.querySelectorAll('.q-goal-start').forEach(b => b.addEventListener('click', () => {
       selectQuestView('goals'); const form = body.querySelector('.q-life-manage');
       form.open = true; form.scrollIntoView({ block: 'start' }); form.querySelector('.q-new-goal').focus();
@@ -9493,7 +12030,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       if (r && r.ok) { sfx('click'); }
       // ARM-STATE truth: acceptPending reports {disarmed:{text}} when the scheduler that fires this
       // routine is off — surface it here too (the Dialogue flow already does), never approve-and-silence.
-      if (r && r.ok && r.disarmed && r.disarmed.text) notify(r.disarmed.text, 'warn');
+      if (r && r.ok && r.disarmed && r.disarmed.text) notify(r.disarmed.text, 'warn', undefined, { kind: 'alert', go: { term: 'automation', section: 'routines' } });
       rerender('quests', false);
     }));
     body.querySelectorAll('.q-prop-no').forEach(b => b.addEventListener('click', ev => {
@@ -9555,7 +12092,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
       if (m) { sfx('click'); rerender('quests', false); }
     }));
     // §C — GO: open the existing surface where this quest's next move happens (never a new window). openTerm is
-    // idempotent (restores a minimized panel, no-ops if already open); a floor gap opens REFIT via Build.open.
+    // idempotent (restores a minimized panel, no-ops if already open); a floor gap opens BUILD MODE via Build.open.
     body.querySelectorAll('.q-go').forEach(b => b.addEventListener('click', ev => {
       ev.stopPropagation();
       const d = b.dataset.dest;
@@ -9634,20 +12171,29 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     // `wide` = wide width only). The old per-window pixel widths (460/540/560/620/640/760/1000) are
     // gone — they made eight windows read as eight unrelated apps. A window earns WIDE only by having
     // a rail, a card grid, or side-by-side columns; everything single-column is a PANEL.
-    commander:['COMMANDER DOSSIER',      buildCommander, { console: true, className: 'commander-console' }],   // focused profile, preferences, briefing, and record sections
+    commander:['YOU · COMMANDER DOSSIER',      buildCommander, { console: true, className: 'commander-console' }],   // focused profile, preferences, briefing, and record sections
     // NAV CONDENSE 2 (2026-08-04): 'skills' is no longer a window key — the skill library/agent-
     // skills sections live in the ABILITIES (connectors) console via AbilityLanes, and per-agent
     // capabilities live in the dossier's SKILLS tab. openTerm keeps the old keys alive as aliases
     // (TERM_ALIAS). UPDATES stays its own SYSTEM-dock window (Andrew's call — an update is a
     // check-it-now surface, not a setting).
     updates:  ['UPDATE CENTER',          buildUpdates,   {}],
-    tasks:    ['TASK BOARD',             buildTasks,     { console: true, className: 'tasks-win' }],   // three kanban lanes side by side
+    tasks:    ['TASKS',                  buildTasks,     { console: true, className: 'tasks-win' }],   // three kanban lanes side by side
     // DELIVERABLES is console-WIDE (a project rail beside the cards needs the room) and holds a STEADY height for
     // the same reason the dossier does: a never-moved window is CSS-centred, so a content-fit box would re-centre
     // itself every time a card's details drawer opens — the row you just clicked would slide out from under you.
     // The `dlv` class owns that height; the card list scrolls inside it.
-    deliverables:['DELIVERABLES',         body => { if (typeof Deliverables !== 'undefined') Deliverables.mount(body); }, { console: true, className: 'dlv-win' }],
-    settings: ['SETTINGS',               buildSettings,  { console: true }],
+    deliverables:['DELIVERABLES',         body => {
+      if (typeof Deliverables !== 'undefined') Deliverables.mount(body);
+      // TO REVIEW (the old OUTBOX): finished runs waiting for your verdict, above the library — hidden when none
+      const lib = body.querySelector('.dlv'), host = mkEl('section', 'dlv-review');
+      const head = lib && lib.querySelector(':scope > p.muted');
+      if (head) head.after(host); else if (lib) lib.prepend(host); else body.prepend(host);
+      if (typeof OutboxView !== 'undefined' && OutboxView.build) OutboxView.build(host); else host.hidden = true;
+      if (consoleSection.deliverables === 'review') { delete consoleSection.deliverables; if (!host.hidden) setTimeout(() => { try { host.scrollIntoView({ block: 'start' }); } catch (_) {} }, 0); }
+    }, { console: true, className: 'dlv-win', onClose: w => { if (typeof OutboxView !== 'undefined' && OutboxView.unmount) OutboxView.unmount(w); } }],
+    // a closed SETTINGS must not stay reachable through its repaint hooks (night-leak 10-15: they held the whole closed window)
+    settings: ['SETTINGS',               buildSettings,  { console: true, onClose: dropSettingsRepaints }],
     notifs:   ['NOTIFICATIONS',          buildNotifs,    { console: true, className: 'notifs-win' }],
     // the FIELD MANUAL codex is owned by tutorial.js (P3); this term just hosts its builder
     manual:   ['FIELD MANUAL',           body => { if (typeof Tutorial !== 'undefined' && Tutorial.fillFieldManual) Tutorial.fillFieldManual(body); }, { console: true, className: 'manual-win' }],
@@ -9671,11 +12217,11 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     // dom + format primitives
     esc, mkEl, sfx, clock, ts, fmtRel,
     // hud + window plumbing
-    notify, toast, mountConsole, rerender, openTerm, openSignIn, navigateWork, workConversation,
+    notify, settleNotifs, waitingNotifKeys, seenSession, toast, mountConsole, rerender, openTerm, openSignIn, navigateWork, workConversation,
     // deep-link a missing capability object into the REAL placement surface (minimize this console,
-    // open REFIT, arm its palette on the exact prop). The TOOLSETS pane's inert rows use it, so a row
+    // open BUILD MODE, arm its palette on the exact prop). The TOOLSETS pane's inert rows use it, so a row
     // that diagnoses "no dish on station" can also cure it. Shared, never re-implemented: an auto-place
-    // that skipped REFIT would be a fake placement, and the honest path already exists.
+    // that skipped BUILD MODE would be a fake placement, and the honest path already exists.
     placeGearForSkill,
     // shared window fragments (roster switcher for the per-agent windows; dossier memory loader)
     rosterSwitchHtml, wireRosterSwitch, loadMemoryCore, workshopCard, wireWorkshop,
@@ -9684,6 +12230,9 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     // live core state (read-only views — never reassign through these)
     get present() { return present; },
     get sel() { return sel; },
+    skillsAgentId,   // ORG P21: the agent the ABILITIES skills lane shows — the BUILT-IN ABILITIES picker opens on the same one
+    agentPostureOf,  // a pure read (no state): the ONE ACCESS posture an agent's saved answer matches — TOOLS names it in those words
+    get deskAgentId() { return deskAgentId; },
     get store() { return store; }
   };
 
@@ -9711,6 +12260,19 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
         const k = b.dataset.term, def = BUILDERS[k];
         if (def) toggleTerm(k, def[0], def[1], def[2]);
       }));
+    // ONE PROGRESS HOME doors: an agent's GROWTH points at the station's progress, the station's progress at the TROPHY CASE
+    // (until now reachable only by clicking its prop on the floor). The TROPHY CASE door rides a <summary>: its click must
+    // not also fold the milestones.
+    document.addEventListener('click', ev => {
+      const b = ev.target && ev.target.closest && ev.target.closest('[data-open-progress],[data-open-trophies]');
+      if (!b || !b.closest('#terms')) return;
+      if (b.closest('summary')) ev.preventDefault();
+      sfx('click');
+      if (b.hasAttribute('data-open-progress')) openTerm('quests', 'progress');
+      else openTerm('trophies');
+    });
+    // ONE MENU dock buttons (MY WORK / AUTOMATE / CONNECT): open the menu's last-used tab
+    document.querySelectorAll('.bb[data-family]').forEach(b => b.addEventListener('click', () => toggleFamily(b.dataset.family)));
     badges();
   }
 
@@ -9724,6 +12286,8 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   // ('create' → 'routines-create', 'start'/'active' → 'loops-start'/'loops').
   const TERM_ALIAS = {
     routines: { term: 'automation', section: 'routines', map: { active: 'routines', create: 'routines-create' } },
+    // ONE PLACE FOR FINISHED WORK (10-02): the OUTBOX is DELIVERABLES' TO REVIEW section — every old door lands there
+    outbox:   { term: 'deliverables', section: 'review', map: {} },
     loops:    { term: 'automation', section: 'loops',    map: { active: 'loops', start: 'loops-start' } },
     // NAV CONDENSE 2: three more retired window keys live on as deep links. 'skills' lands on the
     // ABILITIES skill library (its per-agent CAPABILITIES grid moved to the dossier SKILLS tab, so
@@ -9735,26 +12299,136 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     logbook:  { term: 'agents',     section: 'record', map: { runs: 'record', slag: 'record', insights: 'record' } },
     rewind:   { term: 'agents',     section: 'record', map: { restore: 'record' } }
   };
+  /* ONE FLAT LIST (UX night 10-26): CONNECT › ABILITIES lost its INSTALLED / DISCOVER / CREATE switch and four
+     sections became blocks of their neighbours. Their ids are named all over the app (places, error doors, the
+     dossier, SETTINGS), so each retired id still opens: on the section that absorbed it, scrolled to its block. */
+  const SECTION_ALIAS = {
+    connectors: { keys: ['mcp', '#ab-keys'], computer: ['toolsets', '#ab-computer'], agent: ['library', '#ab-agent-skills'], exchange: ['market', '#ab-exchange'] }
+  };
+  // a door to a merged block lands ON it: opens every fold on the way down, then scrolls (setTimeout, never rAF — a
+  // hidden or non-compositing tab never fires rAF). The window may still be swapping in, so it waits for the block;
+  // rows that load late above it (the services list) push it down, so it lands once more unless the Commander scrolled.
+  function revealInTerm(key, anchor) {
+    let tries = 0, landed = -1, pane = null;
+    const land = () => {
+      const w = open[key], el = w && w.querySelector(anchor);
+      if (!el) { if (++tries < 25) setTimeout(land, 60); return; }
+      for (let p = el.parentElement; p && p !== w; p = p.parentElement) if (p.tagName === 'DETAILS') p.open = true;
+      pane = el.closest('.con-pane');
+      if (!pane) { try { el.scrollIntoView({ block: 'start' }); } catch (_) {} return; }
+      pane.scrollTop = Math.max(0, el.offsetTop - pane.offsetTop - 8); landed = pane.scrollTop;
+    };
+    setTimeout(land, 0);
+    setTimeout(() => { if (pane && pane.isConnected && pane.scrollTop === landed) land(); }, 700);
+  }
   function openTerm(key, section) {
     if (key === 'work') key = 'tasks'; // compatibility for old saved links; the station remains home
     const al = TERM_ALIAS[key];
     if (al) { section = (section && al.map[section]) || al.section; key = al.term; }
     const def = BUILDERS[key]; if (!def) return;
+    const sal = section && SECTION_ALIAS[key] && SECTION_ALIAS[key][section];
+    if (sal) { section = sal[0]; revealInTerm(key, sal[1]); }   // the scroll runs after this open/rerender below
+    // the old NIGHT SHIFT settings section is part of AUTONOMY now (ONE WORD: AUTONOMY) — an old link still lands.
+    if (key === 'settings' && section === 'nightshift') section = 'autonomy';
+    // ONE PLAIN LIST (10-02): MODEL DEFAULTS lives on AI & MODELS, LIVE VOICE on LOOK & SOUND
+    if (key === 'settings' && (section === 'models' || section === 'livevoice')) section = section === 'models' ? 'providers' : 'appearance';
     // optional section arg (Lane A error-door routing): land the console rail on a specific section — same
     // mechanism as the dossier's "jump to CONFIG" (consoleSection is what mountConsole reads at render).
     if (section) consoleSection[key] = section;
-    if (open[key]) { if (minimized[key]) restoreTerm(key); if (section) rerender(key); return; }   // minimized → restore, not duplicate
+    // minimized → restore, not duplicate. A door that moves an open menu window to another section (AWAY WORK while
+    // SCHEDULES shows) lights that section's tab too — the strip otherwise only followed clicks inside the window
+    if (open[key]) { if (minimized[key]) restoreTerm(key); if (section) { rerender(key); syncFamilyTabs(open[key], key); } return; }
+    // ONE MENU: a link to a sibling of a menu window that is already showing (OUTBOX → DELIVERABLES, ABILITIES →
+    // CHANNELS, a schedule draft while WORKFLOWS is up) switches that window's tab in place — never a second window
+    const fam = familyOf(key);
+    const sib = fam && Object.keys(open).find(k => k !== key && open[k] && !minimized[k] && !open[k]._closing && familyOf(k) === fam);
+    // name the window (toKey): the sheet is seated the moment its frame mounts (SEAT BEFORE BUILD), so the source's spot,
+    // size and docked height must be carried BEFORE it opens — carried after, a deep link (TASKS' ▸ DELIVERABLES) opened
+    // at the sibling's own dock height and the tab switch snapped (0.14.1 review)
+    if (sib && !windowDirty(open[sib])) { swapInPlace(sib, () => toggleTerm(key, def[0], def[1], def[2]), key); return; }
     toggleTerm(key, def[0], def[1], def[2]);
+  }
+  /* org P03 — an error door lands ON the provider's card, not at the top of a long AI & MODELS page. Opens the
+     section, scrolls the card a quarter-pane from the top (the CONFIG jump's offsetTop landing, never scrollIntoView's
+     minimum scroll) and marks it for a moment. `signin` presses the card's own ⏼ SIGN IN / ⏼ RECONNECT — the same
+     prov-oauth-signin flow a click starts; on a card that shows no such key (a sign-in still listed as connected) it
+     starts that same card flow itself (startCardSignin), so a RECONNECT door always reconnects.
+     The section can paint a beat after openTerm, so the card is looked up again for up to ~3s; a repaint that replaces
+     the landed card re-lands on the new one until the Commander takes over the window (or ~20s).
+     ONE LIVE LANDING (org P03 review): a newer door ends the older landing before it opens anything. The newer door's
+     openTerm repaints Settings, which replaces the older card, and the older stay() loop read that as "a repaint took my
+     card" and landed the pane back on the card the Commander had NOT just asked for (two cards marked). */
+  let provLanding = null;   // the landing in flight ({ end }); focusProvider ends it before starting its own
+  function focusProvider(pid, opts) {
+    const o = opts || {};
+    const id = String(pid || '').replace(/[^a-z0-9_-]/gi, '');
+    if (provLanding) { const prev = provLanding; provLanding = null; prev.end(); }
+    openTerm('settings', 'providers');
+    if (!id) return;
+    // the landing holds until the Commander takes over the window (pointer, wheel, key) or ~20s pass: a first-open probe
+    // can repaint Settings up to its 15s credential check + the model-list fetch after the door opened it (org P03 wiring;
+    // a 4s window let a slow probe drop the view off the card). scheduleSettingsRepaint keeps the scroll; this re-marks.
+    let tries = 0, pressed = false, touched = false, watched = null, marked = null;
+    const until = Date.now() + 20000;
+    const TAKE_OVER = ['pointerdown', 'wheel', 'keydown'];
+    const me = {};
+    const touch = () => { touched = true; if (watched) TAKE_OVER.forEach(t => watched.removeEventListener(t, touch, true)); watched = null; if (provLanding === me) provLanding = null; };
+    // superseded by a newer door: stop, and take this landing's mark off its card (one marked card, the newest)
+    me.end = () => { touch(); if (marked) marked.classList.remove('prov-landed'); marked = null; };
+    provLanding = me;
+    // a click/scroll/key in Settings ends the landing from the moment the door opens it, even before the card has painted
+    const watch = w => {
+      if (touched || !w || watched === w) return;
+      if (watched) TAKE_OVER.forEach(t => watched.removeEventListener(t, touch, true));
+      watched = w; TAKE_OVER.forEach(t => w.addEventListener(t, touch, true));
+    };
+    watch(open.settings);
+    const land = () => {
+      if (touched) return;   // a pending retry of a landing that was taken over or superseded never lands
+      const w = open.settings;
+      const card = w && w.querySelector('.prov-card[data-provider="' + id + '"]');
+      if (!card) { if (++tries < 12) setTimeout(land, 250); return; }
+      watch(w);
+      const pane = card.closest('.con-pane');
+      // a quarter-pane lift, not flush to the top: the cards above stay in view, so the landing reads as a place in
+      // AI & MODELS rather than a lone card with no context
+      if (pane) pane.scrollTop = Math.max(0, card.offsetTop - pane.offsetTop - Math.min(120, Math.round(pane.clientHeight * 0.25)));
+      // the mark stays until the Commander touches the window (or ~8s): a 2.4s flash was gone before the card was read
+      card.classList.add('prov-landed'); marked = card;
+      const unmark = () => { card.classList.remove('prov-landed'); w.removeEventListener('pointerdown', unmark, true); };
+      w.addEventListener('pointerdown', unmark, true);
+      setTimeout(unmark, 8000);
+      // a sign-in door RUNS the sign-in: the card's own key when it shows one, else the same card flow directly — a
+      // RECONNECT door can name a sign-in the station still lists as connected (a mid-run 401 the sidecar has not
+      // marked expired yet), and that card shows no key to press. The flow's box is drawn from state, so the
+      // first-open repaints below can't lose its code.
+      if (o.signin && !pressed) {
+        pressed = true;
+        const b = card.querySelector('[data-act="prov-oauth-signin"]'); if (b) b.click(); else if (isOAuthProvider(id)) startCardSignin(id);
+      }
+      // the first open of Settings starts background checks whose answers repaint the whole window (a fresh pane at the
+      // top); while the landing is new, a repaint that replaced this card lands on the new one instead of the top
+      const stay = () => {
+        if (touched) return;
+        if (Date.now() > until || !open.settings) { touch(); return; }
+        if (!card.isConnected) { land(); return; }
+        setTimeout(stay, 200);
+      };
+      setTimeout(stay, 200);
+    };
+    land();
   }
 
   // Following work should uncover the destination and preserve the source's scroll/draft.
   // Reuse the window manager's suspension, never destroy a form to follow a link.
-  const WORK_LABELS = { tasks: 'TASK BOARD', outbox: 'OUTBOX', deliverables: 'LIBRARY', agents: 'AGENT RECORD' };
+  const WORK_LABELS = { tasks: 'TASKS', deliverables: 'DELIVERABLES', agents: 'AGENT DOSSIER', notifs: 'NOTIFICATIONS' };   // display words only (org P30): the keys stay
   let workTrail = [];
   function navigateWork(from, to, section, back) {
     const alias = TERM_ALIAS[to];
     if (alias) { section = (section && alias.map[section]) || alias.section; to = alias.term; }
     if (!BUILDERS[to]) return;
+    // ONE MENU: two tabs of the same menu (OUTBOX → DELIVERABLES) — the tab strip is the way back, so switch in place
+    if (from !== to && familyOf(from) && familyOf(from) === familyOf(to)) { openTerm(to, section); return; }
     if (!back) {
       if (!workTrail.length || workTrail[workTrail.length - 1].key !== from) workTrail = [{ key: from, section: consoleSection[from] }];
       const prior = workTrail.findIndex(x => x.key === to);
@@ -9801,7 +12475,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   function wireNotifyLive() {
     if (notifyLiveWired || typeof U === 'undefined' || !U.bus) return;
     notifyLiveWired = true;
-    U.bus.on('notify', s => { if (typeof s === 'string' && s) notify(s, 'gold', 'cronDigest'); });
+    U.bus.on('notify', s => { if (typeof s === 'string' && s) notify(s, 'gold', 'cronDigest', { go: { term: 'automation', section: 'away' } }); });
   }
 
   // called when entering the game room with the live agent(s)
@@ -9829,7 +12503,9 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
     wireCompactBeat();
     wireNotifyLive();
     tick();
-    if (!started) { started = true; tickTimer = setInterval(tick, 1000); }
+    /* the 1 s station tick runs through PollGate (idle CPU piece 3, 2026-10-20): 1 s while the station can be seen, a
+       30 s floor while the Commander is away, and one tick at once on return. The quest ledger and refresh syncs ride it. */
+    if (!started) { started = true; tickTimer = (typeof PollGate !== 'undefined' && PollGate.every) ? PollGate.every(tick, { ms: 1000, immediate: false }) : setInterval(tick, 1000); }
   }
 
   // update the live roster WITHOUT re-running enter's one-time setup (legacy-task import, timer) — used
@@ -9903,10 +12579,64 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
   }
   function getTheme() { return store.settings.theme; }
 
+  /* LOOK & SOUND from chat (station.control): the Settings › LOOK & SOUND controls without the clicks. Every key is
+     checked against the same steps/ranges the controls offer; then the same `apply + save` they run. Returns what is
+     now in force (read back from the store) and whether the browser kept it; an unknown key or value refuses the whole
+     change, so nothing half-applies. */
+  function lookOptions() {
+    const bds = typeof SpaceBG === 'undefined' ? [] : [].concat(SpaceBG.list()).concat(typeof Terrain === 'undefined' || !Terrain.list ? [] : Terrain.list());
+    return { theme: THEMES.map(([n]) => n).concat('custom'), themeHue: '0-359', themeSat: '0-100', themeGlow: '0-150', panelBright: '-100-100',
+      roomLighting: '0-100', textScale: TEXT_SCALES.map(([v, n]) => v + ' (' + n + ')'), flicker: 'true|false',
+      crtGlass: GLASS_STEPS.map(([id]) => id), staticLevel: '0-200', sound: 'true|false', hints: 'true|false', backdrop: bds.map(b => b.id), sessionRow: ROW_STEPS.map(([id]) => id),
+      notifyPrefs: Object.keys(notifyDefaults()).join('|') + ': true|false' };
+  }
+  function lookNow() {
+    const s = store.settings, out = {};
+    ['theme', 'themeHue', 'themeSat', 'themeGlow', 'panelBright', 'roomLighting', 'textScale', 'flicker', 'crtGlass', 'staticLevel', 'sound', 'hints', 'backdrop', 'sessionRow'].forEach(k => { out[k] = s[k]; });
+    out.notifyPrefs = Object.assign({}, s.notifyPrefs);
+    return out;
+  }
+  function setLook(patch) {
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('say which look settings to change');
+    const opts = lookOptions(), next = {}, num = (k, lo, hi) => {
+      const v = Number(patch[k]); if (!isFinite(v) || v < lo || v > hi) throw new Error(k + ' must be a number from ' + lo + ' to ' + hi); next[k] = Math.round(v);
+    };
+    const pick = (k, list) => { const v = String(patch[k]); if (list.indexOf(v) < 0) throw new Error(k + ' must be one of: ' + list.join(', ')); next[k] = v; };
+    const bool = k => { if (typeof patch[k] !== 'boolean') throw new Error(k + ' must be true or false'); next[k] = patch[k]; };
+    for (const k of Object.keys(patch)) {
+      if (k === 'theme') pick(k, opts.theme);
+      else if (k === 'themeHue') num(k, 0, 359);
+      else if (k === 'themeSat') num(k, 0, 100);
+      else if (k === 'themeGlow') num(k, 0, 150);
+      else if (k === 'panelBright') num(k, -100, 100);
+      else if (k === 'staticLevel') num(k, 0, 200);
+      else if (k === 'roomLighting') num(k, 0, 100);
+      else if (k === 'crtGlass') pick(k, GLASS_STEPS.map(([id]) => id));
+      else if (k === 'sessionRow') pick(k, ROW_STEPS.map(([id]) => id));
+      else if (k === 'backdrop') pick(k, opts.backdrop);
+      else if (k === 'textScale') { const v = Number(patch[k]); if (!TEXT_SCALES.some(([n]) => n === v)) throw new Error('textScale must be one of: ' + TEXT_SCALES.map(([n, l]) => n + ' (' + l + ')').join(', ')); next[k] = v; }
+      else if (k === 'flicker' || k === 'sound' || k === 'hints') bool(k);
+      else if (k === 'notifyPrefs') {
+        const np = patch[k]; if (!np || typeof np !== 'object') throw new Error('notifyPrefs takes { runComplete, needsApproval, cronDigest, sound } as true/false');
+        const d = notifyDefaults(); next[k] = Object.assign({}, store.settings.notifyPrefs);
+        for (const nk of Object.keys(np)) { if (!(nk in d) || typeof np[nk] !== 'boolean') throw new Error('notifyPrefs.' + nk + ' is not an alert setting (use ' + Object.keys(d).join(', ') + ' as true/false)'); next[k][nk] = np[nk]; }
+      } else throw new Error('"' + k + '" is not a look setting (use ' + Object.keys(opts).join(', ') + ')');
+    }
+    if (next.theme && next.theme !== 'custom' && PRESET_HS[next.theme] && next.themeHue == null && next.themeSat == null) { next.themeHue = PRESET_HS[next.theme][0]; next.themeSat = PRESET_HS[next.theme][1]; }
+    Object.assign(store.settings, next);
+    applySettings();
+    const kept = save();
+    try { if (typeof App !== 'undefined' && App.refreshRail && next.sessionRow) App.refreshRail(); } catch (_) {}
+    try { rerender('settings'); } catch (_) {}   // an open SETTINGS window repaints its chips to what is now in force
+    let durable = false;
+    try { const r = JSON.parse(localStorage.getItem(KEY)); durable = !!(r && r.settings && Object.keys(next).every(k => JSON.stringify(r.settings[k]) === JSON.stringify(next[k]))); } catch (_) {}
+    return { changed: Object.keys(next), now: lookNow(), saved: kept && durable };
+  }
+
   // GROWTH Tier 3: repaint the Settings AUTONOMY panel's EARNED badge if it is open (no-op otherwise — the paint fn
   // queries its own (possibly detached) host nodes, so a closed panel costs nothing). Called after a trust accept.
   const repaintAutonomy = () => { try { if (repaintAutonomyDial) repaintAutonomyDial(); } catch (_) {} };
-  return { init, enter, setRoster, setExternalCrew, leave, clearRunning, runningCount: () => runningAgents.size, isAgentRunning: (id) => agentLive(id), notify, flashSave, openAgent, openArcade, toggleTerm, openTerm, closeTerm, rerender, refreshBoard: refreshBoardLive, pokeQuests, setTheme, getTheme, repaintAutonomy, registerWindow, h };
+  return { init, enter, setRoster, setExternalCrew, leave, clearRunning, runningCount: () => runningAgents.size, isAgentRunning: (id) => agentLive(id), notify, warnIfStationLacksKey, settleNotifs, waitingNotifKeys, seenSession, storedWaits, settleStoredWait, flashSave, refreshSave: () => refreshSaveDurability(), offerPreservedSaves, openAgent, refreshCrew: () => crewTick(), openArcade, toggleTerm, openTerm, focusProvider, showTerm, showAgent, notifsMarkRead, notifsClear, badges, openDesk, closeTerm, rerender, refreshBoard: refreshBoardLive, pokeQuests, setTheme, getTheme, setLook, lookNow, lookOptions, repaintAutonomy, initiativeLabel, refreshSystems, toggleFamily, familyOf, registerWindow, h, motionRestState, reseatToasts };
 })();
 
 if (typeof module !== 'undefined' && module.exports) module.exports = { visibleTerminalRect, clampTerminalSize };

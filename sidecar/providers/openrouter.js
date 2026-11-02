@@ -11,9 +11,9 @@
    price catalog. With it, the final chunk carries the authoritative billed cost cost.js prefers. */
 'use strict';
 (function (root, factory) {
-  if (typeof module !== 'undefined' && module.exports) module.exports = factory(require('./provider.js'), require('./errorClass.js'));
-  else { root.SK = root.SK || {}; root.SK.providers = root.SK.providers || {}; root.SK.providers.openrouter = factory(root.SK.providers.provider, root.SK.providers.errorClass); }
-})(typeof globalThis !== 'undefined' ? globalThis : this, function (provider, errorClass) {
+  if (typeof module !== 'undefined' && module.exports) module.exports = factory(require('./provider.js'), require('./errorClass.js'), require('./toolschema.js'));
+  else { root.SK = root.SK || {}; root.SK.providers = root.SK.providers || {}; root.SK.providers.openrouter = factory(root.SK.providers.provider, root.SK.providers.errorClass, root.SK.providers.toolschema); }
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (provider, errorClass, toolschema) {
   'use strict';
 
   const normalizeFinish = provider.normalizeFinish;
@@ -33,11 +33,75 @@
   // throttle degrades to "at most one kick per provider instance" (instances are per-run -> at most once/run).
   let CATALOG_REWARM_AT = 0;
   const REWARM_MIN_MS = 5 * 60 * 1000;
+  /* CATALOG AGE (providers/catalog-cache.js, attached once at boot through the factory). A warm CATALOG was never
+     refreshed: a model OpenRouter listed after boot stayed unknown (window 0, unpriced) for the whole session. With the
+     process cache attached, its clock ages CATALOG: past the TTL, or when a warm list lacks an id asked for (once past
+     the failure back-off), ONE background refresh runs and the old list answers until a NON-empty one replaces it.
+     Every load also feeds the cache's window facts. Absent = exactly as before. */
+  let SHARED = null;
+  let CATALOG_AT = 0;          // when CATALOG last loaded, on SHARED's clock
+  let CATALOG_TRIED_AT = 0;    // when the last background refresh was kicked
+  let CATALOG_REFRESHING = null;
+  function attachCatalogCache(cache) {
+    SHARED = (cache && typeof cache.now === 'function' && typeof cache.isStale === 'function') ? cache : null;
+    return SHARED;
+  }
+  async function fetchCatalogList(doFetch, baseUrl) {
+    try {
+      const res = await doFetch(baseUrl + '/models', {});
+      const j = await res.json();
+      return (j.data || []).map(m => ({
+        id: m.id,
+        name: m.name || m.id,
+        context_length: m.context_length || 0,
+        max_completion_tokens: (m.top_provider && m.top_provider.max_completion_tokens) || null,
+        pricing: m.pricing,
+        supported_parameters: Array.isArray(m.supported_parameters) ? m.supported_parameters.slice() : [],
+        supportsTools: !!(m.supported_parameters && m.supported_parameters.indexOf('tools') >= 0),
+        supportsReasoning: !!(m.supported_parameters && (m.supported_parameters.indexOf('reasoning') >= 0 || m.supported_parameters.indexOf('reasoning_effort') >= 0 || m.supported_parameters.indexOf('include_reasoning') >= 0)),
+        reasoningEfforts: normalizeEffortList(m.reasoningEfforts || m.reasoning_efforts || m.supportedReasoningEfforts || m.supported_reasoning_efforts),
+        // architecture.input_modalities: true/false when the catalog says, null when it does not (provider.imageInputOf)
+        supportsImages: provider.imageInputOf(m)
+      }));
+    } catch (e) { return []; }
+  }
+  function stampCatalog(baseUrl, list) {
+    if (!SHARED) return;
+    CATALOG_AT = SHARED.now();
+    SHARED.noteWindows(baseUrl, list);
+  }
+  let CATALOG_MISS_GAP = 0;    // a miss refresh's gap: the failure back-off, doubling per miss refresh up to the TTL
+  function maybeRefreshCatalog(doFetch, baseUrl, miss) {
+    if (!SHARED || !CATALOG || !CATALOG.length || CATALOG_REFRESHING) return;
+    const now = SHARED.now();
+    if (CATALOG_TRIED_AT && now - CATALOG_TRIED_AT < SHARED.failBackoffMs) return;
+    if (miss) {
+      const gap = CATALOG_MISS_GAP || SHARED.failBackoffMs;
+      if (now - Math.max(CATALOG_AT, CATALOG_TRIED_AT) < gap) return;   // an id OpenRouter never lists cannot keep re-fetching it
+      CATALOG_MISS_GAP = Math.min(SHARED.ttlMs, gap * 2);
+    } else if (!SHARED.isStale(CATALOG_AT)) return;
+    CATALOG_TRIED_AT = now;
+    CATALOG_REFRESHING = fetchCatalogList(doFetch, baseUrl).then(list => {
+      if (list.length) { CATALOG = list; stampCatalog(baseUrl, list); }
+    });
+    const done = () => { CATALOG_REFRESHING = null; };
+    CATALOG_REFRESHING.then(done, done);
+  }
 
   function isAbort(e, signal) {
     // ONLY a real cancellation — never a loose message match, which would mask a genuine provider
     // error (whose text happens to contain "abort") as a clean, empty, "successful" turn.
     return provider.runtime.isAbort(e, signal);
+  }
+
+  /* OpenRouter wraps an upstream refusal as "Provider returned error" and puts the upstream's OWN words in
+     error.metadata.raw. Keep them (bounded): they are what tells a region refusal or an upstream rate limit apart
+     from a rejected key. The message head stays error.message, so existing routing keeps matching. */
+  function errorDetail(e, fallback) {
+    const msg = String((e && e.message) || fallback || '');
+    const raw = e && e.metadata && e.metadata.raw;
+    const rawText = raw == null ? '' : (typeof raw === 'string' ? raw : JSON.stringify(raw));
+    return rawText && msg.indexOf(rawText) < 0 ? msg + ' — ' + rawText.slice(0, 400) : msg;
   }
 
   const RETRY_DELAYS = [400, 1200];   // up to 2 retries (no jitter -> determinism); retryability comes from classifyApiError
@@ -101,10 +165,18 @@
        undocumented), non-blank text only (Anthropic 400s an empty text block), and copies — never stamps a
        caller's message or part in place. Anthropic-through-OpenRouter only (supportsExplicitCache above);
        every other upstream sees the exact prior wire shape. */
+    /* ONE ANCHOR PER USER TURN (lean-prompt, 2026-10-12). Consecutive user messages are ONE turn upstream, and the newest
+       one is now routinely preceded by host notes made user-side for Claude (the per-run <run_context>, recall). Stamping
+       those notes spent the two tail anchors on bytes no later request repeats, so the PREVIOUS assistant reply — the
+       last thing the next message's request shares — was never written, and history was never read back. Only the last
+       message of a consecutive user run is stamped; the next anchor slides back to that reply. */
+    // KILL SWITCH: STARNET_STABLE_PREFIX=0 (the run-context switch, index.js) restores per-message stamping.
+    const oneAnchorPerTurn = String((typeof process !== 'undefined' && process.env && (process.env.STARNET_STABLE_PREFIX != null ? process.env.STARNET_STABLE_PREFIX : process.env.SKYNET_STABLE_PREFIX)) || '').trim() !== '0';
     let stamped = 0;
     for (let i = out.length - 1; i > idx && stamped < 4 - systemAnchors; i--) {
       const m = out[i];
       if (!m || m.role === 'system') continue;
+      if (oneAnchorPerTurn && m.role === 'user' && out[i + 1] && out[i + 1].role === 'user') continue;
       if (typeof m.content === 'string' && m.content.trim()) {
         out[i] = Object.assign({}, m, { content: [{ type: 'text', text: m.content, cache_control: { type: 'ephemeral' } }] });
         stamped++;
@@ -123,7 +195,10 @@
 
   const repairToolPairs = provider.repairToolPairs;
 
-  const preserveClaudeContinuations = provider.preserveClaudeContinuations;
+  // A Claude model keeps its continuation placement; every other upstream gets the strict 'chat' shape: one leading
+  // system message, host notes and the loop's mid-run host messages user-side, ending on a user or tool turn (provider.js
+  // projectRoles via chatRoleProjection — strict upstream chat templates refuse a system message after index 0).
+  const chatRoleProjection = provider.chatRoleProjection;
 
   function normalizeReasoningEffort(value) {
     const key = String(value || 'medium').trim().toLowerCase().replace(/[\s_-]+/g, '');
@@ -165,14 +240,39 @@
     const family = modelFamily(model, meta);
     return family === 'gpt' || family === 'anthropic' || family === 'google';
   }
-  function reasoningEffortsForModel(model, meta) {
+  // `learned` (optional): what the endpoint itself said this model takes, from a refusal (effortRefusal below). It
+  // outranks the catalog and the guess — it is the only rung list on this route the model has actually stated.
+  function reasoningEffortsForModel(model, meta, learned) {
+    if (Array.isArray(learned) && learned.length) return learned.slice();
     const declared = normalizeEffortList(meta && (meta.reasoningEfforts || meta.reasoning_efforts || meta.supportedReasoningEfforts || meta.supported_reasoning_efforts));
     if (declared.length) return declared;
     if (!modelSupportsReasoning(model, meta)) return OFF_ONLY_EFFORTS.slice();
     return OPENROUTER_REASONING_EFFORTS.slice();
   }
-  function clampReasoningEffortForModel(model, effort, meta) {
-    const allowed = reasoningEffortsForModel(model, meta);
+  /* EFFORT REFUSALS (10-14). /models never states a model's reasoning levels, so every reasoning model is GUESSED the
+     whole ladder above — and many refuse a rung of it. Measured live with the real key: gpt-5-mini, gemini-2.5-pro,
+     deepseek-r1, claude-sonnet-5.5, claude-opus-5.5, gemini-3.8-flash, grok-4.7 and glm-5.3-flash answer effort 'none'
+     with 400 "Reasoning is mandatory for this endpoint and cannot be disabled." (each took 'minimal'); o4-mini answers
+     'none' and 'minimal' with 400 "Provider returned error", the provider's own sentence in error.metadata.raw:
+     "Unsupported value: 'none' is not supported with the 'o4-mini-2025-04-16' model. Supported values are: 'low',
+     'medium', and 'high'." Either refusal is the endpoint's truth about that model: it is learned (per endpoint + model,
+     capability facts only — no key) and the request resent at the nearest rung it keeps (requestWithRetry). Returns
+     { refused, supported } or null. Only a refusal of the effort WE sent qualifies; any other 400 stands as-is. */
+  const LEARNED_EFFORTS = new Map();   // baseUrl + '\n' + model -> levels the endpoint said it takes
+  function effortRefusal(status, errBody, detail, sent) {
+    if (!sent || (status !== 400 && status !== 422)) return null;
+    const e = errBody && errBody.error;
+    const raw = e && e.metadata && typeof e.metadata.raw === 'string' ? e.metadata.raw : '';
+    const text = String(detail || '') + '\n' + String((e && e.message) || '') + '\n' + raw;
+    const mandatory = sent === 'none' && /reasoning is mandatory|cannot be disabled/i.test(text);
+    const unsupported = /reasoning[ ._]?effort/i.test(text) && /unsupported|not supported|invalid value/i.test(text);
+    if (!mandatory && !unsupported) return null;
+    const m = /supported values are:?\s*([^.\n"]*)/i.exec(text);
+    const named = m ? (m[1].match(/'[^']+'/g) || []).map(s => s.slice(1, -1).toLowerCase()).filter(v => REASONING_EFFORT_ORDER.indexOf(v) >= 0) : [];
+    return { refused: sent, supported: normalizeEffortList(named) };
+  }
+  function clampReasoningEffortForModel(model, effort, meta, learned) {
+    const allowed = reasoningEffortsForModel(model, meta, learned);
     const normalized = normalizeReasoningEffort(effort);
     if (allowed.indexOf(normalized) >= 0) return normalized;
     const set = new Set(allowed);
@@ -198,7 +298,7 @@
     // later run prices/compacts correctly. Fire-and-forget — the CURRENT run never waits on it (it uses whatever
     // is warm, exactly as before). Safe to call every run; the timestamp gate bounds the /models traffic.
     function maybeRewarmCatalog() {
-      if (CATALOG && CATALOG.length) return;               // already warm
+      if (CATALOG && CATALOG.length) { maybeRefreshCatalog(doFetch, baseUrl, false); return; }   // warm: refresh only past its TTL
       if (CATALOG_PROMISE) return;                         // a load is already in flight
       if (clock) {
         const now = clock.now();
@@ -211,18 +311,32 @@
       Promise.resolve().then(() => loadCatalog()).catch(() => {});
     }
 
-    async function* stream(req) {
+    // A tool advertised under sanitized property keys gets its args mapped back to the declared names before
+    // the loop sees them; with no such tool this is the raw stream itself.
+    function stream(req) { return toolschema.withRestoredArgKeys(wireStream(req), req && req.tools); }
+
+    async function* wireStream(req) {
       maybeRewarmCatalog();
       // usage.include asks OpenRouter to return the real billed `cost` in the final usage chunk (opt-in for
       // streaming). Without it tokens still tally but usd stays 0 unless priceOf(model) resolves — so SPEND
       // reads $0 for any custom/uncatalogued slug. cost.js then takes this authoritative cost over the estimate.
       const meta = findModel(req.model);
-      const allowed = reasoningEffortsForModel(req.model, meta);
-      const effort = clampReasoningEffortForModel(req.model, req.reasoningEffort || reasoningEffort, meta);
-      const body = { model: req.model, messages: applyCacheControl(preserveClaudeContinuations(repairToolPairs(req.messages), req.model), req.model, req.cacheSystemPrefix), stream: true, usage: { include: true } };
+      const allowed = reasoningEffortsForModel(req.model, meta, learnedFor(req.model));
+      const effort = clampReasoningEffortForModel(req.model, req.reasoningEffort || reasoningEffort, meta, learnedFor(req.model));
+      // ONE pre-send normalization (provider.js prepareWireMessages) — for this wire, exactly repairToolPairs.
+      // Strict upstreams behind OpenRouter must never see StarNet's own bookkeeping keys on a message (ts, streamId,
+      // agentId, sourceRunId, error, stopped, attachments) — only Chat Completions message keys leave, projected
+      // BEFORE applyCacheControl so its cache_control anchors are stamped inside the content parts of clean copies.
+      // A model the catalog (or its own earlier refusal) calls text-only gets each image as a short note instead: OpenRouter
+      // refuses the whole request otherwise (404 "No endpoints found that support image input"). Unknown keeps them.
+      const sent = supportsImages(req.model) === false ? provider.withoutImageParts(req.messages, req.model) : req.messages;
+      const body = { model: req.model, messages: applyCacheControl(provider.chatWireMessages(chatRoleProjection(provider.prepareWireMessages(sent, 'chat'), req.model)), req.model, req.cacheSystemPrefix), stream: true, usage: { include: true } };
       if (effort !== 'none' || allowed.length > 1) body.reasoning = { effort };
       if (req.tools && req.tools.length) {
-        body.tools = req.tools;
+        // Grammar-safe property keys on every tool (OpenRouter fronts Anthropic/Bedrock, which 400 the whole request
+        // on one bad key), and the Moonshot dialect for a moonshotai/* model. A well-formed catalog on any other
+        // model is req.tools itself, byte-identical.
+        body.tools = toolschema.wireTools(req.tools, { moonshot: toolschema.isMoonshotRoute(req.model) });
         body.tool_choice = 'auto';
         /* parallel_tool_calls is deliberately OMITTED (provider default: enabled). It was forced `false` in the
            MVP "to keep the visualization linear" — a decision made BEFORE the loop grew its concurrent dispatch
@@ -232,15 +346,16 @@
            four prompt re-sends). Reverses docs/harness-runtime-spec.md's MVP position, dated 2026-08-17. */
       }
       let res;
-      try { res = await requestWithRetry(body, req.signal); }   // retries transient 429/5xx + network errors BEFORE any token streams
+      try { res = await requestWithRetry(body, req.signal, provider.runtime.preStreamRetries(req, RETRY_DELAYS.length)); }   // retries transient 429/5xx + network errors BEFORE any token streams
       catch (e) { if (isAbort(e, req.signal)) return; throw e; }  // cancel during the POST/backoff -> end cleanly so the loop reports 'cancelled', not 'error'
       // idle watchdog: no bytes for SKYNET_PROVIDER_IDLE_MS -> cancel the reader + throw a `timeout` error (a hung
       // stream must not pin a paid run forever). A user-cancel via req.signal still surfaces as an AbortError below.
-      const reader = timeouts.idleGuardedReader(res.body.getReader(), { signal: req.signal });
+      const reader = timeouts.idleGuardedReader(res.body.getReader(), { signal: req.signal, url: res.url || baseUrl });
       const dec = new TextDecoder();
       let buf = '';
       const started = {};   // index -> true once tool_start has been emitted
       let doneEmitted = false;   // exactly one terminal event per stream (see STREAM-END TRUTH below)
+      let reasoningSeen = false;   // this stream already said reasoning is streaming (emitFrom)
 
       // parse ONE raw SSE line into either a control signal or its JSON payload
       function parseLine(line) {
@@ -253,10 +368,26 @@
       }
       // one decoded chunk -> 0..n normalized HarnessEvents (shared by the loop + end-of-stream flush)
       function* emitFrom(j) {
-        if (j.error) throw new Error((j.error && j.error.message) || 'openrouter stream error');
+        if (j.error) {
+          /* IN-BAND ERROR. OpenRouter has already answered 200 (its keep-alives precede the upstream), so a numeric
+             error.code here IS the HTTP-equivalent status: say so in the adapter's own sentence, which classifyApiError
+             and the browser's friendlyerror both route on. Without it an in-band 401 read `unknown` and was retried for
+             ~100 s (sweep/providers 2026-10-20). A string code ('server_error') invents no status. */
+          const code = Number(j.error.code);
+          const http = Number.isInteger(code) && code >= 400 && code < 600;
+          const err = new Error((http ? 'openrouter http ' + code + ' (in-stream) — ' : '') + errorDetail(j.error, 'openrouter stream error'));
+          if (http) err.status = code;
+          err.body = j;   // the structured error (code, metadata) — errorClass reads it
+          err.ownMessage = true;
+          throw err;
+        }
         const choice = j.choices && j.choices[0];
         if (choice && choice.delta) {
           const d = choice.delta;
+          // reasoning (billed output, not shown) streams before the answer: say so once, so a Stop in that phase is a
+          // cut call, never a known $0 (80de2a75 review; same rule as openai-compatible emitFrom)
+          if (!reasoningSeen && ((typeof d.reasoning === 'string' && d.reasoning) || (typeof d.reasoning_content === 'string' && d.reasoning_content)
+            || (Array.isArray(d.reasoning_details) && d.reasoning_details.length))) { reasoningSeen = true; yield { type: 'reasoning' }; }
           if (typeof d.content === 'string' && d.content) yield { type: 'text', delta: d.content };
           if (Array.isArray(d.tool_calls)) {
             for (const tc of d.tool_calls) {
@@ -318,21 +449,9 @@
       if (CATALOG && CATALOG.length) return CATALOG;   // only a NON-empty catalog is a cache hit
       if (!CATALOG_PROMISE) {
         CATALOG_PROMISE = (async () => {
-          try {
-            const res = await doFetch(baseUrl + '/models', {});
-            const j = await res.json();
-            return (j.data || []).map(m => ({
-              id: m.id,
-              name: m.name || m.id,
-              context_length: m.context_length || 0,
-              max_completion_tokens: (m.top_provider && m.top_provider.max_completion_tokens) || null,
-              pricing: m.pricing,
-              supported_parameters: Array.isArray(m.supported_parameters) ? m.supported_parameters.slice() : [],
-              supportsTools: !!(m.supported_parameters && m.supported_parameters.indexOf('tools') >= 0),
-              supportsReasoning: !!(m.supported_parameters && (m.supported_parameters.indexOf('reasoning') >= 0 || m.supported_parameters.indexOf('reasoning_effort') >= 0 || m.supported_parameters.indexOf('include_reasoning') >= 0)),
-              reasoningEfforts: normalizeEffortList(m.reasoningEfforts || m.reasoning_efforts || m.supportedReasoningEfforts || m.supported_reasoning_efforts)
-            }));
-          } catch (e) { return []; }
+          const list = await fetchCatalogList(doFetch, baseUrl);
+          if (list.length) stampCatalog(baseUrl, list);
+          return list;
         })();
       }
       CATALOG = await CATALOG_PROMISE;
@@ -340,8 +459,16 @@
       return CATALOG;
     }
     async function listModels() { return (await loadCatalog()).map(m => Object.assign({}, m)); }
-    function findModel(id) { return CATALOG ? CATALOG.find(m => m.id === id) : null; }
+    // a run's setup asks for the window before its first request (catalog-cache.js runWindow bounds the wait): warm = at once
+    function warmCatalog() { return loadCatalog(); }
+    function findModel(id) {
+      const m = CATALOG ? CATALOG.find(x => x.id === id) : null;
+      if (!m && id) maybeRefreshCatalog(doFetch, baseUrl, true);   // a warm list without this id: a model listed after it loaded
+      return m;
+    }
     function contextLimit(id) { const m = findModel(id); return (m && m.context_length) || 0; }
+    // the catalog's max output for this model (provider.js outputLimit: top_provider.max_completion_tokens); 0 = unknown
+    function outputLimit(id) { const m = findModel(id); return (m && Number(m.max_completion_tokens)) || 0; }
     function priceOf(id) {
       // best-effort: null until the catalog is loaded — cost.js then relies on the provider's
       // real `usage.cost` (always returned by OpenRouter), so this never blocks honest accounting.
@@ -352,12 +479,24 @@
     }
     // true/false once the catalog is warm; null = unknown (cold catalog) so callers don't false-refuse.
     function supportsTools(id) { const m = findModel(id); return m ? !!m.supportsTools : null; }
-    function reasoningEfforts(id) { return reasoningEffortsForModel(id, findModel(id)); }
+    // Image input: false once this model refused an image here, else the catalog's word (true/false), else null (unknown).
+    function supportsImages(id) {
+      if (provider.refusedImages(baseUrl, id)) return false;
+      const m = findModel(id);
+      return (m && typeof m.supportsImages === 'boolean') ? m.supportsImages : null;
+    }
+    function reasoningEfforts(id) { return reasoningEffortsForModel(id, findModel(id), learnedFor(id)); }
+    function learnedFor(id) { return LEARNED_EFFORTS.get(baseUrl + '\n' + String(id || '')) || null; }
 
     // POST the chat request, retrying transient failures (429/5xx + network resets) BEFORE the stream
     // starts — safe because no tokens have been emitted yet. Aborts propagate at once. Returns an ok Response.
-    async function requestWithRetry(body, signal) {
+    async function requestWithRetry(body, signal, maxRetries) {
+      // maxRetries: the loop may LOWER this ladder (req.preStreamRetries = 0 once it owns the pacing — provider.js).
+      // `waited` is the backoff actually spent; the exhaustion marker reports it so the loop counts it, not repeats it.
+      const retries = (maxRetries == null) ? RETRY_DELAYS.length : maxRetries;
+      let waited = 0;
       let lowCreditHealed = false;   // one-shot: a 402 affordability refusal retries ONCE with a clamped max_tokens
+      let effortHeals = 0;           // a refused reasoning rung resends at the nearest one kept (each heal drops a rung; capped)
       for (let attempt = 0; ; attempt++) {
         if (signal && signal.aborted) throw abortError();
         let res;
@@ -373,15 +512,42 @@
           });
         } catch (e) {
           if (isAbort(e, signal)) throw e;
-          if (attempt < RETRY_DELAYS.length) { await delay(RETRY_DELAYS[attempt], signal); continue; }   // network error / connect timeout -> retry
-          throw provider.runtime.markPreStreamRetriesExhausted(e);
+          provider.runtime.stampRequestHost(e, baseUrl);   // a TLS/socket cause names no host: say which one we dialled
+          // a TLS rejection or a crash in our own request code cannot heal by re-sending: fail fast, unmarked
+          const failure = classifyApiError(e, { model: body.model });   // unreachable: one retry (its retryBudget), then name the host
+          if (!failure.retryable) throw e;
+          if (attempt < provider.runtime.retryLimit(failure, retries)) { const wait = provider.runtime.retryDelay(failure, attempt, RETRY_DELAYS); waited += wait; await delay(wait, signal); continue; }   // network error / connect timeout -> retry
+          throw provider.runtime.markPreStreamRetriesExhausted(e, { attempts: attempt + 1, waitedMs: waited });
         } finally {
           guard.disarm();
         }
         if (res.ok && res.body) return res;
-        let detail = res.statusText || '';
-        try { const j = await res.json(); detail = (j && j.error && j.error.message) || JSON.stringify(j); }
-        catch (e) { try { detail = (await res.text()).slice(0, 300); } catch (_) {} }
+        // The body is read ONCE, as text, through the idle watchdog and the caller's Stop (provider.runtime.readErrorBody):
+        // a stalled error body ignored Stop for up to 300 s. Only a JSON error's own words are quoted. A non-JSON page (a
+        // proxy's 503 "... reset reason: connection reset") keeps the status text: the browser's error copy reads
+        // transport and policy words before the status (friendlyerror kindFromRaw), so its prose would be told as a
+        // dropped connection or a content block the harness cannot prove.
+        const eb = await provider.runtime.readErrorBody(res, { signal, url: baseUrl, tag: 'providers.openrouter' });
+        const errBody = eb.parsed ? eb.data : null;
+        let detail = eb.parsed ? ((errBody && errBody.error && errorDetail(errBody.error, '')) || JSON.stringify(errBody)) : (res.statusText || '');
+        if (eb.stalled) detail += ' (error body did not finish)';
+        // EFFORT SELF-HEAL (400): the model refused the reasoning rung we sent (effortRefusal). Learn what it takes and
+        // resend at the nearest rung it keeps — before any token streams, so nothing is billed twice. Does not consume
+        // a transient-retry attempt. A refusal that removes nothing new stands as the honest error.
+        const refusal = effortHeals < 3 ? effortRefusal(res.status, errBody, detail, body.reasoning && body.reasoning.effort) : null;
+        if (refusal) {
+          const meta = findModel(body.model);
+          const before = reasoningEffortsForModel(body.model, meta, learnedFor(body.model));
+          const kept = refusal.supported.length ? refusal.supported : before.filter(x => x !== refusal.refused);
+          if (kept.indexOf(refusal.refused) < 0) {
+            effortHeals++;
+            LEARNED_EFFORTS.set(baseUrl + '\n' + String(body.model || ''), kept.slice());
+            const next = kept.length ? clampReasoningEffortForModel(body.model, refusal.refused, meta, kept) : '';
+            body = Object.assign({}, body);
+            if (next) body.reasoning = { effort: next }; else delete body.reasoning;   // no rung left: the model's own default
+            attempt--; continue;
+          }
+        }
         // LOW-CREDIT SELF-HEAL (402): with max_tokens unset, OpenRouter reserves the model's FULL output
         // ceiling against the account balance — a low-credit account gets "requires more credits, or fewer
         // max_tokens … can only afford N" even though the actual reply needs a fraction of N. That stranded
@@ -398,18 +564,26 @@
             continue;
           }
         }
+        // the model refused image input: text-only for this process, so the next request to it goes without the image
+        if (errorClass.isImageInputRefusal(detail)) provider.noteImageRefusal(baseUrl, body.model);
         const err = new Error('openrouter http ' + res.status + ' — ' + detail);
         err.status = res.status;
         err.headers = res.headers;   // H6.1: let classifyApiError read Retry-After / X-RateLimit-Reset off the real response
+        /* KEEP THE PROVIDER'S ERROR BODY (same law as codex.js): errorClass reads error.code off it (a 429 carrying
+           'insufficient_quota' is an empty wallet, not a busy moment). The message stays this adapter's own sentence
+           (label + status — what the UI routes on; err.ownMessage tells errorClass so). */
+        if (errBody && typeof errBody === 'object') { err.body = errBody; err.ownMessage = true; }
+        // an upstream chat template refused the shape (errorClass template_refusal): its sentence names where it was sent
+        if (errorClass.isTemplateRefusal(detail)) provider.runtime.stampRequestHost(err, baseUrl);
         const cls = classifyApiError(err, { model: body.model });   // single source of truth for retryability
         err.transient = cls.retryable;                              // keep the field other code reads, now classifier-derived
-        if (cls.retryable && attempt < RETRY_DELAYS.length) { await delay(Math.min(60000, Math.max(RETRY_DELAYS[attempt], cls.retryAfterMs || 0)), signal); continue; }   // honor the server-stated wait, capped at 60s
-        throw cls.retryable ? provider.runtime.markPreStreamRetriesExhausted(err) : err;
+        if (cls.retryable && attempt < retries) { const wait = Math.min(60000, Math.max(RETRY_DELAYS[attempt], cls.retryAfterMs || 0)); waited += wait; await delay(wait, signal); continue; }   // honor the server-stated wait, capped at 60s
+        throw cls.retryable ? provider.runtime.markPreStreamRetriesExhausted(err, { attempts: attempt + 1, waitedMs: waited }) : err;
       }
     }
 
-    return { stream, listModels, contextLimit, priceOf, supportsTools, reasoningEfforts };
+    return { stream, listModels, warmCatalog, contextLimit, outputLimit, priceOf, supportsTools, supportsImages, reasoningEfforts };
   }
 
-  return { makeOpenRouterProvider, applyCacheControl, _internals: { normalizeReasoningEffort, reasoningEffortsForModel, clampReasoningEffortForModel, repairToolPairs } };
+  return { makeOpenRouterProvider, applyCacheControl, attachCatalogCache, _internals: { normalizeReasoningEffort, reasoningEffortsForModel, clampReasoningEffortForModel, repairToolPairs } };
 });

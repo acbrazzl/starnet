@@ -70,10 +70,14 @@ async function collect(provider, req) { const out = []; for await (const e of pr
     A.eq(captured.headers['anthropic-version'], '2023-06-01', 'Anthropic API version header set');
     A.eq(captured.body.system, [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral' } }],
       'leading system lifted — block form, carrying the cache breakpoint');
+    // an UNSPLIT system prompt keeps the system anchor over the tools (the TOOL ANCHOR rides only a split, task-run system)
     A.eq(captured.body.tools[0], { name: 'web', description: 'd', input_schema: { type: 'object' } }, 'OpenAI tool -> Anthropic tool');
-    A.eq(captured.body.messages[0].content[1], { type: 'tool_use', id: 'call_7', name: 'web', input: { q: 1 }, cache_control: { type: 'ephemeral' } },
+    // the transcript opens on an assistant turn: the request gets a fenced user boundary first (provider.js projectRoles —
+    // the API refuses a first message that is not a user turn)
+    A.eq([captured.body.messages[0].role, /^<host_turn>/.test(captured.body.messages[0].content[0].text)], ['user', true], 'a <host_turn> user boundary opens the request');
+    A.eq(captured.body.messages[1].content[1], { type: 'tool_use', id: 'call_7', name: 'web', input: { q: 1 }, cache_control: { type: 'ephemeral' } },
       'assistant tool_call -> tool_use block (inside the last-3 sliding window, so it carries an anchor)');
-    A.eq(captured.body.messages[1].content[0], { type: 'tool_result', tool_use_id: 'call_7', content: 'result text', cache_control: { type: 'ephemeral' } },
+    A.eq(captured.body.messages[2].content[0], { type: 'tool_result', tool_use_id: 'call_7', content: 'result text', cache_control: { type: 'ephemeral' } },
       'tool result -> tool_result block (last block of the last turn carries the conversation breakpoint)');
   }
 
@@ -101,10 +105,33 @@ async function collect(provider, req) { const out = []; for await (const e of pr
     };
     const TOOLS = [{ type: 'function', function: { name: 'a', parameters: { type: 'object' } } }];
 
-    // With a system prompt, SYSTEM is the anchor — it renders after tools, so one breakpoint caches both.
-    const withSys = await cap({ model: 'm', messages: [{ role: 'system', content: 's' }, { role: 'user', content: 'u' }], tools: TOOLS });
+    // With an UNSPLIT system prompt, SYSTEM is the anchor — it renders after tools, so one breakpoint caches both, and the
+    // three newest messages keep their sliding anchors (1 + 3 = the API's 4).
+    const tail3 = [{ role: 'system', content: 's' }, { role: 'user', content: 'u1' }, { role: 'assistant', content: 'a1' }, { role: 'user', content: 'u2' }];
+    const withSys = await cap({ model: 'm', messages: tail3, tools: TOOLS });
     A.eq(withSys.system[0].cache_control, { type: 'ephemeral' }, 'system block carries the static-prefix breakpoint');
-    A.ok(!withSys.tools[0].cache_control, 'no redundant breakpoint on tools when system already covers them');
+    A.ok(!withSys.tools[withSys.tools.length - 1].cache_control, 'unsplit system: no redundant breakpoint on the tools (the system anchor covers them)');
+    A.eq(withSys.messages.map(m => m.content.some(b => b.cache_control)), [true, true, true], 'unsplit system: the three newest messages keep their sliding anchors');
+    /* TOOL ANCHOR (lean-prompt 2026-10-12): only a SPLIT system (a task run's cacheSystemPrefix + the per-conversation
+       tail) anchors the last tool on its own, so a change in the system tail (a Dossier edit, a persona toggle) never
+       re-writes the catalogue in front of it (issue #105). Budget: tools 1 + the stable system block 1 + 2 tail. */
+    const SPLIT_SYS = 'stable prefix. '.repeat(10);
+    const split = await cap({ model: 'm', cacheSystemPrefix: SPLIT_SYS, messages: [{ role: 'system', content: SPLIT_SYS + '\n\nper-conversation tail' }].concat(tail3.slice(1)), tools: TOOLS });
+    A.eq(split.tools[split.tools.length - 1].cache_control, { type: 'ephemeral' }, 'split system: the last tool anchors the catalogue');
+    A.ok(split.system[0].cache_control && !split.system[1].cache_control, 'split system: the stable block is anchored, the tail block is not');
+    A.eq(split.messages.map(m => m.content.some(b => b.cache_control)), [false, true, true], 'split system: two sliding tail anchors');
+    {
+      // the kill switch is read PER CALL: the provider made above (module already loaded) obeys it without a re-require
+      const prev = process.env.STARNET_ANTHROPIC_TOOL_ANCHOR;
+      process.env.STARNET_ANTHROPIC_TOOL_ANCHOR = '0';
+      let legacy = null;
+      try {
+        await collect(makeAnthropicProvider({ key: 'k', fetch: async (_, o) => { legacy = JSON.parse(o.body); return new Response('data: {"type":"message_stop"}\n\n'); } }),
+          { model: 'm', cacheSystemPrefix: SPLIT_SYS, messages: [{ role: 'system', content: SPLIT_SYS + '\n\nper-conversation tail' }].concat(tail3.slice(1)), tools: TOOLS });
+      } finally { if (prev === undefined) delete process.env.STARNET_ANTHROPIC_TOOL_ANCHOR; else process.env.STARNET_ANTHROPIC_TOOL_ANCHOR = prev; }
+      A.ok(legacy && !legacy.tools[0].cache_control && legacy.system[0].cache_control && legacy.system[1].cache_control,
+        'kill switch STARNET_ANTHROPIC_TOOL_ANCHOR=0 (read per call): the system-only anchor layout');
+    }
 
     // With NO system prompt the last tool is the only anchor that still covers the tool catalogue.
     const noSys = await cap({ model: 'm', messages: [{ role: 'user', content: 'u' }], tools: TOOLS });
@@ -173,6 +200,43 @@ async function collect(provider, req) { const out = []; for await (const e of pr
     A.eq(models[0].id, 'claude-x', 'catalog id parsed');
     A.eq(models[0].supportsTools, true, 'Anthropic native models are marked tool-capable');
   }
+  // D2 (#90). A /models answer the API REFUSED is still an empty catalog to every caller, but the adapter keeps its
+  // status so the key check can say "rejected this key (HTTP 401)" instead of blaming an empty catalog.
+  {
+    let status = 401;
+    const p = makeAnthropicProvider({ fetch: async () => (status === 200
+      ? new Response(JSON.stringify({ data: [{ id: 'claude-x' }] }), { status: 200 })
+      : new Response(JSON.stringify({ type: 'error', error: { type: 'authentication_error', message: 'invalid x-api-key' } }), { status })), key: 'KEY' });
+    A.eq(await p.listModels(), [], 'a refused /models listing is still an empty catalog (no caller changes shape)');
+    A.eq(p.catalogHttpStatus(), 401, 'the refusal status is kept for the key check');
+    status = 403;
+    await p.listModels();
+    A.eq(p.catalogHttpStatus(), 403, 'the LATEST refusal is what it reports');
+    status = 200;
+    A.eq((await p.listModels()).length, 1, 'a later good answer still loads the catalog');
+    A.eq(p.catalogHttpStatus(), 0, 'and clears the refusal (0 = the last answer was not an HTTP refusal)');
+    let online = true;
+    const offline = makeAnthropicProvider({ fetch: async () => { if (online) return new Response('{}', { status: 401 }); throw new Error('fetch failed'); }, key: 'KEY' });
+    await offline.listModels();
+    A.eq(offline.catalogHttpStatus(), 401, 'refused first');
+    online = false;
+    await offline.listModels();
+    A.eq(offline.catalogHttpStatus(), 0, 'a later network failure is NOT an HTTP refusal: the old status is not reported as current');
+    // the request never reached Anthropic (DNS / refused connection / proxy): keep THAT error, so the key check can name
+    // the network cause (#62 wording) instead of blaming the key
+    const netErr = Object.assign(new Error('fetch failed'), { cause: { code: 'ECONNREFUSED' } });
+    let reach = false;
+    const unreached = makeAnthropicProvider({ fetch: async () => { if (!reach) throw netErr; return new Response(JSON.stringify({ data: [{ id: 'claude-x' }] }), { status: 200 }); }, key: 'KEY' });
+    A.eq(await unreached.listModels(), [], 'an unreachable /models is still an empty catalog');
+    A.ok(unreached.catalogFetchError() === netErr, 'the network error that kept the request from Anthropic is kept');
+    A.eq(unreached.catalogHttpStatus(), 0, 'and it is not reported as an HTTP refusal');
+    reach = true;
+    A.eq((await unreached.listModels()).length, 1, 'a later answer loads the catalog');
+    A.eq(unreached.catalogFetchError(), null, 'and clears the network error');
+    const garbled = makeAnthropicProvider({ fetch: async () => new Response('<html>proxy</html>', { status: 200 }), key: 'KEY' });
+    A.eq(await garbled.listModels(), [], 'an answer that is not a model list is an empty catalog');
+    A.eq(garbled.catalogFetchError(), null, 'an ANSWERED request is never reported as unreachable');
+  }
 
   // E. max_tokens default is bumped high (no silent 4096 truncation); explicit + catalog ceilings honored.
   {
@@ -186,6 +250,8 @@ async function collect(provider, req) { const out = []; for await (const e of pr
     const p1 = makeAnthropicProvider({ fetch: fetchImpl, key: 'k' });
     await collect(p1, { model: 'claude-unknown', messages: [{ role: 'user', content: 'hi' }] });
     A.eq(captured.body.max_tokens, 32000, 'cold catalog + no explicit -> 32000 fallback (not 4096)');
+    // outputLimit (bug d3a76db3: the run's spend pool prices a call's output by it) is exactly what the adapter sends
+    A.eq(p1.outputLimit('claude-unknown'), 32000, 'outputLimit: the max_tokens a cold catalog sends (32000)');
 
     // E2: explicit per-request max_tokens still wins unchanged.
     captured = null;
@@ -198,12 +264,14 @@ async function collect(provider, req) { const out = []; for await (const e of pr
     captured = null;
     await collect(p2, { model: 'claude-cap', messages: [{ role: 'user', content: 'hi' }] });
     A.eq(captured.body.max_tokens, 8192, "warm catalog -> the model's real max_output_tokens");
+    A.eq(p2.outputLimit('claude-cap'), 8192, "outputLimit: the warm catalog's max_output_tokens, the max_tokens it sends");
 
     // E4: opts.maxTokens override applies when no explicit/catalog value is available.
     const p3 = makeAnthropicProvider({ fetch: async (url, init) => { if (/\/models$/.test(url)) return new Response('{"data":[]}', { status: 200 }); captured = { body: JSON.parse(init.body) }; return new Response([line({ type: 'message_stop' }), ''].join('\n'), { status: 200, headers: { 'Content-Type': 'text/event-stream' } }); }, key: 'k', maxTokens: 16000 });
     captured = null;
     await collect(p3, { model: 'claude-unknown', messages: [{ role: 'user', content: 'hi' }] });
     A.eq(captured.body.max_tokens, 16000, 'opts.maxTokens override applied when no explicit/catalog ceiling');
+    A.eq(p3.outputLimit('claude-unknown'), 16000, 'outputLimit: the configured max_tokens it sends');
   }
 
   // F. USER ATTACHMENTS: a user message with image_url parts maps to native Anthropic image blocks (base64 +
@@ -287,7 +355,7 @@ async function collect(provider, req) { const out = []; for await (const e of pr
       A.ok(!Dock._internals.effortOptionsFor(row).includes('none'), model + ' picker consumes the supported catalog levels');
       for (const off of ['none', 'off', 'disabled']) {
         b = await ask(model, { reasoningEffort: off });
-        A.eq(b.thinking, { type: 'adaptive' }, model + ' saved ' + off + ' uses adaptive thinking');
+        A.eq(b.thinking, { type: 'adaptive', block_binding: { prefix_mismatch_behavior: 'drop_block' } }, model + ' saved ' + off + ' uses adaptive thinking (+ #73 drop_block binding)');
         A.eq(b.output_config, { effort: 'low' }, model + ' saved ' + off + ' clamps to lowest supported effort');
       }
       b = await ask(model, { reasoningEffort: 'high' }, { reasoningEffort: 'none' });
@@ -320,7 +388,7 @@ async function collect(provider, req) { const out = []; for await (const e of pr
     A.eq(evs.filter(e => e.type === 'text').map(e => e.delta).join(''), 'Answer.', 'thinking deltas NEVER become assistant text');
     const reasoning = evs.filter(e => e.type === 'reasoning');
     A.eq(reasoning.length, 1, 'one reasoning event per completed thinking block');
-    A.eq(reasoning[0].block, { type: 'thinking', thinking: 'let me check', signature: 'sig123' }, 'the block is assembled whole: text + signature');
+    A.eq(reasoning[0].block, { type: 'thinking', thinking: 'let me check', signature: 'sig123', pos: { text: 0, tools: 0 } }, 'the block is assembled whole: text + signature (+ its position in the turn, #73)');
 
     // An UNSIGNED block cannot be replayed (the wire validates the signature), so it is dropped at the source
     // rather than handed on to fail the NEXT turn.
@@ -364,8 +432,12 @@ async function collect(provider, req) { const out = []; for await (const e of pr
       await collect(p,{model:'claude-test',messages,cacheSystemPrefix:prefix,tools:[{type:'function',function:{name:'verify',description:'verify work',parameters:{type:'object',properties:{}}}}]});
       A.eq(body.system.map(b=>b.text).join(''),text,'split preserves every system byte');
       A.eq(body.system.length,2,'stable and changing context have separate blocks');
-      A.ok(body.system.every(b=>b.cache_control),'both boundaries remain cacheable');
+      // lean-prompt 2026-10-12: with tools present the budget is tools 1 + the STABLE system block 1 + 2 tail anchors
+      // (it was both system blocks + 2 tail); the per-run tail block rides uncached, as the per-run note now does.
+      A.ok(body.system[0].cache_control && !body.system[1].cache_control,'the stable boundary stays cacheable; the changing tail is not anchored');
+      A.ok(body.tools[body.tools.length-1].cache_control,'the tool catalogue carries its own anchor');
       A.eq((JSON.stringify(body).match(/cache_control/g)||[]).length,4,'four-breakpoint budget includes tail');
+      A.eq(body.messages.map(m=>m.content.some(b=>b.cache_control)),[false,true,true],'two sliding tail anchors: the newest turn and the reply before it');
       A.eq(body.tools[0].name,'verify','verification tool retained');
       A.eq(body.messages.map(m=>m.role),history.map(m=>m.role),'history roles unchanged');
       A.eq(JSON.stringify(messages),snapshot,'cache decoration never mutates history');
@@ -378,6 +450,20 @@ async function collect(provider, req) { const out = []; for await (const e of pr
       A.eq(body.system.length,1,'mismatch uses unchanged legacy block');
       A.eq(body.system[0].text,'policy','mismatch never drops text');
     }
+  }
+  /* RUN CONTEXT NOTE (lean-prompt 2026-10-12). The per-run block now rides a fenced system note placed with the newest
+     user message. On a conversation's FIRST message nothing precedes it but the system prompt — the leading-system
+     hoist must stop at it, or message 1's system would differ from message 2's. It becomes part of the user turn. */
+  {
+    const provider = require('../sidecar/providers/provider.js');
+    const note = provider.runContextNote('[RUNTIME]\nRun id: r1');
+    const first = _internals.messagesToAnthropic([{ role: 'system', content: 'S' }, { role: 'system', content: note }, { role: 'system', content: '<recalled-memory>\nm\n</recalled-memory>' }, { role: 'user', content: 'hi' }]);
+    A.eq(first.system, 'S', 'first message: the run-context note is NOT hoisted into the system prompt');
+    A.eq(first.messages, [{ role: 'user', content: [{ type: 'text', text: note }, { type: 'text', text: '<recalled-memory>\nm\n</recalled-memory>' }, { type: 'text', text: 'hi' }] }],
+      'first message: note, recall and the request merge into ONE user turn (the request still ends on it)');
+    const later = _internals.messagesToAnthropic([{ role: 'system', content: 'S' }, { role: 'user', content: 'hi' }, { role: 'assistant', content: 'yo' }, { role: 'system', content: provider.runContextNote('[RUNTIME]\nRun id: r2') }, { role: 'user', content: 'again' }]);
+    A.eq(later.system, first.system, 'second message: the system prompt is byte-identical to the first message\'s');
+    A.eq(later.messages.map(m => m.role), ['user', 'assistant', 'user'], 'second message: roles alternate, ending on the user turn');
   }
   A.report('provider.anthropic.test');
 })().catch(e => { console.log('FAIL: provider.anthropic.test threw -- ' + (e && e.stack || e)); process.exit(1); });

@@ -57,7 +57,17 @@
     const s = str(v || 'active').toLowerCase();
     return STATES.has(s) ? s : 'active';
   }
-  const REVIEW_ACTORS = new Set(['background-review', 'skill-review']);   // autonomous writers whose versions must be approved (the 24h curator is deliberately NOT here: it archives narrow siblings into a widened umbrella, and withholding the umbrella would leave the Commander with neither until they clicked)
+  // Two different questions. STAGE_ACTORS: the autonomous writers whose NEW writes become proposals instead of the
+  // active skill. reviewWritten(entry): whose STORED versions persist() stamps 'ask' (provenance) on EVERY save,
+  // telemetry included. A curator version saved before curator writes became proposals (0.13.2/0.13.3, stamped
+  // 'allow', its narrow siblings archived into it) must not turn 'ask' the first time a run merely uses it:
+  // withholding the umbrella would leave the agent with neither. A curator version is review-written once it was
+  // promoted (its approval is digest-keyed: the approve route precommits it for the candidate's bytes).
+  const STAGE_ACTORS = new Set(['background-review', 'skill-review', 'curator']);
+  function reviewWritten(entry) {
+    const by = str(entry && entry.writtenBy);
+    return STAGE_ACTORS.has(by) && (by !== 'curator' || !!str(entry && entry.promotionReceiptId));
+  }
   function trustSource(createdBy) {
     const source = str(createdBy).trim().toLowerCase();
     if (source === 'user') return 'user';
@@ -126,6 +136,10 @@
       id: str(r.id || slug(n.name)),
       agentId: str(r.agentId) || 'agent',
       name: n.name,
+      scope: ['agent', 'project', 'station'].includes(r.scope) ? r.scope : 'agent',
+      projectRoot: str(r.projectRoot),
+      promotionReceiptId: str(r.promotionReceiptId),
+      canonicalRevision: bool(r.canonicalRevision),
       summary: str(r.summary).slice(0, SUMMARY_MAX),
       description: str(r.description || r.summary).slice(0, SUMMARY_MAX),
       body: str(r.body).slice(0, BODY_MAX),
@@ -174,6 +188,8 @@
     const out = {
       id: s.id, agentId: s.agentId, name: s.name, summary: s.summary, description: s.description || s.summary || '',
       category: s.category, setup: s.setup || '',
+      scope: s.scope || 'agent', projectRoot: s.projectRoot || '',
+      promotionReceiptId: s.promotionReceiptId || '', canonicalRevision: !!s.canonicalRevision,
       requires: (s.requires || []).slice(), platforms: (s.platforms || []).slice(), state: s.state, pinned: !!s.pinned,
       createdBy: s.createdBy, writtenBy: s.writtenBy || s.createdBy, sourceRunId: s.sourceRunId || null,
       sourceUrl: s.sourceUrl || '', sourceDigest: s.sourceDigest || '', sourceFetchedAt: s.sourceFetchedAt || 0,
@@ -207,13 +223,67 @@
     const maxPackageBytes = opts.maxPackageBytes > 0 ? opts.maxPackageBytes : DEFAULT_MAX_PACKAGE_BYTES;
 
     const latest = new Map();
+    const candidateRows = new Map();
+    // Receipts must come from the host evaluator's durable authority, not model-submitted JSON.
+    const validatePromotionReceipt = typeof opts.validatePromotionReceipt === 'function' ? opts.validatePromotionReceipt : null;
+    // stale is the aging clock, not content: using a stale skill flips it active, which must not orphan its pending
+    // revision (the same rule as skillevaluation.js digestSkill, the digest the run host injects)
+    const digestCandidate = typeof opts.digestCandidate === 'function' ? opts.digestCandidate : (s) => {
+      const f = require('./skills/gate.js').digestOf;
+      if (!s) return f({ body: 'null' });
+      return f({ body: JSON.stringify([s.name, s.summary, s.description, s.body, s.setup, s.category,
+        s.requires, s.platforms, s.scope || 'agent', s.projectRoot || '', s.state === 'stale' ? 'active' : s.state, s.pinned, s.absorbedInto, s.packageFiles]), files: s.files || [] });
+    };
+    function revisionDigest(entry) { return str(digestCandidate(entry ? projectSkill(entry, true) : null)); }
+    function restoreCandidate(r) {
+      if (!r || r.recordType !== 'skill-candidate' || !r.candidateId || !r.skill) return;
+      const skill = normalizeEntry(r.skill);
+      if (!skill || skill.agentId !== str(r.agentId) || skill.name !== r.name) return;
+      candidateRows.set(keyOf(skill.agentId, skill.name), Object.assign({}, r, { skill }));
+    }
+    // A USAGE ROW (markUsed) carries only the counters, keyed by `skillName` — never `name`, so an older StarNet
+    // that does not know the row reads it as a nameless record and skips it instead of replacing the skill.
+    // A use always leaves the skill ACTIVE (markUsed never touches an archived one, and the run's view() has already
+    // flipped a stale one in RAM), so the row restores that unconditionally; a later curate/archive record, which comes
+    // after it in file order, still wins.
+    function applyUsage(r) {
+      const e = latest.get(keyOf(str(r.agentId), str(r.skillName)));
+      if (!e) return;
+      e.useCount = Math.max(num(e.useCount), num(r.useCount));
+      e.viewCount = Math.max(num(e.viewCount), num(r.viewCount));
+      if (r.lastUsedAt != null) e.lastUsedAt = Math.max(num(e.lastUsedAt), num(r.lastUsedAt));
+      if (e.state === 'stale') e.state = 'active';
+    }
+    // The library may only be WRITTEN (persist, a staged proposal, a rejection, markUsed, curate, compact) after a
+    // COMPLETE load: a failed or partial read
+    // leaves skills that exist on disk missing from RAM, and a write over one of them (or a compaction of the
+    // partial view) is exactly how skills get replaced or deleted.
+    let loaded = false, loadError = null;
     try {
       const raw = io.readAll();
       if (Array.isArray(raw)) for (const r of raw) {
+        if (r && r.recordType === 'skill-usage') { applyUsage(r); continue; }
+        if (r && r.recordType === 'skill-candidate') { restoreCandidate(r); continue; }
+        if (r && r.recordType === 'skill-promotion') {
+          const active = normalizeEntry(r.entry);
+          if (active) latest.set(keyOf(active.agentId, active.name), active);
+          restoreCandidate(r.candidate); continue;
+        }
         const n = normalizeEntry(r);
         if (n) latest.set(keyOf(n.agentId, n.name), n);
       }
-    } catch (e) { /* corrupt log -> empty library (fail-open) */ }
+      loaded = true;
+    } catch (e) { loadError = e; failNote('skillstore.load', e); }   // the library reads empty, and refuses writes (canWrite)
+    function canWrite() { return loaded && !(io && typeof io.loadComplete === 'function' && io.loadComplete() === false); }
+    function cannotWrite() {
+      return new Error('the skill library did not load completely (' + ((loadError && loadError.message) || 'a partial read') + '), so nothing is written over it until it loads');
+    }
+    // Compaction instead of rotation: once the io says the file has grown (or a legacy rotated archive is still on
+    // disk), rewrite it to one line per skill. Runs only after a write was published to RAM, so the rewrite holds it.
+    function maybeCompact() {
+      try { if (io && typeof io.needsCompaction === 'function' && io.needsCompaction()) compact(); }
+      catch (e) { failNote('skillstore.compact', e); }
+    }
 
     function now() { return num(clock.now()); }
     function red(s, max) {
@@ -223,15 +293,15 @@
     }
     // RAM-only bump: update the in-memory `latest` copy WITHOUT appending a JSONL line. view() is called on
     // every skill.view / skill load, many times per run — appending each one is what grows skills.jsonl without
-    // bound. The bumped counters (viewCount/useCount/lastUsedAt/state) instead ride along the NEXT real mutation
-    // (write/edit/patch/markUsed/curate all persist the skill, and makeEntry carries viewCount/useCount forward),
-    // or a low-frequency compaction flush. Returns the projected skill (same shape view() returned before).
+    // bound. The bumped counters (viewCount/useCount/lastUsedAt/state) instead ride along the NEXT durable write:
+    // markUsed's usage row at the end of the run that loaded it, a real mutation (write/edit/patch/curate persist the
+    // skill and makeEntry carries the counters forward), or a compaction. Returns the projected skill.
     function bumpView(entry) {
       latest.set(keyOf(entry.agentId, entry.name), clone(entry));
       return entry;
     }
-    function persist(entry) {
-      const projected = projectSkill(entry, true);
+    // The guard's verdict for these bytes under the CURRENT rules, stamped onto `entry` (scan + guardAction).
+    function scanInto(entry, projected) {
       try {
         if (guard && typeof guard.scanSkillRecord === 'function') {
           // 'user' (the Commander's own typing) is its own trust tier — see the TRUST table in
@@ -243,9 +313,13 @@
               return { path: f.path, content: Buffer.from(text, 'utf8').equals(bytes) ? text : '[binary asset: ' + bytes.length + ' bytes]' };
             });
           }
-          const scan = guard.scanSkillRecord(scanInput, { source: trustSource(entry.createdBy) });
+          const origin = typeof guard.originTier === 'function' ? guard.originTier(entry) : trustSource(entry.createdBy);
+          const scan = guard.scanSkillRecord(scanInput, { source: origin });
           entry.scan = scan;
-          if (guard && typeof guard.shouldAllow === 'function') {
+          if (typeof guard.actionFor === 'function') {
+            // the stricter of where the skill came from and who wrote this version (skills/guard.js actionFor)
+            entry.guardAction = guard.actionFor(entry, scan.verdict);
+          } else if (typeof guard.shouldAllow === 'function') {
             const policy = guard.shouldAllow(scan, { allowAsk: true });
             entry.guardAction = policy.action || '';
           }
@@ -254,23 +328,48 @@
              prompt until the Commander approves THESE bytes — the same digest-keyed gate a scanner `ask` uses
              and the same keep/discard the memory turn-in card has always had. Memory proposals were reviewed;
              skill writes landed straight into the next run's system prompt. A `block` stays a block. */
-          if (REVIEW_ACTORS.has(str(entry.writtenBy)) && entry.guardAction !== 'block') entry.guardAction = 'ask';
+          if (reviewWritten(entry) && entry.guardAction !== 'block') entry.guardAction = 'ask';
         }
       } catch (e) { failNote('skillstore.guard.scan', e); }
+      return entry;
+    }
+    /* THE PACKAGE MIRROR (skill-packages/<agent>/<id>/SKILL.md) is what view() hydrates over a non-canonical skill's
+       stored body, so it may only ever hold bytes the store accepted. persist() writes it AFTER the durable append (a
+       refused edit never reaches it), and markUsed re-writes it for a skill this process has not yet mirrored from its
+       current record: the first use after a boot, or the first use after a failed write (a Windows EBUSY on SKILL.md).
+       That is the repair a use used to get from persist() on every run, at one package write per skill per boot. */
+    const mirrored = new Set();
+    function mirrorDir(entry) {
+      if (!packageStore) return '';
+      const dirOf = entry.state === 'archived' && typeof packageStore.archiveDir === 'function' ? packageStore.archiveDir : packageStore.packageDir;
+      return typeof dirOf === 'function' ? str(dirOf(entry)) : '';
+    }
+    function writeMirror(entry, tag) {
+      if (!packageStore || typeof packageStore.writePackage !== 'function') return;
+      const key = keyOf(entry.agentId, entry.name);
+      mirrored.delete(key);
+      try { packageStore.writePackage(projectSkill(entry, true)); mirrored.add(key); }
+      catch (e) { failNote(tag, e); }
+    }
+    function persist(entry, promotion) {
+      if (!canWrite()) throw cannotWrite();
+      const projected = projectSkill(entry, true);
+      scanInto(entry, projected);
       // Stamp the digest of the content that was JUST scanned, so the verdict and the digest can
       // never disagree about which bytes they describe.
       try { if (digest) entry.contentDigest = str(digest(projected)); } catch (_) {}
-      try {
-        if (packageStore && typeof packageStore.writePackage === 'function') {
-          const dir = packageStore.writePackage(projectSkill(entry, true));
-          if (dir) entry.packagePath = dir;
-        }
-      } catch (e) { failNote('skillstore.package.write', e); }
-      try { io.append(clone(entry)); }
+      // The record names its mirror before the append; the mirror itself is written after it (see writeMirror).
+      if (!promotion) { const dir = mirrorDir(entry); if (dir) entry.packagePath = dir; }
+      try { io.append(clone(promotion ? { recordType: 'skill-promotion', entry, candidate: promotion } : entry)); }
       catch (e) { failNote('skillstore.append', e); throw e; }
       // Publish to RAM only after the durable event was accepted. Otherwise manage() reports
       // success for a skill that vanishes on the next sidecar restart.
       latest.set(keyOf(entry.agentId, entry.name), clone(entry));
+      // The durable entry is authoritative: a promotion's mirror is written only once publication committed, so a
+      // failed append cannot make a new candidate overwrite the previously approved package.
+      if (promotion) candidateRows.set(keyOf(entry.agentId, entry.name), clone(promotion));
+      writeMirror(entry, promotion ? 'skillstore.package.promotion' : 'skillstore.package.write');
+      maybeCompact();
       return entry;
     }
     function mine(agentId, opts2) {
@@ -310,6 +409,9 @@
         id: existing ? existing.id : slug(n.name),
         agentId: str(e.agentId || (existing && existing.agentId) || 'agent'),
         name: n.name,
+        scope: existing ? existing.scope || 'agent' : 'agent',
+        projectRoot: existing ? existing.projectRoot || '' : '',
+        promotionReceiptId: '', canonicalRevision: false,
         summary: e.summary != null ? red(e.summary, SUMMARY_MAX) : (existing ? existing.summary : ''),
         description: e.description != null ? red(e.description, SUMMARY_MAX) : (existing ? (existing.description || existing.summary) : red(e.summary, SUMMARY_MAX)),
         body,
@@ -319,7 +421,9 @@
         platforms: e.platforms != null ? arr(e.platforms) : (existing ? (existing.platforms || []).slice() : []),
         state: stateOf(e.state || (existing && existing.state) || 'active'),
         pinned: e.pinned != null ? !!e.pinned : !!(existing && existing.pinned),
-        createdBy: str(e.createdBy || (existing && existing.createdBy) || 'agent'),
+        // createdBy is the skill's ORIGIN and is never rewritten by an edit: the trust tier is read from it, and
+        // an edit that relabeled it was how a withheld community skill got un-withheld (skills/guard.js actionFor)
+        createdBy: str((existing && existing.createdBy) || e.createdBy || 'agent'),
         writtenBy: str(e.createdBy || 'agent'),   // the actor of THIS write, never inherited (a review edit of a user skill is a review write)
         sourceRunId: e.sourceRunId ? str(e.sourceRunId) : ((existing && existing.sourceRunId) || null),
         sourceUrl: e.sourceUrl != null ? str(e.sourceUrl) : ((existing && existing.sourceUrl) || ''),
@@ -364,6 +468,7 @@
 
     function write(e) {
       e = e || {};
+      if (shouldStage(e, true)) return stageMutation(e, true);
       const agentId = str(e.agentId) || 'agent';
       const n = cleanName(e.name);
       if (!n.ok) return { ok: false, error: n.error };
@@ -395,6 +500,7 @@
 
     function manage(e) {
       e = e || {};
+      if (shouldStage(e, false)) return stageMutation(e, false);
       const agentId = str(e.agentId) || 'agent';
       const action = str(e.action || 'create').toLowerCase();
       const target = e.target != null ? e.target : (e.id != null ? e.id : e.name);
@@ -430,7 +536,7 @@
       if (action === 'patch') {
         p = patchBody(existing.body, e.find, e.replace);
         if (!p.ok) return p;
-        made = makeEntry(Object.assign({}, existing, { agentId, name: existing.name, body: p.body }), existing);
+        made = makeEntry(Object.assign({}, existing, { agentId, name: existing.name, body: p.body, createdBy: e.createdBy || 'agent', sourceRunId: e.sourceRunId }), existing);
         made.entry.patchCount = (made.entry.patchCount || 0) + 1;
         made.entry.packageDiverged = !!made.entry.packageDigest;
         entry = persist(made.entry);
@@ -456,6 +562,9 @@
         } else if (str(e.absorbedInto || '').trim()) {
           heir = find(agentId, str(e.absorbedInto).trim(), { includeArchived: false });
         }
+        // Archive and restore change no content, so they keep the writer of these bytes: relabeling a withheld
+        // review-written version as the Commander's would approve bytes nobody read. (A staged archive is still
+        // stamped with its proposer in stageMutation.)
         entry = clone(existing); entry.state = 'archived'; entry.updatedAt = now();
         if (heir) entry.absorbedInto = heir.name;
         entry = persist(entry);
@@ -467,7 +576,14 @@
         return { ok: true, action: 'restore', skill: projectSkill(entry, true), edited: true };
       }
       if (action === 'pin' || action === 'unpin') {
-        entry = clone(existing); entry.pinned = action === 'pin' ? true : (e.pinned != null ? !!e.pinned : false); entry.updatedAt = now();
+        const pinNext = action === 'pin' ? true : (e.pinned != null ? !!e.pinned : false);
+        /* ONLY THE COMMANDER TAKES A PIN OFF (bug 97743dff). The pin is the lock pinnedGuard holds against every model
+           write; while a run could unpin (pin/unpin are never staged), the lock lasted one tool call and the next patch
+           went through. Pinning stays open to any writer: it only adds the lock. */
+        if (existing.pinned && !pinNext && str(e.createdBy) !== 'user') {
+          return { ok: false, error: '"' + existing.name + '" is pinned by the Commander - only the Commander can unpin it, in ABILITIES > SKILLS' };
+        }
+        entry = clone(existing); entry.pinned = pinNext; entry.updatedAt = now();
         entry = persist(entry);
         return { ok: true, action, skill: projectSkill(entry, true), edited: true };
       }
@@ -476,6 +592,8 @@
         if (!p.ok) return p;
         t = now();
         entry = clone(existing);
+        // A support file ships with the body it sits beside: never lower a review stamp on that body.
+        if (!reviewWritten(existing)) entry.writtenBy = str(e.createdBy || 'agent');
         entry.files = normFiles(entry.files);
         const encoding = e.encoding === 'base64' ? 'base64' : 'utf8';
         const content = encoding === 'base64' ? str(e.content).slice(0, Math.ceil(supportFileMax * 4 / 3) + 4) : red(e.content, supportFileMax);
@@ -501,6 +619,8 @@
         p = supportPath(e.path || e.file || e.filePath);
         if (!p.ok) return p;
         entry = clone(existing);
+        // A support file ships with the body it sits beside: never lower a review stamp on that body.
+        if (!reviewWritten(existing)) entry.writtenBy = str(e.createdBy || 'agent');
         entry.files = normFiles(entry.files);
         delete entry.files[p.path];
         entry.packageDiverged = !!entry.packageDigest;
@@ -513,6 +633,269 @@
       return { ok: false, error: 'unknown skill action: ' + action };
     }
 
+    // A review edits an isolated draft using the same validation as foreground writes.
+    // It never publishes into latest or the package mirror. Multiple calls in one review
+    // build on its pending draft; every revision invalidates previous evaluation receipts.
+    function shouldStage(e, legacyWrite) {
+      if (opts.stageReviews === false) return false;   // private isolated draft constructor
+      if (STAGE_ACTORS.has(str(e.createdBy))) return true;
+      if (!legacyWrite && ['pin', 'unpin'].includes(str(e.action))) return false;
+      return trustSource(e.createdBy || 'agent') === 'agent-created';
+    }
+    function stageMutation(e, legacyWrite) {
+      // The model's write path is a write too: after a failed load it would build on an empty view (isNew for a skill
+      // on disk) and its row would replace the real pending proposal on the next boot.
+      if (!canWrite()) return { ok: false, error: cannotWrite().message };
+      const aid = str(e.agentId) || 'agent';
+      const seeds = Array.from(latest.values()).map(clone);
+      // A writer builds on a pending draft only when it can SEE that draft: the review/curator passes read it
+      // through pendingView, and a foreground run sees it only when its own run wrote it. Otherwise the run's
+      // patch text comes from the active body (so it "isn't found" in the draft) and a full edit would silently
+      // discard the proposal it never saw. Two empty run ids are not the same run (a review draft can carry none).
+      const unseen = new Map(), runId = str(e.sourceRunId);
+      for (const row of candidateRows.values()) if (row.agentId === aid && row.status === 'pending'
+        && row.baseDigest === revisionDigest(latest.get(keyOf(row.agentId, row.name)) || null)) {
+        const own = !!runId && str(row.skill.sourceRunId) === runId;
+        if (!STAGE_ACTORS.has(str(e.createdBy)) && !own) { unseen.set(keyOf(row.agentId, row.name), row); continue; }
+        const i = seeds.findIndex(s => keyOf(s.agentId, s.name) === keyOf(row.agentId, row.name));
+        if (i >= 0) seeds[i] = clone(row.skill); else seeds.push(clone(row.skill));
+      }
+      const awaiting = name => ({ ok: false, error: '"' + name + '" already has a proposal awaiting evaluation in ABILITIES > SKILLS - the Commander must approve or reject it before this skill can be changed again' });
+      const draft = makeSkillStore(Object.assign({}, opts, { stageReviews: false, packageStore: null, packages: null,
+        io: { readAll: () => seeds, append() {} } }));
+      const r = legacyWrite ? draft.write(e) : draft.manage(e);
+      if (!r.ok) {
+        // A skill that exists only as an unseen proposal (a new skill, listed to its owner as WITHHELD) is not in
+        // the draft at all: name the waiting proposal, not 'no such skill'.
+        const target = str(legacyWrite ? e.name : (e.target != null ? e.target : (e.id != null ? e.id : e.name))).trim();
+        const hidden = target && Array.from(unseen.values()).find(row => row.skill.id === target || row.name.toLowerCase() === target.toLowerCase());
+        return hidden ? awaiting(hidden.name) : r;
+      }
+      // Only the skill this write targets can collide; an unrelated pending proposal never blocks it.
+      if (unseen.has(keyOf(aid, r.skill && r.skill.name))) return awaiting(r.skill.name);
+      const entry = normalizeEntry(r.skill);
+      entry.writtenBy = str(e.createdBy || 'agent');
+      entry.packagePath = ''; entry.canonicalRevision = false;
+      if (entry.guardAction !== 'block') entry.guardAction = 'ask';
+      const key = keyOf(aid, entry.name), active = latest.get(key) || null, prior = candidateRows.get(key);
+      const revision = prior ? (Number(prior.revision) || 0) + 1 : 1;
+      const row = { recordType: 'skill-candidate', candidateId: entry.id + '-candidate-' + revision,
+        agentId: aid, name: entry.name, status: 'pending', revision,
+        baseDigest: revisionDigest(active), candidateDigest: revisionDigest(entry),
+        createdAt: prior && prior.status === 'pending' ? prior.createdAt : now(), updatedAt: now(),
+        action: r.action || (r.edited ? 'edit' : 'create'), skill: entry };
+      // An archive into a heir is bound to the heir version this draft saw (the curator's pending merge when there
+      // was one, else the live heir): see heirBlocker.
+      if (entry.state === 'archived' && entry.absorbedInto) {
+        const heirSeen = seeds.find(s => keyOf(s.agentId, s.name) === keyOf(aid, entry.absorbedInto) && s.state !== 'archived');
+        if (heirSeen) row.heirDigest = heirDigestOf(heirSeen);
+      }
+      try { io.append(clone(row)); } catch (err) { failNote('skillstore.candidate.append', err); throw err; }
+      candidateRows.set(key, clone(row));
+      // isNew: no active version (archived counts as one), so skill.write/manage can say "proposed skill" not "revision"
+      return Object.assign({}, r, { pending: true, isNew: !active, candidate: projectCandidate(row, true),
+        skill: Object.assign(projectSkill(entry, true), { pendingCandidate: true, candidateId: row.candidateId }) });
+    }
+    function projectCandidate(row, includeBody) {
+      const out = clone(row); out.skill = projectSkill(row.skill, !!includeBody);
+      return out;
+    }
+    // A pending proposal whose base is no longer the active skill can only be rejected: say so (baseCurrent:false)
+    // instead of listing it as something the Commander can still evaluate. baseCurrent compares the STORED record,
+    // as approveCandidate does. The evaluate/approve routes must read their baseline the same way (hydrate:false,
+    // skills-eval-03): until they do, a hydrated body or support file can differ, so baseCurrent:true alone does not
+    // promise that Evaluate will be accepted.
+    function listedCandidate(row, includeBody) {
+      const out = projectCandidate(row, includeBody);
+      if (row.status === 'pending') out.baseCurrent = row.baseDigest === revisionDigest(latest.get(keyOf(row.agentId, row.name)) || null);
+      return out;
+    }
+    function candidates(agentId, options) {
+      const o = options || {};
+      return Array.from(candidateRows.values()).filter(r => r.agentId === str(agentId)
+        && (o.includeResolved || r.status === 'pending')).map(r => listedCandidate(r, !!o.includeBody));
+    }
+    function candidate(agentId, id) {
+      const row = Array.from(candidateRows.values()).find(r => r.agentId === str(agentId) && r.candidateId === str(id));
+      return row ? listedCandidate(row, true) : null;
+    }
+    function pendingView(agentId, target) {
+      const row = Array.from(candidateRows.values()).find(r => r.agentId === str(agentId) && r.status === 'pending'
+        && r.baseDigest === revisionDigest(latest.get(keyOf(r.agentId, r.name)) || null)
+        && (r.skill.id === str(target) || r.name.toLowerCase() === str(target).toLowerCase() || r.candidateId === str(target)));
+      return row ? Object.assign(projectSkill(row.skill, true), { pendingCandidate: true, candidateId: row.candidateId }) : null;
+    }
+    // A heir's CONTENT: lifecycle and pin are not content (a stale or pinned umbrella still carries the merged steps).
+    function heirDigestOf(entry) { return entry ? revisionDigest(Object.assign(clone(entry), { state: 'active', pinned: false })) : ''; }
+    /* AN ARCHIVE IS BOUND TO ITS HEIR (CONSOLIDATION MUST NAME ITS HEIR). A curator consolidation is two proposals,
+       widen the umbrella and archive the narrow sibling into it, and the Commander can click them in any order.
+       The archive row records the heir version it was built on (heirDigest), and it is approvable only while that
+       exact content is the live heir. Otherwise the archived steps would be in no active skill: the merge was
+       rejected, is outdated, or the heir changed since. Returns the refusal text, or null. */
+    function heirBlocker(row) {
+      const entry = row.skill;
+      if (!entry || entry.state !== 'archived' || !entry.absorbedInto) return null;
+      const heirName = str(entry.absorbedInto), q = '"' + heirName + '"';
+      const heir = find(row.agentId, heirName, { includeArchived: false });
+      const other = candidateRows.get(keyOf(row.agentId, heirName));
+      const heirRow = other && other.candidateId !== row.candidateId ? other : null;
+      const approveFirst = 'approve the proposal for ' + q + ' first - this archive moves its content there';
+      const notLive = q + ' is not an active skill, so this archive would point at content nobody can load';
+      if (!row.heirDigest) {   // proposed before archives recorded their heir version
+        if (heirRow && heirRow.status === 'pending') return approveFirst;
+        return heir ? null : notLive;
+      }
+      if (heir && heirDigestOf(heir) === row.heirDigest) return null;
+      const merge = heirRow && heirDigestOf(heirRow.skill) === row.heirDigest ? heirRow : null;
+      if (merge && merge.status === 'pending'
+        && merge.baseDigest === revisionDigest(latest.get(keyOf(row.agentId, heirName)) || null)) return approveFirst;
+      if (merge && (merge.status === 'pending' || merge.status === 'rejected'))
+        return 'the merge into ' + q + ' was not approved, so archiving this skill would lose its steps; reject this archive';
+      if (!heir) return notLive;
+      return q + ' changed after this archive was proposed, so it may not hold these steps; reject this archive';
+    }
+    function candidateDecision(e) {
+      const row = Array.from(candidateRows.values()).find(r => r.agentId === str(e.agentId) && r.candidateId === str(e.candidateId));
+      if (!row || row.status !== 'pending') return { error: 'no pending candidate with that id' };
+      if (!e.candidateDigest || str(e.candidateDigest) !== row.candidateDigest || revisionDigest(row.skill) !== row.candidateDigest)
+        return { error: 'candidate changed; read and evaluate its current revision first' };
+      return { row, active: latest.get(keyOf(row.agentId, row.name)) || null };
+    }
+    // Everything that stops a pending proposal from being promoted apart from its evaluation receipt (null when
+    // nothing does). approveCandidate runs it, and the approve route must run it (promotionBlocker) BEFORE it
+    // precommits a digest approval for the candidate's bytes: an archive carries the live sibling's bytes, so a
+    // refused archive would otherwise leave a withheld sibling's bytes approved.
+    function blockerFor(row, active) {
+      if (revisionDigest(active) !== row.baseDigest) return 'the active skill changed after this proposal; reject it or wait for the agent to propose a new revision';
+      if (row.skill.guardAction === 'block') return 'candidate is blocked by the skill guard';
+      // Pinned content cannot be changed by proposing a revision before it was pinned.
+      if (active && active.pinned) return 'the active skill is pinned; unpin it before promotion';
+      return heirBlocker(row);
+    }
+    function promotionBlocker(agentId, candidateId) {
+      const row = Array.from(candidateRows.values()).find(r => r.agentId === str(agentId) && r.candidateId === str(candidateId));
+      if (!row || row.status !== 'pending') return 'no pending candidate with that id';
+      return blockerFor(row, latest.get(keyOf(row.agentId, row.name)) || null);
+    }
+    function approveCandidate(e) {
+      e = e || {};
+      if (e.approvedBy !== 'user') return { ok: false, error: 'only the Commander may promote a candidate' };
+      const found = candidateDecision(e);
+      if (found.error) return { ok: false, error: found.error };
+      const { row, active } = found;
+      const blocked = blockerFor(row, active);
+      if (blocked) return { ok: false, error: blocked };
+      if (!validatePromotionReceipt) return { ok: false, error: 'candidate needs a host-verified behavior evaluation before promotion' };
+      let checked;
+      // acknowledgedNoImprovement is the Commander's explicit "accept a complete tie"; the verifier decides if it qualifies.
+      try { checked = validatePromotionReceipt(e.evaluation, { candidateDigest: row.candidateDigest, baselineDigest: row.baseDigest,
+        candidate: projectSkill(row.skill, true), baseline: active ? projectSkill(active, true) : null, agentId: row.agentId,
+        acknowledgedNoImprovement: e.acknowledgedNoImprovement === true }); }
+      catch (_) { checked = null; }
+      if (!checked || checked.ok !== true || (checked.status && checked.status !== 'pass'))
+        return { ok: false, error: (checked && checked.error) || 'evaluation is missing, stale, insufficient, or regressed' };
+      const entry = clone(row.skill);
+      // (A pinned active skill was already refused by blockerFor above.)
+      // Usage belongs to the ACTIVE record: it kept counting while the candidate waited (no digest covers it), so
+      // the proposal-time snapshot must not reset it, or a skill used every day since it was proposed would look
+      // idle to curate() right after approval. Stale/active is the same freshness clock; archive/restore is content.
+      if (active) {
+        entry.viewCount = active.viewCount || 0; entry.useCount = active.useCount || 0;
+        entry.lastUsedAt = active.lastUsedAt == null ? null : active.lastUsedAt;
+        if (entry.state !== 'archived' && active.state !== 'archived') entry.state = active.state;
+      }
+      entry.canonicalRevision = true; entry.updatedAt = now();
+      entry.promotionReceiptId = str(checked.receiptId || (e.evaluation && (e.evaluation.receiptId || e.evaluation.id)));
+      // The decision record says whether the promotion was measured or only owner-acknowledged as no improvement.
+      const resolved = Object.assign({}, clone(row), { status: 'promoted', resolvedAt: now(), evaluation: clone(e.evaluation),
+        acknowledgedNoImprovement: checked.acknowledged === true });
+      // Active content and resolution are one append; restart cannot observe half a promotion.
+      persist(entry, resolved);
+      return { ok: true, skill: projectSkill(entry, true), candidate: projectCandidate(resolved, false) };
+    }
+    function rejectCandidate(e) {
+      e = e || {};
+      if (!canWrite()) return { ok: false, error: cannotWrite().message };
+      const found = candidateDecision(e);
+      if (found.error) return { ok: false, error: found.error };
+      const row = Object.assign({}, clone(found.row), { status: 'rejected', resolvedAt: now() });
+      io.append(clone(row)); candidateRows.set(keyOf(row.agentId, row.name), row);
+      return { ok: true, candidate: projectCandidate(row, false) };
+    }
+    /* VETO = UNDO A SILENT SAVE (COMMS). The reflection auto-saves a learned skill through write(), which makes it
+       a proposal, so the veto rejects that proposal. A plain archive was a new staged write that could not see the
+       reflection's draft: refused for a revision, 'no such skill' for a new skill, and the proposal stayed
+       approvable. Only an active skill is archived, as the Commander, so the archive is not staged again (a pending
+       retirement proposal is rejected first, then the skill is archived). Matched by skill id or name; 'no such
+       skill' when neither exists, which the route treats as already undone. */
+    function veto(e) {
+      e = e || {};
+      const aid = str(e.agentId) || 'agent';
+      const target = str(e.target != null ? e.target : e.id).trim();
+      const row = target ? Array.from(candidateRows.values()).find(r => r.agentId === aid && r.status === 'pending'
+        && (r.skill.id === target || r.name.toLowerCase() === target.toLowerCase())) : null;
+      if (row) {
+        const r = rejectCandidate({ agentId: aid, candidateId: row.candidateId, candidateDigest: row.candidateDigest });
+        if (!r.ok) return r;
+        if (row.skill.state !== 'archived') return Object.assign({ action: 'reject' }, r);
+      }
+      return manage({ agentId: aid, target, action: 'archive', createdBy: 'user' });
+    }
+    function projectKey(root) {
+      const s = str(root).trim().replace(/\\/g, '/').replace(/\/+$/, '');
+      return /^[A-Za-z]:\//.test(s) ? s.toLowerCase() : s;
+    }
+    function isAccessible(s, agentId, projectRoot) {
+      if (s.scope === 'station') return true;
+      if (s.scope === 'project') return !!projectKey(projectRoot) && projectKey(projectRoot) === projectKey(s.projectRoot);
+      return s.agentId === str(agentId);
+    }
+    function listAccessible(agentId, options) {
+      const o = options || {};
+      const rows = Array.from(latest.values()).filter(s => isAccessible(s, agentId, o.projectRoot)
+        && (o.includeArchived || s.state !== 'archived')).map(s => projectSkill(s, false));
+      // A pending-only name is discoverable only by its owner. Its unapproved summary,
+      // prerequisites and support files never enter a foreground index or tool response.
+      if (o.includePending !== false) for (const row of candidateRows.values()) {
+        if (row.agentId !== str(agentId) || row.status !== 'pending' || latest.has(keyOf(row.agentId, row.name))) continue;
+        rows.push({ id: row.skill.id, agentId: row.agentId, name: row.name, state: 'active', scope: 'agent',
+          pendingCandidate: true, candidateId: row.candidateId, guardAction: 'ask', summary: '', files: [] });
+      }
+      // Own skills first; inside each group mine()'s order (pinned, then most recently updated, then name), so a
+      // budget-capped index or a paged skill.list drops the stale skills, not the alphabetically late ones.
+      return rows.sort((a, b) => (Number(b.agentId === str(agentId)) - Number(a.agentId === str(agentId)))
+        || (!!b.pinned - !!a.pinned) || ((b.updatedAt || 0) - (a.updatedAt || 0)) || a.name.localeCompare(b.name));
+    }
+    function viewAccessible(agentId, target, options) {
+      const o = options || {};
+      let matches = listAccessible(agentId, o).filter(s => (!o.ownerAgentId || s.agentId === str(o.ownerAgentId))
+        && (s.id === str(target) || s.name.toLowerCase() === str(target).toLowerCase()));
+      if (!o.ownerAgentId && matches.some(s => s.agentId === str(agentId))) {
+        const own = matches.filter(s => s.agentId === str(agentId));
+        /* An agent's own pending-only PROPOSAL is not an active skill, so it never hides an active skill of the same
+           name the agent can read (customer report f702f2f6: a worker whose background review had drafted a same-name
+           proposal was told the Commander-approved station skill awaited approval). Its own ACTIVE skill still wins. */
+        const ownActive = own.filter(s => !s.pendingCandidate);
+        const others = matches.filter(s => s.agentId !== str(agentId) && !s.pendingCandidate);
+        matches = ownActive.length ? ownActive : (others.length ? others : own);
+      }
+      if (matches.length !== 1) return null;   // never choose an arbitrary owner's same-name skill
+      return matches[0].pendingCandidate ? matches[0] : view(matches[0].agentId, matches[0].id, o);
+    }
+    function share(e) {
+      e = e || {};
+      if (e.actor !== 'user') return { ok: false, error: 'only the Commander may change skill sharing' };
+      const existing = find(e.agentId, e.target, { includeArchived: true });
+      if (!existing) return { ok: false, error: 'no such owned skill' };
+      if (!['agent', 'project', 'station'].includes(e.scope)) return { ok: false, error: 'choose agent, project, or station scope' };
+      const root = str(e.projectRoot).trim();
+      if (e.scope === 'project' && (!/^(?:[A-Za-z]:[\\/]|\/)/.test(root) || root.split(/[\\/]/).includes('..') || /[\x00-\x1f]/.test(root)))
+        return { ok: false, error: 'project sharing requires an absolute project root' };
+      const entry = Object.assign(clone(existing), { scope: e.scope, projectRoot: e.scope === 'project' ? root : '', updatedAt: now() });
+      persist(entry);
+      return { ok: true, skill: projectSkill(entry, true) };
+    }
+
     function list(agentId, opts2) {
       return mine(agentId, opts2).map(s => projectSkill(s, false));
     }
@@ -521,7 +904,7 @@
       const s = find(agentId, idOrName, { includeArchived: !!opts2.includeArchived });
       if (!s) return null;
       let out = s;
-      if (packageStore && typeof packageStore.hydrate === 'function' && opts2.hydrate !== false) {
+      if (!s.canonicalRevision && packageStore && typeof packageStore.hydrate === 'function' && opts2.hydrate !== false) {
         try {
           const h = packageStore.hydrate(projectSkill(s, true));
           if (h) out = Object.assign(clone(s), {
@@ -532,9 +915,11 @@
         } catch (_) {}
       }
       if (opts2.bump !== false) {
+        // A view counts views and freshness only. useCount means "runs that loaded this skill": the run host
+        // calls markUsed ONCE per run for the skills that run actually loaded (2026-09-28; it used to call it for
+        // every skill merely LISTED in the prompt index, so every indexed skill looked used on every run).
         const bumped = {
           viewCount: (s.viewCount || 0) + 1,
-          useCount: (s.useCount || 0) + 1,
           lastUsedAt: now(),
           state: s.state === 'stale' ? 'active' : s.state
         };
@@ -552,7 +937,19 @@
       }
       return projectSkill(out, true);
     }
+    /* A USE IS TELEMETRY, NOT A NEW VERSION. markUsed runs at the end of every run for every skill the run loaded.
+       It used to persist() the WHOLE record each time (body, support files, base64 package, a guard re-scan and a
+       package rewrite), which grew skills.jsonl by megabytes a day; the log's size rotation then deleted the only
+       durable copy of every skill not used recently. Now each use appends a ~200-byte usage row (applied on load,
+       folded into the record by the next compaction) and updates RAM. A failed append keeps the RAM bump, which
+       the next compaction flushes. The package mirror is re-written only when this process has not written it from
+       the current record (writeMirror): once per skill per boot, and after a failed write.
+       THE GUARD STILL SEES EVERY USE. The re-scan on use was how a new guard rule reached a skill nobody edits, so a
+       use still scans the bytes under the current rules (CPU, no disk); only when the scan (verdict, findings, summary)
+       or action would change, or a legacy record lacks a digest, is the whole record persisted (rare: once per rule
+       change). */
     function markUsed(agentId, idOrNames) {
+      if (!canWrite()) return { ok: false, count: 0, error: cannotWrite().message };
       const ids = Array.isArray(idOrNames) ? idOrNames : [idOrNames];
       let count = 0;
       for (const id of ids) {
@@ -562,8 +959,26 @@
         entry.useCount = (entry.useCount || 0) + 1;
         entry.lastUsedAt = now();
         if (entry.state === 'stale') entry.state = 'active';
-        persist(entry); count++;
+        if (guard && typeof guard.scanSkillRecord === 'function') {
+          // the WHOLE scan, not only the verdict: a rule that adds a finding under the same verdict changes the
+          // categories the gate shows the Commander (the scan is deterministic for the same bytes and rules)
+          const probe = scanInto(clone(entry), projectSkill(entry, true));
+          const scanOf = (x) => JSON.stringify((x && x.scan) || null);
+          if (str(probe.guardAction) !== str(entry.guardAction) || scanOf(probe) !== scanOf(entry) || (digest && !entry.contentDigest)) {
+            persist(entry); count++;
+            continue;
+          }
+        }
+        const row = { recordType: 'skill-usage', agentId: entry.agentId, skillName: entry.name, useCount: entry.useCount, viewCount: num(entry.viewCount), lastUsedAt: entry.lastUsedAt };
+        try { io.append(row); } catch (e) { failNote('skillstore.usage.append', e); }
+        const key = keyOf(entry.agentId, entry.name);
+        // heal a mirror this process has not written from the current record (see writeMirror); the path rides the
+        // next compaction like the counters do
+        if (!mirrored.has(key)) { const dir = mirrorDir(entry); if (dir) entry.packagePath = dir; writeMirror(entry, 'skillstore.package.write'); }
+        latest.set(key, entry);
+        count++;
       }
+      if (count) maybeCompact();
       return { ok: true, count };
     }
     /* compact — rewrite the append-only JSONL keeping ONLY the newest entry per (agentId, name). `latest`
@@ -575,33 +990,54 @@
        (the bounded-read boot loader still keeps memory sane) — reported via `ok:false, reason`. Never throws:
        a compaction failure must never crash a run (the RAM mirror still answers). Returns counts for tests. */
     function compact() {
-      const entries = Array.from(latest.values()).map(e => clone(e));
+      const entries = Array.from(latest.values()).concat(Array.from(candidateRows.values())).map(e => clone(e));
       if (!io || typeof io.rewrite !== 'function') return { ok: false, reason: 'io has no rewrite', kept: entries.length };
+      if (!canWrite()) return { ok: false, reason: cannotWrite().message, kept: entries.length };
       try { io.rewrite(entries); return { ok: true, kept: entries.length }; }
       catch (e) { return { ok: false, reason: (e && e.message) || 'rewrite failed', kept: entries.length }; }
     }
     function curate(agentId, opts2) {
+      if (!canWrite()) return { ok: false, stale: 0, archived: 0, proposedArchives: 0, error: cannotWrite().message };
       opts2 = opts2 || {};
       const staleMs = opts2.staleMs > 0 ? opts2.staleMs : 30 * 24 * 60 * 60 * 1000;
       const archiveMs = opts2.archiveMs > 0 ? opts2.archiveMs : 90 * 24 * 60 * 60 * 1000;
       const t = opts2.now != null ? num(opts2.now) : now();
-      let stale = 0, archived = 0;
+      let stale = 0, archived = 0, proposedArchives = 0;
       for (const s of mine(agentId, { includeArchived: true })) {
         if (s.pinned || s.state === 'archived') continue;
+        const pending = candidateRows.get(keyOf(s.agentId, s.name));
+        // Aging must not invalidate a pending replacement or repeatedly override a rejected RETIREMENT. A rejected
+        // content edit says nothing about the skill's age, so it must not freeze aging. (manage reports delete as
+        // action 'archive', so this covers both.)
+        if (pending && pending.baseDigest === revisionDigest(s)
+          && (pending.status === 'pending' || (pending.status === 'rejected' && pending.action === 'archive'))) continue;
         const base = s.lastUsedAt || s.updatedAt || s.createdAt || t;
         const age = Math.max(0, t - base);
         const entry = clone(s);
-        if (age >= archiveMs) { entry.state = 'archived'; archived++; }
+        // Only a MODEL-authored skill (the agent, a review, the curator) retires itself. A skill the Commander wrote
+        // or chose to install can go stale, never auto-archive: it is theirs to retire (Hermes parity: its curator
+        // only ages curator-managed skills). This matters since 2026-09-28, when lastUsedAt stopped being refreshed
+        // for every skill merely listed in the index, so the aging clock now measures real loads.
+        const autoArchive = (guard && typeof guard.originTier === 'function' ? guard.originTier(s) : trustSource(s.createdBy)) === 'agent-created';
+        if (age >= archiveMs && autoArchive && opts.stageReviews !== false) {
+          const proposed = manage({ agentId: s.agentId, target: s.id, action: 'archive', createdBy: 'background-review' });
+          if (proposed.ok && proposed.pending) proposedArchives++;
+          continue;
+        }
+        if (age >= archiveMs && autoArchive) { entry.state = 'archived'; archived++; }
         else if (age >= staleMs) { entry.state = 'stale'; stale++; }
         else continue;
         entry.updatedAt = t;
         persist(entry);
       }
-      return { ok: true, stale, archived };
+      return { ok: true, stale, archived, proposedArchives };
     }
 
     return {
       write, manage, list, view, markUsed, curate, compact,
+      // broken is not empty: a library that failed to load says so instead of listing nothing
+      loadState() { return canWrite() ? { ok: true, error: null } : { ok: false, error: cannotWrite().message }; },
+      candidates, candidate, pendingView, promotionBlocker, approveCandidate, rejectCandidate, veto, share, listAccessible, viewAccessible,
       all() { return Array.from(latest.values()).map(s => projectSkill(s, true)); },
       count() { return latest.size; },
       _internals: { slug, keyOf, supportPath, cleanName, normalizeEntry, bumpView, trustSource }

@@ -13,7 +13,7 @@ const map = ToolProps.toolPropType;
 // computer=the compute gate, workbench=dedicated shell/verify events, orchestrator=handoff boxes).
 const EXPECT = {
   computer: null, notebook: 'notebook', cabinet: 'cabinet', dish: 'dish',
-  connector: null, workbench: null, orchestrator: null, studio: 'studio', jukebox: 'jukebox'
+  connector: null, plugin: null /* plugin__<id>__* tools: the plugin terminal, like a connector portal */, workbench: null, orchestrator: null, builder: null /* the lent slice of the orchestrator's builder */, studio: 'studio', jukebox: 'jukebox'
 };
 for (const [objectType, grants] of Object.entries(CAP_REGISTRY)) {
   A.ok(objectType in EXPECT, 'registry objectType "' + objectType + '" has an expected mapping (update toolprops when the registry grows)');
@@ -32,6 +32,8 @@ A.eq(map('skill.view'), 'notebook', 'skill.view -> notebook');
 A.eq(map('recall_conversation'), 'notebook', 'recall_conversation -> notebook');
 A.eq(map('todo'), null, 'todo rides the computer (taskplan freebie, 2026-08-17) — no cap-prop pulse, same rule as quest.update');
 A.eq(map('image_generate'), 'studio', 'image_generate -> studio');
+A.eq(map('resolve_timeline_file'), 'studio', 'resolve_timeline_file -> studio');
+A.eq(map('resolve_control'), 'studio', 'resolve_control -> studio');
 A.eq(map('spotify_play'), 'jukebox', 'spotify_play -> jukebox');
 
 /* ---- the no-double-fire law: tools with their OWN floor visual return null ---- */

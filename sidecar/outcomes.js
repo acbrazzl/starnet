@@ -18,14 +18,21 @@
       harness itself named. 'cancelled' (the Commander's own hand) and 'clarifying' (a question, not an attempt)
       classify NOTHING — the same rule recqualitystore holds for its outcome folds. internal rows (harness
       self-talk) are excluded wholesale.
+      THE COMMANDER'S VERDICT OUTRANKS THE HARNESS (2026-10-01): a 'done' run the Commander rated `miss` is a
+      failure ('rated_missed') — finishing is not the same as landing, and a record that called rejected work
+      "proven" would steer the station toward exactly what they disliked. fold() takes the verdicts as an
+      injected map (opts.verdicts: runId -> 'great'|'ok'|'miss'); absent = the harness reason alone, as before.
    4. PURE + DETERMINISM-CLEAN: rows in, plain object out; `now` injected; no IO, no clock, no rng. */
 'use strict';
 (function (root, factory) {
-  const api = factory();
-  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  // under node, a recipe run's title is scrubbed through prompt-scrub before fold() clips it into a label (see fold)
+  const node = typeof module !== 'undefined' && module.exports && typeof require === 'function';
+  const api = factory(node ? require('./prompt-scrub.js').scrubStored : null);
+  if (node) module.exports = api;
   else { (root.SK = root.SK || {}).outcomes = api; }
-})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (scrubStored) {
   'use strict';
+  const scrub = typeof scrubStored === 'function' ? scrubStored : (s => s);
 
   const WINDOW_MS = 30 * 86400000;   // the record's memory: a month of literal, countable runs
   const MIN_SUPPORT = 3;             // decided attempts before a key may speak or lean a ranker
@@ -55,6 +62,7 @@
      reasons contribute nothing. */
   function fold(rows, opts) {
     const now = num(opts && opts.now);
+    const verdicts = (opts && opts.verdicts && typeof opts.verdicts === 'object') ? opts.verdicts : null;
     const cut = now - WINDOW_MS;
     const keys = {};
     let decided = 0;
@@ -68,14 +76,18 @@
       if (!r || r.internal === true) continue;
       const ts = num(r.ts);
       if (!ts || ts < cut || (now && ts > now)) continue;
-      const reason = str(r.reason);
-      const ok = SUCCESS[reason] === 1;
+      let reason = str(r.reason);
+      let ok = SUCCESS[reason] === 1;
       if (!ok && FAILURE[reason] !== 1) continue;   // cancelled/clarifying/unknown: not a decided attempt
+      if (ok && verdicts && verdicts[str(r.runId)] === 'miss') { ok = false; reason = 'rated_missed'; }   // finished ≠ landed
       decided += 1;
       const lane = laneOf(r.streamId);
       bump('lane:' + lane, 'lane', lane, ok, reason, ts);
       const recipeId = str(r.recipeId);
-      if (recipeId) bump('recipe:' + recipeId, 'recipe', str(r.title) || recipeId, ok, reason, ts);
+      // SECRETS (context-key-redact, 2026-10-28): the label is a run TITLE the TRACK RECORD quotes into later prompts. A
+      // title older builds stored raw (cut at 120, maybe mid-key) is scrubbed WHOLE here, before the 80-char clip leaves
+      // a fragment no rule could match inside '"<label>" (recipe) — …'.
+      if (recipeId) bump('recipe:' + recipeId, 'recipe', scrub(str(r.title)) || recipeId, ok, reason, ts);
       const model = str(r.model);
       if (model && model !== '(unknown)') bump('model:' + model, 'model', model, ok, reason, ts);
     }
@@ -114,7 +126,8 @@
       const what = p.kind === 'recipe' ? '"' + p.label + '" (recipe)' : p.kind === 'model' ? p.label + ' (model)' : p.label + ' runs';
       if (p.verdict === 'proven') return what + ' — finished clean ' + p.ok + ' of ' + p.n + ' recent runs';
       const tf = p.topFail ? ' (top failure: ' + p.topFail.reason + ' ×' + p.topFail.count + ')' : '';
-      return what + ' — only ' + p.ok + ' of ' + p.n + ' recent runs finished' + tf;
+      // "landed", not "finished": a run the Commander rated missed DID finish, it just didn't land
+      return what + ' — only ' + p.ok + ' of ' + p.n + ' recent runs landed' + tf;
     });
   }
 

@@ -14,12 +14,12 @@ A.eq(Au.INITIATIVE, ['wait', 'propose', 'leash', 'free'], 'Initiative axis is wa
 A.eq(Au.REACH, ['observe', 'sandbox', 'reach'], 'Reach axis is observe→sandbox→reach (ascending)');
 
 /* ---------- fresh(): the safe default floor ---------- */
-A.eq(Au.fresh(), { v: 1, initiative: 'wait', reach: 'sandbox', leashPerDay: 3 }, 'fresh() = fully wait-for-me, Sandbox ceiling, leash 3');
+A.eq(Au.fresh(), { v: 1, initiative: 'propose', reach: 'sandbox', leashPerDay: 3 }, 'fresh() = PROPOSE (suggest, never act), Sandbox ceiling, leash 3');
 
 /* ---------- normalize(): tolerant hydrate, clamps to the floor per field ---------- */
 A.eq(Au.normalize(null), Au.fresh(), 'normalize(null) → the safe floor, never throws');
 A.eq(Au.normalize({}).initiative, 'wait', 'an empty object hydrates to the floor');
-A.eq(Au.normalize({ initiative: 'bogus', reach: 'nope' }), Au.fresh(), 'out-of-enum values fall back to the floor (never an invalid posture)');
+A.eq(Au.normalize({ initiative: 'bogus', reach: 'nope' }), { v: 1, initiative: 'wait', reach: 'sandbox', leashPerDay: 3 }, 'out-of-enum values in a corrupt save fall back to the wait-for-me floor (never MORE active, never invalid)');
 A.eq(Au.normalize({ initiative: 'free', reach: 'reach', leashPerDay: 5 }), { v: 1, initiative: 'free', reach: 'reach', leashPerDay: 5 }, 'valid values are kept');
 A.eq(Au.normalize({ leashPerDay: 0 }).leashPerDay, 1, 'leashPerDay clamps up to the min (1)');
 A.eq(Au.normalize({ leashPerDay: 999 }).leashPerDay, 12, 'leashPerDay clamps down to the max (12)');
@@ -37,7 +37,7 @@ A.eq(Au.atLeast(free, 'reach', 'bogus-level'), false, 'an unknown level is false
 
 /* ---------- setters: valid changes stick, invalid are ignored (posture stays valid) ---------- */
 A.eq(Au.setInitiative(Au.fresh(), 'free').initiative, 'free', 'setInitiative applies a valid level');
-A.eq(Au.setInitiative(Au.fresh(), 'ludicrous').initiative, 'wait', 'setInitiative ignores an invalid level');
+A.eq(Au.setInitiative(Au.fresh(), 'ludicrous').initiative, 'propose', 'setInitiative ignores an invalid level');
 A.eq(Au.setReach(Au.fresh(), 'reach').reach, 'reach', 'setReach applies a valid level');
 A.eq(Au.setReach(Au.fresh(), 'orbit').reach, 'sandbox', 'setReach ignores an invalid level');
 A.eq(Au.setLeash(Au.fresh(), 8).leashPerDay, 8, 'setLeash applies a clamped value');
@@ -64,7 +64,8 @@ A.eq(Au.matchPreset({ initiative: 'free', reach: 'reach' }), null, 'a hand-tuned
 A.eq(Au.presetById('nope'), null, 'presetById(unknown) → null');
 
 /* ---------- summary(): the derived read surface (AND of both axes, honest) ---------- */
-A.eq(Au.summary(Au.fresh()).enabled, false, 'the default posture does nothing unattended (enabled:false)');
+A.eq([Au.summary(Au.fresh()).enabled, Au.summary(Au.fresh()).proposesOnly, Au.summary(Au.fresh()).actsUnattended], [true, true, false], 'the default posture lines up suggestions and NEVER acts unattended');
+A.eq(Au.summary(Au.setInitiative(Au.fresh(), 'wait')).enabled, false, 'wait-for-me stays one tap away and is honored exactly (enabled:false)');
 const sFree = Au.summary({ initiative: 'free', reach: 'reach' });
 A.eq([sFree.actsUnattended, sFree.buildsUnattended, sFree.reachesOut], [true, true, true], 'free+reach: acts, builds, and reaches out unattended');
 const sBuild = Au.summary({ initiative: 'leash', reach: 'sandbox', leashPerDay: 2 });
@@ -84,12 +85,16 @@ A.ok(/3 small jobs/i.test(Au.describe({ initiative: 'leash', reach: 'sandbox', l
 A.ok(/freely toward your goals/i.test(Au.describe({ initiative: 'free', reach: 'sandbox' })), 'describe(free) says it works freely');
 A.ok(/up to 7 jobs a day/i.test(Au.describe({ initiative: 'free', reach: 'sandbox', leashPerDay: 7 })), 'describe(free) also names the daily leash cap (full autonomy is honest about the pace)');
 A.ok(/nothing leaves the machine/i.test(Au.describe({ initiative: 'free', reach: 'sandbox' })), 'describe(sandbox) is explicit that nothing leaves');
+// call #57 (org pass 10-14): the work lands somewhere REAL — a new ⚒ session, or LAST REPORT for a draft — never "your desk"
+A.ok(/new session in your rail/.test(Au.describe({ initiative: 'leash', reach: 'sandbox' })) && /LAST REPORT below/.test(Au.describe({ initiative: 'leash', reach: 'sandbox' })), 'describe(leash) names the real destinations');
+A.ok(!/⚒|SETTINGS ›/.test(Au.describe({ initiative: 'leash', reach: 'sandbox' })), 'describe carries no fallback-font glyph and no breadcrumb to the AUTONOMY page it is shown on');
+A.ok(!/desk/i.test(Au.describe({ initiative: 'free', reach: 'reach' })), 'describe never points at a desk that does not exist');
 A.ok(/send|publish|external/i.test(Au.describe({ initiative: 'free', reach: 'reach' })), 'describe(reach) is explicit it can act externally');
 A.ok(Au.describe({ initiative: 'free', reach: 'reach' }).indexOf('see everything it did') >= 0, 'describe always promises legibility (you see everything)');
 
 /* ---------- purity / determinism ---------- */
 A.eq(Au.cadencePresets(), Au.cadencePresets(), 'cadencePresets() is deterministic (no clock/RNG)');
 const snap = Au.fresh(); Au.setInitiative(snap, 'free');
-A.eq(snap.initiative, 'wait', 'setters do not mutate their input (return a fresh posture)');
+A.eq(snap.initiative, 'propose', 'setters do not mutate their input (return a fresh posture)');
 
 A.report('autonomy.test');

@@ -6,6 +6,7 @@
       writes, and a corrupt/negative persisted value silently falls back to env (never grants headroom).
    3) SOURCE GUARD: the frontend Budget panel + the /api/budget/caps endpoint + status fields actually exist. */
 'use strict';
+const { readSidecarSource } = require('./helpers/source');
 const fs = require('fs');
 const path = require('path');
 const A = require('./_assert.js');
@@ -97,7 +98,7 @@ const ENV = { perRun: 3, perAgent: 5, perDay: 40, global: 100 };   // a fully-go
 
 // ---------- 4. SOURCE GUARD: endpoint + status fields wired in the host ----------
 {
-  const idx = fs.readFileSync(path.join(__dirname, '..', 'sidecar', 'index.js'), 'utf8');
+  const idx = readSidecarSource();
   A.ok(/\/api\/budget\/caps/.test(idx) && /handleBudgetCaps/.test(idx), 'POST /api/budget/caps route + handler present');
   A.ok(/require\('\.\/budgetcaps\.js'\)/.test(idx), 'host uses the pure budgetcaps helper (single source of logic)');
   A.ok(/const budgetStore = makeDomainStore/.test(idx) && /budgetStore\.load\(\)\.value/.test(idx) && /budgetStore\.save\(budgetOverrides\)/.test(idx), 'caps persist via the normalized domain store (durable + .bak + read-back proof)');
@@ -124,6 +125,65 @@ const ENV = { perRun: 3, perAgent: 5, perDay: 40, global: 100 };   // a fully-go
   A.ok(/blank or 0 = no cap/i.test(station) && /leave blank or 0 for no cap/i.test(station), 'the "blank/0 = no cap" semantics are surfaced to the user');
   A.ok(/class="mc-hint"/.test(station), 'one-line inline help under each cap field (reuses the connector-form idiom)');
   A.ok(/#budget-form .set-row/.test(css) && /input\[type=number\]\.key-input/.test(css), 'budget panel styles present (number-input phosphor + row layout)');
+}
+
+// ---- the SHIPPED defaults (2026-09-17): a fresh install is no longer ungoverned on the day pool ----------------
+// A customer's loop burned ~$98 overnight with every cap at 0. perDay now ships as a soft rail; everything else
+// stays off. The rail must be (a) a real cap the governor blocks on, (b) overridable to 0 from the UI, and
+// (c) beaten by an explicit env value — the same precedence every other cap already has.
+{
+  const shipped = bc.shippedDefaults();
+  A.eq(shipped, { perRun: 0, perAgent: 0, perDay: 25, global: 0 }, 'perDay ships at $25; the other three stay off');
+  A.eq(bc.DEFAULT_PER_DAY_USD, 25, 'the constant the sidecar wires is the same number');
+  A.ok(bc.shippedDefaults() !== bc.shippedDefaults(), 'each call is a fresh copy (a caller cannot mutate the shipped table)');
+  A.eq(bc.resolveCaps(shipped, {}), shipped, 'with nothing saved, the shipped defaults ARE the effective caps');
+  A.eq(bc.resolveCaps(shipped, { perDay: 0 }).perDay, 0, 'a saved 0 dials the shipped rail OFF (the Commander\'s explicit choice wins)');
+  A.eq(bc.resolveCaps(shipped, { perDay: 100 }).perDay, 100, 'a saved value raises it');
+  A.eq(bc.resolveCaps(Object.assign({}, shipped, { perDay: 40 }), {}).perDay, 40, 'an env value (SKYNET_BUDGET_PER_DAY) replaces the shipped default');
+  // the governor actually blocks on it — this is the number that stops the overnight burn
+  const B = require('../sidecar/budget.js');
+  const ev = B.evaluate({ day: shipped.perDay }, { day: 25.5 });
+  A.eq(ev.blocked, 'day', 'the day pool blocks once spend reaches the shipped cap');
+  A.eq(B.evaluate({ day: shipped.perDay }, { day: 24 }).blocked, null, 'and not before');
+  A.eq(B.evaluate({ day: shipped.perDay }, { day: 21 }).warn, ['day'], 'with the 80% warn band ahead of it');
+  // the SETTINGS → BUDGET copy still tells the truth: a value that is not saved reads as the environment default
+  const station = require('fs').readFileSync(require('path').join(__dirname, '..', 'frontend', 'app', 'stationui.js'), 'utf8');
+  A.ok(/environment default/.test(station), 'the panel badges an unsaved cap as the default, so $25 never reads as something the user set');
+}
+
+// ---- issue #53: a StarNet-credit run never reserves the whole wallet by default ------------------------------
+// Before: no per-run cap in force -> admission reserved the ENTIRE balance, which is also the loop's per-run
+// ceiling, so one prompt could spend a fresh $10 top-up. Now: min(managed default, balance); a positive cap the
+// user (or a delegating caller) chose is honoured verbatim. The live proof is test/managed-run-cap.e2e.test.js.
+{
+  const D = bc.DEFAULT_MANAGED_PER_RUN_USD;
+  A.eq(D, 2, 'the managed per-run default is $2 (a fifth of the $10 minimum top-up)');
+  A.ok(D < bc.DEFAULT_PER_DAY_USD, 'it sits well under the $25/day rail, so the day rail stays the backstop');
+  A.eq(bc.managedRunCapUsd(0, 10, D), 2, 'no cap chosen + $10 wallet -> reserve $2, not $10');
+  A.eq(bc.managedRunCapUsd(Infinity, 10, D), 2, 'an "ungoverned" (Infinity) run cap is treated as no cap chosen');
+  A.eq(bc.managedRunCapUsd(0, 1.2, D), 1.2, 'a wallet under the default is clamped, never refused for a cap nobody chose');
+  A.eq(bc.managedRunCapUsd(5, 10, D), 5, 'a user\'s higher per-run cap wins');
+  A.eq(bc.managedRunCapUsd(0.5, 10, D), 0.5, 'a user\'s lower per-run cap wins');
+  // a cap is a CEILING: a $100 cap on a $79 wallet used to be refused as "out of credit" (customer report 2026-10-06)
+  A.eq(bc.managedRunCapUsd(50, 10, D), 10, 'a cap above the balance reserves the balance, never a refusal');
+  A.eq(bc.managedRunCapUsd(5, 0, D), 0, 'a cap on an empty wallet -> 0 (the host fails closed: out of credit)');
+  A.eq(bc.managedRunCapUsd(5, null, D), 0, 'a cap on an unknown wallet -> 0 (fail closed: credits unavailable)');
+  A.eq(bc.managedRunCapUsd(0, 0, D), 0, 'an empty wallet -> 0 (the host fails closed: out of credit)');
+  A.eq(bc.managedRunCapUsd(0, NaN, D), 0, 'an unknown wallet -> 0 (fail closed: credits unavailable)');
+  A.eq(bc.managedRunCapUsd(0, null, D), 0, 'a null (never reported) wallet -> 0, the same as unknown');
+  A.eq(bc.managedRunCapUsd(0, 10, 0), 10, 'an operator default of 0 restores the old wallet-is-the-ceiling behaviour');
+  // the host really uses it (a pure helper nobody calls fixes nothing — injected-deps-hide-wiring-bugs)
+  const idx = readSidecarSource();
+  A.ok(/runCapUsd = budgetCaps\.managedRunCapUsd\(\(runCapUsd > 0 && isFinite\(runCapUsd\)\) \? runCapUsd : 0, avail, MANAGED_PER_RUN_DEFAULT\)/.test(idx), 'managed admission reserves through managedRunCapUsd, a chosen cap included');
+  // Number(null) is 0: a failed refresh (null balance) must never be read as a reported $0 wallet
+  A.ok(/const avail = \(snap && typeof snap\.balanceUsd === 'number' && isFinite\(snap\.balanceUsd\)\) \? snap\.balanceUsd : NaN;/.test(idx), 'admission reads only a REPORTED balance; null stays unknown');
+  A.ok(!/runCapUsd = \(isFinite\(avail\) && avail > 0\) \? avail : 0/.test(idx), 'the reserve-the-whole-wallet line is gone');
+  A.ok(/MANAGED_PER_RUN_DEFAULT = num\(ENV\('BUDGET_MANAGED_PER_RUN'\), budgetCaps\.DEFAULT_MANAGED_PER_RUN_USD\)/.test(idx), 'the default is env-tunable (SKYNET_BUDGET_MANAGED_PER_RUN)');
+  // truthful UI: "0 = no cap" must not be the whole story on StarNet credits, and a run stop never says "remove"
+  const station = require('fs').readFileSync(require('path').join(__dirname, '..', 'frontend', 'app', 'stationui.js'), 'utf8');
+  A.ok(/id="bg-managed-hint"/.test(station) && /st\.managedRunDefaultUsd/.test(station), 'the Budget panel paints the managed default from /api/budget/status');
+  const chat = require('fs').readFileSync(require('path').join(__dirname, '..', 'frontend', 'app', 'chat.js'), 'utf8');
+  A.ok(/scope === 'run' \? ' — raise it' : ' — raise or remove it'/.test(chat), 'a per-run budget stop says "raise it", never a "remove" that would do nothing on credits');
 }
 
 A.report('budget-caps');

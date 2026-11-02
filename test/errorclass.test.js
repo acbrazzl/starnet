@@ -4,7 +4,7 @@
 'use strict';
 const A = require('./_assert.js');
 const { classifyApiError, REASONS } = require('../sidecar/providers/errorClass.js');
-const { friendlyError, KINDS } = require('../frontend/app/friendlyerror.js');
+const { friendlyError, actionButton, KINDS } = require('../frontend/app/friendlyerror.js');
 
 // openrouter-adapter-shaped error: `new Error('openrouter http <s> — <detail>')` with .status set
 function httpErr(status, detail) { return Object.assign(new Error('openrouter http ' + status + (detail ? ' — ' + detail : '')), { status: status }); }
@@ -35,6 +35,30 @@ const R = (err, ctx) => classifyApiError(err, ctx || {});
 
   A.eq(R(httpErr(404, 'no endpoints found for model')).reason, 'model_not_found', '404 -> model_not_found');
   A.eq(R(httpErr(404)).shouldFallback, true, 'model_not_found -> fallback');
+}
+
+// ---- A2. xAI's own shapes (live-probed 2026-09-27): a REJECTED KEY arrives as 400, an UNFUNDED team as 403 ----
+{
+  // the adapter's own sentence, with the provider body kept for its code (err.ownMessage), exactly as openai-compatible throws it
+  const xaiErr = (status, body) => Object.assign(new Error('openai-compatible http ' + status + ' - ' + JSON.stringify(body)), { status: status, body: body, ownMessage: true });
+  const badKey = xaiErr(400, { code: 'invalid-argument', error: 'Incorrect API key provided. You can obtain an API key from https://console.x.ai.' });
+  A.eq(R(badKey).reason, 'auth', 'xAI bad-key 400 -> auth (was format_error: "Something went wrong")');
+  A.eq(R(badKey).shouldRotateCredential, true, 'a rejected key rotates to the next pooled key');
+  const broke = xaiErr(403, { code: 'The caller does not have permission to execute the specified operation', error: 'Your newly created team doesn\'t have any credits yet. You can purchase credits on https://console.x.ai/team/x.' });
+  A.eq(R(broke).reason, 'billing', 'xAI no-credits 403 -> billing (was auth: "No model is connected yet")');
+  A.eq(R(xaiErr(403, { error: 'Your team has either used all available credits or reached its monthly spending limit.' })).reason, 'billing', 'xAI spent-credits 403 -> billing');
+  A.eq(R(xaiErr(403, { error: 'The caller does not have permission to execute the specified operation' })).reason, 'auth', 'a plain permission 403 stays auth');
+  // Anthropic refuses an empty wallet with a 400 invalid_request_error (2026-10-07 report: three runs read "Something went wrong")
+  const anthroBroke = Object.assign(new Error('anthropic http 400 - Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'), { status: 400 });
+  A.eq(R(anthroBroke).reason, 'billing', 'Anthropic "credit balance is too low" 400 -> billing (was format_error)');
+  A.eq(R(Object.assign(new Error('anthropic http 400 - messages.0.content: field required'), { status: 400 })).reason, 'format_error', 'a malformed-request 400 stays format_error');
+  A.ok(R(new Error('An earlier run was interrupted before its spend was recorded, so the spending limits you set can’t be checked. Settle it in SETTINGS › SPENDING LIMITS.')).reason !== 'billing', 'a local spend-ledger error is not provider billing');
+  A.eq(R(httpErr(400, 'Invalid value for messages[0].role')).reason, 'format_error', 'an ordinary malformed 400 is still format_error');
+  // Groq: a badly-sampled tool call (gpt-oss-120b) is a 400 tool_use_failed — resending re-samples, so it is retryable (2026-10-08 report)
+  const groqTool = xaiErr(400, { error: { message: "Failed to call a function. Please adjust your prompt. See 'failed_generation' for more details.", type: 'invalid_request_error', code: 'tool_use_failed', failed_generation: 'x' } });
+  A.eq(R(groqTool).reason, 'unknown', 'Groq tool_use_failed 400 -> unknown (was format_error: the run died at zero tokens)');
+  A.eq(R(groqTool).retryable, true, 'and it is retried (a resend re-samples the tool call)');
+  A.eq(R(httpErr(400, 'Tool call validation failed: parameters for tool fs_write did not match schema')).retryable, true, 'Groq tool-call validation failure is retried too');
 }
 
 // ---- B. 400 ambiguity: context vs format, gated by the cold-catalog guard ----
@@ -69,10 +93,11 @@ const R = (err, ctx) => classifyApiError(err, ctx || {});
   A.eq(R(new Error('request blocked by moderation')).reason, 'content_policy_blocked', 'moderation message -> content_policy_blocked');
 }
 
-// ---- E. transport / network codes -> timeout (retryable) ----
+// ---- E. transport / network codes -> timeout (retryable); nothing answering at the address -> unreachable ----
 {
   A.eq(R(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })).reason, 'timeout', 'ECONNRESET -> timeout');
-  A.eq(R(Object.assign(new Error('fetch failed'), { cause: { code: 'ENOTFOUND' } })).reason, 'timeout', 'node fetch cause.code -> timeout');
+  // quick win 15 (bug 8873fd77): a name that did not resolve is not a slow provider (test/errorclass.unreachable.test.js)
+  A.eq(R(Object.assign(new Error('fetch failed'), { cause: { code: 'ENOTFOUND' } })).reason, 'unreachable', 'node fetch cause.code ENOTFOUND -> unreachable');
   A.eq(R(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })).retryable, true, 'transport timeout retryable');
 }
 
@@ -198,7 +223,7 @@ const F = (err, status, opts) => friendlyError(err, status, opts);
   A.eq(v.retryable, false, 'capdenied not retryable');
   A.eq(v.action, 'refit', 'capdenied points at REFIT (place the gear), not the SKILLS list');
   A.eq(v.cap, 'web', 'capdenied parses the missing capability off the raw message');
-  A.ok(/WEB ACCESS/.test(v.userMessage) && /DISH/.test(v.userMessage) && /REFIT/.test(v.userMessage), 'capdenied headline names the power (WEB ACCESS), the gear (DISH), and the door (REFIT)');
+  A.ok(/WEB ACCESS/.test(v.userMessage) && /DISH/.test(v.userMessage) && /BUILD MODE/.test(v.userMessage), 'capdenied headline names the power (WEB ACCESS), the gear (DISH), and the door (BUILD MODE)');
   A.eq(F(new Error('capdenied: terminal')).kind, 'capdenied', 'literal capdenied token -> capdenied');
 
   // timeout vs user-abort: a user cancel is a quiet, non-retryable "Stopped."; a real timeout is retryable.
@@ -259,7 +284,8 @@ const F = (err, status, opts) => friendlyError(err, status, opts);
   for (const k of Object.keys(KINDS)) {
     const def = KINDS[k];
     A.ok(typeof def.retryable === 'boolean' && typeof def.msg === 'string' && def.msg.length > 0, 'kind "' + k + '" has a boolean retryable + a non-empty message');
-    A.ok(def.action === null || def.action === 'settings' || def.action === 'skills' || def.action === 'store' || def.action === 'refit' || def.action === 'reload' || def.action === 'toolsets', 'kind "' + k + '" action is null|settings|skills|store|refit|reload|toolsets');
+    A.ok(def.action === null || def.action === 'settings' || def.action === 'skills' || def.action === 'store' || def.action === 'refit' || def.action === 'reload' || def.action === 'toolsets' || def.action === 'budget', 'kind "' + k + '" action is null|settings|skills|store|refit|reload|toolsets|budget');
+    if (def.action !== null) A.ok(!!actionButton({ kind: k, action: def.action }), 'kind "' + k + '" action "' + def.action + '" has a door');
   }
 }
 
@@ -306,7 +332,31 @@ const F = (err, status, opts) => friendlyError(err, status, opts);
   // the new pre-flight misconfig mapping must hold on the browser path too (points at Settings, not a retry).
   A.eq(B(new Error('no API key set')).kind, 'auth', 'browser: "no API key set" -> auth');
   A.eq(B(new Error('no API key set')).action, 'settings', 'browser: missing key points at Settings');
-  A.eq(B(new Error('no model selected')).kind, 'auth', 'browser: "no model selected" -> auth');
+  // a connected provider with no MODEL picked is its own kind: the door is the model dock, not a key or sign-in
+  A.eq(B(new Error('no model selected')).kind, 'no_model', 'browser: "no model selected" -> no_model');
+  A.eq(B(new Error('no model selected')).action, 'settings', 'browser: no_model is a fix-it door, not a blind retry');
+  A.eq(B(new Error('sidecar HTTP 400 — no model selected — pick a model for GROK OAUTH first')).kind, 'no_model',
+    'browser: the /api/run no-model guard -> no_model');
+  A.eq(B(new Error('sidecar HTTP 400 — missing key/model — sign in to GROK OAUTH first - a signed-in subscription + model are required')).kind, 'oauth',
+    'browser: the /api/run guard for a signed-out GROK OAUTH -> the grok sign-in class, not the key/ChatGPT door');
+  A.eq(B(new Error('sidecar HTTP 400 — missing key/model — connect a XAI API key')).kind, 'auth', 'browser: keyed guard stays auth');
+  // xAI (live-probed 2026-09-27): a bad key is a 400, an unfunded team a 403 naming credits
+  A.eq(B(new Error('openai-compatible http 400 - {"code":"invalid-argument","error":"Incorrect API key provided. You can obtain an API key from https://console.x.ai."}')).kind, 'auth',
+    'browser: xAI bad-key 400 -> auth, not an unknown retry');
+  A.eq(B(new Error('openai-compatible http 403 - {"code":"The caller does not have permission to execute the specified operation","error":"Your newly created team doesn\'t have any credits yet. You can purchase credits on https://console.x.ai/team/x."}')).kind, 'billing',
+    'browser: xAI no-credits 403 -> billing, not "no model connected"');
+  // Anthropic's empty wallet is a 400: the browser ladder must not call it `unknown` → "try again" (2026-10-07)
+  const anthroBroke = 'anthropic http 400 - Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.';
+  A.eq(B(new Error(anthroBroke)).kind, 'billing', 'browser: Anthropic credit-balance 400 -> billing, not an unknown retry');
+  A.eq(B(new Error(anthroBroke)).retryable, false, 'browser: Anthropic out of credit offers no doomed retry');
+  A.ok(/out of credit/i.test(B(new Error(anthroBroke)).userMessage), 'browser: the Anthropic empty-wallet copy says the account is out of credit');
+  // org P03 (final round): a sign-in SUBSCRIPTION has no wallet — on the browser ladder too, its 402 / "quota" is a spent plan
+  for (const raw of ['codex http 402 — Payment Required', 'codex http 429 — Codex quota exceeded', 'Grok (xAI) http 402 - insufficient credits', 'Kimi For Coding http 429 - insufficient_quota']) {
+    const v = B(new Error(raw));
+    A.eq(v.kind, 'quota_exhausted', 'browser: ' + raw + ' -> quota_exhausted (a plan allowance), never billing');
+    A.ok(!/out of credit|top (?:it )?up/i.test(v.userMessage) && /plan allowance is used up/.test(v.userMessage), 'browser: ' + raw + ' never says "out of credit — top it up": ' + v.userMessage);
+  }
+  A.eq(B(new Error('Kimi For Coding http 429 - quota exceeded: requests per minute')).kind, 'rate_limit', 'browser: a per-minute quota on a subscription stays a rate limit');
 }
 
 /* ---- a TRANSPORT status beats a policy WORD in the message ----
@@ -359,6 +409,26 @@ const F = (err, status, opts) => friendlyError(err, status, opts);
   A.eq(spent.reason, 'billing', 'a 429 carrying insufficient_quota is BILLING, not a busy provider');
   A.eq(spent.retryable, false, 'and it is not retryable either');
   A.eq(R({ status: 429, code: 'insufficient_quota', message: 'x' }).reason, 'billing', 'the code form too');
+}
+
+/* A MODEL THIS ChatGPT ACCOUNT MAY NOT RUN (2026-10-27 report: four gpt-6-astra runs in four minutes, each read as
+   format_error -> "Something went wrong — try again"). The Codex backend refuses the model for the account; a resend is
+   refused the same way, so it is model_not_found: no retry, a configured fallback may answer. */
+{
+  const refusal = "The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account.";
+  // the codex.js adapter's exact shape: its own sentence, the parsed body kept for its code
+  const adapter = R(Object.assign(new Error('codex http 400 — ' + refusal), { status: 400, ownMessage: true, body: { error: { message: refusal } } }), { model: 'gpt-6-astra' });
+  A.eq(adapter.reason, 'model_not_found', 'a ChatGPT account refusing the model is model_not_found, not format_error');
+  A.eq(adapter.retryable, false, 'and never resent: the same request is refused again');
+  A.eq(adapter.shouldFallback, true, 'a configured fallback may still answer');
+  A.eq(adapter.unsupportedPart, false, 'the whole model is refused, not a part of the request');
+  A.eq(R(new Error(refusal)).reason, 'model_not_found', 'the same words with no status read the same');
+  // the status still wins where it proves something else
+  A.eq(R(Object.assign(new Error('codex http 401 — ' + refusal), { status: 401 })).reason, 'auth', 'a 401 stays the sign-in');
+  A.eq(R(Object.assign(new Error('codex http 503 — ' + refusal), { status: 503 })).reason, 'overloaded', 'a 503 stays transient');
+  // control: another 400 that says "not supported" keeps its verdict
+  A.eq(R(Object.assign(new Error("codex http 400 — Unsupported parameter: 'temperature' is not supported with this model."), { status: 400 })).reason, 'format_error',
+    'an unsupported PARAMETER is not the account refusing the model');
 }
 
 A.report('errorclass.test');

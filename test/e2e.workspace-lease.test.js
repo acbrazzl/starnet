@@ -15,6 +15,9 @@ const os = require('os');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const { bootToken } = require('./_httpToken.js');
+// the run-context note is the leading text of the newest user message on a non-Claude chat wire: match the Commander's own words
+const { userWords } = require('./helpers/host-notes.js');
+const { allocatePort, BIND_REFUSED } = require('./helpers/ports.js');
 const HOST = '127.0.0.1';
 const INDEX = path.resolve(__dirname, '..', 'sidecar', 'index.js');
 
@@ -39,7 +42,7 @@ function startMockOpenRouter() {
           requests.push(msgs);
           const toolResults = msgs.filter(m => m && m.role === 'tool').length;
           const lastUser = [...msgs].reverse().find(m => m && m.role === 'user');
-          const directive = lastUser ? String(lastUser.content || '') : '';
+          const directive = lastUser ? userWords(lastUser) : '';
           const m = /WRITE\s+(\S+)/.exec(directive);
           res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
           const toolTurn = (id, name, args) => {
@@ -73,7 +76,7 @@ function boot(port, env, attemptsLeft) {
     const onData = d => {
       out += d.toString();
       if (!settled && out.indexOf('http://' + HOST + ':' + port) >= 0) { settled = true; resolve({ child, port }); }
-      else if (!settled && /already in use/i.test(out)) { settled = true; try { child.kill(); } catch (_) {} if (attemptsLeft > 0) resolve(boot(port + 1, env, attemptsLeft - 1)); else reject(new Error('no free port')); }
+      else if (!settled && BIND_REFUSED.test(out)) { settled = true; try { child.kill(); } catch (_) {} if (attemptsLeft > 0) resolve(allocatePort().then(next => boot(next, env, attemptsLeft - 1))); else reject(new Error('no free port')); }
     };
     child.stdout.on('data', onData); child.stderr.on('data', onData);
     child.on('error', e => { if (!settled) { settled = true; reject(e); } });
@@ -118,14 +121,14 @@ async function untilReady(check, label) {
   {
     const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'wlease-ws1-'));
     const env = { SKYNET_WORKSPACES: ws, SKYNET_OPENROUTER_BASE: mock.base, SKYNET_FULL_ACCESS: '1' };
-    const { child, port } = await boot(8700 + (process.pid % 40), env, 25);
+    const { child, port } = await boot(await allocatePort(), env, 25);
     const B = 'http://' + HOST + ':' + port;
     try {
       const token = await bootToken(B, B);
       const pA = driveRun(B, token, 'lease-agent', 'WRITE a.txt SLOWFINISH', 'sess-a');
       await untilReady(() => mock.held.has('a.txt') && findFile(ws, 'a.txt').length === 1, 'A holds the lease');
       const pB = driveRun(B, token, 'lease-agent', 'WRITE b.txt', 'sess-b');               // same agent: write must WAIT
-      await untilReady(() => mock.requests.some(msgs => msgs.some(m => m.role === 'user' && m.content === 'WRITE b.txt') && msgs.filter(m => m.role === 'tool').length === 1), 'B requests its write');
+      await untilReady(() => mock.requests.some(msgs => msgs.some(m => m.role === 'user' && userWords(m) === 'WRITE b.txt') && msgs.filter(m => m.role === 'tool').length === 1), 'B requests its write');
       A.eq(findFile(ws, 'b.txt').length, 0, 'B cannot write while A is held');
       mock.release('a.txt');
       const [rawA, rawB] = await Promise.all([pA, pB]);
@@ -142,7 +145,7 @@ async function untilReady(check, label) {
   {
     const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'wlease-ws2-'));
     const env = { SKYNET_WORKSPACES: ws, SKYNET_OPENROUTER_BASE: mock.base, SKYNET_FULL_ACCESS: '1', STARNET_WORKSPACE_LEASE_WAIT_MS: '250' };
-    const { child, port } = await boot(8745 + (process.pid % 40), env, 25);
+    const { child, port } = await boot(await allocatePort(), env, 25);
     const B = 'http://' + HOST + ':' + port;
     try {
       const token = await bootToken(B, B);

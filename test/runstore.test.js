@@ -3,6 +3,7 @@
    length-capped, list() returns newest-first filtered by agentId and respects the limit, ts comes from the
    injected clock, and the on-disk log is replayed into a fresh store. Pure + deterministic. */
 'use strict';
+const { readSidecarSource } = require('./helpers/source');
 const A = require('./_assert.js');
 const { makeRunStore } = require('../sidecar/runstore.js');
 
@@ -28,15 +29,16 @@ const clock = { now: () => clk };
   A.eq(io.lines.length, 2, 'both rows appended to io');
 }
 
-// ---- B. reason clamped to the known enum; unknown -> 'done' ----
+// ---- B. reason clamped to the known enum; unknown -> 'error' (bug 812c3bfb: an unknown end is never a finished run) ----
 {
   const s = makeRunStore({ io: memIo(), clock });
   A.eq(s.record({ runId: 'r', reason: 'refusal' }).reason, 'refusal', 'valid reason kept');
   A.eq(s.record({ runId: 'r', reason: 'budget' }).reason, 'budget', 'budget reason kept');
   A.eq(s.record({ runId: 'r', reason: 'empty' }).reason, 'empty', 'provider-empty remains empty (never rewritten as success)');
   A.eq(s.record({ runId: 'r', reason: 'clarifying' }).reason, 'clarifying', 'a Task Brief question remains neutral (never rewritten as success)');
-  A.eq(s.record({ runId: 'r', reason: 'kaboom' }).reason, 'done', 'unknown reason clamped to done');
-  A.eq(s.record({ runId: 'r' }).reason, 'done', 'missing reason defaults to done');
+  A.eq(s.record({ runId: 'r', reason: 'kaboom' }).reason, 'error', 'unknown reason clamped to error, never done');
+  A.eq(s.record({ runId: 'r' }).reason, 'error', 'a missing reason (a run that threw) records as error, never done');
+  A.eq(s.record({ runId: 'r', reason: 'done' }).reason, 'done', 'a real done is kept');
 }
 
 // ---- C. title is length-capped (no unbounded blob on disk) ----
@@ -259,6 +261,168 @@ const clock = { now: () => clk };
   const s2 = makeRunStore({ io, clock, ramMax: 50 });
   A.eq(s2.count(), 50, 'a boot load over the cap is trimmed at construction too');
   A.eq(s2.list('a', { limit: 1 })[0].runId, 'r199', 'the trimmed boot load keeps the NEWEST rows');
+}
+
+// ---- L. INTERRUPTED runs (2026-09-22): one served row per run, kept current by append-only updates ----
+{
+  const io = memIo();
+  let s = makeRunStore({ io, clock });
+  clk = 10; s.record({ runId: 'before', agentId: 'a', reason: 'done' });
+  clk = 20;
+  const first = s.record({ runId: 'int', agentId: 'a', reason: 'interrupted', turns: 4, startedAt: 5, endedAt: 9, recoveryStatus: 'needs_review', spendUnknown: true, error: 'interrupted:\n  stopped  mid-action' });
+  A.eq([first.reason, first.recoveryStatus, first.spendUnknown, first.error], ['interrupted', 'needs_review', true, 'interrupted: stopped mid-action'], 'an interrupted row keeps its reason, recovery status, unknown-spend flag and a one-line error');
+  clk = 30; s.record({ runId: 'after', agentId: 'a', reason: 'done' });
+  clk = 40; s.record({ runId: 'int', agentId: 'a', reason: 'interrupted', turns: 4, recoveryStatus: 'resolved' });
+  clk = 50; s.record({ runId: 'cont', agentId: 'a', reason: 'done', recoveryOf: 'int' });
+  clk = 60; s.record({ runId: 'int', agentId: 'a', reason: 'interrupted', turns: 4, recoveryStatus: 'continued', continuedRunId: 'cont', continuedReason: 'done' });
+  A.eq(io.lines.length, 6, 'every update is an appended line (the log stays append-only)');
+  A.eq(s.count(), 4, 'count() serves one row per run');
+  A.eq(s.list(null).map(r => r.runId), ['cont', 'after', 'int', 'before'], 'the interrupted run keeps its original position (no duplicate, no jump)');
+  const served = s.list(null).find(r => r.runId === 'int');
+  A.eq([served.recoveryStatus, served.continuedRunId, served.continuedReason, served.ts, 'error' in served], ['continued', 'cont', 'done', 20, false], 'the served row carries the NEWEST state at the FIRST row\'s ts');
+  A.eq(s.all().filter(r => r.runId === 'int').length, 1, 'all() serves one row per interrupted run');
+  A.eq(s.latest('int').recoveryStatus, 'continued', 'latest() returns the collapsed row');
+  A.eq(s.list(null).find(r => r.runId === 'cont').recoveryOf, 'int', 'the continuation row links back with recoveryOf');
+  A.eq(s.list(null, { limit: 2, beforeRunId: 'after' }).map(r => r.runId), ['int', 'before'], 'a page cursor never re-serves rows around a collapsed chain');
+  A.eq(s.list(null, { since: 15, through: 25 }).map(r => r.runId), ['int'], 'the time window applies to the served row\'s original ts');
+  s = makeRunStore({ io, clock });
+  A.eq([s.count(), s.latest('int').recoveryStatus], [4, 'continued'], 'the collapse survives a reload from disk');
+  A.eq(s.record({ runId: 'x', reason: 'interrupted', recoveryStatus: 'bogus', continuedReason: 'nope' }).recoveryStatus, undefined, 'unknown recovery states are not accepted');
+  A.eq(Object.keys(s.record({ runId: 'plain2', reason: 'done' })).filter(k => /^(?:recoveryStatus|recoveryOf|continuedRunId|continuedReason|spendUnknown|error)$/.test(k)), [], 'ordinary rows keep their exact pre-existing shape');
+  const dup = makeRunStore({ io: memIo(), clock });
+  dup.record({ runId: 'same', reason: 'done' }); dup.record({ runId: 'same', reason: 'error' });
+  A.eq(dup.count(), 2, 'rows of runs that were never interrupted are never collapsed');
+}
+
+// ---- STREAM FILTER (conveyor sweep 2026-09-25): a trigger fire / sample reads back ITS rows by streamId ----
+// It used to read the station's newest 50 rows and filter — a busy station pushed the fire's own rows out of that
+// window, so a finished fire said "no run was recorded". list({ streamId }) scans the whole window for that stream.
+{
+  const s = makeRunStore({ io: memIo(), clock });
+  s.record({ runId: 'mine-1', agentId: 'a', reason: 'done', streamId: 'trigger-abc' });
+  s.record({ runId: 'mine-2', agentId: 'b', reason: 'done', streamId: 'trigger-abc' });
+  for (let i = 0; i < 80; i++) s.record({ runId: 'busy-' + i, agentId: 'c', reason: 'done', streamId: 'other-' + i });
+  A.eq(s.list(null, { limit: 50 }).filter(r => r.streamId === 'trigger-abc').length, 0, '(the old read: the fire\'s rows are outside the newest 50)');
+  const mine = s.list(null, { streamId: 'trigger-abc', limit: 200 });
+  A.eq(mine.map(r => r.runId), ['mine-2', 'mine-1'], 'list({ streamId }) returns exactly that stream\'s rows, newest-first');
+  A.eq(s.list(null, { streamId: 'nope' }).length, 0, 'an unknown stream has no rows');
+  const src = readSidecarSource();
+  A.ok(/runsFor: \(streamId\) => \(runStore\.list\(null, \{ streamId: streamId/.test(src), 'the trigger runner reads its fire back by streamId');
+  A.ok(/(?:runs|const rows) = \(runStore\.list\(null, \{ streamId: streamId, limit: 200 \}\)/.test(src), 'the sample route reads its runs back by streamId');   // `rows` since the delivered-receipt rule reads them twice
+}
+
+// ---- ROUTINE HISTORY (2026-10-01): a scheduled run carries its routine id; ordinary rows stay byte-identical ----
+{
+  const s = makeRunStore({ io: memIo(), clock });
+  A.eq(s.record({ runId: 'c1', cronJobId: 'job-1' }).cronJobId, 'job-1', 'a scheduled run records its routine id');
+  A.ok(!('cronJobId' in s.record({ runId: 'i1' })), 'a non-scheduled run has no cronJobId key');
+}
+
+// ---- #57: delegatedBy (additive) — who delegated a worker run; absent on every other row, survives a replay ----
+{
+  const io = memIo();
+  let s = makeRunStore({ io, clock });
+  const w = s.record({ runId: 'w1', parentRunId: 'lead1', delegatedBy: 'strategist', agentId: 'strategist-2', reason: 'done' });
+  A.eq(w.delegatedBy, 'strategist', 'a worker row records the lead that delegated it');
+  const plain = s.record({ runId: 'c1', parentRunId: 'w1', agentId: 'strategist', reason: 'done' });
+  A.ok(!('delegatedBy' in plain), 'a row without a delegator keeps its old shape (no empty field)');
+  A.ok(!('delegatedBy' in s.record({ runId: 'x1', delegatedBy: 'bad id!', reason: 'done' })), 'a malformed delegator id is dropped');
+  s = makeRunStore({ io, clock });
+  A.eq(s.latest('w1').delegatedBy, 'strategist', 'delegatedBy survives a replay from disk');
+}
+
+// Dispatch validation finalizes a delivery without rewriting the execution outcome or booking its spend twice.
+{
+  const io = memIo();
+  let s = makeRunStore({ io, clock });
+  clk = 100; s.record({ runId: 'original', agentId: 'worker', streamId: 'thread', reason: 'budget', usd: 2,
+    deliveryText: 'raw unvalidated text', dispatchDelivery: { state: 'pending' } });
+  clk = 110; s.record({ runId: 'repair', agentId: 'worker', streamId: 'thread', reason: 'done', usd: 1,
+    deliveryText: 'also invalid', dispatchDelivery: { state: 'internal' } });
+  clk = 120; s.record({ runId: 'later', agentId: 'worker', reason: 'done', usd: 4 });
+  clk = 130; const final = s.finalizeDelivery('original', { text: 'No completion accepted.', reason: 'invalid-result', repairRunId: 'repair' });
+  A.eq(final.reason, 'budget', 'dispatch validation never rewrites the original execution terminal');
+  A.eq(final.deliveryText, 'raw unvalidated text', 'raw execution output remains available as evidence');
+  A.eq(final.dispatchDelivery.reason, 'invalid-result', 'dispatch failure is separate from the execution terminal');
+  A.eq(final.dispatchDelivery.text, 'No completion accepted.', 'the authoritative delivery contains the validated outcome');
+  A.eq(final.dispatchDelivery.repairRunId, 'repair', 'the repair remains linked as its own real execution');
+  A.eq(final.ts, 100, 'finalization preserves the original run position and time');
+  A.eq(s.list().map(r => r.runId), ['later', 'repair', 'original'], 'a delivery patch is never a second run row');
+  A.eq(s.all().reduce((sum, r) => sum + r.usd, 0), 7, 'delivery finalization does not duplicate spend');
+  A.eq(s.count(), 3, 'delivery finalization does not duplicate run counts');
+  A.eq(s.list(null, { beforeRunId: 'repair' }).map(r => r.runId), ['original'], 'pagination ignores delivery patches');
+  const lines = io.lines.length;
+  A.eq(s.finalizeDelivery('original', { text: 'replacement', reason: 'done' }).dispatchDelivery.reason, 'invalid-result', 'a finalized result cannot be silently replaced');
+  A.eq(io.lines.length, lines, 'finalization is idempotent without another disk append');
+  A.eq(s.finalizeDelivery('repair', { text: 'repair', reason: 'done' }), null, 'an internal repair cannot deliver independently');
+  A.eq(s.finalizeDelivery('missing', { text: 'invented', reason: 'done' }), null, 'a missing execution never becomes invented run/spend history');
+  A.eq(s.finalizeDelivery('later', { text: 'legacy', reason: 'done' }), null, 'legacy rows are not rewritten');
+  s = makeRunStore({ io, clock });
+  A.eq(s.latest('original').dispatchDelivery, final.dispatchDelivery, 'the final delivery survives a fresh store replay');
+  A.eq(s.count(), 3, 'replay keeps one row per real execution');
+  A.eq(s.latest('repair').dispatchDelivery.state, 'internal', 'repair non-delivery survives restart');
+  A.ok(!('dispatchDelivery' in s.latest('later')), 'legacy shape is unchanged');
+  const read = s.latest('original'); read.dispatchDelivery.text = 'mutated by reader';
+  A.eq(s.latest('original').dispatchDelivery.text, 'No completion accepted.', 'readers cannot mutate the persisted delivery envelope');
+}
+{
+  const io = memIo(); let fail = false;
+  const append = io.append.bind(io); io.append = row => { if (fail) throw new Error('disk full'); append(row); };
+  const s = makeRunStore({ io, clock });
+  s.record({ runId: 'pending', reason: 'done', dispatchDelivery: { state: 'pending' } });
+  fail = true; let error = null;
+  try { s.finalizeDelivery('pending', { text: 'validated', reason: 'done' }); } catch (e) { error = e; }
+  A.ok(error && /disk full/.test(error.message), 'persistence failure is reported to the dispatch host');
+  A.eq(s.latest('pending').dispatchDelivery.state, 'pending', 'failed persistence cannot claim a durable finalized delivery');
+  fail = false; s.finalizeDelivery('pending', { text: 'validated', reason: 'done' });
+  A.eq(makeRunStore({ io, clock }).latest('pending').dispatchDelivery.text, 'validated', 'a failed append can be retried and replayed');
+}
+
+{
+  const lines = []; let fail = true;
+  const io = { readAll: () => lines.slice(), append: row => { if (fail) throw new Error('disk full before run record'); lines.push(row); } };
+  const s = makeRunStore({ io, clock });
+  s.record({ runId: 'lost-base', reason: 'done', dispatchDelivery: { state: 'pending' } });
+  fail = false; let error = null;
+  try { s.finalizeDelivery('lost-base', { text: 'answer', reason: 'done' }); } catch (e) { error = e; }
+  A.ok(error && /original dispatch run/.test(error.message), 'a missing durable base cannot masquerade as a recoverable finalized delivery');
+  A.eq(s.latest('lost-base').dispatchDelivery.state, 'pending', 'failed base persistence leaves delivery unconfirmed');
+  A.eq(lines.length, 0, 'no orphan finalization patch is written after the original record failed');
+}
+
+// The real host adapter must propagate a strict delivery write failure (ordinary run history stays fail-open).
+{
+  const fs = require('fs'), vm = require('vm');
+  const source = readSidecarSource();
+  const start = source.indexOf('const runsIo = {'), end = source.indexOf('// In-process capability', start);
+  const io = vm.runInNewContext(source.slice(start, end) + '; runsIo;', {
+    fs: {}, RUNS_FILE: 'runs.jsonl', readBoundedJsonl: () => [], failNote: () => {}, rotateJsonl: () => {},
+    console: { warn: () => {} }, appendJsonlDurable: () => { throw new Error('host disk failure'); }
+  });
+  let ordinary = null, strict = null;
+  try { io.append({}); } catch (e) { ordinary = e; }
+  try { io.append({}, { strict: true }); } catch (e) { strict = e; }
+  A.eq(ordinary, null, 'legacy run record append policy remains fail-open');
+  A.ok(strict && /host disk failure/.test(strict.message), 'the actual host adapter reports strict finalization persistence failure');
+}
+
+// ---- ownerDirective (additive, 2026-10-12) — the host proved the Commander gave this run's directive ----
+{
+  const io = memIo();
+  let s = makeRunStore({ io, clock });
+  A.eq(s.record({ runId: 'o1', agentId: 'agent', reason: 'done', ownerDirective: true }).ownerDirective, true, 'an owner directive is recorded');
+  A.ok(!('ownerDirective' in s.record({ runId: 'g1', agentId: 'agent', reason: 'done', ownerDirective: false })), 'a guest run keeps the old shape (no false field)');
+  A.ok(!('ownerDirective' in s.record({ runId: 'g2', agentId: 'agent', reason: 'done', ownerDirective: 'true' })), 'only the boolean host stamp is kept');
+  s = makeRunStore({ io, clock });
+  A.eq(s.latest('o1').ownerDirective, true, 'ownerDirective survives a replay from disk');
+}
+
+// ---- token-burn audit 2026-10-17: the cache-served part of a run's input rides the row (additive, only when > 0) ----
+{
+  const s = makeRunStore({ io: memIo(), clock });
+  A.eq(s.record({ runId: 'c1', tokens: 1000, cachedTokens: 800 }).cachedTokens, 800, 'cachedTokens is recorded on the run row');
+  A.ok(!('cachedTokens' in s.record({ runId: 'c2', tokens: 1000 })), 'a run with no cache reads keeps the old row shape (no key)');
+  A.ok(!('cachedTokens' in s.record({ runId: 'c3', tokens: 1000, cachedTokens: 'x' })), 'a garbage value is dropped, never stored');
 }
 
 A.report('runstore.test');

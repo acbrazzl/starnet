@@ -241,20 +241,21 @@
   function armStateLine(schedulerArmed) {
     if (schedulerArmed) return null;
     return {
-      text: 'saved, but the scheduler is off — this won’t run until you enable scheduling (ROUTINES → enable scheduling).',
-      cta: { label: 'enable scheduling', panel: 'routines' }
+      text: 'saved, but the scheduler is off — this won’t run until you turn scheduling on (AUTOMATE › SCHEDULES → ▶ TURN SCHEDULING ON).',
+      cta: { label: 'turn scheduling on', panel: 'routines' }
     };
   }
 
   function doneLine(scheduled, schedulerArmed) {
-    if (scheduled <= 0) return "no worries — i'll keep waiting for your word. you can ask me to propose jobs anytime from ROUTINES.";
+    // ROUTINES is not a door any more (AUTOMATE › SCHEDULES is) — a pointer to it sent people hunting
+    if (scheduled <= 0) return "no worries — i'll keep waiting for your word. you can ask me to propose jobs anytime from AUTOMATE › SCHEDULES.";
     // HONEST: don't claim it will run if the scheduler that fires it is off. When armed → the normal line; when off
     // → say it's saved-but-dormant and where to arm it (matches the ROUTINES panel's own disarmed copy).
-    const where = " you'll find " + (scheduled === 1 ? 'it' : 'them') + " (and what " + (scheduled === 1 ? 'it produces' : 'they produce') + ") in ROUTINES.";
+    const where = " you'll find " + (scheduled === 1 ? 'it' : 'them') + " (and what " + (scheduled === 1 ? 'it produces' : 'they produce') + ") in AUTOMATE › SCHEDULES.";
     if (schedulerArmed === false) {
       return scheduled === 1
-        ? "done — it's saved, but scheduling is OFF so it won't run yet. enable scheduling in ROUTINES to arm it." + where
-        : "done — " + scheduled + " jobs are saved, but scheduling is OFF so they won't run yet. enable scheduling in ROUTINES to arm them." + where;
+        ? "done — it's saved, but scheduling is OFF so it won't run yet. turn scheduling on in AUTOMATE › SCHEDULES to start it." + where
+        : "done — " + scheduled + " jobs are saved, but scheduling is OFF so they won't run yet. turn scheduling on in AUTOMATE › SCHEDULES to start them." + where;
     }
     return scheduled === 1
       ? "done — it's on the schedule." + where

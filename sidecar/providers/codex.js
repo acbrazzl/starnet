@@ -23,9 +23,9 @@
    before the error is surfaced. No renewToken injected = byte-identical to the old behavior. */
 'use strict';
 (function (root, factory) {
-  if (typeof module !== 'undefined' && module.exports) module.exports = factory(require('./provider.js'), require('./errorClass.js'));
-  else { root.SK = root.SK || {}; root.SK.providers = root.SK.providers || {}; root.SK.providers.codex = factory(root.SK.providers.provider, root.SK.providers.errorClass); }
-})(typeof globalThis !== 'undefined' ? globalThis : this, function (provider, errorClass) {
+  if (typeof module !== 'undefined' && module.exports) module.exports = factory(require('./provider.js'), require('./errorClass.js'), require('./toolschema.js'));
+  else { root.SK = root.SK || {}; root.SK.providers = root.SK.providers || {}; root.SK.providers.codex = factory(root.SK.providers.provider, root.SK.providers.errorClass, root.SK.providers.toolschema); }
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (provider, errorClass, toolschema) {
   'use strict';
 
   const normalizeFinish = provider.normalizeFinish;
@@ -33,6 +33,8 @@
   const timeouts = provider.timeouts;
   const isAbort = provider.runtime.isAbort;
   const delay = provider.runtime.abortableDelay;
+  // failopen.note — the tagged SYNC swallow (per-tag count + throttled warn): a fail-open catch must never be invisible.
+  const { note: failNote } = (typeof require === 'function') ? require('../failopen.js') : { note: function (tag, e) { console.warn('[failopen] ' + tag + ':', (e && e.message) || e); } };
   const BASE = 'https://chatgpt.com/backend-api/codex';
 
   // The ChatGPT-account Codex backend exposes its OWN model list (DIFFERENT from the public OpenAI API
@@ -92,37 +94,22 @@
     return { instructions, rest };
   }
 
+  /* Chat-shaped messages -> Responses input items. The transcript arrives PAIRED: buildBody runs the one shared pre-send
+     normalization first (provider.js prepareWireMessages -> repairToolPairs), which gives every call its result directly
+     after its batch, turns an orphaned or duplicate result into labelled user text ("[recovered tool result …]"), stubs a
+     call whose result never landed ("[interrupted — …]") and mints an id for a call that arrived with none. The Responses
+     backend 400s a function_call_output with no function_call ("No tool call found for function call output with call_id
+     …", the 2026-08-25 Telegram loop) and a call with no output, and that shared pass is what keeps both out.
+     This wire used to run a second pairing pass of its own here (2026-08-25, before the shared pass existed); the
+     provider-conformance-suite (2026-10-27) deleted it, and test/provider.codex.pairing.test.js pins the same invariants
+     through the whole wire instead. */
   function messagesToInput(messages) {
-    /* TOOL-PAIR REPAIR (2026-08-25). The Responses backend 400-rejects the WHOLE request when the replayed
-       transcript contains a function_call_output with no matching function_call ("No tool call found for
-       function call output with call_id …") — or a function_call with no output. A restart/resume/compaction
-       seam that loses one side of a tool pair therefore doesn't just lose a message: it bricks the chat
-       PERMANENTLY, because every later turn replays the same orphan and dies on the same 400 (the reported
-       Telegram loop). Enforce the invariant here, at the only module that knows this wire's rule:
-         · an orphaned or duplicate tool result is downgraded to a plain user message — content preserved,
-           truthfully labeled as recovered, impossible to 400;
-         · a tool call whose result never made it into the transcript gets a synthesized "no result recorded"
-           output spliced directly after it, so the model reissues the call instead of the request dying.
-       A well-formed transcript passes through byte-identical. */
     const input = [];
-    const open = new Map();      // call_id -> index in `input` of its function_call item (awaiting its output)
-    const answered = new Set();  // call_ids already paired in this request
-    let minted = 0;              // deterministic ids for assistant tool_calls that arrived with none
     for (const msg of (messages || [])) {
       if (!msg || typeof msg !== 'object') continue;
       const role = msg.role;
-      if (role === 'system') { input.push({ role: 'user', content: contentToParts(msg.content, 'user') }); continue; }
       if (role === 'tool') {
-        // a chat tool-result message -> a Responses function_call_output item (iff its call is in this request)
-        const callId = String(msg.tool_call_id || msg.call_id || '');
-        const body = String(msg.content == null ? '' : msg.content);
-        if (callId && open.has(callId)) {
-          input.push({ type: 'function_call_output', call_id: callId, output: body });
-          open.delete(callId); answered.add(callId);
-        } else {
-          // orphan (its call was lost from the transcript) or duplicate: keep the information, drop the pairing
-          input.push({ role: 'user', content: [textPart('user', '[recovered tool result' + (callId ? ' ' + callId : '') + ' — its originating call is not in this transcript]\n' + body)] });
-        }
+        input.push({ type: 'function_call_output', call_id: String(msg.tool_call_id || msg.call_id || ''), output: String(msg.content == null ? '' : msg.content) });
         continue;
       }
       if (role === 'assistant') {
@@ -131,25 +118,19 @@
         if (Array.isArray(msg.tool_calls)) {
           for (const tc of msg.tool_calls) {
             const fn = (tc && tc.function) || {};
-            const callId = String(tc.id || fn.call_id || '') || ('call_local_' + (++minted));
             input.push({
               type: 'function_call',
-              call_id: callId,
+              call_id: String((tc && tc.id) || fn.call_id || ''),
               name: fn.name || '',
               arguments: typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments || {})
             });
-            if (!answered.has(callId)) open.set(callId, input.length - 1);
           }
         }
         continue;
       }
-      // default: user (or any other) role -> a user message
-      input.push({ role: 'user', content: contentToParts(msg.content, role === 'assistant' ? 'assistant' : 'user') });
-    }
-    // calls that never got a result: pair each in place so the request is valid and the model may reissue it
-    const unpaired = Array.from(open.entries()).sort((a, b) => b[1] - a[1]);   // descending, so splices don't shift earlier positions
-    for (const [callId, pos] of unpaired) {
-      input.splice(pos + 1, 0, { type: 'function_call_output', call_id: callId, output: '[interrupted — this call produced no recorded result. Reissue it if it is still needed.]' });
+      // user, and a later leading system message (projectRoles 'native' leaves the leading block system; only the first
+      // one is lifted into `instructions`) -> a user message
+      input.push({ role: 'user', content: contentToParts(msg.content, 'user') });
     }
     return input;
   }
@@ -161,10 +142,58 @@
       const fn = (item && item.function) || {};
       const name = fn.name;
       if (typeof name !== 'string' || !name.trim()) continue;
-      out.push({ type: 'function', name: name, description: fn.description || '', strict: false, parameters: fn.parameters || { type: 'object', properties: {} } });
+      // sanitizeKeys: property names every wire accepts; the model's args are mapped back on the way in (stream()).
+      out.push({ type: 'function', name: name, description: fn.description || '', strict: false, parameters: toolschema.sanitizeKeys(fn.parameters) || { type: 'object', properties: {} } });
     }
     return out.length ? out : null;
   }
+  /* PROMPT-CACHE ROUTING (2026-10-17, token-burn audit). The Codex backend serves a cached prefix only to a request
+     that names a cache route. Measured live, 4 identical-prefix calls of a 21k-token StarNet request on gpt-5.6-sol:
+       no route ............................. 0 cached tokens on every call
+       body prompt_cache_key only ........... 0 cached on every call (this backend ignores it)
+       session_id header only ............... 20,864 of 21,046 (99%) from call 2
+       both (what the Codex CLI sends) ...... 99% from call 2
+     So the `session_id` HEADER is the load-bearing half; the body key rides along for parity. Without either, every
+     turn of every run was billed as fresh input against the ChatGPT plan.
+     The route is a hash of (ChatGPT account + model + the byte-stable system prefix): the turns of a run and the
+     next message of a conversation share it. Tool NAMES are not in it, so a tool.search reveal mid-run does not move
+     the route, and the per-conversation tail after cacheSystemPrefix does not split it. The account salt keeps a
+     fixed background-pass prompt (identical on every install) from sharing one route across accounts.
+     req.promptCacheKey, when a caller has a better identity, wins. Carries no content: a 128-bit hash in uuid shape. */
+  function hash128(s) {
+    let h1 = 1779033703, h2 = 3144134277, h3 = 1013904242, h4 = 2773480762;
+    for (let i = 0; i < s.length; i++) {
+      const k = s.charCodeAt(i);
+      h1 = h2 ^ Math.imul(h1 ^ k, 597399067); h2 = h3 ^ Math.imul(h2 ^ k, 2869860233);
+      h3 = h4 ^ Math.imul(h3 ^ k, 951274213); h4 = h1 ^ Math.imul(h4 ^ k, 2716044179);
+    }
+    h1 = Math.imul(h3 ^ (h1 >>> 18), 597399067); h2 = Math.imul(h4 ^ (h2 >>> 22), 2869860233);
+    h3 = Math.imul(h1 ^ (h3 >>> 17), 951274213); h4 = Math.imul(h2 ^ (h4 >>> 19), 2716044179);
+    h1 ^= (h2 ^ h3 ^ h4); h2 ^= h1; h3 ^= h1; h4 ^= h1;
+    return [h1, h2, h3, h4].map(h => (h >>> 0).toString(16).padStart(8, '0')).join('');
+  }
+  // The ChatGPT account a Codex access token belongs to (its JWT's auth claim), '' when it is not a readable JWT.
+  function tokenAccount(tok) {
+    const parts = String(tok || '').split('.');
+    if (parts.length !== 3 || !parts[1]) return '';
+    try {
+      const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+      const json = (typeof Buffer !== 'undefined') ? Buffer.from(b64, 'base64').toString('utf8') : decodeURIComponent(escape(atob(b64)));
+      const p = JSON.parse(json) || {};
+      const auth = p['https://api.openai.com/auth'] || {};
+      return String(auth.chatgpt_account_id || auth.chatgpt_user_id || p.sub || '');
+    } catch (e) { failNote('codex.cache-account', e); return ''; }   // value default: an unsalted route still caches
+  }
+  function promptCacheKey(req, body, account) {
+    const explicit = req && typeof req.promptCacheKey === 'string' ? req.promptCacheKey.trim() : '';
+    const prefix = (req && typeof req.cacheSystemPrefix === 'string' && req.cacheSystemPrefix && body.instructions.indexOf(req.cacheSystemPrefix) === 0)
+      ? req.cacheSystemPrefix : body.instructions;
+    const seed = explicit ? 'key\n' + (account || '') + '\n' + explicit
+      : 'prefix\n' + (account || '') + '\n' + body.model + '\n' + prefix;
+    const h = hash128(seed);
+    return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20, 32);
+  }
+
   const DEFAULT_REASONING_EFFORT = 'low';
   function normalizeCodexReasoningEffort(value) {
     const key = String(value || DEFAULT_REASONING_EFFORT).trim().toLowerCase().replace(/[\s_-]+/g, '');
@@ -187,9 +216,16 @@
     const renew = (typeof opts.renewToken === 'function') ? opts.renewToken : null;
     const baseUrl = (opts.baseUrl || BASE).replace(/\/$/, '');
     const reasoningEffort = normalizeCodexReasoningEffort(opts.reasoningEffort || DEFAULT_REASONING_EFFORT);
+    // WINDOW FACTS (providers/catalog-cache.js, attached by the factory). The account's live list reports each slug's
+    // context_window, and a run's adapter never lists: the window the dock's listing saw answers contextLimit instead of
+    // a flat 272000. No list is shared (a token is one account), only the window each slug REPORTED. Absent = as before.
+    const facts = (opts.catalogCache && typeof opts.catalogCache.bind === 'function')
+      ? opts.catalogCache.bind({ scope: null, endpoint: baseUrl }) : null;
 
     function buildBody(req) {
-      const { instructions, rest } = extractInstructions(req.messages || []);
+      // ONE pre-send normalization (provider.js prepareWireMessages): a well-formed transcript is untouched; a malformed
+      // one arrives paired (messagesToInput relies on it). Then the ONE role projection (projectRoles 'native').
+      const { instructions, rest } = extractInstructions(provider.projectRoles(provider.prepareWireMessages(req.messages || [], 'codex'), 'native'));
       const effort = normalizeCodexReasoningEffort(req.reasoningEffort || reasoningEffort);
       const body = {
         model: req.model || DEFAULT_MODEL,
@@ -203,15 +239,20 @@
       if (effort !== 'none') body.include = ['reasoning.encrypted_content'];
       const tools = toResponsesTools(req.tools);
       if (tools) { body.tools = tools; body.tool_choice = 'auto'; body.parallel_tool_calls = true; }
+      body.prompt_cache_key = promptCacheKey(req, body, tokenAccount(token));
       return body;
     }
 
-    async function* stream(req) {
+    // A tool advertised under sanitized property keys gets its args mapped back to the declared names before
+    // the loop sees them; with no such tool this is the raw stream itself.
+    function stream(req) { return toolschema.withRestoredArgKeys(wireStream(req), req && req.tools); }
+
+    async function* wireStream(req) {
       const body = buildBody(req);
       let res;
-      try { res = await requestWithRetry(body, req.signal); }
+      try { res = await requestWithRetry(body, req.signal, provider.runtime.preStreamRetries(req, RETRY_DELAYS.length)); }
       catch (e) { if (isAbort(e, req.signal)) return; throw e; }
-      const reader = timeouts.idleGuardedReader(res.body.getReader(), { signal: req.signal });
+      const reader = timeouts.idleGuardedReader(res.body.getReader(), { signal: req.signal, url: res.url || baseUrl });
       const dec = new TextDecoder();
       let buf = '';
 
@@ -300,7 +341,10 @@
           }
           case 'response.failed': {
             const err = (ev.response && ev.response.error) || ev.error || {};
-            throw new Error('codex stream failed: ' + (err.message || err.code || 'unknown'));
+            const failed = new Error('codex stream failed: ' + (err.message || err.code || 'unknown'));
+            failed.body = { error: err };   // its code (e.g. usage_limit_reached) is what errorClass decides on
+            failed.ownMessage = true;
+            throw failed;
           }
           case 'error':
             throw new Error('codex stream error: ' + ((ev.error && ev.error.message) || ev.message || 'unknown'));
@@ -356,7 +400,11 @@
     // A 401 additionally gets ONE renew+retry through opts.renewToken (see the header comment): the server's
     // "expired" verdict wins over the sidecar's local expiry check. The renew does not consume a transient
     // retry slot — it is a different recovery (new credential, not "wait and hope").
-    async function requestWithRetry(body, signal) {
+    async function requestWithRetry(body, signal, maxRetries) {
+      // maxRetries: the loop may LOWER this ladder (req.preStreamRetries = 0 once it owns the pacing — provider.js).
+      // `waited` is the backoff actually spent; the exhaustion marker reports it so the loop counts it, not repeats it.
+      const retries = (maxRetries == null) ? RETRY_DELAYS.length : maxRetries;
+      let waited = 0;
       let renewed = false;
       for (let attempt = 0; ; attempt++) {
         if (signal && signal.aborted) throw abortError();
@@ -372,25 +420,44 @@
               'Content-Type': 'application/json',
               'Accept': 'text/event-stream',
               'OpenAI-Beta': 'responses=experimental',
-              'originator': 'codex_cli_rs'
+              'originator': 'codex_cli_rs',
+              // the cache route this backend actually honors (measured; see PROMPT-CACHE ROUTING) — the body key alone caches nothing
+              ...(body.prompt_cache_key ? { 'session_id': body.prompt_cache_key } : {})
             },
             body: JSON.stringify(body),
             signal: guard.signal
           });
         } catch (e) {
           if (isAbort(e, signal)) throw e;
-          if (attempt < RETRY_DELAYS.length) { await delay(RETRY_DELAYS[attempt], signal); continue; }
-          throw provider.runtime.markPreStreamRetriesExhausted(e);
+          provider.runtime.stampRequestHost(e, baseUrl);   // a TLS/socket cause names no host: say which one we dialled
+          // a TLS rejection or a crash in our own request code cannot heal by re-sending: fail fast, unmarked
+          const failure = classifyApiError(e, { model: body.model });   // unreachable: one retry (its retryBudget), then name the host
+          if (!failure.retryable) throw e;
+          if (attempt < provider.runtime.retryLimit(failure, retries)) { const wait = provider.runtime.retryDelay(failure, attempt, RETRY_DELAYS); waited += wait; await delay(wait, signal); continue; }
+          throw provider.runtime.markPreStreamRetriesExhausted(e, { attempts: attempt + 1, waitedMs: waited });
         } finally {
           guard.disarm();
         }
         if (res.ok && res.body) return res;
-        let detail = res.statusText || '';
-        try { const j = await res.json(); detail = (j && j.error && (j.error.message || j.error.code)) || JSON.stringify(j); }
-        catch (e) { try { detail = (await res.text()).slice(0, 300); } catch (_) {} }
+        // The body is read ONCE, as text, through the idle watchdog and the caller's Stop (provider.runtime.readErrorBody):
+        // a stalled error body ignored Stop for up to 300 s. Only a JSON error's own words are quoted. A non-JSON page (a
+        // proxy's 503 "... reset reason: connection reset") keeps the status text: the browser's error copy reads
+        // transport and policy words before the status (friendlyerror kindFromRaw), so its prose would be told as a
+        // dropped connection or a content block the harness cannot prove.
+        const eb = await provider.runtime.readErrorBody(res, { signal, url: baseUrl, tag: 'providers.codex' });
+        const errBody = eb.parsed ? eb.data : null;
+        let detail = eb.parsed ? ((errBody && errBody.error && (errBody.error.message || errBody.error.code)) || JSON.stringify(errBody)) : (res.statusText || '');
+        if (eb.stalled) detail += ' (error body did not finish)';
         const err = new Error('codex http ' + res.status + ' — ' + detail);
         err.status = res.status;
         err.headers = res.headers;
+        /* KEEP THE PROVIDER'S ERROR BODY. The message above keeps only error.message, but the classifier's decisive
+           signal is error.code: a ChatGPT plan 429 carries code 'usage_limit_reached' — a spent quota that no amount
+           of waiting fixes — while its message can read like any rate limit ('Codex quota exceeded'). Dropping the
+           body classed it rate_limit, and once the loop's pre-stream ladder rode out transient 429s a spent plan was
+           retried for ~100 s before failing. With the body, errorClass reads the code and fails fast (or falls over). */
+        // ownMessage: the sentence above (label + status) stays the reported message; the body is read for its code.
+        if (errBody && typeof errBody === 'object') { err.body = errBody; err.ownMessage = true; }
         if (res.status === 401 && renew && !renewed) {
           renewed = true;
           try {
@@ -404,8 +471,8 @@
         }
         const cls = classifyApiError(err, { model: body.model });
         err.transient = cls.retryable;
-        if (cls.retryable && attempt < RETRY_DELAYS.length) { await delay(Math.min(60000, Math.max(RETRY_DELAYS[attempt], cls.retryAfterMs || 0)), signal); continue; }
-        throw cls.retryable ? provider.runtime.markPreStreamRetriesExhausted(err) : err;
+        if (cls.retryable && attempt < retries) { const wait = Math.min(60000, Math.max(RETRY_DELAYS[attempt], cls.retryAfterMs || 0)); waited += wait; await delay(wait, signal); continue; }
+        throw cls.retryable ? provider.runtime.markPreStreamRetriesExhausted(err, { attempts: attempt + 1, waitedMs: waited }) : err;
       }
     }
 
@@ -431,6 +498,7 @@
           const j = await res.json();
           const entries = (j && Array.isArray(j.models)) ? j.models : [];
           const out = [];
+          const reported = [];   // only the windows the backend stated (the row's 272000 stand-in teaches nothing)
           for (const it of entries) {
             if (!it || typeof it.slug !== 'string' || !it.slug.trim()) continue;
             const vis = String(it.visibility || '').toLowerCase();
@@ -458,7 +526,9 @@
               reasoningLevelDescriptions: Object.keys(effortDescriptions).length ? effortDescriptions : undefined,
               _rank: (typeof it.priority === 'number') ? it.priority : 10000
             });
+            reported.push({ id: it.slug.trim(), context_length: Number(it.context_window || it.max_context_window || 0) || 0 });
           }
+          if (facts && out.length) facts.noteWindows(reported);
           out.sort((a, b) => (a._rank - b._rank) || a.id.localeCompare(b.id));
           if (out.length) return out.map(({ _rank, ...m }) => m);
         }
@@ -468,13 +538,64 @@
       // hardcoded list, and the model dock can label the catalog offline.
       return STATIC_MODELS.map(m => Object.assign({}, m, { pricing: null, fallback: true }));
     }
-    function contextLimit(id) { const m = findModel(id); return (m && m.context_length) || 272000; }   // sane default for an unlisted Codex model
+    // the window the account's live list reported for this slug, else the curated row, else 272000 (the sane default for
+    // an unlisted Codex model)
+    function contextLimit(id) {
+      const live = facts ? facts.windowFact(id) : 0;
+      if (live) return live;
+      const m = findModel(id);
+      return (m && m.context_length) || 272000;
+    }
     function priceOf() { return null; }                  // flat-rate subscription -> no per-token price
     function supportsTools(id) { const m = findModel(id); return m ? !!m.supportsTools : true; }   // Codex models are tool-capable; never false-refuse
     // Which reasoning levels a codex model exposes — the static entry's list, or the four-level default.
     function reasoningEfforts(id) { const m = findModel(id); return (m && Array.isArray(m.reasoningEfforts) && m.reasoningEfforts.length) ? m.reasoningEfforts.slice() : CODEX_EFFORT_LIST.slice(); }
 
     return { stream, listModels, contextLimit, priceOf, supportsTools, reasoningEfforts };
+  }
+
+  /* #118 (2026-10-15): the ids a listModels() answer proves the ACCOUNT offers, in the backend's priority order. The
+     curated offline list (fallback:true) proves nothing about the account, so it yields []. A caller that must name
+     a slug this sign-in accepts (the plan's image host, an aux pass) reads this instead of trusting DEFAULT_MODEL. */
+  function liveModelIds(models) {
+    const out = [];
+    for (const m of Array.isArray(models) ? models : []) {
+      const id = m && !m.fallback && typeof m.id === 'string' ? m.id.trim() : '';
+      if (id && out.indexOf(id) < 0) out.push(id);
+    }
+    return out;
+  }
+  // The slug an aux pass names on this sign-in: `pinned` while the account's live list still offers it (an account it
+  // already serves never moves to a newer, costlier flagship by itself), the list's top model when the list no longer
+  // offers it, and `pinned` again when the list is offline, empty, failed, or silent past timeoutMs (the listing has no
+  // abort seam, so a silent one must not hold its caller).
+  async function liveDefaultModel(listModels, pinned, timeoutMs) {
+    let timer = null;
+    const silent = new Promise(resolve => { timer = setTimeout(() => resolve(null), Math.max(1, Number(timeoutMs) || 10000)); });
+    try {
+      const ids = liveModelIds(await Promise.race([Promise.resolve().then(() => listModels()), silent]));
+      return (!ids.length || (pinned && ids.indexOf(pinned) >= 0)) ? pinned : ids[0];
+    } catch (e) { failNote('codex.live-default', e); return pinned; }   // value default: the pinned slug is what ran before the live list existed
+    finally { clearTimeout(timer); }
+  }
+  // One live-list read shared by a caller's scope (a run's image host choices). Concurrent asks share the read in
+  // flight; only a list that proves something is kept, so a failed read (rejects: the caller records it) or an
+  // offline/empty answer is asked again next time.
+  function memoLiveModelIds(listModels) {
+    let kept = null, pending = null;
+    return () => {
+      if (kept) return Promise.resolve(kept.slice());
+      if (!pending) {
+        pending = Promise.resolve().then(() => listModels()).then(models => {
+          const ids = liveModelIds(models);
+          if (ids.length) kept = ids;
+          return ids.slice();
+        });
+        const clear = () => { pending = null; };
+        pending.then(clear, clear);
+      }
+      return pending;
+    };
   }
 
   // Responses usage uses input_tokens/output_tokens; remap to the prompt_tokens/completion_tokens shape
@@ -493,5 +614,5 @@
     };
   }
 
-  return { makeCodexProvider, STATIC_MODELS, DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, _internals: { messagesToInput, extractInstructions, toResponsesTools, normalizeUsage, normalizeCodexReasoningEffort } };
+  return { makeCodexProvider, STATIC_MODELS, DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, liveModelIds, liveDefaultModel, memoLiveModelIds, _internals: { messagesToInput, extractInstructions, toResponsesTools, normalizeUsage, normalizeCodexReasoningEffort, promptCacheKey, tokenAccount } };
 });

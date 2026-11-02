@@ -34,14 +34,40 @@ function parseVerdict(text) {
   return null;
 }
 
-/* verdictBrief(when) -> the instruction a reviewer dock receives when its lane meets a LOOP gate keyed on a
-   verdict word; '' when the gate is not verdict-keyed. Prompt text only. */
-function verdictBrief(when) {
+/* stripVerdict(text) -> the text without its VERDICT line (the one parseVerdict reads, within the tail), for the work that
+   LEAVES an approved gate: the line is the gate's control signal, not part of the work (2026-09-27 audit R1). A text with no
+   verdict line comes back unchanged. Pure. */
+function stripVerdict(text) {
+  if (typeof text !== 'string' || !parseVerdict(text)) return text;
+  const lines = text.split(/\r?\n/);
+  let seen = 0;
+  for (let i = lines.length - 1; i >= 0 && seen < TAIL_LINES; i--) {
+    if (!lines[i].trim()) continue;
+    seen++;
+    const l = lines[i].trim().replace(/^[\s>*\-_`#]+/, '').replace(/[\s*_`.!]+$/, '');
+    if (/^verdict\s*[:=\-–—]\s*[A-Za-z]/i.test(l)) { lines.splice(i, 1); break; }
+  }
+  return lines.join('\n').replace(/\s+$/, '');
+}
+
+/* verdictBrief(when, handsOn) -> the instruction a reviewer dock receives when its lane meets a LOOP gate keyed on a
+   verdict word; '' when the gate is not verdict-keyed. Prompt text only; pipeline.js handoffPrompt keeps its first 600
+   characters. `handsOn` === true only when the caller KNOWS a bare approval at that gate hands on the work the reviewer was
+   handed (chain.js hopTurn → bareApprovalHandsOn, the rule in chain.js bareApproval, 2026-10-21): only then does the brief offer
+   it. Everyone else — a self-loop gate, a crate another gate framed, the browser's COMMS work line (/api/routing/chain), which
+   hands on the reply as it is — gets the plain promise that the reply is what moves on. */
+function verdictBrief(when, handsOn) {
   if (!isVerdictWord(when)) return '';
   const other = when.toLowerCase() === 'approved' ? 'revise' : 'approved';
   return 'YOUR VERDICT DECIDES THE LOOP GATE AFTER YOU: end your reply with one final line, exactly '
     + '"VERDICT: ' + when.toLowerCase() + '" when the work should leave the loop, or "VERDICT: ' + other + '" when it should go '
-    + 'back round. Nothing after that line. A reply with no VERDICT line is treated as "' + other + '".';
+    + 'back round. Nothing after that line. A reply with no VERDICT line is treated as "' + other + '". '
+    + (handsOn === true
+      ? 'When the work passes, a reply of only the VERDICT line, or a bare approval such as "Looks good.", passes it on exactly as '
+        + 'you were handed it. Any other reply is what moves on past the gate: lead with the finished work itself (with any fixes '
+        + 'applied), and keep review notes short.'
+      : 'When the work passes, your reply is what moves on past the gate: lead with the finished work itself (with any fixes '
+        + 'applied), and keep review notes short.');
 }
 
-module.exports = { parseVerdict, isVerdictWord, verdictBrief, VERDICT_WORDS };
+module.exports = { parseVerdict, stripVerdict, isVerdictWord, verdictBrief, VERDICT_WORDS };

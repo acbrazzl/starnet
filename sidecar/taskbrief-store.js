@@ -38,6 +38,8 @@ function normalizeBrief(b) {
   const x = b && typeof b === 'object' ? b : {};
   return {
     id: bounded(x.id, 100), key: bounded(x.key, 160), streamId: bounded(x.streamId, 80),
+    // Completion updates runId; the original owner occurrence remains immutable across clarification/recovery.
+    ...(x.originalRunId ? { originalRunId: bounded(x.originalRunId, 100) } : {}),
     agentId: bounded(x.agentId || 'agent', 40), source: bounded(x.source || 'interactive', 24),
     originalDirective: bounded(x.originalDirective, 4000), currentInput: bounded(x.currentInput, 4000),
     status: STATES.has(x.status) ? x.status : 'ready',
@@ -115,7 +117,7 @@ function makeTaskBriefStore(deps) {
             id: bounded(input.id, 100) || ('tb_' + bounded(input.runId, 80)), key,
             streamId: bounded(input.streamId, 80), agentId: bounded(input.agentId || prior.agentId || 'agent', 40),
             source: bounded(input.source || prior.source || 'interactive', 24), originalDirective: routed.text, currentInput: routed.text,
-            status: 'ready', createdAt: ts, updatedAt: ts, runId: bounded(input.runId, 100)
+            status: 'ready', createdAt: ts, updatedAt: ts, runId: bounded(input.runId, 100), originalRunId: bounded(input.runId, 100)
           });
           rec.briefs.push(out); while (rec.briefs.length > CAP) rec.briefs.shift();
           out = Object.assign({}, out, { inputAction: 'replace' }); return rec;
@@ -124,14 +126,19 @@ function makeTaskBriefStore(deps) {
         // walks away mid-batch; the durable fallback re-asks them in order, so the reply belongs to the
         // earliest open one. For legacy single-question briefs the two are the same question.
         const q = prior.questions.find(x => !x.answer);
+        const prevInput = prior.currentInput;
         if (q) { q.answer = q.mode === 'conversation' ? text : routed.text; q.answeredAt = ts; }
         prior.currentInput = text; prior.status = 'ready'; prior.updatedAt = ts; out = prior;
+        // The answer is only SPENT once a model run actually reads it. The returned copy (never the persisted
+        // record) names what this call consumed, so a run refused or failed before any model output can hand
+        // the question back with reopenAnswer() instead of stranding the original task behind a 'ready' brief.
+        if (q) out = Object.assign({}, prior, { inputAction: 'answer', answered: { index: prior.questions.indexOf(q), at: ts, prevInput } });
       } else {
         out = normalizeBrief({
           id: bounded(input.id, 100) || ('tb_' + bounded(input.runId, 80)), key,
           streamId: bounded(input.streamId, 80), agentId: bounded(input.agentId || 'agent', 40),
           source: bounded(input.source || 'interactive', 24), originalDirective: text, currentInput: text,
-          status: 'ready', createdAt: ts, updatedAt: ts, runId: bounded(input.runId, 100)
+          status: 'ready', createdAt: ts, updatedAt: ts, runId: bounded(input.runId, 100), originalRunId: bounded(input.runId, 100)
         });
         rec.briefs.push(out); while (rec.briefs.length > CAP) rec.briefs.shift();
       }
@@ -209,6 +216,27 @@ function makeTaskBriefStore(deps) {
     }).then(() => out);
   }
 
+  /* reopenAnswer(id, answered, now) — undo ONE prepare() answer that no model run ever read. The run that
+     carried the Commander's answer was refused before the model (a dead sign-in, a tool-less model, a journal
+     failure) or the provider failed on turn 0, so nothing acted on the answer; leaving the brief 'ready' made
+     the re-sent answer mint a NEW brief whose ORIGINAL REQUEST was the one-word answer (and a "yes"/"no" ran
+     as tool-less chat). Restores exactly the pre-answer state. Refuses (null, record untouched) whenever
+     anything moved since that answer: a proceed/ask/update/complete on this brief, or a newer brief on the key. */
+  function reopenAnswer(id, answered, now) {
+    const key = String(id || ''); const a = answered && typeof answered === 'object' ? answered : null; let out = null;
+    if (!key || !a || !(Number(a.at) > 0) || !Number.isInteger(a.index) || a.index < 0) return Promise.resolve(null);
+    return durable.update(STORE_KEY, cur => {
+      const rec = normalize(cur); const b = rec.briefs.find(x => x.id === key); if (!b) return undefined;
+      if (b.status !== 'ready' || b.updatedAt !== Number(a.at)) return undefined;
+      const q = b.questions[a.index];
+      if (!q || !q.answer || q.answeredAt !== Number(a.at)) return undefined;
+      if (rec.briefs.some(x => x !== b && x.key === b.key && (x.updatedAt >= b.updatedAt || x.createdAt > Number(a.at)))) return undefined;
+      q.answer = ''; q.answeredAt = 0;
+      b.status = 'clarifying'; b.currentInput = bounded(a.prevInput, 4000); b.updatedAt = Number(now) || b.updatedAt;
+      out = b; return rec;
+    }).then(() => out);
+  }
+
   function proceed(id, candidate, now) {
     const key = String(id || ''); let out = null;
     return durable.update(STORE_KEY, cur => {
@@ -228,6 +256,24 @@ function makeTaskBriefStore(deps) {
       const checked=Context.validate(candidate,b); if(!checked.ok) throw new Error(checked.error);
       b.context=checked.context; b.updatedAt=Number(now)||b.updatedAt; out=b; return rec;
     }).then(()=>out);
+  }
+
+  /* SCRUB A SAVED KEY (keys.save, 2026-10-25): the brief captured the Commander's message — a pasted key included —
+     before the agent could store that key in KEYS. fn(text) -> text names it; every brief's directive, input and
+     answers pass through it. The store snapshots the PRIOR value to .bak on each write, so a changed store is written
+     twice: once scrubbed, once more so the .bak holds the scrubbed copy too. Resolves true iff anything changed. */
+  function scrubText(fn) {
+    let changed = false;
+    const pass = t => { const s = fn(String(t || '')); if (s !== String(t || '')) changed = true; return s; };
+    return durable.update(STORE_KEY, cur => {
+      const rec = normalize(cur);
+      for (const b of rec.briefs) {
+        b.originalDirective = pass(b.originalDirective);
+        b.currentInput = pass(b.currentInput);
+        for (const q of b.questions) q.answer = pass(q.answer);
+      }
+      return changed ? rec : undefined;
+    }).then(() => changed ? durable.update(STORE_KEY, cur => normalize(cur)).then(() => true) : false);
   }
 
   function complete(id, runId, now, assumptions) {
@@ -359,7 +405,7 @@ function makeTaskBriefStore(deps) {
       .map(t => t.dimension);
   }
 
-  return { read, list, active, prepare, ask, askMany, answerInTurn, updateContext, proceed, complete, patterns, groundedFor, dimensionDeferrals, deferredDimensions, fingerprintQuestion, _durable: durable };
+  return { read, list, active, prepare, reopenAnswer, ask, askMany, answerInTurn, updateContext, proceed, complete, scrubText, patterns, groundedFor, dimensionDeferrals, deferredDimensions, fingerprintQuestion, _durable: durable };
 }
 
 module.exports = { makeTaskBriefStore, normalize, normalizeBrief, normalizeQuestion, fingerprintQuestion };

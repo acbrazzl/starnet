@@ -6,12 +6,14 @@
 'use strict';
 
 const A = require('./_assert.js');
+const { hostText } = require('./helpers/host-notes.js');
 const http = require('http');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const { bootToken } = require('./_httpToken.js');
+const { allocatePort, BIND_REFUSED } = require('./helpers/ports.js');
 
 const HOST = '127.0.0.1';
 const INDEX = path.resolve(__dirname, '..', 'sidecar', 'index.js');
@@ -19,7 +21,8 @@ const INDEX = path.resolve(__dirname, '..', 'sidecar', 'index.js');
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function agentIdFrom(messages) {
-  const sys = (messages[0] && messages[0].role === 'system') ? String(messages[0].content || '') : '';
+  // [RUNTIME] (Agent id) rides the per-run <run_context> note since lean-prompt (2026-10-12), not messages[0] (user-side on this chat wire)
+  const sys = hostText(messages || []);
   const m = sys.match(/Agent id:\s*([^\n]+)/);
   return m ? m[1].trim() : '';
 }
@@ -84,9 +87,9 @@ function boot(port, env, attemptsLeft) {
     const onData = d => {
       out += d.toString();
       if (!settled && out.indexOf('http://' + HOST + ':' + port) >= 0) { settled = true; resolve({ child, port }); }
-      else if (!settled && /already in use/i.test(out)) {
+      else if (!settled && BIND_REFUSED.test(out)) {
         settled = true; try { child.kill(); } catch (_) {}
-        if (attemptsLeft > 0) resolve(boot(port + 1, env, attemptsLeft - 1));
+        if (attemptsLeft > 0) resolve(allocatePort().then(next => boot(next, env, attemptsLeft - 1)));
         else reject(new Error('no free port'));
       }
     };
@@ -188,14 +191,14 @@ async function waitUntil(fn, ms, label) {
     // full-auto posture exactly like e2e.summon.test; the APPROVAL prompt path is covered by the consent suites.
     SKYNET_FULL_ACCESS: '1'
   };
-  const { child, port } = await boot(8990 + (process.pid % 50), env, 20);
+  const { child, port } = await boot(await allocatePort(), env, 20);
   const B = 'http://' + HOST + ':' + port;
   let sse = null;
   try {
     const token = await bootToken(B, B);
     A.ok(token.length >= 32, 'got a session API token');
     const headers = { 'Content-Type': 'application/json', 'X-StarNet-Token': token, Origin: B };
-    sse = await startSseCollector(B + '/api/channels/events?token=' + encodeURIComponent(token));
+    sse = await startSseCollector(B + '/api/channels/events?' + require('./_httpToken.js').sseQuery(token));
 
     const res = await fetch(B + '/api/run', {
       method: 'POST',

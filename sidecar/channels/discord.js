@@ -55,9 +55,12 @@
       allowedChats: o.allowedChats,
       ownerUserId: o.ownerUserId,
       onOwnerClaim: o.onOwnerClaim,
+      ownerAdmission: o.ownerAdmission,   // one-time pairing code (index.js channelOwnerAdmission)
       onInbound: o.onInbound,
       onCallback: o.onCallback,
       onStatus: o.onStatus,
+      onMembership: o.onMembership,   // our own membership changed (blocked/kicked) — the hub stops retrying that chat
+      onDelivery: o.onDelivery,       // per-send outcome (delivery health), separate from poll health
       clock: o.clock,
       sleep: o.sleep,
       dropPendingOnConnect: o.dropPendingOnConnect,   // gateway pushes only post-connect, but forward it for parity/tests

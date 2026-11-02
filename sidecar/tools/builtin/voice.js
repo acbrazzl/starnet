@@ -42,7 +42,9 @@
     const fsp = deps.fsp, P = deps.pathMod, ROOT = deps.root;
     if (!fsp || !P || !ROOT) throw new Error('voice.js requires { fsp, pathMod, root }');
     const synth = typeof deps.synth === 'function' ? deps.synth : null;
-    const jail = fsMod.makeFsTools({ fsp, pathMod: P, root: ROOT })._internals;
+    // pathTrust (issue #77): with the run's guard wired, a relative path in a project-scoped run lands IN the
+    // project and an absolute path inside a trusted project is allowed, exactly like fs.write / image_generate.
+    const jail = fsMod.makeFsTools({ fsp, pathMod: P, root: ROOT, pathTrust: typeof deps.pathTrust === 'function' ? deps.pathTrust : undefined })._internals;
 
     function emitDeliverable(ctx, aid, rel) {
       if (!ctx || typeof ctx.emit !== 'function') return;
@@ -68,18 +70,17 @@
     const generateTool = {
       name: 'voice_generate', capability: 'studio', scope: 'write', requiresConsent: true, timeoutMs: SYNTH_TIMEOUT_MS + 15000,
       description: 'Speak text as neural audio and SAVE it into your workspace as a playable clip (returns the saved '
-        + 'path + a viewer URL, and the clip appears in chat with a player). Use for any "record / narrate / read this '
+        + 'path + a viewer URL; the clip appears in chat with a player). Use for any "record / narrate / read this '
         + 'aloud / make a voiceover" request, or to hand the Commander an audio version of something you wrote. This '
-        + 'is NOT how you talk in conversation — your spoken replies are already handled by the station. Optional '
-        + '"voice" picks a named voice and "style" gives delivery direction (e.g. "calm and deliberate"); support for '
-        + 'both depends on which voice credential the station holds. Optional "path" sets the output filename. Long '
-        + 'scripts: split them into takes and call once per take — text over ' + MAX_TEXT + ' characters is refused, never truncated.',
+        + 'is NOT how you talk in conversation: the station already handles your spoken replies. Whether voice and '
+        + 'style work depends on which voice credential the station holds. Long scripts: split them into takes and '
+        + 'call once per take; text over ' + MAX_TEXT + ' characters is refused, never truncated.',
       schema: {
         type: 'object', required: ['text'], properties: {
           text: { type: 'string', description: 'what to say — plain prose, no SSML' },
-          voice: { type: 'string', description: 'optional named voice' },
-          style: { type: 'string', description: 'optional delivery direction, e.g. "warm, unhurried"' },
-          path: { type: 'string', description: 'optional output filename inside your workspace' }
+          voice: { type: 'string', description: 'a named voice' },
+          style: { type: 'string', description: 'delivery direction, e.g. calm and deliberate' },
+          path: { type: 'string', description: 'output filename: relative = the project folder in a project-scoped conversation, else your private workspace; or an absolute path inside a trusted project folder' }
         }
       },
       run: async (args, ctx) => {
@@ -109,17 +110,19 @@
           const h = nodeCrypto ? nodeCrypto.createHash('sha1').update(buffer).digest('hex').slice(0, 12) : 'take';
           rel = 'audio/voice-' + h + ext;
         }
-        const { abs } = await jail.resolveInside(aid, rel);   // throws on jail escape / abs / '..'
+        const placed = await jail.resolveInside(aid, rel, { scope: 'write', ctx });   // throws on escape / '..' / untrusted
+        const abs = placed.abs;
         await fsp.mkdir(P.dirname(abs), { recursive: true });
         await fsp.writeFile(abs, buffer);
         emitDeliverable(ctx, aid, rel);
 
-        const viewer = '/api/file?agent=' + encodeURIComponent(aid) + '&path=' + encodeURIComponent(rel);
+        const where = await jail.outputPlacement(aid, placed);
+        const viewer = where.viewer;
         const kb = (buffer.length / 1024).toFixed(0) + ' KB';
         const via = str(r.provider);
         return {
           content: 'Spoke ' + text.length + ' characters and saved ' + rel + ' (' + kb + ', ' + mime
-            + (via ? ', via ' + via : '') + ').\nPlay: ' + viewer,
+            + (via ? ', via ' + via : '') + ').\n' + where.line + (viewer ? '\nPlay: ' + viewer : ''),
           summary: 'voice → ' + rel
         };
       }
