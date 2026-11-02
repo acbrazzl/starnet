@@ -71,7 +71,7 @@ A.ok(/if \(obj && obj\.credentialVerified === false\) noteKeyCheckFailure\('vali
 A.ok(/noteKeyCheckFailure\('probe', id, obj, probeKey\)/.test(sidecar), 'a saved credential failing its probe is noted');
 
 // ---- refused API calls are no longer silent ----
-A.ok(/isAllowedApiOrigin\(String\(req\.headers\.origin \|\| ''\), PORT, req\.headers\.host\)\) \{ noteApiRefusal\(req, 'forbidden origin'\);/.test(sidecar), 'rejectApi passes the Host (tunnel same-origin) and notes an origin refusal');
+A.ok(/isAllowedApiOrigin\(String\(req\.headers\.origin \|\| ''\), PORT, req\.headers\.host(?:, REMOTE_HOSTS)?\)\) \{ noteApiRefusal\(req, 'forbidden origin'\);/.test(sidecar), 'rejectApi passes the Host (tunnel same-origin) and notes an origin refusal');
 A.ok(/noteApiRefusal\(req, 'forbidden token'\);/.test(sidecar), 'a stale-token refusal is noted');
 // sidecar-index-06: a page the station WITHHELD its key from sends no key at all. Its refusals must not be logged as "a
 // page from before a sidecar restart; reload it" (the station did not restart, and reloading changes nothing).
