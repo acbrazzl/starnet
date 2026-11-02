@@ -5,8 +5,8 @@
    sources, sinking at open ends, spaced so they never stack) and the pixel art.
 
    Bridge-reference materials: layered blackened steel rails, graphite mechanical rollers,
-   dull amber wear and sparse cyan drive markers. Riveted cargo modules retain semantic
-   inbound/result/unproductive-work colours. Topology-aware tracks keep every bend and
+   dull amber wear and sparse cyan drive markers. The crates that ride them are pale containers
+   whose lids keep the semantic inbound/result/unproductive-work colours. Topology-aware tracks keep every bend and
    incoming merge arm aligned with the tile graph. Cosmetic material changes never drive
    the simulation, create work, or report a run.
 
@@ -63,118 +63,74 @@ const Conveyor = (() => {
   /* ---- art context (module-local, set per draw call — like propsprites/sprites) ---- */
   let _ctx = null, _now = 0;
   const px = (x, y, w, h, c) => { _ctx.fillStyle = c; _ctx.fillRect(x, y, w, h); };
-  const SH = (c, n) => U.shade(c, n);
 
   /* ============================ CARGO ART ============================ */
-  // Handled blackened-steel modules keep the 9x8 floor stance. Nested armour,
-  // recessed seams, corner bolts and worn leading edges follow the bridge reference.
-  function cargoChassis(cx, py, h32, body, dir) {
-    const x = cx - 4, y = py - 5;
-    px(x, y, 9, 8, '#090c0c');
-    px(x + .4, y + .3, 8.2, 4.8, '#53534a');
-    px(x + .8, y + .8, 7.4, 4.2, '#252b29');
-    px(x + 1.2, y + 1.15, 6.6, 3.2, '#343934');
-    px(x + 1.7, y + 1.7, 5.6, 2.3, '#121918');
-    px(x + 2.1, y + 2, 4.8, 1.6, body);
-    // Deep apron with two protected catches and a recessed grab handle.
-    px(x + .4, y + 5, 8.2, 2.6, '#222725');
-    px(x + .5, y + 5, 8, .35, '#555448');
-    px(x + 2.8, y + 5.8, 3.4, 1.1, '#0a1111');
-    px(x + 3, y + 5.8, 3, .25, '#77705b');
-    for (const xx of [x + 1.2, x + 7.15]) {
-      px(xx, y + .65, .6, 6.1, '#161b1a');
-      px(xx, y + .65, .2, 6.1, '#696350');
-      px(xx - .1, y + 5.7, .85, 1.1, '#3e4239');
-      px(xx + .1, y + 5.8, .25, .5, '#9d8150');
-    }
-    for (const dx of [.9, 7.65]) for (const dy of [.7, 4.25]) {
-      px(x + dx, y + dy, .6, .6, '#111817');
-      px(x + dx + .05, y + dy + .05, .25, .25, '#8a8067');
-    }
-    // A restrained scuff is deterministic per module, never a flashing status.
-    const wear = (h32 >>> 2) % 4;
-    px(x + 2.2 + wear * .65, y + 1, .8, .2, '#7c7154');
-    px(x + 5.4 - wear * .5, y + 4.4, .45, .15, '#696854');
-    const v = DIRV[dir] || DIRV.E;
-    if (v[0]) px(cx + (v[0] > 0 ? 4.15 : -3.8), y + 1.2, .2, 2.6, '#7d755d');
-    else px(x + 2.5, v[1] < 0 ? y + .4 : y + 4.75, 4, .2, '#7d755d');
-    return { tx: x + 1, ty: y };
+  /* THE CRATE (2026-09-30 — "the crate is ugly"). The old module was blackened steel on a blackened belt: at the floor's own
+     scale it read as a smudge under a coloured tag. A crate is now a PALE container that fills its 9×8 stance, and the one
+     thing it says — what kind of work it carries — is its LID, a full slab of that colour: amber = work coming in, green =
+     a finished result, red = work that was wasted. Whole pixels only (one art pixel is one world pixel, so it sits at the
+     grain of the deck and the machines); the outline is a dark tint of the body's own warm grey, never black. */
+  const CRATE = { ink: '#2b261f', face: '#b8b2a0', faceLo: '#948e7c', latch: '#4b4538' };
+  // a lid's ramp: [the lit edge, the lid, the seam under it]
+  const LID = {
+    ore:        ['#f6d388', '#e0aa40', '#93681e'],
+    product:    ['#a2e8c2', '#57bd8b', '#2b7a56'],
+    slag:       ['#f2a189', '#d2684c', '#863829'],
+    data:       ['#9fe2ee', '#50b4c8', '#27707f'],
+    utility:    ['#dbe0da', '#a5b0ab', '#65706b'],
+    production: ['#e9cd92', '#c69c50', '#7c5e27'],
+    command:    ['#eea892', '#cb6b4f', '#7f3729'],
+    money:      ['#f5e493', '#d8bb45', '#897321'],
+  };
+  function crate(cx, py, lid) {
+    const x = cx - 4, y = py - 5, L = LID[lid] || LID.data;
+    px(x + 1, y, 7, 8, CRATE.ink); px(x, y + 1, 9, 6, CRATE.ink);   // the outline: the 9×8 stance with its corners cut
+    px(x + 1, y + 1, 7, 1, L[0]);                                    // the lid's lit edge
+    px(x + 1, y + 2, 7, 2, L[1]);                                    // the lid — the crate's one feature
+    px(x + 1, y + 4, 7, 1, L[2]);                                    // the seam under the lid
+    px(x + 1, y + 5, 7, 1, CRATE.face);                              // the front: pale, so the crate reads on a dark belt
+    px(x + 1, y + 6, 7, 1, CRATE.faceLo);
+    px(x + 3, y + 5, 3, 1, CRATE.latch);                             // the latch
+    return { x, y };
   }
 
-  function cargoProduction(cx, py, h32, dir) {
-    cargoChassis(cx, py, h32, '#454638', dir);
-    px(cx - 1.5, py - 2.5, 3, .5, '#a48c55');
-  }
-  function cargoUtility(cx, py, h32, dir) {
-    cargoChassis(cx, py, h32, '#303c39', dir);
-    px(cx - 1, py - 3, 2, 1, '#787b66');
-  }
-  function cargoData(cx, py, h32, dir) {
-    cargoChassis(cx, py, h32, '#1a353c', dir);
-    px(cx - 1.5, py - 2.5, 3, .5, '#659ca4');
-    px(cx + 1, py - 3, .5, 1, '#8bb8b6');
-  }
-  function cargoCommand(cx, py, h32, dir) {
-    cargoChassis(cx, py, h32, '#412927', dir);
-    px(cx, py - 3, .5, 1.5, '#ba7961');
-  }
-  function cargoMoney(cx, py, h32, dir) {
-    cargoChassis(cx, py, h32, '#41412b', dir);
-    px(cx - 1.5, py - 3, 1, 1, '#a79556');
-    px(cx + .5, py - 3, 1, 1, '#a79556');
-  }
-  // Incoming work has a uniform module size: it cannot imply a cost estimate.
-  function cargoOre(cx, py, h32, dir, weight) {
-    cargoChassis(cx, py, h32, '#4b412b', dir);
-    px(cx - 1.5, py - 2.5, 3, .5, '#ac8d48');
-  }
+  function cargoProduction(cx, py) { crate(cx, py, 'production'); }
+  function cargoUtility(cx, py) { crate(cx, py, 'utility'); }
+  function cargoData(cx, py) { crate(cx, py, 'data'); }
+  function cargoCommand(cx, py) { crate(cx, py, 'command'); }
+  function cargoMoney(cx, py) { crate(cx, py, 'money'); }
+  // Incoming work has a uniform crate: it cannot imply a cost estimate.
+  function cargoOre(cx, py) { crate(cx, py, 'ore'); }
   // Seal pips still express only reconciled spend, never a guessed future cost.
   const FULL_MASS_USD = 1.00;
   function weightForUsd(usd) { return (typeof usd === 'number' && isFinite(usd) && usd > 0) ? Math.min(1, usd / FULL_MASS_USD) : 0; }
   function cargoProduct(cx, py, h32, dir, weight) {
-    const w = Math.max(0, Math.min(1, weight || 0));
-    cargoChassis(cx, py, h32, '#233c32', dir);
-    px(cx - .5, py - 3, 1, 1, '#6d9c79');
-    for (let i = 0; i < Math.round(w * 2); i++) px(cx - 2 + i * 4, py - 2.5, .5, .5, '#95b799');
+    const w = Math.max(0, Math.min(1, weight || 0)), c = crate(cx, py, 'product');
+    for (let i = 0; i < Math.round(w * 2); i++) px(c.x + 1 + i * 6, c.y + 5, 1, 1, '#eafff3');   // one seal pip each side of the latch
   }
-  function cargoSlag(cx, py, h32, dir) {
-    cargoChassis(cx, py, h32, '#3e2421', dir);
-    px(cx - 1, py - 3, .5, .5, '#b16a4e'); px(cx + .5, py - 3, .5, .5, '#b16a4e');
-    px(cx - .5, py - 2.5, 1, .5, '#b16a4e');
+  function cargoSlag(cx, py) {
+    const c = crate(cx, py, 'slag');
+    const k = LID.slag[2];   // struck through: an ✕ across the lid
+    px(c.x + 3, c.y + 1, 1, 1, k); px(c.x + 5, c.y + 1, 1, 1, k); px(c.x + 4, c.y + 2, 1, 1, k); px(c.x + 3, c.y + 3, 1, 1, k); px(c.x + 5, c.y + 3, 1, 1, k);
   }
 
-  /* ---- GHOST projection crate (guided workflows Phase 3): NOT a cargo type. A payload flagged
-     `ghost:true` rides with a hollow dashed outline + a faint interior — deliberately unlike every
-     real body above (no solid faces, no economy colour, no shadow, no tag), so a viewer can never
-     mistake the projection for real work. Marching dashes + shimmer run off the injected _now only
-     (deterministic). Drawn by ghostline.js's DEDICATED engine — a real conveyor never carries one. */
-  function cargoGhost(cx, py, h32, dir) {
-    const x = cx - 4, y = py - 5;                 // same 9x8 stance as the chassis, so it rides the belt right
+  /* ---- GHOST projection crate (guided workflows Phase 3): NOT a cargo type. A payload flagged `ghost:true` rides as a
+     HOLOGRAM of the crate — the same silhouette in projection cyan: a hairline outline, a see-through body the belt shows
+     through, the lid's seam, one scan row sweeping down it. No solid face, no role colour, no shadow, no tag, so a viewer
+     can never mistake the projection for real work. (It was a marching-dash square: at this size the dashes read as noise.)
+     The sweep runs off the injected _now only (deterministic). Drawn by ghostline.js's DEDICATED engine — a real conveyor
+     never carries one. */
+  function cargoGhost(cx, py, h32) {
+    const x = cx - 4, y = py - 5;                 // the crate's own 9×8 stance, so it rides the belt right
     const C = '#8fd8e8';                          // projection phosphor (pale scanner cyan)
     const a = _ctx.globalAlpha;
-    _ctx.globalAlpha = a * 0.14; px(x + 1, y + 1, 7, 6, C);            // faint field — the belt shows through
-    _ctx.globalAlpha = a * 0.26; px(x + 2, y + 2, 5, 4, '#0c2a32');    // dim interior (net ~0.4 read)
-    // interior scan shimmer: one pale line sweeping the field (injected clock, hash-phased)
-    const sweep = ((((_now / 240) | 0) + (h32 & 7)) % 5);
-    _ctx.globalAlpha = a * 0.30; px(x + 2 + sweep, y + 2, 1, 4, C);
-    // ◇ projection glyph at the heart
-    _ctx.globalAlpha = a * 0.55;
-    px(cx, py - 3, 1, 1, C); px(cx - 1, py - 2, 1, 1, C); px(cx + 1, py - 2, 1, 1, C); px(cx, py - 1, 1, 1, C);
-    // dashed outline: 2-on/1-off pixels marching around the silhouette (reads "drawn, not built")
-    _ctx.globalAlpha = a * 0.75;
-    let i = ((_now / 160) | 0) % 3;
-    const dot = (dx, dy) => { if ((i++ % 3) !== 2) px(dx, dy, 1, 1, C); };
-    for (let k = 0; k < 9; k++) dot(x + k, y);
-    for (let k = 1; k < 8; k++) dot(x + 8, y + k);
-    for (let k = 8; k >= 0; k--) dot(x + k, y + 7);
-    for (let k = 7; k >= 1; k--) dot(x, y + k);
-    // leading-edge tick (travel direction, like the rim light — but dashed-thin, never a lit face)
-    const v = DIRV[dir];
-    _ctx.globalAlpha = a * 0.9;
-    if (v[0] > 0) px(x + 8, y + 3, 1, 2, C);
-    else if (v[0] < 0) px(x, y + 3, 1, 2, C);
-    else if (v[1] < 0) px(x + 3, y, 3, 1, C);
-    else px(x + 3, y + 7, 3, 1, C);
+    _ctx.globalAlpha = a * 0.16; px(x + 1, y + 1, 7, 6, C);                       // the body: the belt shows through
+    _ctx.globalAlpha = a * 0.20; px(x + 1, y + 2, 7, 2, C);                       // the lid, a shade more present
+    _ctx.globalAlpha = a * 0.55; px(x + 1, y + 4, 7, 1, C);                       // the seam under the lid
+    const sweep = ((((_now / 220) | 0) + (h32 & 3)) % 6);                         // one scan row sweeping down (injected clock, hash-phased)
+    _ctx.globalAlpha = a * 0.34; px(x + 1, y + 1 + sweep, 7, 1, C);
+    _ctx.globalAlpha = a * 0.9;                                                   // the outline: a hairline, corners cut like the crate's
+    px(x + 1, y, 7, 1, C); px(x + 1, y + 7, 7, 1, C); px(x, y + 1, 1, 6, C); px(x + 8, y + 1, 1, 6, C);
     _ctx.globalAlpha = a;
   }
 
@@ -188,18 +144,6 @@ const Conveyor = (() => {
     return 4;                  //  7% money (gold)
   }
   const CARGO_FN = [cargoUtility, cargoProduction, cargoData, cargoCommand, cargoMoney];
-
-  /* a floating tag marking a box that carries a REAL work-item. Colour reads its economic ROLE:
-     amber = inbound ore, green = banked product, red = wasted slag (legacy: outbound -> green). */
-  const TAG_FACE = { ore: ['#ad843c', '#d0b16c'], product: ['#4e8d79', '#86b3a2'], slag: ['#a8583e', '#cc8964'] };
-  function payloadTag(cx, py, role) {
-    const fs = TAG_FACE[role] || TAG_FACE.ore, face = fs[0], sheen = fs[1], yy = py - 8.5;
-    px(cx - .25, yy + 2.5, .5, 1.5, '#5b5744');
-    px(cx - 2.5, yy, 5, 3, '#080d0c');
-    px(cx - 2, yy + .5, 4, 2, face);
-    px(cx - 2, yy + .5, 4, .5, sheen);
-    px(cx - .75, yy + 1.5, 1.5, .5, SH(face, -.2));
-  }
 
   /* ---- motion bundle: bob/lean/shadow + spawn-pop + sink-chute. translate-only (no ctx.scale). ---- */
   function boxMotion(bx, now) {
@@ -288,13 +232,24 @@ const Conveyor = (() => {
       // that reaches ITS OWNER's bay (jt.owners = {dir: [agentIds]}, precompiled from the plan). Filters
       // and splitters only ever decide for UNOWNED work — so the crate's path can never contradict who
       // actually runs the job. Deterministic: fixed LANE_ORDER scan.
+      // (multi-bay, 2026-09-22) a crate addressed to ONE BAY (payload.dockId) steers by the lanes' DOCKS first —
+      // quill's bay C crate must take the lane to bay C even where another lane reaches quill's bay A.
+      if (bx.payload && bx.payload.dockId && !bx.payload.outbound && jt.ownerDocks) {
+        for (const d of lanes) { const own = jt.ownerDocks[d]; if (own && own.indexOf(bx.payload.dockId) >= 0) { if (onAdvance) onAdvance(bx, { kind: jt.kind, tile: { x, y }, lane: d, owner: bx.payload.agentId }); return d; } }
+      }
       if (bx.payload && bx.payload.agentId && !bx.payload.outbound && jt.owners) {
         for (const d of lanes) { const own = jt.owners[d]; if (own && own.indexOf(bx.payload.agentId) >= 0) { if (onAdvance) onAdvance(bx, { kind: jt.kind, tile: { x, y }, lane: d, owner: bx.payload.agentId }); return d; } }
       }
       if (jt.kind === 'split') {
         const n = rr.get(k) || 0;
         rr.set(k, (n + 1) % lanes.length);
-        return lanes[n % lanes.length];
+        const dir = lanes[n % lanes.length];
+        // REPORT THE DECISION (2026-09-27 audit X2): the REFIT preview and the ghost projection caption splitters from
+        // this seam, and it never fired for unowned work — no preview ever said what a splitter does. `fanout` is the
+        // compiled cfg: a split with a JOINER downstream sends EVERY branch a copy (the sidecar runs them all; this
+        // sim still moves one crate per lane — the caller narrates and draws the copies).
+        if (onAdvance) onAdvance(bx, { kind: 'split', tile: { x, y }, lane: dir, fanout: !!jt.fanout });
+        return dir;
       }
       if (jt.kind === 'filter') {
         const tag = (bx.payload && bx.payload.tag) || 'general';
@@ -381,7 +336,8 @@ const Conveyor = (() => {
       return best;
     }
 
-    /* stops (optional 5th arg): { "x,y": agentId } — bound-bay hookup tiles. An INBOUND crate arriving on
+    /* stops (optional 5th arg): { "x,y": agentId | { agentId, dockId } } — bound-bay hookup tiles (the object form
+       names the DOCK — multi-bay agents, 2026-09-22 — so one agent's two bays are two different stops). An INBOUND crate arriving on
        a stop tile is DELIVERED there (the dock consumes the job): an unowned crate stops at the FIRST dock
        it reaches; an addressed crate stops only at ITS OWNER's dock and rides past every other. Outbound
        crates ignore stops entirely (they START at a dock and ship out). This is what makes "the crate ends
@@ -442,10 +398,15 @@ const Conveyor = (() => {
           // payload.fromAgentId names the PRODUCER, so a handoff crate rides past every OTHER ring tile of
           // the bay that made it — physics, not just an emitter convention; the spawn-tile check alone only
           // covered the birth tile of a multi-tile hookup.)
-          const stopOwner = stops && stops[key(bx.x, bx.y)];
-          if (stopOwner && bx.payload && !bx.payload.outbound && bx.spawnTile !== key(bx.x, bx.y) &&
-              bx.payload.fromAgentId !== stopOwner &&
-              (!bx.payload.agentId || bx.payload.agentId === stopOwner)) {
+          // (multi-bay) a stop may name its DOCK: the crate is consumed at stopDock === payload.dockId (when the
+          // crate names one) and never at the dock that PRODUCED it (payload.fromDockId) — the same agent's other
+          // bay is a different dock and does consume a handoff addressed to it.
+          const stop = stops && stops[key(bx.x, bx.y)];
+          const stopOwner = stop && typeof stop === 'object' ? stop.agentId : stop;
+          const stopDock = stop && typeof stop === 'object' ? (stop.dockId || null) : null;
+          const own = bx.payload && (stopDock && bx.payload.fromDockId ? bx.payload.fromDockId === stopDock : bx.payload.fromAgentId === stopOwner);
+          const mine = bx.payload && (stopDock && bx.payload.dockId ? bx.payload.dockId === stopDock : (!bx.payload.agentId || bx.payload.agentId === stopOwner));
+          if (stopOwner && bx.payload && !bx.payload.outbound && bx.spawnTile !== key(bx.x, bx.y) && !own && mine) {
             if (onDeliver && !bx.delivered) { bx.delivered = true; onDeliver(bx, bx.x, bx.y); }
             bx.prog = 1; bx.sink = 1; break;
           }
@@ -478,17 +439,122 @@ const Conveyor = (() => {
        route render ENERGIZED (moving rollers, pale drive light); everything else renders COLD
        (static rollers, dark drive light, dimmed) so an incomplete line visibly isn't running. Omitted →
        every tile draws live (legacy callers unchanged). The glow IS the compiled plan — truthful telemetry. */
+    /* BELT ATLAS + CULLING (2026-10-07, the 0.13 "laggy" reports). A belt tile is ~50 canvas commands (seven rim
+       strokes, the rollers, rail rivets, wear) and a 133-tile station drew ~6,500 fills + ~1,100 strokes a frame:
+       >90% of every command on the stage, ~3ms of each draw and ~14% of a core in the GPU process alone.
+         · a tile wholly off the canvas is skipped (every command is clipped to its own tile: it drew nothing);
+         · while the camera holds still, each on-screen tile is drawn ONCE per roller phase into a device-aligned atlas
+           cell and blitted 1:1 — one drawImage per tile, every tile from the same texture. A cell is rasterized at the
+           device pixels the live tile covers, so the art is the same art; only the roller phase is held to steps of at
+           most 1/4 device px. A zoom (or a resize, or a new layout) drops the atlas and tiles draw live until it holds.
+       A caller without getTransform (the test recorder) always draws live.
+     PANS KEEP IT (2026-10-10, "can't navigate"): the atlas used to cover only the on-screen tiles at one exact camera,
+     so every pan frame drew every belt live — the dearest part of a moving frame on a big line (CPU×4: 7 → 26 ms).
+     When the WHOLE layout fits ATLAS_WHOLE_MAX_PX (all roller phases together) the atlas covers every belt and a pan
+     only shifts where its cells land: a whole-device-pixel shift blits the very same pixels; a fractional one (a
+     high-DPI drag, the idle director's ease) lands rounded — at most half a device px — until the camera holds, and
+     then the atlas is rebuilt at the exact offset. A layout too big for that budget keeps the still-only atlas. */
+    const ATLAS_MAX_TILE_PX = 40, ATLAS_MAX_TILES = 4096, ATLAS_WHOLE_MAX_PX = 8388608, ROLL_MS = 180;
+    const views = new WeakMap();   // canvas -> { a, e, f: last transform, still: unchanged draws, held: same-zoom draws, atlas }
     function drawBelts(ctx, nowMs, T, belts, liveSet) {
       if (!belts || !belts.length) return;
       _ctx = ctx; _now = nowMs;
       const map = buildMap(belts);
-      for (const b of belts) {
-        const live = !liveSet || !!liveSet[key(b.x, b.y)];
-        // A cold tile freezes at now=0: every roller parks instead of marching.
-        // The line reads as powered-down machinery, not broken art.
-        beltTile(b.x * T, b.y * T, T, classify(map, b), live ? nowMs : 0, live);
+      const m = typeof ctx.getTransform === 'function' ? ctx.getTransform() : null, cv = ctx.canvas;
+      if (!(m && cv && !m.b && !m.c && m.a > 0 && m.a === m.d)) {
+        for (const b of belts) drawTileLive(b, map, T, nowMs, liveSet);
+        drawMergeFx(T);
+        return;
       }
+      let view = views.get(cv);
+      if (!view) views.set(cv, view = { a: 0, e: 0, f: 0, w: 0, h: 0, belts: null, still: 0, held: 0, atlas: null });
+      // held = the zoom, the canvas size AND the layout held for this draw (a BUILD-mode paint-drag lays a new belts
+      // array per tile: no sheet is built for a layout that changes again next frame); still = the pan held too
+      const zoomSame = view.a === m.a && view.w === cv.width && view.h === cv.height && view.belts === belts;
+      const same = zoomSame && view.e === m.e && view.f === m.f;
+      view.still = same ? view.still + 1 : 0; view.held = zoomSame ? view.held + 1 : 0;
+      view.a = m.a; view.e = m.e; view.f = m.f; view.w = cv.width; view.h = cv.height; view.belts = belts;
+      if (!zoomSame || (!same && view.atlas && !view.atlas.whole)) dropAtlas(view);
+      const s = m.a, W = cv.width, H = cv.height, tilePx = T * s, shown = [];
+      for (const b of belts) {
+        const x0 = b.x * T * s + m.e, y0 = b.y * T * s + m.f;
+        if (x0 + tilePx < -1 || y0 + tilePx < -1 || x0 > W + 1 || y0 > H + 1) continue;   // wholly off the canvas
+        shown.push(b);
+      }
+      if (tilePx <= ATLAS_MAX_TILE_PX && typeof document !== 'undefined') {
+        const S = Math.ceil(tilePx) + 2, cols = Math.max(1, Math.ceil(Math.sqrt(belts.length)));
+        const whole = belts.length <= ATLAS_MAX_TILES && cols * cols * S * S * atlasPhases(T, s) <= ATLAS_WHOLE_MAX_PX;
+        if ((whole ? view.held >= 2 : (view.still >= 2 && shown.length <= ATLAS_MAX_TILES))
+          && drawAtlas(ctx, view, map, T, belts, whole ? belts : shown, whole, liveSet, nowMs, m)) { drawMergeFx(T); return; }
+      }
+      for (const b of shown) drawTileLive(b, map, T, nowMs, liveSet);
       drawMergeFx(T);   // convergence pulses over the merge tiles (under the riding boxes)
+    }
+    function drawTileLive(b, map, T, nowMs, liveSet) {
+      const live = !liveSet || !!liveSet[key(b.x, b.y)];
+      // A cold tile freezes at now=0: every roller parks instead of marching.
+      // The line reads as powered-down machinery, not broken art.
+      beltTile(b.x * T, b.y * T, T, classify(map, b), live ? nowMs : 0, live);
+    }
+    function dropAtlas(view) {
+      if (!view.atlas) return;
+      for (const c of view.atlas.sheets.values()) c.width = c.height = 1;   // free the bitmaps now, not at GC
+      view.atlas = null;
+    }
+    // enough roller phases that the held roller is never more than 1/4 device px from where the live one would be
+    function atlasPhases(T, s) { return Math.max(4, Math.min(32, Math.ceil(4 * (T / 3) * s))); }
+    // blit each tile from this roller phase's sheet (drawn once, on first use). `list` is every belt (a whole atlas,
+    // which a pan reuses) or the on-screen tiles (a still-only atlas, dropped by the first pan).
+    function drawAtlas(ctx, view, map, T, belts, list, whole, liveSet, nowMs, m) {
+      const s = m.a, lives = list.map(b => !liveSet || !!liveSet[key(b.x, b.y)]), liveKey = lives.map(v => v ? 1 : 0).join('');
+      let at = view.atlas;
+      // where this camera puts the atlas's cells, relative to the camera it was rasterized at
+      let dx = at ? m.e - at.e0 : 0, dy = at ? m.f - at.f0 : 0;
+      const fractional = Math.abs(dx - Math.round(dx)) > 1e-3 || Math.abs(dy - Math.round(dy)) > 1e-3;
+      if (!at || at.belts !== belts || at.T !== T || at.whole !== whole || at.count !== list.length || at.liveKey !== liveKey
+        || (fractional && view.still >= 2)) {   // the camera came to rest off the atlas's pixel grid: re-rasterize there
+        dropAtlas(view);
+        const S = Math.ceil(T * s) + 2, cols = Math.max(1, Math.ceil(Math.sqrt(list.length)));
+        const phases = lives.some(Boolean) ? atlasPhases(T, s) : 1;
+        at = view.atlas = { belts, T, whole, e0: m.e, f0: m.f, count: list.length, liveKey, S, cols, rows: Math.ceil(list.length / cols), phases, sheets: new Map(),
+          cells: list.map((b, i) => { const ix = Math.floor(b.x * T * s + m.e) - 1, iy = Math.floor(b.y * T * s + m.f) - 1;
+            return { b, ix, iy, cx: (i % cols) * S, cy: Math.floor(i / cols) * S, live: lives[i] }; }) };
+        dx = dy = 0;
+      }
+      dx = Math.round(dx); dy = Math.round(dy);
+      const q = at.phases > 1 ? Math.round(((nowMs / ROLL_MS) % 1) * at.phases) % at.phases : 0;
+      let sheet = at.sheets.get(q);
+      if (sheet) { const g = sheet.getContext('2d'); if (!g || (g.isContextLost && g.isContextLost())) { dropAtlas(view); return false; } }
+      else {
+        sheet = document.createElement('canvas'); sheet.width = at.cols * at.S; sheet.height = at.rows * at.S;
+        // a GPU reset loses the sheet, and a RESTORED one comes back blank while isContextLost() reads false: either
+        // event drops this atlas, so a still camera never blits empty belts (the next still draw rebuilds it)
+        const lose = () => { if (view.atlas === at) dropAtlas(view); };
+        try { sheet.addEventListener('contextlost', lose); sheet.addEventListener('contextrestored', lose); } catch (_) {}
+        const g = sheet.getContext('2d');
+        if (!g) return false;
+        const nowQ = q * ROLL_MS / at.phases;
+        _ctx = g;
+        try {
+          for (const c of at.cells) {
+            // world -> this cell: the device transform (as of the atlas's build — a phase first drawn mid-pan must
+            // match its siblings) shifted by whole pixels, so every edge lands on the same pixel
+            g.setTransform(s, 0, 0, s, at.e0 - c.ix + c.cx, at.f0 - c.iy + c.cy);
+            beltTile(c.b.x * T, c.b.y * T, T, classify(map, c.b), c.live ? nowQ : 0, c.live);
+          }
+        } finally { _ctx = ctx; }
+        at.sheets.set(q, sheet);
+      }
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      const W = ctx.canvas.width, H = ctx.canvas.height;
+      for (const c of at.cells) {
+        const x = c.ix + dx, y = c.iy + dy;
+        if (x + at.S < 0 || y + at.S < 0 || x > W || y > H) continue;   // a whole atlas carries the off-screen tiles too
+        ctx.drawImage(sheet, c.cx, c.cy, at.S, at.S, x, y, at.S, at.S);
+      }
+      ctx.restore();
+      return true;
     }
     /* MERGE PULSE: a crate just crossed a converging junction — pulse the tile so the convergence point
        reads as live machinery. This is the ONLY thing the flash may say now: it fires once per real
@@ -655,15 +721,15 @@ const Conveyor = (() => {
         const sa = (0.30 - 0.12 * m.lift) * m.shadowMul;
         if (sa > 0 && !isGhost) { ctx.globalAlpha = sa * m.alpha; const sw = 9 + Math.round(m.lift * 2); px(cx - (sw >> 1), Math.round(base.py) + 3, sw, 2, '#05080a'); }
         ctx.globalAlpha = m.alpha;
-        if (isGhost) { cargoGhost(cx, py, h32, bx.dir); ctx.globalAlpha = 1; continue; }
-        // ECONOMIC role (set by world.js from real cost/outcome events) picks the art; an untyped
-        // payload still rides as the cyan data cassette, so nothing about existing boxes changes.
-        const role = bx.payload && bx.payload.box;
-        if (role === 'ore') cargoOre(cx, py, h32, bx.dir, +bx.payload.weight || 0);
-        else if (role === 'product') cargoProduct(cx, py, h32, bx.dir, +bx.payload.weight || 0);
-        else if (role === 'slag') cargoSlag(cx, py, h32, bx.dir);
-        else CARGO_FN[bx.payload ? 2 : cargoType(bx.id)](cx, py, h32, bx.dir);   // work-items default to cyan data cassettes
-        if (bx.payload) payloadTag(cx, py, role || (bx.payload.outbound ? 'product' : 'ore'));
+        if (isGhost) { cargoGhost(cx, py, h32); ctx.globalAlpha = 1; continue; }
+        // ECONOMIC role (set by world.js from real cost/outcome events) picks the LID: amber = inbound work, green = a
+        // banked result, red = wasted. A work-item with no role yet reads by its direction — outbound is a result, anything
+        // else is work coming in (the rule the floating tag over the old crate used; the lid says it now, so no tag).
+        const p = bx.payload, role = p ? (p.box || (p.outbound ? 'product' : 'ore')) : null;
+        if (role === 'ore') cargoOre(cx, py);
+        else if (role === 'product') cargoProduct(cx, py, h32, bx.dir, +p.weight || 0);
+        else if (role === 'slag') cargoSlag(cx, py);
+        else CARGO_FN[p ? 2 : cargoType(bx.id)](cx, py);   // a role this floor does not know rides as a data crate
         ctx.globalAlpha = 1;
       }
     }
@@ -679,7 +745,19 @@ const Conveyor = (() => {
     };
   }
 
-  return { create, weightForUsd };
+  /* THE CRATE, FOR A CALLER THAT PARKS ONE OFF THE BELT — the INBOX's waiting jam, the OUTBOX's shipped pallet, a paused step
+     test's hand-off. The same art the riding boxes wear, so a job reads as ONE object wherever it is. (cx, py) is the point a
+     riding box is drawn at: the crate covers cx-4…cx+4 by py-5…py+2. */
+  function drawCrate(ctx, cx, py, role, weight) {
+    const was = _ctx; _ctx = ctx;
+    try {
+      if (role === 'product') cargoProduct(cx, py, 0, null, weight || 0);
+      else if (role === 'slag') cargoSlag(cx, py);
+      else crate(cx, py, LID[role] ? role : 'ore');
+    } finally { _ctx = was; }
+  }
+
+  return { create, weightForUsd, drawCrate };
 })();
 
 if (typeof module !== 'undefined' && module.exports) module.exports = Conveyor;

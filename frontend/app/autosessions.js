@@ -270,7 +270,14 @@ const AutoSessions = (() => {
         // /api/runs list once it's DONE, so backfilling it here is correct — and it also clears the wedged busy
         // state (foldTurns → completeSession-style, plus Channels.end below).
         const existing = Workstreams.get(sid);
-        if (existing && run.cronJobId) Workstreams.adopt({ id: sid, automation: { kind: 'routine', id: run.cronJobId, name: run.cronJobName || run.title || 'Routine' } });
+        // the GROUP name is the routine's own name from the catalogue (a run row carries no name — its title is the
+        // prompt, which used to rename every routine group header to its raw instructions on each boot)
+        const job = run.cronJobId ? routineFor(run.cronJobId) : null;
+        const jobName = (job && job.name) || run.cronJobName || '';
+        if (existing && run.cronJobId) Workstreams.adopt({ id: sid, automation: { kind: 'routine', id: run.cronJobId, name: jobName || (existing.automation && existing.automation.name) || run.title || 'Routine' } });
+        // a fire that landed before the catalogue loaded (a boot catch-up) was adopted as the placeholder 'Routine' —
+        // heal it to the routine's real name (only the placeholder; a Commander rename is theirs)
+        if (existing && jobName && existing.title === 'Routine' && existing.titleAuto !== false) existing.title = jobName;
         const runId = String(sid).slice(STREAM_PREFIX.length);
         const outcome = String(run.runId || '') === runId ? outcomeOfRun(run) : null;
         if (existing && hasReadableOutput(existing.history)) {
@@ -280,7 +287,9 @@ const AutoSessions = (() => {
           continue;
         }
         // adopt (idempotent) — an existing seed-only session is preserved by adopt; a while-away run is already DONE.
-        Workstreams.adopt({ id: sid, title: String(run.title || 'Routine').split('\n')[0].slice(0, 80) || 'Routine', agentId: String(run.agentId || 'agent'), lane: 'active', history: (existing && existing.history) || [], automation: { kind: 'routine', id: run.cronJobId || '', name: run.cronJobName || run.title || 'Routine' } });
+        // A run that finished while the station was CLOSED arrives UNREAD (lastReadAt 0: the Commander has never
+        // opened it), so the rail lamp shows what ran while you were gone. A session already on this page keeps its own.
+        Workstreams.adopt({ id: sid, title: jobName || String(run.title || 'Routine').split('\n')[0].slice(0, 80) || 'Routine', agentId: String(run.agentId || 'agent'), lane: 'active', history: (existing && existing.history) || [], automation: { kind: 'routine', id: run.cronJobId || '', name: jobName || run.title || 'Routine' }, lastReadAt: existing ? undefined : 0 });
         const ws = Workstreams.get(sid);
         if (!ws) continue;
         const loaded = await fetchTranscript(ws.agentId, sid, options);

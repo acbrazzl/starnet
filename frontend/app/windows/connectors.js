@@ -26,6 +26,37 @@
     if (typeof StationUI.openTerm === 'function') StationUI.openTerm('connectors', 'catalog');
   };
 
+  /* LOCKED CREDENTIAL STORAGE — the next step the panel names under the sidecar's own message. A held file ('busy':
+     antivirus, backup or sync) and an unreachable OS store ('key-unavailable') leave an intact store that a restart or
+     an unlock fixes, and START FRESH would only set it aside, so neither is told its files are unreadable: the restart
+     or the unlock comes first and START FRESH stays as the exit when that fails. A busy lock's sidecar message already
+     says restart, then START FRESH, so the line adds nothing for it. The sidecar sends canStartFresh for every lock
+     today; a lock with no START FRESH and no fix of its own leaves the sidecar's message to speak. */
+  function storageNextStep(storage) {
+    const s = storage || {};
+    if (s.reason === 'busy') return s.canStartFresh ? '' : ' Restart StarNet to try again.';
+    if (s.reason === 'key-unavailable') return s.canStartFresh ? ' Use START FRESH only if you cannot unlock or repair the credential store.' : ' Unlock the credential store and restart StarNet.';
+    return s.canStartFresh ? ' START FRESH sets the unreadable files aside and lets you sign in to each service again.' : '';
+  }
+  /* An open store's storage notes. `notice` is a store StarNet does not count as encrypted (fallback, or a seal not yet
+     checked), so it is headed that way. `migrationNotice` is an older sign-in file left beside a SEALED store: a plain
+     heading, never 'not encrypted'. */
+  function storageNoticeHtml(storage) {
+    const s = storage || {};
+    return (s.notice ? '<div class="mc-notice"><b>Credential storage · not encrypted</b>' + esc(s.notice) + '</div>' : '') +
+      (s.migrationNotice ? '<div class="mc-notice"><b>Credential storage</b>' + esc(s.migrationNotice) + '</div>' : '');
+  }
+  /* START FRESH's answer: where the old files went. Finishing an interrupted attempt also returns `previous`, the
+     folders that attempt filled; with nothing left to move it has no movedTo, and the marker that named those folders
+     is gone, so this toast is the one place left that says where the old files are. */
+  function startFreshKeptText(answer) {
+    const j = answer || {};
+    const previous = Array.isArray(j.previous) ? j.previous.filter(p => typeof p === 'string' && p) : [];
+    const where = (typeof j.movedTo === 'string' && j.movedTo) || previous[0] || 'the connectors folder';
+    const earlier = previous.filter(p => p !== where);
+    return 'Connector storage started fresh. Old files kept in ' + where + (earlier.length ? ' (earlier copies in ' + earlier.join(', ') + ')' : '');
+  }
+
   /* ============== CONNECTORS — attach MCP servers so agents gain external tools ==============
      A connector is a remote MCP (Model Context Protocol) server. Once added + connected, its tools
      become real agent tools, gated by the same consent prompt as everything else. The server URL +
@@ -40,19 +71,23 @@
     // form/list handlers) resolves against the mounted panes with no rewrite.
     // ---- TOOLSETS pane: rendered async from GET /api/toolsets; the Spotify flow markup is embedded in-line so
     //      the JUKEBOX row can host it (kept verbatim from the old SPOTIFY section, ids unchanged). ----
+    // FOLDED, NOT REMOVED (UX night 10-26, "pretend these users are like 5"): the developer-app setup stood open in the
+    // middle of the TOOLS list ("Redirect URI to whitelist", "OAuth PKCE"). The status line stays in sight; the steps
+    // and fields are one click away, numbered, every sp-* id unchanged so setupSpotify() is untouched.
     const spotifyInline =
       '<div class="ts-spotify" id="ts-spotify">' +
-        '<p class="set-about">One-time setup: make a free app at <span class="dim">developer.spotify.com/dashboard</span>, add the redirect URI below to it, paste the Client ID, then connect. ' +
-          '<span class="dim">(OAuth PKCE — no client secret is ever stored.)</span></p>' +
         '<div id="sp-status" class="mc-url dim">checking…</div>' +
+        '<details class="mc-add-fold" id="sp-setup-fold"><summary>Connect your Spotify</summary>' +
+        '<p class="set-about">1. Make a free app at <span class="dim">developer.spotify.com/dashboard</span>.<br>2. Add the Redirect URI below to that app.<br>3. Paste the app’s Client ID here, then choose CONNECT SPOTIFY. ' +
+          '<span class="dim">StarNet never stores a client secret.</span></p>' +
         '<div class="mc-form">' +
           '<input id="sp-client" class="key-input" placeholder="Spotify Client ID" autocomplete="off" spellcheck="false" maxlength="64">' +
-          '<div class="mc-url dim">Redirect URI to whitelist: <code id="sp-redir">…</code></div>' +
+          '<div class="mc-url dim">Redirect URI: <code id="sp-redir">…</code></div>' +
           '<div class="mc-acts">' +
             '<button class="bb sm" id="sp-connect">▶ CONNECT SPOTIFY</button>' +
             '<button class="bb xs danger" id="sp-disconnect" style="display:none">✕ DISCONNECT</button>' +
           '</div>' +
-        '</div>' +
+        '</div></details>' +
         '<div id="sp-msg" class="msg" role="status" aria-live="polite"></div>' +
       '</div>';
     // NO LEAD PARAGRAPH HERE. mountConsole already prints this section's `desc` as `.con-sec-desc`
@@ -61,12 +96,12 @@
     // capability your agents can use, grouped into toolsets…"). Every pane in this console had the same
     // stutter. The `desc` is the one that stays — it is also what the search box matches on.
     const secToolsets =
-      '<label class="mc-hint" for="ts-agent">Capabilities for agent</label><select id="ts-agent" class="key-input" aria-label="Capabilities for agent"></select>' +
-      '<button class="bb xs" id="ts-refresh" type="button">REFRESH AUTHORITY</button>' +
+      '<label class="mc-hint" for="ts-agent">Show abilities of</label><select id="ts-agent" class="ab-agent-pick" aria-label="Show the abilities of agent"></select>' +
+      '<button class="bb xs" id="ts-refresh" type="button">REFRESH ACCESS</button>' +
       '<div id="ts-authority" class="set-about" role="status"></div>' +
       '<div class="ts-core set-row"><span class="ts-glyph" aria-hidden="true">◉</span>' +
         '<span class="ts-main"><span class="ts-name">COMPUTE <span class="ts-core-tag">CORE</span></span>' +
-        '<span class="ts-desc dim">The compute gate — an agent can always think. Always on.</span></span></div>' +
+        '<span class="ts-desc dim">Thinking and talking to you. Every agent can always think; it has no switch.</span></span></div>' +
       '<div id="ts-list"><span class="loading pulse">loading toolsets…</span></div>';
     // ---- CONNECTORS pane markup (unchanged generic MCP manager) ----
     // The lead sentence that used to open this pane restated the section `desc` verbatim; only the two
@@ -87,7 +122,9 @@
       '<details class="mc-adv"><summary>About connected services</summary>' +
         '<p class="set-about">Remote http(s) MCP servers. Secrets are stored locally by the sidecar and never displayed. ' +
         'Looking to chat with your agent <i>from</i> Slack or Telegram instead? That’s the <b>CHANNELS</b> window.</p></details>' +
-      '<div class="sec"><span class="sec-l" id="mc-form-h">ADD A CONNECTOR</span><span class="sec-r"></span><span class="sec-nd"></span></div>' +
+      // CONNECTED shows what you have first (UX night 10-26): this form stood open under the list, so a newcomer's first
+      // sight of the section was "a short handle for this server … mcp__<id>__<tool>". It is one click away instead.
+      '<details class="mc-add-fold" id="mc-add-fold"><summary><span id="mc-form-h">Add a service by its address</span> <span class="dim">(advanced)</span></summary>' +
       '<div class="mc-form" id="mc-form">' +
         '<input id="mc-id" class="key-input" placeholder="id — e.g. github (a-z 0-9 _ -)" autocomplete="off" spellcheck="false" maxlength="40">' +
         '<div class="mc-hint">A short handle for this server. Its tools appear to agents as <code>mcp__&lt;id&gt;__&lt;tool&gt;</code>.</div>' +
@@ -133,32 +170,29 @@
           '<button class="bb sm" id="mc-add">+ ADD &amp; CONNECT</button>' +
           '<button class="bb xs" id="mc-cancel" style="display:none">CANCEL EDIT</button>' +
         '</div>' +
-      '</div>' +
+      '</div></details>' +
       '<div id="mc-msg" class="msg" role="status" aria-live="polite"></div>';
     // ---- CATALOG pane markup: one-click, vetted MCP servers and platform APIs. Cards render async from
     //      both catalog endpoints and route through the existing connector/key setup flows. ----
-    // The pane copy is JUST the setup-type legend now — the "browse vetted MCP servers and add them" sentence lived
-    // here AND verbatim in the section desc below (mountConsole), so it read twice. CRT glyphs, not emoji.
-    // The legend doubles as the FILTER: it already taught the three setup tiers, so making those same
-    // words the control costs no new vocabulary. "What can I add without any setup right now?" is the
-    // first question a newcomer has and 39 cards in one scroll could not answer it; "which of these am
-    // I already on?" was equally unanswerable without reading every card.
+    // The setup tiers are the FILTER: "What can I add without any setup right now?" is the first question a newcomer
+    // has, and "which of these am I already on?" was unanswerable without reading every card. CRT glyphs, not emoji.
+    // LEAD WITH THE SERVICES (UX night 10-25): a second intro paragraph and a legend line restated the section desc
+    // and the chips' own words, and in the docked window they pushed the first service below the fold. What each
+    // tier means now rides its chip as the hover tip, so the pane opens on the catalog itself.
     const secCatalog =
-      '<p class="set-about"><b>Connect an app you already use.</b> Choose a platform below. SIGN IN opens your browser; API key setup walks you through adding a key from your account.</p>' +
       (typeof Tutorial !== 'undefined' && Tutorial.platformGuideHTML ? Tutorial.platformGuideHTML('apps') : '') +
       '<div class="cc-filters" id="cc-filters" role="group" aria-label="Filter connectors by setup type">' +
-        '<button type="button" class="cc-filter active" data-cc-filter="all" aria-pressed="true">ALL</button>' +
-        '<button type="button" class="cc-filter cc-lg-none" data-cc-filter="none" aria-pressed="false">▸ no setup</button>' +
-        '<button type="button" class="cc-filter cc-lg-key" data-cc-filter="apikey" aria-pressed="false">API key</button>' +
-        '<button type="button" class="cc-filter cc-lg-oauth" data-cc-filter="oauth" aria-pressed="false">SIGN IN</button>' +
-        '<button type="button" class="cc-filter" data-cc-filter="manual" aria-pressed="false">MANUAL SETUP</button>' +
-        '<button type="button" class="cc-filter cc-f-on" data-cc-filter="installed" aria-pressed="false">YOUR SERVICES</button>' +
+        '<button type="button" class="cc-filter active" data-cc-filter="all" aria-pressed="true" data-tip="Every service in the catalog">ALL</button>' +
+        '<button type="button" class="cc-filter cc-lg-none" data-cc-filter="none" aria-pressed="false" data-tip="No credentials needed: add it and it works">NO SETUP</button>' +
+        '<button type="button" class="cc-filter cc-lg-key" data-cc-filter="apikey" aria-pressed="false" data-tip="You paste a key from your account; the setup walks you through it">API KEY</button>' +
+        '<button type="button" class="cc-filter cc-lg-oauth" data-cc-filter="oauth" aria-pressed="false" data-tip="Connect through your browser">SIGN IN</button>' +
+        '<button type="button" class="cc-filter" data-cc-filter="manual" aria-pressed="false" data-tip="Needs a one-time app setup on the service first">MANUAL SETUP</button>' +
+        '<button type="button" class="cc-filter cc-f-on" data-cc-filter="installed" aria-pressed="false" data-tip="Services you have set up (a saved setup, not a live connection check)">YOUR SERVICES</button>' +
       '</div>' +
-      '<p class="set-about"><span class="cc-legend"><b class="cc-lg-none">▸ no setup</b> no credentials needed · ' +
-        '<b class="cc-lg-key">API key</b> you paste a key · <b class="cc-lg-oauth">SIGN IN</b> connect through your browser. Some services require one-time app setup first.</span></p>' +
       '<div id="cc-list" class="cc-list"><span class="loading pulse">loading catalog…</span></div>' +
       '<div id="cc-msg" class="msg" role="status" aria-live="polite"></div>' +
-      '<p class="set-about dim">Need something not listed? Add any remote MCP server by URL in <b>MCP CONNECTORS</b>, or paste a custom platform key in <b>KEYS</b>.</p>';
+      // the two cross-window answers the old ADD AN ABILITY fold gave live here now: chat apps are the CHANNELS tab above
+      '<p class="set-about dim">Not listed? Add it yourself in <b>CONNECTED</b>: a service by its address, or any platform’s API key. AI models like Claude or ChatGPT are set up in <b>SETTINGS › AI &amp; MODELS</b>.</p>';
     // ---- KEYS pane markup: every platform key the agents hold, in one place. Top = keyed catalog/MCP platforms
     //      currently connected (truth from /api/connectors — managed on their own tab, read-only here). Bottom =
     //      encrypted API credentials (POST /api/servicekeys): the sidecar exposes each as an env var in
@@ -178,26 +212,33 @@
        and prefill this form; KEYS stays the inventory/setup surface for credentials the Commander actually
        holds, plus the escape hatch for a custom platform the catalog does not list. */
     const secKeys =
-      '<div class="sec"><span class="sec-l">YOUR KEYS</span><span class="sec-r"></span><span class="sec-nd"></span></div>' +
-      '<div class="set-sub"><span class="set-sub-k">CONNECTED PLATFORMS</span><span class="set-sub-d" id="ky-plat-n">0</span></div>' +
-      '<div id="ky-platforms" class="mc-list"><span class="loading pulse">loading…</span></div>' +
-      '<div class="set-sub"><span class="set-sub-k">CONNECTED API KEYS</span><span class="set-sub-d" id="ky-mine-n">0</span></div>' +
+      '<div class="sec" id="ab-keys"><span class="sec-l">API KEYS</span><span class="sec-r"></span><span class="sec-nd"></span></div>' +
+      // ONE EMPTY LINE (UX night 10-26): with nothing saved, two labelled lists each said "none yet" and each offered OPEN
+      // APPS. The keyed-platform group shows only when it has rows (or a failed read to report); the key list's own
+      // label shows only beside it, where the two groups need telling apart.
+      '<div class="set-sub" id="ky-plat-head" hidden><span class="set-sub-k">CONNECTED PLATFORMS</span><span class="set-sub-d" id="ky-plat-n">0</span></div>' +
+      '<div id="ky-platforms" class="mc-list" hidden></div>' +
+      '<div class="set-sub" id="ky-mine-head" hidden><span class="set-sub-k">CONNECTED API KEYS</span><span class="set-sub-d" id="ky-mine-n">0</span></div>' +
       '<div id="ky-list" class="mc-list"></div>' +
-      '<div class="sec"><span class="sec-l">ADD A KEY</span><span class="sec-r"></span><span class="sec-nd"></span></div>' +
+      '<details class="mc-add-fold" id="ky-add-fold"><summary>Add an API key</summary>' +
       '<div class="mc-form">' +
         '<div id="ky-guide" class="mc-hint" hidden></div>' +
         '<input id="ky-name" class="key-input" placeholder="platform name — e.g. Resend" autocomplete="off" spellcheck="false" maxlength="64">' +
-        '<input id="ky-key" type="password" class="key-input" placeholder="API key" autocomplete="off" spellcheck="false">' +
+        '<input id="ky-key" type="password" class="key-input" placeholder="API key — or a 1Password reference (op://vault/item/field)" autocomplete="off" spellcheck="false">' +
         '<input id="ky-docs" class="key-input" placeholder="API docs URL (optional — helps agents use the service)" autocomplete="off" spellcheck="false">' +
         '<div class="mc-hint">Stored locally by the sidecar and shown as ····last4 only. Agents get it as an environment variable ' +
           '(e.g. <code>RESEND_API_KEY</code>) in their shell, so they can call the platform’s API directly.</div>' +
+        // 1PASSWORD: the same field takes a secret reference. Only the reference is saved; the sidecar reads the key with
+        // the 1Password CLI when an agent needs it and keeps it in memory (sidecar/onepassword.js).
+        '<div class="mc-hint">Keep keys in 1Password? Paste the field’s secret reference instead (in 1Password: the field’s menu → Copy Secret Reference). ' +
+          'StarNet saves only the reference and reads the key with the 1Password CLI (<code>op</code>) when an agent needs it.</div>' +
         // TRUTHFUL TELEMETRY: the key alone is not enough. The shell it is handed to only exists when a WORKBENCH
         // prop is placed (capability/office.js grants it nowhere by default), and workspace-process tools are not
         // projected onto unattended surfaces at all (inputpolicy.js), so a saved key is inert until both hold.
-        '<div class="mc-hint">These API keys are used through the terminal. Check the selected agent in TOOLSETS: access may come from a workbench, an execution profile or Full Access. ' +
+        '<div class="mc-hint">These API keys are used through the terminal. Check the selected agent in TOOLS: access may come from a workbench, an execution profile or Full Access. ' +
           'Scheduled work also follows its saved unattended access settings. Saving a key does not verify that the service accepts it.</div>' +
         '<div class="mc-acts"><button class="bb sm" id="ky-add">+ SAVE KEY</button></div>' +
-      '</div>' +
+      '</div></details>' +
       '<div id="ky-msg" class="msg" role="status" aria-live="polite"></div>';
     /* ---- EXTENSIONS: the Commander's OWN code, running inside the station ----
        Sits in this console and not in SETTINGS because "MCP server", "hook" and "plugin" are one user intent —
@@ -237,9 +278,9 @@
         </section>
         <section class="ext-editor mc-form" id="pl-form" aria-label="Create a plugin" hidden>
           <div class="ext-editor-head"><b>Create a plugin</b><button class="bb xs" data-ext-editor="">CANCEL</button></div>
-          <p class="mc-hint">Your starter counts tool calls and logs a total after each run. Edit its code to make it do more.</p>
+          <p class="mc-hint">Your starter comes with its own window, styled like the rest of the station, plus code that counts tool calls each run. Open the window, then edit its files to make it yours.</p>
           <label for="pl-name">Plugin name</label>
-          <input id="pl-name" class="key-input" placeholder="e.g. Run counter" autocomplete="off" maxlength="60">
+          <input id="pl-name" class="key-input" placeholder="e.g. PR Radar" autocomplete="off" maxlength="60">
           <details class="ext-details" id="pl-options"><summary>Optional settings</summary>
             <label for="pl-desc">Description</label>
             <input id="pl-desc" class="key-input" placeholder="A short note about this plugin" autocomplete="off" maxlength="140">
@@ -264,90 +305,53 @@
     // onto window.AbilityLanes ((body)=>({sections,wire}), the windows/automation.js shape); the
     // lanes' sections mount in THIS console and their wire() runs after ours, against the same body.
     const lanes = (window.AbilityLanes || []).map(fn => { try { return fn(body); } catch (_) { return null; } }).filter(l => l && Array.isArray(l.sections));
-    // TOOLSETS first (audit finding 5): the dock button says TOOLSETS, so the panel must open on the tab it's
-    // named for — a first click used to land on the CATALOG storefront, which read as "TOOLSETS = connectors".
-    /* ---- THE FRONT DOOR ----
-       This console's five tabs are five MECHANISMS (curated MCP server · platform API key · MCP server by
-       URL · hook/plugin · built-in toolset), and picking the right one is a question a newcomer cannot
-       answer — they know the NAME of the thing they want, not which of six subsystems implements it.
-       Landing on TOOLSETS and reading a rail of jargon is where that user stops.
-
-       So the console opens with the question they CAN answer ("what are you trying to connect?") and each
-       answer is a real jump to the tab that handles it. Two of the answers leave this window entirely —
-       chat-FROM-Slack is CHANNELS and model providers are SETTINGS — because the honest answer to "how do
-       I connect Telegram" is a different window, and silence there is exactly what sends people hunting.
-       Nothing here gates anything: every tab remains one click away in the rail. */
-    const ROUTES = [
-      { glyph: '⊞', to: 'catalog', title: 'Connect a service you use',
-        blurb: 'Find services and platform APIs, including print-on-demand. See what they can do and follow their setup steps. <b>Start here.</b>' },
-      { glyph: '⧉', to: 'mcp', title: 'Advanced: add a custom connection',
-        blurb: 'You already have an MCP endpoint and want to point the station at it.' },
-      { glyph: '▤', to: 'toolsets', title: 'Switch a built-in on or off',
-        blurb: 'Web, files, terminal, memory — inspect the selected agent’s tools and where its access comes from.' },
-      // cross-window, and deliberately so: naming the wrong window is worse than naming none.
-      { glyph: '✉', term: 'messaging', title: 'Message your agent from Telegram or Slack',
-        blurb: 'Connect a chat account so you can give your agent work from there. Opens CHANNELS.' },
-      { glyph: '◈', term: 'settings', section: 'providers', title: 'Add an AI model provider',
-        blurb: 'Anthropic, OpenAI, OpenRouter keys and sign-ins live in SETTINGS › PROVIDERS.' }
-    ];
-    const secRouter =
-      '<details class="ab-router" id="ab-router">' +
-        '<summary class="ab-router-q"><span>＋ ADD AN ABILITY</span><small>Choose a service, server, channel or model provider</small></summary>' +
-        '<div class="ab-router-grid">' +
-          ROUTES.map((r, i) =>
-            '<button type="button" class="ab-route" style="--ci:' + i + '"' +
-              (r.to ? ' data-ab-to="' + esc(r.to) + '"' : '') +
-              (r.term ? ' data-ab-term="' + esc(r.term) + '"' : '') +
-              (r.section ? ' data-ab-section="' + esc(r.section) + '"' : '') + '>' +
-              '<span class="ab-route-glyph" aria-hidden="true">' + esc(r.glyph) + '</span>' +
-              '<span class="ab-route-main"><span class="ab-route-title">' + esc(r.title) + '</span>' +
-                '<span class="ab-route-blurb dim">' + r.blurb + '</span></span>' +
-              '<span class="ab-route-go" aria-hidden="true">' + (r.term ? '↗' : '›') + '</span>' +
-            '</button>').join('') +
-        '</div>' +
-      '</details>';
-
-    const host = mountConsole(body, 'connectors', [
-      { id: 'toolsets', label: 'BUILT-IN ABILITIES', glyph: '▤', desc: 'Inspect an agent’s capability grants. Switches apply in ASK mode; Full Access overrides them. Connected services still need working credentials.', build: frag(secToolsets) },
-      { id: 'computer', label: 'COMPUTER CONTROL', glyph: '▣', desc: 'Choose how agents interact with native desktop apps. Full Power or a paired remote-owner lease is required.', build: frag(
+    /* ONE FLAT LIST (UX night 10-26, Andrew: "more like the settings menu where u can see all the different options …
+       better off perfectly organizing every category, and condensing those that need it"). The rail was three intent
+       keys (INSTALLED / DISCOVER / CREATE) that each swapped in a different set of sections, so most of the window was
+       always out of sight, and above every section an ADD AN ABILITY fold asked "what are you adding?" all over again.
+       Now every place shows at once, like SETTINGS, in the order a newcomer needs them: find an app, see what is
+       connected, get skills, the skills you have, the built-in tools, your own code. Four sections became blocks of the
+       neighbour that already held the same kind of thing (API keys under CONNECTED, COMPUTER CONTROL under TOOLS, and in
+       the skills lane SKILL EXCHANGE under SKILL MARKET, AGENT SKILLS under SKILLS); every element id is unchanged and
+       every old section id still opens on its block (stationui SECTION_ALIAS). Chat apps stay the CHANNELS tab. */
+    const secComputer =
+      '<div class="sec" id="ab-computer"><span class="sec-l">COMPUTER CONTROL</span><span class="sec-r"></span><span class="sec-nd"></span></div>' +
+      // plain first (UX night 10-26): what it does and when it works; how the drivers work is one click away
+      '<div class="set-about">Let agents use the apps on your computer: open windows, click and type. It works for an agent on FULL POWER, or when you ask from your paired Telegram chat.</div>' +
+      '<div id="cu-status" class="set-about" role="status" aria-live="polite">Checking computer control…</div>' +
+      '<div class="mc-acts" role="group" aria-label="Computer control backend">' +
+      '<button type="button" class="bb sm" data-cu-backend="cua" data-tip="Finds buttons and fields by name, and can work in the background where Windows allows it. Install it first.">CUA · ACCESSIBILITY</button>' +
+      '<button type="button" class="bb sm" data-cu-backend="win32" data-tip="The Windows driver StarNet already has: nothing to install">WINDOWS · CLASSIC</button>' +
+      '<button type="button" class="bb sm" data-cu-backend="off" data-tip="Agents cannot use the apps on your computer">OFF</button></div>' +
+      '<div class="mc-acts"><button type="button" class="bb sm" id="cu-install">INSTALL CUA</button>' +
+      '<button type="button" class="bb sm" id="cu-check">CHECK DRIVER</button></div>' +
+      '<details class="mc-adv"><summary>How it works</summary>' +
         '<div class="set-about">CUA targets windows and accessibility elements, works in the background where supported, and reports evidence for each action. Foreground input can move focus when needed.</div>' +
-        '<div id="cu-status" class="set-about" role="status" aria-live="polite">Checking computer control…</div>' +
-        '<div class="mc-acts" role="group" aria-label="Computer control backend">' +
-        '<button type="button" class="bb sm" data-cu-backend="cua">CUA · ACCESSIBILITY</button>' +
-        '<button type="button" class="bb sm" data-cu-backend="win32">WINDOWS · CLASSIC</button>' +
-        '<button type="button" class="bb sm" data-cu-backend="off">OFF</button></div>' +
-        '<div class="mc-acts"><button type="button" class="bb sm" id="cu-install">INSTALL CUA</button>' +
-        '<button type="button" class="bb sm" id="cu-check">CHECK DRIVER</button></div>' +
         '<p class="dim">Install downloads the verified Windows x64 driver from CUA’s official release. Reinstall and backend changes close current CUA sessions; start a new task afterward.</p>' +
-        '<div id="cu-message" class="msg" role="status" aria-live="polite"></div>') },
-      { id: 'catalog', label: 'CATALOG', glyph: '⊞', desc: 'Find a service by name or what you want to do. Choose it to see the setup required; YOUR SERVICES shows saved setups, not a live connection guarantee.', build: frag(secCatalog) },
-      { id: 'keys', label: 'SAVED API CONNECTIONS', glyph: '⊟', desc: 'The platform credentials your agents actually hold, plus a safe drop for a custom API the catalog does not list.', build: frag(secKeys) },
-      { id: 'mcp', label: 'CONNECTED SERVICES', glyph: '⧉', desc: 'Manage service access, check connection status, and reconnect when needed.', build: frag(secMcp) },
-      { id: 'custom', label: 'CREATE / ADVANCED', glyph: '＋', desc: 'Configure a custom server, API, skill package, hook or plugin.', build: frag('<div class="ab-router-grid"><button class="ab-route" data-ab-to="mcp">Add a custom MCP server</button><button class="ab-route" data-ab-to="keys">Add a custom API key</button><button class="ab-route" data-ab-to="exchange">Import a skill package</button><button class="ab-route" data-ab-to="extensions">Create hooks and plugins</button></div>') },
-      { id: 'extensions', label: 'EXTENSIONS', glyph: '⌥', desc: 'Automate a step or extend StarNet with your own code.', build: frag(secExt) }
-    ].concat(lanes.reduce((acc, l) => acc.concat(l.sections), [])), {
+      '</details>' +
+      '<div id="cu-message" class="msg" role="status" aria-live="polite"></div>';
+
+    // FIRST OPEN LANDS ON APPS (first-hour walk 2026-09-28): a newcomer who came here to connect Gmail met "capability
+    // grants", "ASK mode" and REFRESH AUTHORITY first. With no remembered section yet, land on APPS ("find an app by
+    // name"); every later open returns to the section last used.
+    if (H.consoleSection && !H.consoleSection.connectors) H.consoleSection.connectors = 'catalog';
+    const host = mountConsole(body, 'connectors', [
+      { id: 'catalog', label: 'APPS', glyph: '⊞', desc: 'Connect the apps you use, like Gmail, Notion or Google Drive. Pick one to see how to set it up.', build: frag(secCatalog) },
+      { id: 'mcp', label: 'CONNECTED', glyph: '⧉', desc: 'Everything you have connected: services and API keys. Add your own here too.', build: frag(
+        '<div class="sec" id="ab-services"><span class="sec-l">SERVICES</span><span class="sec-r"></span><span class="sec-nd"></span></div>' + secMcp + secKeys) }
+    ].concat(lanes.reduce((acc, l) => acc.concat(l.sections), []), [   // SKILL MARKET, SKILLS
+      { id: 'toolsets', label: 'TOOLS', glyph: '▤', desc: 'The tools built into StarNet, like web, files and terminal. Each switch turns a tool on or off for every agent; CHECK WITH ME and LET IT WORK obey the switches, FULL POWER overrides them.', build: frag(secToolsets + secComputer) },
+      { id: 'extensions', label: 'EXTENSIONS', glyph: '⌥', desc: 'Advanced: run your own scripts and plugins inside StarNet.', build: frag(secExt) }
+    ]), {
       search: true,
-      groups: [
-        { id: 'installed', label: 'INSTALLED', sections: ['toolsets', 'computer', 'mcp', 'keys', 'agent'] },
-        { id: 'discover', label: 'DISCOVER', sections: ['catalog', 'library'] },
-        { id: 'advanced', label: 'CREATE / ADVANCED', sections: ['custom', 'extensions', 'exchange'] }
-      ],
       searchLabel: 'Search abilities',
-      searchPlaceholder: 'search a platform, tool or skill — try “notion”…',
+      searchPlaceholder: 'search abilities…',   // fits the rail's search box whole (the long hint was cut at 'search a platform,')
       searchEmptyText: 'No abilities match that search. Try another platform, tool, or skill.'
     });
     lanes.forEach(l => { try { if (typeof l.wire === 'function') l.wire(); } catch (_) {} });
     if (typeof Tutorial !== 'undefined' && Tutorial.wirePlatformGuide) Tutorial.wirePlatformGuide(body);
 
-    /* Mount the front door ABOVE the panes, inside the scrolling content column: it is the first thing
-       read on every tab, and it scrolls away once you are working — permanent chrome for a question you
-       only ask once would be worse than no answer. It hides itself while the search box is active
-       (`.con-searching`), because then the Commander has already named the thing and the results ARE the
-       answer. */
-    const routerEl = document.createElement('div');
-    routerEl.innerHTML = secRouter;
-    const routerNode = routerEl.firstChild;
-    if (host && routerNode) host.insertBefore(routerNode, host.firstChild);
+    // a task waiting on a connection says so above every section, with the way back to that task
     const handoffEl = document.createElement('div');
     handoffEl.className = 'mc-hint'; handoffEl.setAttribute('aria-live', 'polite');
     if (host) host.insertBefore(handoffEl, host.firstChild);
@@ -359,14 +363,16 @@
         const c = connectors.find(x => x.id === h.connectorId);
         const ready = c && c.enabled && c.state === 'up' && !c.authRequired;
         const dormant = c && c.enabled && c.state === 'cached' && !c.authRequired;
-        const supported = dormant || (ready && (!h.toolName || (c.tools || []).includes(h.toolName)));
+        // a handoff held while the task's question is open only ever RETURNS to it — continuing would answer it
+        const supported = !h.awaitingAnswer && (dormant || (ready && (!h.toolName || (c.tools || []).includes(h.toolName))));
         const line = document.createElement('div');
         const caption = document.createElement('span');
         caption.textContent = (ws.title || 'Task') + ' · ' + h.connectorId + ' — '
-          + (dormant ? 'saved connection will be checked. ' : supported ? 'connection ready. ' : ready ? 'requested operation is unavailable. ' : 'waiting for connection. ');
+          + (h.awaitingAnswer ? (ready || dormant ? 'connected — answer the task\'s open question to continue. ' : 'waiting for connection; the task has an open question. ')
+            : dormant ? 'saved connection will be checked. ' : supported ? 'connection ready. ' : ready ? 'requested operation is unavailable. ' : 'waiting for connection. ');
         line.appendChild(caption);
         const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'bb xs';
-        btn.textContent = dormant ? 'CHECK & CONTINUE TASK' : supported ? 'CONTINUE TASK' : 'RETURN TO TASK';
+        btn.textContent = h.awaitingAnswer ? 'RETURN TO TASK' : dormant ? 'CHECK & CONTINUE TASK' : supported ? 'CONTINUE TASK' : 'RETURN TO TASK';
         btn.onclick = async () => {
           if (!supported) { App.openWorkstream(ws.id); return; }
           btn.disabled = true;
@@ -387,7 +393,7 @@
       const to = btn.dataset.abTo;
       if (to) {
         const tab = body.querySelector('#con-tab-connectors-' + to);
-        if (tab) { tab.click(); routerNode.open = false; host.scrollTop = 0; }
+        if (tab) { tab.click(); host.scrollTop = 0; }
         return;
       }
       // cross-window jump: openTerm is idempotent (restores a minimized window rather than duplicating).
@@ -441,10 +447,39 @@
     }
     // A findings block is DISCLOSURE at the approval moment — the guard is not a boundary, so the Commander
     // has to be able to see what they are about to say yes to.
+    // The sidecar's guard returns a LIST of findings ({ severity, description, file, line }); the old {level, hits}
+    // shape this used to read never existed, so every plugin's findings silently rendered as nothing.
     function extFindings(f) {
+      if (Array.isArray(f)) {
+        if (!f.length) return '<div class="mc-hint">scanner: nothing suspicious found</div>';
+        const rank = { critical: 3, high: 2, medium: 1, low: 0 };
+        const worst = f.reduce((w, x) => (rank[x && x.severity] || 0) > (rank[w] || 0) ? x.severity : w, 'low');
+        const lines = f.slice(0, 6).map(x => esc(String((x && x.description) || 'finding')) + ' <span class="mc-hint">(' + esc(String((x && x.file) || '')) + ':' + esc(String((x && x.line) || '')) + ')</span>').join('<br>');
+        return '<div class="mc-hint">scanner: <b>' + esc(String(f.length)) + ' finding' + (f.length === 1 ? '' : 's') + ' · worst ' + esc(String(worst)) + '</b><br>' + lines +
+          (f.length > 6 ? '<br>…and ' + esc(String(f.length - 6)) + ' more' : '') + '</div>';
+      }
       if (!f || !f.level) return '';
       const hits = Array.isArray(f.hits) && f.hits.length ? ' — ' + f.hits.map(h => esc(String(h))).join(', ') : '';
       return '<div class="mc-hint">scanner: <b>' + esc(String(f.level)) + '</b>' + hits + '</div>';
+    }
+    // A plugin's TOOLS (what its process actually registered) and its terminal in the station — the tools reach an
+    // agent only through that terminal (object = capability), so the row says where it stands or offers to place it.
+    function extTools(p) {
+      const tools = Array.isArray(p.tools) ? p.tools : [];
+      if (!p.active || !tools.length) return '';
+      const host = typeof PluginHost !== 'undefined' ? PluginHost : null;
+      const term = host && host.terminalOf ? host.terminalOf(p.id) : null;
+      return '<div class="mc-hint">Tools: ' + tools.map(t => '<code>' + esc(t) + '</code>').join(' ') + '<br>' +
+        (term ? 'Its terminal stands in the station: agents in that room can use these. Each call asks you first unless you choose Always or Full access.'
+          : 'No terminal in the station yet, so no agent can use these. <button class="bb xs" data-ext="plugin-place" data-id="' + esc(p.id) + '">PLACE TERMINAL</button>') +
+        '</div>';
+    }
+    // A plugin's windows (plugin.json `screens`), openable only while it is approved and live.
+    function extScreens(p) {
+      const list = Array.isArray(p.screens) ? p.screens : [];
+      if (!list.length) return '';
+      if (!p.active) return '<div class="mc-hint">Has ' + list.length + ' window' + (list.length === 1 ? '' : 's') + ' — approve it to open ' + (list.length === 1 ? 'it' : 'them') + '.</div>';
+      return list.map(s => '<button class="bb xs" data-ext="plugin-open" data-id="' + esc(p.id) + '" data-screen="' + esc(s.id) + '">OPEN ' + esc(String(s.title || s.id).toUpperCase()) + '</button>').join('');
     }
 
     // Keep drafts in the DOM while changing editors; never ask for two setups at once.
@@ -488,6 +523,9 @@
       const results = await Promise.allSettled([read('/api/hooks', 'hooks'), read('/api/plugins', 'plugins')]);
       const hooks = results[0].status === 'fulfilled' ? results[0].value : null;
       const plugins = results[1].status === 'fulfilled' ? results[1].value : null;
+      // nothing left to approve: the bell's "extensions awaiting your approval" leaves NEEDS YOU (it stayed lit for good)
+      if (hooks && plugins && !((hooks.pending || []).length + plugins.plugins.filter(x => x && x.pending).length)
+        && typeof StationUI !== 'undefined' && StationUI.settleNotifs) StationUI.settleNotifs('extensions-pending');
       extPluginDir = plugins ? plugins.dir || '' : '';
       body.querySelector('#pl-where').hidden = !extPluginDir || !plugins.plugins.length;
       const unavailable = label => '<div class="mc-hint">Could not load ' + label + '. <button class="bb xs" data-ext="retry">TRY AGAIN</button></div>';
@@ -515,12 +553,17 @@
           '<span class="mc-state" style="color:' + badge[0] + '">' + badge[1] + '</span></div>' +
           (p.description ? '<div class="mc-hint">' + esc(p.description) + '</div>' : '') +
           (!p.active ? extFindings(p.findings) : '') +
-          '<div class="mc-acts"><button class="bb xs" data-ext="plugin-' + (p.active ? 'revoke' : 'allow') + '" data-id="' + esc(p.id) + '" data-digest="' + esc(p.digest || '') + '">' +
+          '<div class="mc-acts">' + (p.active ? extScreens(p) : '') + '<button class="bb xs" data-ext="plugin-' + (p.active ? 'revoke' : 'allow') + '" data-id="' + esc(p.id) + '" data-digest="' + esc(p.digest || '') + '">' +
           (p.active ? 'TURN OFF' : 'APPROVE &amp; ENABLE') + '</button></div>' +
+          (!p.active ? extScreens(p) : '') +
+          extTools(p) +
+          (p.process && p.process.state === 'crashed' ? '<div class="mc-hint" style="color:var(--bad)">Its code crashed: ' + esc(p.process.error || 'unknown') + '. It restarts on its next use.</div>' : '') +
           '<details class="ext-details"><summary>Details &amp; code</summary>' +
           '<p class="mc-hint">Folder: <code>' + esc(p.id) + '</code> · Version ' + esc(p.version || '0') +
-          '<br>Open its folder to edit the code. Starters use <code>index.js</code>.</p>' +
-          (p.active ? extFindings(p.findings) : '<p class="mc-hint">Enabling loads this code with your computer’s permissions.</p>') +
+          '<br>Open its folder to edit the code. Starters use <code>index.js</code> and <code>ui/index.html</code>.</p>' +
+          (p.active ? extFindings(p.findings) : (p.hasCode === false
+            ? '<p class="mc-hint">Window-only plugin: its pages run sandboxed inside their windows, with no access to your station or computer.</p>'
+            : '<p class="mc-hint">Enabling loads this code with your computer’s permissions.</p>')) +
           '<div class="mc-acts"><button class="bb xs" data-ext="plugin-where" data-id="' + esc(p.id) + '">COPY FOLDER PATH</button>' +
           '<button class="bb xs danger" data-ext-remove="' + esc(p.id) + '">DELETE PLUGIN</button></div>' +
           '<p class="mc-hint">Deleting also removes its code from disk.</p></details></div>';
@@ -531,6 +574,7 @@
           onArm: () => sfx('bad'),
           onConfirm: async () => {
             if (await extPost('/api/plugins/delete', { id: btn.dataset.extRemove }, btn)) {
+              if (typeof PluginHost !== 'undefined') { try { await PluginHost.refresh(); } catch (_) {} }
               const refreshed = await renderExtensions();
               if (refreshed) extSay('Plugin deleted.');
             }
@@ -555,12 +599,31 @@
       // Set AFTER the re-render, never before: renderExtensions() clears the message line to drop stale
       // errors, so a success set inline is wiped the instant it is written (caught live).
       let done = '';
+      let openAfter = '';   // a freshly created plugin opens its window, so the first thing seen is that it works
       if (kind === 'retry') { await renderExtensions(); return; }
       if (kind === 'hook-allow') ok = await extPost('/api/hooks/allow', { event: btn.dataset.event, command: btn.dataset.command }, btn);
       else if (kind === 'hook-revoke') ok = await extPost('/api/hooks/revoke', { event: btn.dataset.event, command: btn.dataset.command }, btn);
       else if (kind === 'hook-delete') ok = await extPost('/api/hooks/delete', { event: btn.dataset.event, command: btn.dataset.command }, btn);
       else if (kind === 'plugin-allow') ok = await extPost('/api/plugins/allow', { id: btn.dataset.id, digest: btn.dataset.digest }, btn);
       else if (kind === 'plugin-revoke') ok = await extPost('/api/plugins/revoke', { id: btn.dataset.id }, btn);
+      else if (kind === 'plugin-place') {
+        const host = typeof PluginHost !== 'undefined' ? PluginHost : null;
+        const r = host ? host.placeTerminal(btn.dataset.id) : { ok: false, msg: 'plugin windows are not available in this build' };
+        if (!r || !r.ok) { extSay('Could not place its terminal: ' + ((r && (r.msg || r.error)) || 'unknown') + '. Place a PLUGIN TERMINAL in BUILD MODE instead.', true); return; }
+        try { sfx('ok'); } catch (_) {}
+        await renderExtensions();
+        extSay('Its terminal now stands in the lead’s room.');
+        return;
+      }
+      else if (kind === 'plugin-open') {
+        const host = typeof PluginHost !== 'undefined' ? PluginHost : null;
+        if (!host) { extSay('plugin windows are not available in this build', true); return; }
+        if (!host.open(btn.dataset.id, btn.dataset.screen)) {
+          await host.refresh();   // approved in another window, or just now: learn about it, then try once more
+          if (!host.open(btn.dataset.id, btn.dataset.screen)) extSay('that window is not available — is the plugin still on?', true);
+        }
+        return;
+      }
       else if (kind === 'hook-add') {
         const ev = body.querySelector('#hk-event'), cmd = body.querySelector('#hk-cmd'), nm = body.querySelector('#hk-name');
         if (!cmd.value.trim()) { extSay('Enter the command you want to run.', true); cmd.focus(); return; }
@@ -576,9 +639,10 @@
           extSay('Use letters or numbers at the start of the folder ID, then letters, numbers, dots, dashes or underscores.', true);
           id.focus(); return;
         }
-        ok = await extPost('/api/plugins/create', { id: id.value.trim(), name: nm.value.trim(), description: ds.value.trim() }, btn);
+        const newId = id.value.trim();
+        ok = await extPost('/api/plugins/create', { id: newId, name: nm.value.trim(), description: ds.value.trim() }, btn);
         if (!ok) body.querySelector('#pl-options').open = true;
-        if (ok) { done = 'Plugin created. Find its code under Details & code.'; id.value = ''; nm.value = ''; ds.value = ''; pluginIdEdited = false; extEditor('', false); }
+        if (ok) { openAfter = newId; done = 'Plugin created and its window opened. Find its code under Details & code.'; id.value = ''; nm.value = ''; ds.value = ''; pluginIdEdited = false; extEditor('', false); }
       }
       else if (kind === 'plugin-where') {
         if (!extPluginDir) { extSay('the station has not reported a plugins folder yet', true); return; }
@@ -588,7 +652,36 @@
         return;
       }
       else return;
-      if (ok) { try { sfx('ok'); } catch (_) {} const refreshed = await renderExtensions(); if (done && refreshed) extSay(done); }
+      if (ok) {
+        try { sfx('ok'); } catch (_) {}
+        // an approve / turn-off / add / remove changes what waits on approval: NEEDS YOU (rail, NOTIFICATIONS, the bell)
+        // re-reads the station now, never up to a minute later (org P01)
+        if (typeof NeedsYou !== 'undefined' && NeedsYou.refreshFeeds) NeedsYou.refreshFeeds(true);
+        // plugin windows follow approval immediately: a turned-off plugin's open window says so, a new one can open
+        if (/^plugin-/.test(kind) && typeof PluginHost !== 'undefined') {
+          try {
+            await PluginHost.refresh();
+            if (openAfter && !PluginHost.open(openAfter)) done = 'Plugin created. Find its code under Details & code.';
+            // INSTALL PLACES THE TERMINAL: a plugin that came up with tools gets its body in the lead's room now,
+            // so "approve" is the only step between writing a tool and the crew being able to use it.
+            const pid = openAfter || (kind === 'plugin-allow' ? btn.dataset.id : '');
+            const p = pid ? PluginHost.list().find(x => x.id === pid) : null;
+            // FIRST TIME ONLY: a terminal the Commander deliberately removed is not put back by a later re-approve
+            // (that would quietly hand the tools back) — the row keeps offering PLACE TERMINAL instead
+            let placedBefore = [];
+            try { placedBefore = JSON.parse(localStorage.getItem('starnet.pluginTerminalsPlaced') || '[]'); } catch (_) { placedBefore = []; }
+            if (p && p.active && Array.isArray(p.tools) && p.tools.length && placedBefore.indexOf(pid) < 0) {
+              const r = PluginHost.placeTerminal(pid);
+              if (r && r.ok) { try { localStorage.setItem('starnet.pluginTerminalsPlaced', JSON.stringify(placedBefore.concat([pid]).slice(-200))); } catch (_) { /* per-browser memory only */ } }
+              const n = p.tools.length + ' tool' + (p.tools.length === 1 ? '' : 's');
+              const note = r && r.ok ? (r.existing ? '' : ' Its terminal now stands in the lead’s room, so the lead can use its ' + n + '.')
+                : ' Its terminal could not be placed (' + ((r && (r.msg || r.error)) || 'unknown') + ') — place a PLUGIN TERMINAL in BUILD MODE.';
+              done = (done || 'Plugin on.') + note;
+            }
+          } catch (_) {}
+        }
+        const refreshed = await renderExtensions(); if (done && refreshed) extSay(done);
+      }
     });
     renderExtensions();
 
@@ -660,14 +753,16 @@
       const inert = availability === 'NEEDS PROP';
       // A DIAGNOSIS WITHOUT A CURE. This span named the exact missing prop and offered nothing to click,
       // so the one row that knows what is wrong was the one row you could not act on. The button hands
-      // off to the same REFIT deep-link the SKILLS library's PLACE uses (arms the palette on the prop),
+      // off to the same BUILD MODE deep-link the SKILLS library's PLACE uses (arms the palette on the prop),
       // which is the honest path: the prop still lands where the Commander puts it.
       const hint = inert
         ? '<span class="ts-inert">no ' + esc(t.object || 'prop') + ' in this agent’s workspace — choose one matching prop for this ability' +
             (t.object ? '<button class="bb xs ts-place" type="button" data-ts-place="' + esc(t.object) + '">⚒ PLACE ONE</button>' : '') +
           '</span>'
         : '';
-      const consent = '<span class="ts-tag">' + (t.available ? esc(t.grantSource || 'granted') : 'not granted') + '</span>' + (t.consentGated ? '<span class="ts-tag">risky actions may ask</span>' : '');
+      // the sidecar names an unrestricted grant 'Full Access'; on screen that is the FULL POWER posture (ONE ACCESS words)
+      const source = t.grantSource === 'Full Access' ? 'FULL POWER' : t.grantSource;
+      const consent = '<span class="ts-tag">' + (t.available ? esc(source || 'granted') : 'not granted') + '</span>' + (t.consentGated ? '<span class="ts-tag">risky actions may ask</span>' : '');
       const status = '<span class="ts-availability' + (t.available ? ' available' : '') + '">' + availability + '</span>';
       const isJuke = t.id === 'jukebox';
       const all = (t.tools && t.tools.length) ? t.tools : [];
@@ -679,7 +774,7 @@
           '</div></details>'
         : '';
       return '<div class="set-row ts-row' + (off ? ' ts-off' : '') + (inert ? ' ts-inert-row' : '') + '" data-id="' + esc(t.id) + '" style="--ci:' + (ri || 0) + '">' +
-          '<input type="checkbox" data-ts-toggle="' + esc(t.id) + '"' + (t.enabled ? ' checked' : '') + ' aria-label="Enable ' + esc(t.label) + '"' + (t.switchEffective ? '' : ' disabled data-tip="Full Access overrides this saved switch. Change authority first."') + '>' +
+          '<input type="checkbox" data-ts-toggle="' + esc(t.id) + '"' + (t.enabled ? ' checked' : '') + ' aria-label="Enable ' + esc(t.label) + ' for every agent"' + (t.switchEffective ? ' data-tip="Turns ' + esc(t.label) + ' on or off for every agent"' : ' disabled data-tip-below data-tip="FULL POWER overrides this saved switch. Change access first."') + '>' +
           '<span class="ts-glyph" aria-hidden="true">' + esc(t.glyph || '▪') + '</span>' +
           '<span class="ts-main">' +
             '<span class="ts-name">' + esc(t.label) + ' ' + status + consent +
@@ -693,8 +788,34 @@
     const tsAuthorityEl = body.querySelector('#ts-authority');
     const agents = H.present || [];
     tsAgentEl.innerHTML = agents.map(a => '<option value="' + esc(a.id) + '">' + esc(a.name || a.id) + '</option>').join('') || '<option value="">Station defaults</option>';
-    if (agents[H.sel]) tsAgentEl.value = agents[H.sel].id;
+    // ORG P21: open on the same agent the skills lane in this console shows (sent from a dossier, or the dossier's own)
+    const openOn = typeof H.skillsAgentId === 'function' ? H.skillsAgentId() : (agents[H.sel] && agents[H.sel].id);
+    if (openOn && agents.some(a => a.id === openOn)) tsAgentEl.value = openOn; else if (agents[H.sel]) tsAgentEl.value = agents[H.sel].id;
+    /* THE ACCESS LINE (UX night 10-26, Andrew: "pretend these users are like 5"). It read "NOVA · ASK — standing grants
+       apply · Trusted project folders. Revoke standing grants in Settings → Permissions. Capability grants shown here;
+       the current task, service connection and operating system can still limit execution." Now it says what this agent
+       may do in the ONE ACCESS words the dossier uses, gated the same way (ORG P21): FULL POWER only when the live
+       authority is unrestricted, else the agent's saved asking posture, else its own mix. The sidecar's exact how-to-undo
+       rides the tip. */
+    function tsAccessLine(a) {
+      const agent = agents.find(x => x && x.id === a.agentId);
+      const P = agent && typeof H.agentPostureOf === 'function' ? H.agentPostureOf(agent) : null;
+      const who = '<b>' + esc(a.name) + '</b>';
+      let html;
+      if (a.unrestricted) {
+        const from = a.source === 'environment' ? 'StarNet was started in full-access mode'
+          : a.source === 'station' ? 'FULL POWER is on for every agent in SETTINGS › PERMISSIONS' : 'set in its dossier, CONFIG › ACCESS';
+        html = who + ' is on <b>FULL POWER</b>: it never asks first and can use your whole computer. The switches below do not limit it <span class="dim">(' + esc(from) + ')</span>.';
+      } else if (P && P.approval === 'ask') {
+        html = who + ' is on <b>' + esc(P.label) + '</b>: ' + esc(P.agentBlurb) + ' <span class="dim">Change it in its dossier, CONFIG › ACCESS.</span>';
+      } else {
+        html = who + ' asks before risky steps, with its own mix of reach. <span class="dim">Change it in its dossier, CONFIG › ACCESS.</span>';
+      }
+      tsAuthorityEl.innerHTML = html;
+      tsAuthorityEl.dataset.tip = a.approvalLabel + ' · ' + a.filesystemLabel + '. ' + a.revoke;
+    }
     let tsRequest = 0;
+    const tsLabels = {};
     tsAgentEl.addEventListener('change', tsRefresh);
     body.querySelector('#ts-refresh').addEventListener('click', tsRefresh);
     async function tsRefresh() {
@@ -705,13 +826,14 @@
         if (request !== tsRequest || !body.isConnected) return;
         if (!j || j.error || !j.authority) throw new Error((j && j.error) || 'authority unavailable');
         const a = j.authority;
-        tsAuthorityEl.textContent = a.name + ' · ' + a.approvalLabel + ' · ' + a.filesystemLabel + '. ' + a.revoke + ' Capability grants shown here; the current task, service connection and operating system can still limit execution.';
+        tsAccessLine(a);
         const list = (j && j.toolsets) || [];
+        list.forEach(t => { if (t && t.id) tsLabels[t.id] = t.label || t.id; });   // the toast names the ability, not its id
         tsListEl.innerHTML = '<div class="ability-readout" aria-label="Selected agent toolset availability">' +
           '<div><b>' + list.filter(t => t.available).length + '</b><span>AVAILABLE</span></div>' +
           '<div><b>' + list.filter(t => tsAvailability(t) === 'NEEDS PROP').length + '</b><span>NEED A PROP</span></div>' +
           '<div><b>' + list.filter(t => !t.available && tsAvailability(t) !== 'NEEDS PROP').length + '</b><span>UNAVAILABLE</span></div></div>' +
-          '<p class="ability-legend">AVAILABLE means this agent has the capability through equipment or access settings. Service connections and task permissions still apply.</p>' +
+          '<p class="ability-legend">AVAILABLE means this agent has the capability right now; a task or a service can still say no. Each switch below applies to every agent.</p>' +
           list.map(tsRowHTML).join('');
         if (body.querySelector('#sp-connect')) setupSpotify(body);   // wire Spotify now the sp-* markup is in the JUKEBOX row
       } catch (_) { if (request !== tsRequest) return; tsAuthorityEl.textContent = 'Effective authority unavailable.'; tsListEl.innerHTML = '<div class="mc-detail">Cannot read current capabilities. Reopen ABILITIES after reconnecting.</div>'; }
@@ -724,13 +846,13 @@
         const r = await Harness.api.post('/api/toolsets/' + encodeURIComponent(id), { enabled });
         const j = r.j || {};
         if (!r.ok || j.error) { cb.checked = !enabled; sfx('bad'); notify('✕ ' + (j.error || 'toggle failed')); }
-        else { sfx('tick'); notify((enabled ? 'Enabled ' : 'Disabled ') + id, enabled ? 'good' : undefined); }
+        else { sfx('tick'); notify((tsLabels[id] || id) + (enabled ? ' on' : ' off') + ' for every agent', enabled ? 'good' : undefined); }
       } catch (e) { cb.checked = !enabled; sfx('bad'); notify('✕ ' + ((e && e.message) || 'request failed')); }
       cb.disabled = false;
       tsRefresh();
     });
     // The two non-toggle controls on a toolset row: unfold the rest of the tool chips, and cure an
-    // inert row by deep-linking its missing prop into REFIT.
+    // inert row by deep-linking its missing prop into BUILD MODE.
     tsListEl.addEventListener('click', ev => {
       const more = ev.target.closest('button[data-ts-more]');
       if (more) {
@@ -741,8 +863,8 @@
       const place = ev.target.closest('button[data-ts-place]');
       if (place) {
         sfx('click');
-        // H.placeGearForSkill minimizes this console, opens REFIT and arms the palette on the prop.
-        // No mapping for this objectType still opens REFIT + names the gear in a toast, which is the
+        // H.placeGearForSkill minimizes this console, opens BUILD MODE and arms the palette on the prop.
+        // No mapping for this objectType still opens BUILD MODE + names the gear in a toast, which is the
         // floor of acceptable — never a silent no-op.
         if (typeof H.placeGearForSkill === 'function') H.placeGearForSkill(place.dataset.tsPlace);
         else notify('Open ⚒ BUILD and place a ' + place.dataset.tsPlace + ' to grant these tools', 'warn');
@@ -805,7 +927,7 @@
 
     function resetForm() {
       editing = null;
-      formH.textContent = 'ADD A CONNECTOR';
+      formH.textContent = 'Add a service by its address';
       addBtn.textContent = '+ ADD & CONNECT';
       cancelBtn.style.display = 'none';
       idInput.disabled = false;
@@ -819,7 +941,7 @@
     // populate the form from an existing connector for EDIT (secrets stay blank = keep-saved).
     function startEdit(c) {
       editing = c.id;
-      formH.textContent = 'EDIT CONNECTOR — ' + (c.label || c.id);
+      formH.textContent = 'Edit service — ' + (c.label || c.id);
       addBtn.textContent = '✓ SAVE & RECONNECT';
       cancelBtn.style.display = '';
       idInput.disabled = true;
@@ -845,6 +967,7 @@
         const adv = body.querySelector('#mc-form .mc-adv');
         if (adv) adv.open = hKeys.length > 0 || !!(c.timeoutMs && c.timeoutMs !== 30000);
       }
+      const addFold = body.querySelector('#mc-add-fold'); if (addFold) addFold.open = true;   // the form is folded by default
       formH.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       idInput.focus();
       sfx('click');
@@ -861,6 +984,7 @@
       const detail = (c.state === 'error' && c.detail) ? '<div class="mc-detail">' + esc(c.detail) + '</div>' : '';
       const next = c.releaseDeferred ? (c.credentialSaved ? 'Saved connection retained.' : 'Unavailable in this release.') : !c.enabled ? 'Turn on the switch above to let agents use this service.'
         : c.oauth && (c.authRequired || !c.oauthAuthorized) ? 'Sign in below to restore access to this account.'
+        : c.catalogSignIn ? 'This service now connects by browser sign-in. SIGN IN below replaces the saved token only after you approve.'
         : c.state === 'error' ? 'Open the error details below, then reload to retry.'
         : '';
       const where = c.transport === 'stdio'
@@ -891,7 +1015,9 @@
           // http-bearer/stdio editor; there is no bearer to paste). A fresh browser consent is the only cure, so
           // the row always carries it — same engine as the catalog card's ▸ SIGN IN (ccSignIn), which is otherwise
           // unreachable here: the catalog card renders a disabled ✓ ADDED for every installed connector.
-          (c.oauth && !c.releaseDeferred ? '<button class="bb xs" data-act="resign" title="' + (c.id === 'google-files' ? 'choose files in Google’s picker">CHOOSE GOOGLE FILES' : c.oauthAuthorized
+          // catalogSignIn = a saved-token row whose catalog entry now signs in: the same engine, and its callback
+          // swaps the token for the grant only after consent (EDIT → OAUTH would drop the token first).
+          ((c.oauth || c.catalogSignIn) && !c.releaseDeferred ? '<button class="bb xs" data-act="resign" title="' + (c.id === 'google-files' ? 'choose files in Google’s picker">CHOOSE GOOGLE FILES' : c.oauthAuthorized
             ? 're-run the browser OAuth sign-in — the fix for a revoked or expired grant">⏼ RE-SIGN-IN'
             : 'open the browser OAuth sign-in">⏼ SIGN IN') + '</button>' : '') +
           (c.releaseDeferred ? '' :
@@ -905,7 +1031,8 @@
       try {
         const j = await Harness.api.get('/api/connectors');
         const list = (j && j.connectors) || []; lastList = list;
-        const storageError = j && j.credentialStorage && j.credentialStorage.error;
+        const storage = (j && j.credentialStorage) || {};
+        const storageError = storage.error;
         renderHandoffs(list);
         const overview = body.querySelector('#mc-overview');
         const notices = body.querySelector('#mc-notices');
@@ -913,30 +1040,51 @@
         const deferred = list.filter(c => c.releaseDeferred);
         const attention = list.filter(c => !c.releaseDeferred && (c.state === 'error' || c.authRequired)).length;
         overview.textContent = list.length + ' service' + (list.length === 1 ? '' : 's') + ' · ' + connected + ' connected' + (deferred.length ? ' · ' + deferred.length + ' deferred' : '') + (attention ? ' · ' + attention + ' need attention' : '');
+        // "0 services · 0 connected" over NOTHING CONNECTED YET said the same thing twice (UX night 10-26)
+        overview.hidden = !list.length && !storageError;
         // A release-wide explanation belongs once above the list, not in every saved service.
         notices.innerHTML = Array.from(new Set(deferred.map(c => c.detail).filter(Boolean))).map(note =>
           '<div class="mc-notice"><b>Service availability</b>' + esc(note) + '</div>').join('');
         if (storageError) {
           overview.textContent = 'Saved services unavailable';
           notices.innerHTML += '<div class="mc-notice"><b>Credential storage</b>' + esc(storageError) + '</div>';
-          listEl.innerHTML = '<div class="mc-detail">Your saved connections have not been erased. Unlock the credential store and restart StarNet.</div>';
+          // START FRESH is the exit the sidecar offers for a store it cannot open (wrong key, damaged, unrecognized):
+          // the old files are moved aside, never deleted, and every service is signed in again.
+          listEl.innerHTML = '<div class="mc-detail">Your saved connections have not been erased.' + storageNextStep(storage) + '</div>' +
+            (storage.canStartFresh ? '<div class="mc-acts"><button class="bb sm danger" id="mc-start-fresh" type="button">START FRESH</button></div>' : '');
+          const fresh = listEl.querySelector('#mc-start-fresh');
+          if (fresh && typeof ArmConfirm !== 'undefined' && ArmConfirm.wire) {
+            ArmConfirm.wire(fresh, {
+              armedLabel: 'SURE? SIGN IN AGAIN', restLabel: 'START FRESH', timeoutMs: 4000,
+              onArm: () => sfx('bad'),
+              onConfirm: async () => {
+                fresh.disabled = true;
+                let r = null;
+                try { r = await Harness.api.post('/api/connectors/storage/start-fresh', { confirm: true }); } catch (_) {}
+                if (r && r.ok) { sfx('ok'); notify(startFreshKeptText(r.j)); }
+                else { sfx('bad'); notify('START FRESH failed: ' + ((r && r.j && r.j.error) || 'the station did not answer')); }
+                refresh();
+              }
+            });
+          }
           return;
         }
+        notices.innerHTML += storageNoticeHtml(storage);
         if (list.length) {
           const expanded = new Set(Array.from(listEl.querySelectorAll('.mc-inspect[open]')).map(el => el.closest('.mc-row').dataset.id));
           listEl.innerHTML = list.map(row).join('');
           listEl.querySelectorAll('.mc-inspect').forEach(el => { el.open = expanded.has(el.closest('.mc-row').dataset.id); });
         }
         else {
+          // the way in for almost everyone is an app from APPS; a service by its own address is the fold below
           listEl.innerHTML = '<div class="empty-state"><span class="es-glyph">⧉</span>' +
-            '<b>NO CONNECTORS YET</b><span>Attach an MCP server to give your agents external tools — GitHub, Slack, a database.</span>' +
-            '<button class="es-cta" id="mc-empty-cta" type="button">+ ADD A CONNECTOR</button></div>';
-          const cta = listEl.querySelector('#mc-empty-cta');
-          if (cta) cta.addEventListener('click', () => { sfx('click'); const idf = body.querySelector('#mc-id'); if (idf) idf.focus(); });
+            '<b>NOTHING CONNECTED YET</b><span>Connect an app like Gmail, Notion or GitHub from APPS.</span>' +
+            '<button class="es-cta" id="mc-empty-cta" type="button" data-ab-to="catalog">⊞ OPEN APPS</button></div>';
         }
         wireRemoveButtons();
       } catch (_) {
-        body.querySelector('#mc-overview').textContent = 'Service status unavailable';
+        const overview = body.querySelector('#mc-overview');
+        overview.textContent = 'Service status unavailable'; overview.hidden = false;
         body.querySelector('#mc-notices').textContent = '';
         listEl.innerHTML = '<div class="mc-detail">Could not read connections. Retry when the station is available.</div>';
       }
@@ -1099,6 +1247,11 @@
     const ccMsgEl = body.querySelector('#cc-msg');
     let ccCache = [];   // flat catalog entries, so a click reads the authoritative id/url/name (never re-typed)
     let ccAlternatives = new Map();
+    // CATEGORY FOLDS (UX night 10-25): eighteen categories as one ~23,000px wall was the catalog a newcomer met. Popular
+    // stays open; every other category is a one-line fold with its count, so the whole catalog reads as an index.
+    // A fold the Commander opens or closes stays that way while the window lives (refreshes re-render every card).
+    const ccFoldOpen = new Map();
+    const ccDefaultOpen = cat => ccFoldOpen.has(cat) ? ccFoldOpen.get(cat) : cat === 'Popular';
     const ccEntry = id => ccCache.find(x => (x.catalogId || x.id) === id);
     const ccPending = new Set();   // connector ids with an in-flight OAuth sign-in (guards duplicate popups/pollers)
     const ccTimers = new Map();    // id -> live poll interval, so a CANCEL / panel-close can clear it (EL-11 #13)
@@ -1128,14 +1281,25 @@
       const cardId = e.catalogId || e.id;
       const chip = e.platformApi && e.unattendedSupported === false
         ? ['', 'manual setup', 'var(--gold)']
+        : e.appPassword ? ['', 'app password', 'var(--gold)']
+        : e.signInHeld ? ['', 'blocked by Google', 'var(--gold)']
         : (e.signInAvailable === false ? ['', e.releaseDeferred ? 'deferred' : 'sign-in unavailable', 'var(--gold)'] : (CC_CHIP[e.authType] || CC_CHIP.none));
       const origin = e.googleApi ? '<span class="cc-badge cc-official" title="StarNet connector using Google’s APIs">STARNET · GOOGLE API</span>' : e.platformApi
-        ? '<span class="cc-badge cc-official" title="first-party REST API documented by the vendor">✓ official API</span>'
+        ? (e.apiVia ? '<span class="cc-badge cc-community" title="this vendor publishes no API of its own">via ' + esc(e.apiVia) + '</span>'
+                    : '<span class="cc-badge cc-official" title="first-party REST API documented by the vendor">✓ official API</span>')
         : (e.official ? '<span class="cc-badge cc-official" title="first-party server, run by the vendor">✓ official</span>'
                       : '<span class="cc-badge cc-community" title="community-run server">community</span>');
       let action;
-      if (e.installed) action = '<button class="bb xs" data-cc-act="manage" data-id="' + esc(cardId) + '">MANAGE SERVICE</button>';
+      if (e.installed) action = '<button class="bb xs" data-cc-act="manage" data-id="' + esc(cardId) + '">MANAGE SERVICE</button>' +
+        // a rejected or revoked app password is fixed HERE (the login error says so): re-open the same form
+        (e.appPassword ? '<button class="bb xs" data-cc-act="key" data-id="' + esc(cardId) + '">NEW APP PASSWORD</button>' : '');
       else if (e.platformApi) action = '<button class="bb xs" data-cc-act="platform" data-id="' + esc(cardId) + '">SET UP API KEY</button>';
+      // Google blocks this sign-in outright: the card's one action opens the connection that works (Gmail -> app password)
+      else if (e.signInHeld && e.useInstead) {
+        const use = ccEntry(e.useInstead);
+        action = '<button class="bb xs" data-cc-act="use" data-id="' + esc(cardId) + '" data-use="' + esc(e.useInstead) + '">' +
+          (use && use.appPassword ? 'SET UP APP PASSWORD' : 'USE ' + esc(String((use && use.name) || e.useInstead).toUpperCase())) + '</button>';
+      }
       else if (e.googleApi && e.signInAvailable === false) action =
         '<button class="bb xs" disabled>' + (e.releaseDeferred ? 'DEFERRED' : 'GOOGLE SIGN-IN UNAVAILABLE') + '</button>';
       else if (e.authType === 'oauth') action = e.url
@@ -1144,12 +1308,24 @@
           // url-less oauth entry reachable through an aggregator: a LIVE jump to that card, never a mute dead button.
           ? '<button class="bb xs" data-cc-act="via" data-id="' + esc(cardId) + '" data-via="' + esc(e.via) + '" title="no direct endpoint — jump to the connector that reaches it">▸ VIA ' + esc(e.via.toUpperCase()) + '</button>'
           : '<button class="bb xs" data-cc-act="soon" disabled title="not directly wired yet — see the note">SOON</button>');   // an oauth entry with no endpoint and no aggregator is honestly not sign-in-able
-      else if (e.authType === 'apikey') action = '<button class="bb xs" data-cc-act="key" data-id="' + esc(cardId) + '">SET UP API KEY</button>';
+      else if (e.authType === 'apikey') action = '<button class="bb xs" data-cc-act="key" data-id="' + esc(cardId) + '">' + (e.appPassword ? 'SET UP APP PASSWORD' : 'SET UP API KEY') + '</button>';
       else action = '<button class="bb sm" data-cc-act="add" data-id="' + esc(cardId) + '">+ ADD</button>';
       const keyDelivery = e.keyHeader
         ? '<code>' + esc(e.keyHeader) + ': &hellip;</code>'
         : '<code>Authorization: Bearer &hellip;</code>';
-      const keyField = (e.authType === 'apikey' || e.deviceFlow) && !e.platformApi
+      const keyField = e.appPassword
+        // address FIRST: both Google links then open as that account (authuser), so a browser signed in to several
+        // Google accounts never mints the password on the wrong one (the #1 cause of "Gmail did not accept")
+        ? '<div class="cc-key cc-apppw" style="display:none"><div class="mc-hint">1. Your Gmail address:</div>' +
+            '<input type="text" inputmode="email" class="key-input" data-cc-addr="' + esc(cardId) + '" aria-label="Gmail address" placeholder="you@gmail.com" autocomplete="off" spellcheck="false">' +
+            '<div class="mc-hint">2. Turn on 2-Step Verification for that account. <a data-g-acct="https://myaccount.google.com/signinoptions/two-step-verification" href="https://myaccount.google.com/signinoptions/two-step-verification" target="_blank" rel="noopener">2-Step Verification ↗</a>' +
+            '<br>3. Create an app password (any name, for example StarNet). <a data-g-acct="' + esc(e.homepage || 'https://myaccount.google.com/apppasswords') + '" href="' + esc(e.homepage || 'https://myaccount.google.com/apppasswords') + '" target="_blank" rel="noopener">Create app password ↗</a>' +
+            '<br>Both links open Google as the address above.' +
+            '<br>4. Paste the 16-letter app password, then choose CONNECT.</div>' +
+            '<input type="password" class="key-input" data-cc-key="' + esc(cardId) + '" aria-label="Google app password" placeholder="16-letter app password" autocomplete="off" spellcheck="false">' +
+            '<div class="mc-hint">This uses an app password, not Google sign-in. StarNet talks to Gmail directly from this computer (IMAP and SMTP); the password is saved with your other connector credentials on this computer and never shown again.' +
+            ' Mail read through this connection is never sent to StarNet Managed. On a work or school account, an administrator can turn app passwords off. Remove the connection or revoke the app password in your Google account at any time.</div></div>'
+        : (e.authType === 'apikey' || e.deviceFlow) && !e.platformApi
         ? '<div class="cc-key" style="display:none"><div class="mc-hint">1. Open your ' + esc(e.name) + ' account and create an API key or token. ' + (e.homepage ? '<a href="' + esc(e.homepage) + '" target="_blank" rel="noopener">Open ' + esc(e.name) + ' ↗</a>' : '') + '<br>2. Paste it below, then choose CONNECT.</div><input type="password" class="key-input" data-cc-key="' + esc(cardId) + '" aria-label="' + esc(e.name) + ' API key or token" placeholder="' + esc(e.name) + ' API key / token" autocomplete="off" spellcheck="false">' +
             '<div class="mc-hint">Stored locally by the sidecar, sent as ' + keyDelivery + ', never displayed again.</div></div>'
         : '';
@@ -1171,6 +1347,7 @@
       const setupHint = e.installed ? 'Setup saved — manage access or reconnect.'
         : e.signInAvailable === false ? (e.signInMessage || 'Sign-in is unavailable in this build.')
         : e.platformApi ? (e.unattendedSupported === false ? 'Manual setup required. See the service instructions before adding a key.' : 'Requires an API key from your account. Guided setup opens the key form.')
+        : e.appPassword ? 'Needs a Google app password.'
         : e.authType === 'apikey' ? 'Requires an API key or token from your account.'
         : e.authType === 'oauth' ? (e.url ? 'Sign in in your browser, then return here to check the connection.' : 'Connect through the service shown below.')
         : e.local ? 'Start the local service first, then connect.' : 'No account credentials needed.';
@@ -1181,25 +1358,26 @@
           ' style="--ci:' + (ci || 0) + '">' +
           '<div class="cc-head">' + ccSeal(e) + '<div class="cc-identity"><b>' + esc(e.name) + '</b>' +
             '<span class="cc-chip" style="color:' + chip[2] + '" title="' + esc(chip[1]) + '">' + (chip[0] ? chip[0] + ' ' : '') + esc(chip[1]) + '</span></div></div>' +
-          '<div class="cc-blurb dim">' + esc(e.blurb) + '</div>' + '<details class="cc-details"><summary>Connection details</summary><div class="cc-details-body">' + clientField + origin + presets + platformMeta + (e.installed ? '<div class="mc-hint">' + (e.releaseDeferred ? 'Saved connection retained. Open Manage Service to view or remove it.' : 'Setup saved. Open Manage Service to check access or reconnect.') + '</div>' : '') + '</div></details>' + keyField +
+          (e.appPassword ? '<div class="cc-blurb dim" data-tip="' + esc(e.blurb) + '">IMAP · SMTP · app password</div>' : '<div class="cc-blurb dim">' + esc(e.blurb) + '</div>') + '<details class="cc-details"><summary>Connection details</summary><div class="cc-details-body">' + clientField + origin + presets + platformMeta + (e.installed ? '<div class="mc-hint">' + (e.releaseDeferred ? 'Saved connection retained. Open Manage Service to view or remove it.' : 'Setup saved. Open Manage Service to check access or reconnect.') + '</div>' : '') + '</div></details>' + keyField +
           '<div class="mc-hint cc-setup-hint">' + esc(setupHint) + '</div>' +
           '<div class="cc-acts">' + action + home + '</div>' + (e.deviceFlow && !e.installed ? '<details><summary>Use a personal access token instead</summary><button class="bb xs" data-cc-act="key" data-id="' + esc(cardId) + '">SET UP TOKEN</button></details>' : '') +
         '</div>';
     }
     function ccGroupHTML(g) {
       if (!g.connectors || !g.connectors.length) return '';
-      return '<div class="cc-group"><div class="sec"><span class="sec-l">' + esc(g.category) + '</span>' +
-          '<span class="sec-tag">' + g.connectors.length + '</span><span class="sec-r"></span><span class="sec-nd"></span></div>' +
+      return '<details class="cc-group" data-cat="' + esc(g.category) + '"' + (ccDefaultOpen(g.category) ? ' open' : '') + '>' +
+          '<summary class="sec"><span class="sec-l">' + esc(g.category) + '</span>' +
+          '<span class="sec-tag">' + g.connectors.length + '</span><span class="sec-r"></span><span class="sec-nd"></span></summary>' +
         (g.category === 'Popular' ? '<p class="mc-hint">A curated starting point for everyday work.</p>' : '') +
         '<div class="cc-grid">' + g.connectors.map((e, i) => {
           const alternate = ccAlternatives.get(e.catalogId || e.id);
           return alternate ? '<div class="cc-service">' + ccCard(e, i) + '<details class="cc-alternatives"><summary>Advanced: ' + esc(e.name) + ' API connection</summary>' + ccCard(alternate, i) + '</details></div>' : ccCard(e, i);
-        }).join('') + '</div></div>';
+        }).join('') + '</div></details>';
     }
     // Editorial picks, not a claim about measured customer usage. Move rather than duplicate
     // cards so sign-in progress, search results and saved-service counts have one owner.
     function ccPopularGroups(groups) {
-      const picks = ['gmail', 'google-drive', 'google-calendar', 'notion', 'github', 'canva', 'linear', 'stripe', 'asana', 'clickup'];
+      const picks = ['gmail', 'gmail-app-password', 'google-drive', 'google-calendar', 'notion', 'github', 'canva', 'linear', 'stripe', 'asana', 'clickup'];
       const entries = groups.flatMap(g => g.connectors);
       const popular = picks.map(id => entries.find(e => e.id === id && !e.platformApi && e.signInAvailable !== false && !e.releaseDeferred && e.url)).filter(Boolean).slice(0, 8);
       const selected = new Set(popular);
@@ -1281,6 +1459,9 @@
         const tag = g.querySelector('.sec-tag');
         if (tag) tag.textContent = String(vis);
         shown += vis;
+        // a picked tier is already the short list, so every category it leaves shows its cards; ALL is the index again.
+        // While searching, the console search owns the folds (it opens the ones holding a hit and closes them after).
+        if (!body.classList.contains('con-searching')) g.open = ccFilter !== 'all' || ccDefaultOpen(g.dataset.cat);
       });
       // An empty result is a real answer and must say which filter produced it — never a blank pane.
       let none = ccListEl.querySelector('.cc-nores');
@@ -1308,6 +1489,12 @@
     if (ccFiltersEl) ccFiltersEl.addEventListener('click', ev => {
       const b = ev.target.closest('button[data-cc-filter]'); if (!b) return;
       ccSetFilter(b.dataset.ccFilter); sfx('tick');
+    });
+    // remember the Commander's own fold choice (a click on the category line; Enter/Space on it clicks too). The click
+    // lands before the fold toggles, so the choice is the opposite of its state now.
+    if (ccListEl) ccListEl.addEventListener('click', ev => {
+      const head = ev.target.closest('summary'); const g = head && head.parentElement;
+      if (g && g.matches('details.cc-group')) ccFoldOpen.set(g.dataset.cat, !g.open);
     });
     // SEARCH BEATS THE TIER FILTER. The console search (stationui doFilter) marks a matching card
     // `.con-hit`, but a card this filter set `hidden` stays display:none — so searching "stripe" with
@@ -1343,7 +1530,7 @@
       const out = msgOut || ccMsgEl;
       if (ccPending.has(id)) { sfx('bad'); out.classList.remove('ok'); out.textContent = 'a sign-in is already in progress for this connector…'; return; }
       const e = ccEntry(id); const label = labelOverride || (e && e.name) || id;
-      if (e && e.releaseDeferred) { out.classList.remove('ok'); out.textContent = e.signInMessage; return; }
+      if (e && (e.releaseDeferred || e.signInHeld)) { out.classList.remove('ok'); out.textContent = e.signInMessage; return; }
       // Disclose the actual model/data path in the app immediately before Google consent.
       // No OAuth attempt exists until the explicit Continue action; dismissing this panel is not consent.
       if (!googleDisclosed && ((e && e.googleApi) || /^(gmail|google-(drive|calendar|docs|sheets))$/.test(id))) {
@@ -1416,7 +1603,10 @@
         tries++;
         try {
           const j = await Harness.api.get('/api/connectors');
-          const c = (j.connectors || []).find(x => x.id === id);
+          const found = (j.connectors || []).find(x => x.id === id);
+          // Only an OAuth row is proof of a finished sign-in: a saved-token row moving to sign-in (catalogSignIn) is
+          // already up — or already erroring — before consent, and stays non-oauth until the callback lands.
+          const c = found && found.oauth ? found : null;
           if (c && c.state === 'up') { stopCcPoll(id); ccPending.delete(id); ccPendingWin.delete(id); ccAttempts.delete(id); sfx('click'); notify('Connector "' + label + '" connected', 'good'); out.classList.add('ok'); out.textContent = '✓ ' + label + ' signed in — ' + (c.toolCount || 0) + ' tool(s)'; ccRefresh(); refresh(); try { if (win && !win.closed) win.close(); } catch (_) {} return; }
           if (c && c.state === 'error' && (!c.oauth || c.oauthAuthorized)) { stopCcPoll(id); ccPending.delete(id); ccPendingWin.delete(id); ccAttempts.delete(id); sfx('bad'); out.textContent = '✕ ' + label + ' — ' + (c.detail || 'connection failed'); ccRefresh(); refresh(); return; }
         } catch (_) {}
@@ -1506,14 +1696,14 @@
       if (act === 'manage') {
         const entry = ccEntry(id);
         if (!entry) return;
-        const tab = body.querySelector('#con-tab-connectors-' + (entry.platformApi ? 'keys' : 'mcp'));
+        const tab = body.querySelector('#con-tab-connectors-mcp');   // CONNECTED holds both services and API keys
         if (tab) tab.click();
-        if (entry.platformApi) { await kyRefresh(); await kyPlatformsRefresh(); }
+        if (entry.platformApi) { await kyRefresh(); await kyPlatformsRefresh(); const keysH = body.querySelector('#ab-keys'); if (keysH && host) host.scrollTop = Math.max(0, keysH.offsetTop - host.offsetTop - 8); }
         else {
           await refresh();
           const target = Array.from(listEl.querySelectorAll('.mc-row')).find(r => r.dataset.id === entry.id);
           if (target) ccFlash(target);
-          else { msgEl.classList.remove('ok'); msgEl.textContent = 'This saved connection is no longer listed. Return to CATALOG and refresh to check its setup.'; }
+          else { msgEl.classList.remove('ok'); msgEl.textContent = 'This saved connection is no longer listed. Go back to APPS and refresh to check its setup.'; }
         }
       }
       else if (act === 'add') { btn.disabled = true; await ccInstall(id); }
@@ -1526,10 +1716,35 @@
         const card = ev.target.closest('.cc-card');
         const wrap = card && card.querySelector('.cc-key');
         const input = wrap && wrap.querySelector('input[data-cc-key]');
-        if (wrap && wrap.style.display === 'none') { wrap.style.display = ''; btn.textContent = '▶ CONNECT'; if (input) input.focus(); sfx('tick'); return; }
-        const token = ((input && input.value) || '').trim();
+        const addrIn = wrap && wrap.querySelector('input[data-cc-addr]');
+        // the class (not the inline style) is what menu-glass.css's :has() keys on: a :has() reading [style] re-checks on every inline-style write in the page
+        if (wrap && wrap.style.display === 'none') { wrap.style.display = ''; wrap.classList.add('cc-key-open'); btn.textContent = '▶ CONNECT'; if (addrIn || input) (addrIn || input).focus(); sfx('tick'); return; }
+        let token = ((input && input.value) || '').trim();
+        if (addrIn) {
+          const addr = (addrIn.value || '').trim();
+          if (!addr || !token) { sfx('bad'); ccMsgEl.classList.remove('ok'); ccMsgEl.textContent = 'enter your Gmail address and the 16-letter app password first'; return; }
+          token = addr + ':' + token.replace(/\s+/g, '');
+          input.value = '';   // the password never lingers in the page
+        }
         if (!token) { sfx('bad'); ccMsgEl.classList.remove('ok'); ccMsgEl.textContent = 'paste the API key first'; return; }
         btn.disabled = true; await ccInstall(id, token);
+      }
+      else if (act === 'use') {
+        // a sign-in Google blocks: go to the card that works and open its setup (Gmail -> the app-password form)
+        const useId = btn.dataset.use;
+        const target = ccListEl.querySelector('.cc-card[data-id="' + (window.CSS && CSS.escape ? CSS.escape(useId) : useId) + '"]');
+        if (!target) { ccMsgEl.classList.remove('ok'); ccMsgEl.textContent = '✕ the "' + useId + '" connector is not in the catalog'; sfx('bad'); return; }
+        for (let p = target.parentElement; p; p = p.parentElement) { if (p.tagName === 'DETAILS') p.open = true; }   // its category may be folded
+        const wrap = target.querySelector('.cc-key');
+        const keyBtn = target.querySelector('button[data-cc-act="key"]');
+        if (wrap && keyBtn && wrap.style.display === 'none') keyBtn.click();   // a closed form's first tap only reveals it, never submits
+        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        target.classList.remove('cc-jump'); void target.offsetWidth;   // restart the flash on a re-click
+        target.classList.add('cc-jump');
+        setTimeout(() => target.classList.remove('cc-jump'), 2500);
+        const e = ccEntry(id);
+        ccMsgEl.classList.remove('ok'); ccMsgEl.textContent = (e && e.signInMessage) || '';
+        sfx('tick');
       }
       else if (act === 'signin') { btn.disabled = true; await ccSignIn(id); btn.disabled = false; }
       else if (act === 'signin-cancel') { ccCancelSignIn(id); }
@@ -1541,12 +1756,25 @@
         ccMsgEl.classList.remove('ok');
         if (!target || !v) { ccMsgEl.textContent = '✕ the "' + viaId + '" connector is not in the catalog'; sfx('bad'); return; }
         ccMsgEl.textContent = ((e && e.name) || id) + ' connects through ' + v.name + ' — add ' + v.name + ' with one API key.';
+        for (let p = target.parentElement; p; p = p.parentElement) { if (p.tagName === 'DETAILS') p.open = true; }   // its category may be folded
         target.scrollIntoView({ behavior: 'smooth', block: 'center' });
         target.classList.remove('cc-jump'); void target.offsetWidth;   // restart the flash on a re-click
         target.classList.add('cc-jump');
         setTimeout(() => target.classList.remove('cc-jump'), 2500);
         sfx('tick');
       }
+    });
+    // The app-password form's Google links follow the typed address (authuser), so they open THAT account.
+    ccListEl.addEventListener('input', ev => {
+      const addrIn = ev.target.closest('input[data-cc-addr]'); if (!addrIn) return;
+      const addr = addrIn.value.trim(), wrap = addrIn.closest('.cc-apppw');
+      if (wrap) wrap.querySelectorAll('a[data-g-acct]').forEach(a => {
+        try {
+          const u = new URL(a.dataset.gAcct);
+          if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(addr)) u.searchParams.set('authuser', addr);
+          a.href = u.href;
+        } catch (_) {}
+      });
     });
     ccRefresh();
 
@@ -1558,11 +1786,15 @@
     const kyKeyEl = body.querySelector('#ky-key');
     const kyDocsEl = body.querySelector('#ky-docs');
     kyNameEl.addEventListener('input', () => { body.querySelector('#ky-guide').hidden = true; });
+    // a 1Password reference is not a secret (it names where the key lives): show it while it is typed or pasted
+    const kyIsRef = v => /^op:\/\//i.test(String(v || '').trim());
+    kyKeyEl.addEventListener('input', () => { kyKeyEl.type = kyIsRef(kyKeyEl.value) ? 'text' : 'password'; });
     // CATALOG owns discovery; KEYS owns the credential. A platform card lands on the real add form and
     // carries only public setup metadata from /api/servicekeys/catalog — never a secret or invented state.
     function ccPrefillPlatform(p) {
-      const tab = body.querySelector('#con-tab-connectors-keys');
+      const tab = body.querySelector('#con-tab-connectors-mcp');   // the key form lives in CONNECTED › API KEYS
       if (tab) tab.click();
+      const keyFold = body.querySelector('#ky-add-fold'); if (keyFold) keyFold.open = true;
       kyNameEl.value = p.name;
       kyKeyEl.value = '';
       kyDocsEl.value = p.docsUrl || '';
@@ -1577,52 +1809,68 @@
         : (p.authHint
           ? 'paste your ' + p.name + ' key — the agent will send it as  ' + p.authHint
           : 'paste your ' + p.name + ' key — the agent reads ' + (p.docsUrl || 'the docs') + ' for the right header');
-      if (host) host.scrollTop = host.scrollHeight;
+      if (host && keyFold) host.scrollTop = Math.max(0, keyFold.offsetTop - host.offsetTop - 8);
       kyKeyEl.focus();
       sfx('click');
     }
     // TOP: platforms whose credential is a saved key/token on a live connector config. Read-only here — each is
     // managed where it was added (its CATALOG card / MCP CONNECTORS row). hasToken/hasHeaders are the backend's honest flags;
     // we never see (or show) the value. OAuth connectors are keyless by design and stay off this list.
+    // the keyed-platform group (and the label that tells the two groups apart) shows only when it has something to say
+    function kyPlatShown(on) {
+      kyPlatEl.hidden = !on;
+      const head = body.querySelector('#ky-plat-head'); if (head) head.hidden = !on;
+      const mine = body.querySelector('#ky-mine-head'); if (mine) mine.hidden = !on;
+    }
     async function kyPlatformsRefresh() {
       try {
         const [cRes, gRes] = await Promise.all([readJSON('/api/connectors'), readJSON('/api/connectors/catalog')]);
         // The CONNECTORS read is what decides "you have none" — if it failed, say so instead of asserting zero.
         // The catalog is only display sugar (names); a failed catalog degrades labels, never the count.
-        if (!cRes.ok) { kyPlatEl.innerHTML = readFailLine(cRes, 'sidecar offline — start it to see connected platforms.'); return; }
+        if (!cRes.ok) { kyPlatShown(true); kyPlatEl.innerHTML = readFailLine(cRes, 'sidecar offline — start it to see connected platforms.'); return; }
         const cj = cRes.json, gj = gRes.json;
         const byId = {};
         for (const e of ((gj && gj.connectors) || [])) byId[e.id] = e;
         const keyed = ((cj && cj.connectors) || []).filter(c => (c.hasToken || c.hasHeaders) && !c.oauth);
         const n = body.querySelector('#ky-plat-n'); if (n) n.textContent = String(keyed.length);
-        if (!keyed.length) {
-          // The sentence named a destination and gave nothing to click — the same dead-end shape as the
-          // inert toolset row. `data-ab-to` is the front door's own jump contract, handled by the router.
-          kyPlatEl.innerHTML = '<div class="mc-detail">No keyed platform connected yet — add one from the CATALOG (the entries marked <b style="color:var(--gold)">API key</b>). ' +
-            '<button type="button" class="bb xs" data-ab-to="catalog">⊞ OPEN CATALOG</button></div>';
-          return;
-        }
+        // none: the group stays out of sight; the key list's own empty line already points at APPS
+        kyPlatShown(keyed.length > 0);
+        if (!keyed.length) { kyPlatEl.innerHTML = ''; return; }
         kyPlatEl.innerHTML = keyed.map((c, i) => {
           const cat = byId[c.id];
           const b = c.state === 'up' ? ['var(--ok)', '● connected'] : (c.state === 'cached' ? ['var(--gold)', '◐ idle · starts on use'] : (c.state === 'error' ? ['var(--bad)', '✕ error'] : ['var(--ph-dim)', '○ ' + esc(c.state || 'off')]));
           return '<div class="mc-row" style="--ci:' + i + '">' +
             '<div class="mc-top"><b>' + esc((cat && cat.name) || c.label || c.id) + '</b> <span class="dim">' + esc(c.id) + '</span>' +
               '<span class="mc-state" style="color:' + b[0] + '">' + b[1] + (c.toolCount ? ' · ' + c.toolCount + ' tool' + (c.toolCount === 1 ? '' : 's') : '') + '</span></div>' +
-            '<div class="mc-url dim"><span class="mc-tag">' + (c.hasHeaders && !c.hasToken ? 'header saved' : 'token saved') + '</span> managed in ' + (cat ? 'CATALOG' : 'MCP CONNECTORS') + '</div>' +
+            '<div class="mc-url dim"><span class="mc-tag">' + (c.hasHeaders && !c.hasToken ? 'header saved' : 'token saved') + '</span> managed in ' + (cat ? 'APPS' : 'CONNECTED › SERVICES') + '</div>' +
           '</div>';
         }).join('');
-      } catch (_) { kyPlatEl.innerHTML = '<div class="mc-detail">sidecar offline — start it to see connected platforms.</div>'; }
+      } catch (_) { kyPlatShown(true); kyPlatEl.innerHTML = '<div class="mc-detail">sidecar offline — start it to see connected platforms.</div>'; }
     }
     // BOTTOM: the custom store. Checkbox = kill-switch (key stays saved, agents stop seeing it); ✕ deletes.
+    // "read 4 min ago" from the sidecar's own read time (refReadAt) — never a client-side guess
+    function kyReadAgo(t) {
+      const s = Math.max(0, Math.round((Date.now() - Number(t || 0)) / 1000));
+      return s < 60 ? 'just now' : (s < 3600 ? Math.round(s / 60) + ' min ago' : Math.round(s / 3600) + ' h ago');
+    }
     function kyRow(k, i) {
       const unattendedSupported = k.unattendedSupported !== false;
       const docs = k.docsUrl ? ' <a class="dim" href="' + esc(k.docsUrl) + '" target="_blank" rel="noopener">docs ↗</a>' : '';
+      // A 1Password row is "live" only when the sidecar actually holds a value it read (refReady); until the first
+      // read it says it reads on use, and a failed read says why in the row itself.
+      const op = k.source === '1password';
+      const notYet = op && !k.refReady && /^not read yet/.test(k.refError || '');
+      const state = !k.enabled ? ['var(--ph-dim)', '○ off']
+        : (!op || k.refReady ? ['var(--ok)', '● live for agents']
+          : (notYet ? ['var(--gold)', '◐ reads from 1Password on use'] : ['var(--bad)', '✕ 1Password not read']));
       return '<div class="mc-row" data-id="' + esc(k.id) + '" style="--ci:' + (i || 0) + '">' +
         '<div class="mc-top">' +
           '<span class="set-row mc-enable"><input type="checkbox" data-ky-act="toggle"' + (k.enabled ? ' checked' : '') + ' aria-label="Enable key ' + esc(k.name) + '"></span>' +
-          '<b>' + esc(k.name) + '</b> <span class="dim">' + esc(k.last4) + '</span>' +
-          '<span class="mc-state" style="color:' + (k.enabled ? 'var(--ok)' : 'var(--ph-dim)') + '">' + (k.enabled ? '● live for agents' : '○ off') + '</span></div>' +
+          '<b>' + esc(k.name) + '</b> <span class="dim">' + esc(op ? '1Password' : k.last4) + '</span>' +
+          '<span class="mc-state" style="color:' + state[0] + '">' + state[1] + '</span></div>' +
         '<div class="mc-url dim">env var <code>' + esc(k.envVar) + '</code>' + docs + '</div>' +
+        (op ? '<div class="mc-url dim">from <code>' + esc(k.ref) + '</code>' + (k.refReady && k.refReadAt ? ' · read ' + kyReadAgo(k.refReadAt) : '') + '</div>' +
+          (k.refError && !notYet ? '<div class="mc-url" style="color:' + (k.refReady ? 'var(--gold)' : 'var(--bad)') + '">' + esc(k.refError) + '</div>' : '') : '') +
         // THE UNATTENDED GRANT, stated plainly. `enabled` = an agent may spend this while you watch;
         // this second switch = ...and while you don't (cron, Night Shift, a Telegram message). Default OFF
         // and never inferred, so pasting a key can't silently change what happens overnight.
@@ -1631,7 +1879,7 @@
           '<span class="dim">' + (!unattendedSupported
             ? 'watched sessions only — ' + esc(k.unattendedReason || 'unattended use is unsupported')
             : (k.autonomous
-              ? 'usable in scheduled &amp; messaged runs'
+              ? 'usable in scheduled &amp; messaged runs' + (op ? ' while 1Password can answer without you (unlocked, or a service account)' : '')
               : 'watched sessions only — tick to allow scheduled &amp; messaged runs')) + '</span></div>' +
         '<div class="mc-acts"><button class="bb xs danger" data-ky-act="remove">✕ REMOVE</button></div>' +
       '</div>';
@@ -1644,13 +1892,16 @@
       const list = (res.json && res.json.keys) || [];
       const n = body.querySelector('#ky-mine-n'); if (n) n.textContent = String(list.length);
       kyListEl.innerHTML = list.length ? list.map(kyRow).join('')
-        : '<div class="mc-detail">No API keys connected yet — choose a platform in CATALOG, or add a custom key below.</div>';
+        : '<div class="mc-detail">No API keys yet. Pick an app in APPS, or add your own key below. ' +
+          '<button type="button" class="bb xs" data-ab-to="catalog">⊞ OPEN APPS</button></div>';
     }
     body.querySelector('#ky-add').addEventListener('click', async () => {
       const name = (kyNameEl.value || '').trim(), key = (kyKeyEl.value || '').trim(), docsUrl = (kyDocsEl.value || '').trim();
       kyMsgEl.classList.remove('ok');
       if (!name) { kyMsgEl.textContent = 'give the platform a name first'; sfx('bad'); kyNameEl.focus(); return; }
       if (!key) { kyMsgEl.textContent = 'paste the API key'; sfx('bad'); kyKeyEl.focus(); return; }
+      // the sidecar reads a reference before it answers: say so, since 1Password may be asking for approval right now
+      if (kyIsRef(key)) kyMsgEl.textContent = 'reading from 1Password — approve StarNet in the 1Password app if it asks…';
       try {
         // a non-JSON refusal parses to {} — without the r.ok check that {} reads as "saved".
         // A body that carries `key` is a structured verdict (saved:false = live-this-session,
@@ -1659,13 +1910,17 @@
         const j = await r.json().catch(() => ({}));
         if (!j.key && (!r.ok || j.error)) { kyMsgEl.textContent = '✕ ' + (j.error || ('the station refused (HTTP ' + r.status + ') — the key was NOT saved')); sfx('bad'); return; }
         // saved:false still means LIVE this session — surface the persistence truth instead of a flat "saved".
-        kyMsgEl.classList.toggle('ok', j.saved !== false);
+        // A 1Password reference is saved even when the read failed; the message says which happened.
+        const opUnread = !!(j.key && j.key.source === '1password' && !j.key.refReady);
+        kyMsgEl.classList.toggle('ok', j.saved !== false && !opUnread);
         kyMsgEl.textContent = j.saved === false
           ? '⚠ ' + name + ' is active for this session, but saving to disk failed — it may not survive a restart'
-          : '✓ ' + name + ' saved — agents can use ' + ((j.key && j.key.envVar) || 'it') + ' in their shell';
-        sfx(j.saved === false ? 'bad' : 'click');
-        if (j.saved !== false) notify('Key "' + name + '" saved', 'good');
-        kyNameEl.value = ''; kyKeyEl.value = ''; kyDocsEl.value = '';
+          : (opUnread
+            ? '⚠ ' + name + ' saved, but 1Password could not be read: ' + (j.key.refError || 'no answer') + ' — agents get ' + j.key.envVar + ' once it can'
+            : '✓ ' + name + ' saved' + (j.key && j.key.source === '1password' ? ' and read from 1Password' : '') + ' — agents can use ' + ((j.key && j.key.envVar) || 'it') + ' in their shell');
+        sfx(j.saved === false || opUnread ? 'bad' : 'click');
+        if (j.saved !== false && !opUnread) notify('Key "' + name + '" saved', 'good');
+        kyNameEl.value = ''; kyKeyEl.value = ''; kyDocsEl.value = ''; kyKeyEl.type = 'password';
         body.querySelector('#ky-guide').hidden = true;
       } catch (e) { kyMsgEl.textContent = '✕ ' + ((e && e.message) || 'failed to reach the sidecar'); sfx('bad'); }
       ccRefresh(); kyRefresh();
@@ -1710,7 +1965,7 @@
     kyRefresh();
     // panes mount once and tab clicks only toggle visibility — re-poll both lists when the Commander
     // lands on KEYS, so a connector keyed on the CATALOG tab moments ago shows up without a window reopen.
-    const kyTab = body.querySelector('#con-tab-connectors-keys');
+    const kyTab = body.querySelector('#con-tab-connectors-mcp');   // CONNECTED shows the API keys too
     if (kyTab) kyTab.addEventListener('click', () => { kyPlatformsRefresh(); kyRefresh(); });
     const ccTab = body.querySelector('#con-tab-connectors-catalog');
     if (ccTab) ccTab.addEventListener('click', ccRefresh);
@@ -1730,8 +1985,12 @@
       try {
         const j = await Harness.api.get('/api/spotify/status');
         if (redirEl && j.redirectUri) redirEl.textContent = j.redirectUri;
+        // the setup fold holds RECONNECT / DISCONNECT once connected, so its name follows the state
+        const foldName = body.querySelector('#sp-setup-fold > summary');
+        if (foldName) foldName.textContent = j.connected ? 'Spotify connection' : 'Connect your Spotify';
         if (j.connected) {
-          statusEl.innerHTML = '<span style="color:var(--ok)">● connected</span>' + (j.scope ? ' <span class="dim">· ' + esc(j.scope) + '</span>' : '');
+          // the OAuth scope list is a developer detail: it rides the tip, the line says connected
+          statusEl.innerHTML = '<span style="color:var(--ok)"' + (j.scope ? ' data-tip="' + esc('Spotify access: ' + j.scope) + '"' : '') + '>● connected</span>';
           connectBtn.textContent = '↻ RECONNECT';
           disconnectBtn.style.display = '';
         } else {

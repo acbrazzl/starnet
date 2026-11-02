@@ -26,6 +26,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { bootToken } = require('./_httpToken.js');
+const { allocatePort, BIND_REFUSED } = require('./helpers/ports.js');
 
 const HOST = '127.0.0.1';
 const INDEX = path.resolve(__dirname, '..', 'sidecar', 'index.js');
@@ -44,9 +45,9 @@ function boot(port, workspaces, attemptsLeft, extraEnv) {
     const onData = d => {
       out += d.toString();
       if (!settled && out.indexOf('http://' + HOST + ':' + port) >= 0) { settled = true; resolve({ child, port, out: () => out }); }
-      if (!settled && /already in use/i.test(out)) {
+      if (!settled && BIND_REFUSED.test(out)) {
         settled = true; try { child.kill(); } catch (_) {}
-        if (attemptsLeft > 0) resolve(boot(port + 1, workspaces, attemptsLeft - 1, extraEnv));
+        if (attemptsLeft > 0) resolve(allocatePort().then(next => boot(next, workspaces, attemptsLeft - 1, extraEnv)));
         else reject(new Error('no free port'));
       }
     };
@@ -60,7 +61,7 @@ function boot(port, workspaces, attemptsLeft, extraEnv) {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'sk-cronarm-'));
   const ARMED_FILE = path.join(ws, 'cron.armed.json');
   // short tick so "fires within one tick" resolves fast + deterministically; NO env-arm (default OFF).
-  let booted = await boot(8950 + (process.pid % 40), ws, 20, { SKYNET_CRON_TICK_MS: '300' });
+  let booted = await boot(await allocatePort(), ws, 20, { SKYNET_CRON_TICK_MS: '300' });
   let child = booted.child, port = booted.port, getOut = booted.out;
   const B = () => 'http://' + HOST + ':' + port;
   let apiToken = '';
@@ -82,19 +83,20 @@ function boot(port, workspaces, attemptsLeft, extraEnv) {
   };
 
   try {
-    // ---- seed a routine that is DUE NOW so the FIRST tick processes it (proving the timer is live). A `once`
-    //      schedule with a PAST ISO timestamp is due the instant the scheduler notices it; with no key it takes
-    //      the no-capability path but STILL drives a cron.tick (plan.fire.length>=1) — a non-mockable "the timer
-    //      ran" signal that doesn't depend on any model spend. ----
-    const create = await j('POST', '/api/cron', { name: 'Due now', prompt: 'do a thing', schedule: '2020-01-01T00:00:00Z', agentId: 'cron_arm' });
-    A.eq(create.status, 200, 'POST /api/cron (valid, past one-shot) -> 200');
-    A.eq(create.body.job.schedule.kind, 'once', 'past ISO parsed to a one-shot (due immediately)');
+    // ---- seed a routine that is DUE within a second so the first live tick processes it (proving the timer is
+    //      live). With no key it takes the no-capability path but STILL drives a cron.tick (plan.fire.length>=1) — a
+    //      non-mockable "the timer ran" signal that doesn't depend on any model spend. (A PAST one-shot used to be the
+    //      seed; that is refused now — stored, it fired the moment it was saved. sweep/autonomy 2026-10-20) ----
+    const create = await j('POST', '/api/cron', { name: 'Due now', prompt: 'do a thing', schedule: 'in 1s', agentId: 'cron_arm' });
+    A.eq(create.status, 200, 'POST /api/cron (valid, one-shot due in 1s) -> 200');
+    A.eq(create.body.job.schedule.kind, 'once', 'a relative "in 1s" parsed to a one-shot (due a second later)');
 
     // ---- INERT-WHEN-OFF (the must-not-regress invariant) ----
     const offList = await j('GET', '/api/cron');
     A.eq(offList.status, 200, 'GET /api/cron -> 200 (off)');
     A.eq(offList.body.enabled, false, 'OFF: enabled:false — scheduler honestly reported unarmed');
     A.ok(!fs.existsSync(ARMED_FILE), 'OFF: no cron.armed.json persisted (a never-enabled user touches nothing)');
+    A.eq(offList.body.armSet, false, 'OFF: armSet:false — nobody ever set the switch (org P16: the first save would turn it on)');
     // give the host MORE than one tick window with cron OFF; nothing must arm and nothing must tick.
     await sleep(800);
     A.ok(getOut().indexOf('cron tick armed') < 0, 'OFF: timer never armed (no "cron tick armed" log)');
@@ -126,11 +128,33 @@ function boot(port, workspaces, attemptsLeft, extraEnv) {
     const offAgain = await j('GET', '/api/cron');
     A.eq(offAgain.body.enabled, false, 'after disarm: GET /api/cron enabled:false');
     A.eq(JSON.parse(fs.readFileSync(ARMED_FILE, 'utf8')).armed, false, 'persisted flag is armed:false after disarm');
+    A.eq(offAgain.body.armSet, true, 'after disarm: armSet:true — an explicit OFF, told apart from a switch never set');
     // no NEW tick should run after disarm — snapshot the tick-log length, wait, assert it did not grow.
     const ticksBefore = (getOut().match(/\[cron\] cron\.tick/g) || []).length;
     await sleep(800);
     const ticksAfter = (getOut().match(/\[cron\] cron\.tick/g) || []).length;
     A.eq(ticksAfter, ticksBefore, 'after disarm: the timer is cleared — no further cron ticks run');
+
+    // ---- ARM ON CREATE, ONE RULE (org P16, 2026-10-14): arm:true turns on a switch NOBODY ever set (proved on a fresh
+    //      workspace below); after an explicit OFF (the disarm just above) a save keeps it off and says so ----
+    const plain = await j('POST', '/api/cron', { name: 'No arm asked', prompt: 'p', schedule: 'every 6h' });
+    A.eq(plain.status, 200, 'a create without arm -> 200');
+    A.eq(plain.body.scheduler && plain.body.scheduler.armed, false, 'a create without arm leaves a disarmed scheduler disarmed, and says so');
+    const armedCreate = await j('POST', '/api/cron', { name: 'Arm me', prompt: 'p', schedule: 'every 6h', arm: true });
+    A.eq(armedCreate.status, 200, 'a create with arm:true -> 200');
+    A.eq(armedCreate.body.scheduler && armedCreate.body.scheduler.armed, false, 'after an explicit OFF, a save with arm:true does NOT override it');
+    A.eq(armedCreate.body.scheduler.armedNow, false, '…the reply says this save did not turn scheduling on');
+    A.eq(armedCreate.body.scheduler.offByChoice, true, '…and that it is off by the Commander’s choice');
+    A.eq((await j('GET', '/api/cron')).body.enabled, false, 'GET /api/cron agrees: still enabled:false');
+    A.eq(JSON.parse(fs.readFileSync(ARMED_FILE, 'utf8')).armed, false, 'the explicit OFF stays on disk');
+    // ---- ROUTINE HISTORY: one routine's past runs (none yet), unknown id is an honest 404 ----
+    const hist = await j('GET', '/api/cron/history?id=' + encodeURIComponent(armedCreate.body.job.id));
+    A.eq(hist.status, 200, 'GET /api/cron/history -> 200');
+    A.ok(hist.body.ok && Array.isArray(hist.body.runs) && hist.body.runs.length === 0, 'a routine that never ran has an empty history (nothing synthesized)');
+    A.eq((await j('GET', '/api/cron/history?id=nope')).status, 404, 'unknown routine -> 404');
+    await j('POST', '/api/cron/remove', { id: plain.body.job.id });
+    await j('POST', '/api/cron/remove', { id: armedCreate.body.job.id });
+    A.eq((await j('POST', '/api/cron/arm', { enabled: false })).status, 200, 'disarm again before the boot phase');
 
     // ---- ARM AT BOOT: re-arm, kill, reboot the SAME workspace with NO env arm -> armed at boot ----
     // Seed a FRESH past one-shot that is unclaimed at reboot so the boot-reconcile has a DUE routine to tick
@@ -146,13 +170,31 @@ function boot(port, workspaces, attemptsLeft, extraEnv) {
     A.eq(JSON.parse(fs.readFileSync(ARMED_FILE, 'utf8')).armed, true, 'persisted armed:true before reboot');
     try { child.kill(); } catch (_) {} await sleep(250);
     // reboot WITHOUT SKYNET_CRON_ENABLED — only the persisted cronArmed flag should arm the scheduler.
-    booted = await boot(port + 100, ws, 20, { SKYNET_CRON_TICK_MS: '300' });
+    booted = await boot(await allocatePort(), ws, 20, { SKYNET_CRON_TICK_MS: '300' });
     child = booted.child; port = booted.port; getOut = booted.out;
     await refreshToken();
     const bootList = await j('GET', '/api/cron');
     A.eq(bootList.body.enabled, true, 'ARM-AT-BOOT: persisted cronArmed:true -> enabled:true with no env var');
     await sleep(400);
     A.ok(getOut().indexOf('cron tick armed') >= 0, 'ARM-AT-BOOT: the timer armed at boot from the persisted flag alone (no env var)');
+
+    // ---- FIRST SAVE ARMS (org P16): a FRESH workspace (no cron.armed.json) — the first save with arm:true turns scheduling on ----
+    try { child.kill(); } catch (_) {} await sleep(250);
+    const ws2 = fs.mkdtempSync(path.join(os.tmpdir(), 'sk-cronarm2-'));
+    const ARMED_FILE2 = path.join(ws2, 'cron.armed.json');
+    booted = await boot(await allocatePort(), ws2, 20, { SKYNET_CRON_TICK_MS: '300' });
+    child = booted.child; port = booted.port; getOut = booted.out;
+    await refreshToken();
+    A.eq((await j('GET', '/api/cron')).body.armSet, false, 'FRESH: the switch was never set');
+    const firstSave = await j('POST', '/api/cron', { name: 'First one', prompt: 'p', schedule: 'every 6h', arm: true });
+    A.eq(firstSave.status, 200, 'FRESH: the first save -> 200');
+    A.eq(firstSave.body.scheduler && firstSave.body.scheduler.armed, true, 'FRESH: the first save turned scheduling on');
+    A.eq(firstSave.body.scheduler.armedNow, true, '…and the reply says THIS save did it (the form prints "scheduling is now on")');
+    A.eq(firstSave.body.scheduler.offByChoice, false, '…never an explicit OFF');
+    A.eq(JSON.parse(fs.readFileSync(ARMED_FILE2, 'utf8')).armed, true, 'FRESH: the arm intent is persisted');
+    const secondSave = await j('POST', '/api/cron', { name: 'Second one', prompt: 'p2', schedule: 'every 7h', arm: true });
+    A.eq(secondSave.body.scheduler.armedNow, false, 'a later save on an armed scheduler did not turn anything on (it was on)');
+    try { fs.rmSync(ws2, { recursive: true, force: true }); } catch (_) {}
   } finally {
     try { child.kill(); } catch (_) {}
     await sleep(150);

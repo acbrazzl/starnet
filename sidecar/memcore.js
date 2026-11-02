@@ -6,10 +6,10 @@
    root, may read the wall clock and pass it in). */
 'use strict';
 (function (root, factory) {
-  const api = factory();
+  const api = factory(typeof require === 'function' ? require('../frontend/app/memtruth.js') : root.MemTruth);
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else { (root.SK = root.SK || {}).memcore = api; }
-})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (MemTruth) {
   'use strict';
 
   const TRUST_STEP = 0.15;   // each signed memory.feedback delta nudges trust by delta*step, clamped to [0,1]
@@ -40,31 +40,13 @@
     return clamp01(t * Math.pow(0.5, (n - ref) / hl));
   }
 
-  // ---- near-duplicate detection (parity with the reference harness: Jaccard token overlap, dependency-free) ----
+  // ---- near-duplicate detection (parity with the reference harness: Jaccard token overlap) ----
   // catches PARAPHRASE dupes that exact-text equality misses ("the user prefers npm start" vs "prefers npm start
-  // over serve"), so reflection doesn't clutter the turn-in beat and the panel can flag redundant beliefs.
-  const SIM_STOP = new Set(('a an the of to in on for and or but is are was were be been it its this that with as at by from your you i we they').split(/\s+/));
-  function simTokens(s) {   // mirrors context.tokenize (3+ char alnum, stopword-stripped) — kept inline so memcore stays standalone
-    const set = new Set();
-    for (const t of String(s == null ? '' : s).toLowerCase().split(/[^a-z0-9]+/)) if (t.length >= 3 && !SIM_STOP.has(t)) set.add(t);
-    return set;
-  }
-  function tokenJaccard(a, b) {
-    const A = simTokens(a), B = simTokens(b);
-    if (!A.size || !B.size) return 0;
-    let inter = 0; for (const t of A) if (B.has(t)) inter++;
-    return inter / (A.size + B.size - inter);
-  }
+  // over serve"), so reflection doesn't clutter the turn-in beat and the panel can flag redundant beliefs. The math
+  // lives in ONE place, frontend/app/memtruth.js (memory-truth-1027): these names stay for their callers.
+  const tokenJaccard = (a, b) => MemTruth.similarity(a, b);
   // first existing record whose text is >= threshold-similar to `text` (the near-dupe it would shadow), or null.
-  function findSimilar(records, text, opts) {
-    const threshold = (opts && typeof opts.threshold === 'number') ? opts.threshold : 0.6;
-    for (const r of (Array.isArray(records) ? records : [])) {
-      if (!r) continue;
-      const rt = r.content != null ? r.content : ((r.title || '') + ' ' + (r.body || ''));
-      if (tokenJaccard(rt, text) >= threshold) return r;
-    }
-    return null;
-  }
+  const findSimilar = (records, text, opts) => MemTruth.findSimilar(records, text, opts);
 
   // ---- ORIGIN: which surface a memory was formed on ----
   // Memory used to form ONLY on the watched browser run, so every record was self-evidently the Commander's own
@@ -140,7 +122,8 @@
     const c = String(content == null ? '' : content);
     let found = false;
     const out = (Array.isArray(records) ? records : []).map(r => {
-      if (!found && r && r.id === id) { found = true; return Object.assign({}, r, { content: c, body: c }); }
+      // the Commander's own edit confirms a feedback record (taste is only their confirmed words — feedbackmemory.isTaste)
+      if (!found && r && r.id === id) { found = true; return Object.assign({}, r, { content: c, body: c }, r.origin === 'feedback' ? { confirmation: 'user-confirmed' } : {}); }
       return r;
     });
     return { records: out, found };
@@ -166,7 +149,7 @@
       id: r.id || '', kind: r.kind || 'note',
       title: String(r.title || ''), body: String(text || ''),
       scope: r.scope || 'global', streamId: r.streamId || null,
-      ...(r.projectRoot ? { projectRoot: r.projectRoot } : {}),
+      projectRoot: r.projectRoot || null,   // the project tier a 'project'-scoped belief is keyed to (memory-compound lane)
       sourceRunId: r.sourceRunId || null,
       // an untagged legacy record predates unattended memory, so it can only have come from the Commander's own
       // COMMS run — 'commander' is the honest default, not a guess.
@@ -177,8 +160,49 @@
     };
     if (now != null) out.effectiveTrust = decayTrust(trust, r.lastFeedbackAt || r.createdAt || r.ts || 0, now);
     if (r.revision) { out.revision = r.revision; out.updatedAt = r.updatedAt; out.updatedSourceRunId = r.updatedSourceRunId; }
+    // memory-truth (additive): what the recall line asserts about this record, so the panel can show the same truth —
+    // whose words it is (with the proving sentence), and an "unhelpful" demotion trust alone could not record
+    if (r.confirmation) out.confirmation = String(r.confirmation);
+    if (r.statedBy && typeof r.statedBy.quote === 'string') out.statedQuote = r.statedBy.quote;
+    if (Number(r.distrust) > 0) out.distrust = clamp01(Number(r.distrust));
+    // memory-truth-1027 (additive): the texts this belief REPLACED, newest first (a supersession or a correction moved
+    // them out of active recall), so the panel shows what was retired instead of letting it vanish — and which retired
+    // text was restored as its own belief. Bounded: the five most recent.
+    if (Array.isArray(r.history) && r.history.length) {
+      out.history = r.history.slice(-5).reverse().filter(h => h && typeof h === 'object').map(h => Object.assign(
+        { body: String(h.body == null ? '' : h.body), replacedAt: Number(h.replacedAt) || 0, superseded: !!h.supersession },
+        h.restoredAs ? { restoredAs: String(h.restoredAs) } : {}));
+    }
+    if (r.restoredFrom && r.restoredFrom.id) out.restoredFrom = String(r.restoredFrom.id);
     return out;
   }
 
-  return { TRUST_STEP, TRUST_HALFLIFE_MS, clamp01, nextTrust, decayTrust, tokenJaccard, findSimilar, nextNoteId, originOf, reduceStats, applyPin, applyEdit, applyForget, projectRecord };
+  /* ---- RUN RECEIPTS (memory-truth lane, 2026-10-11) ----
+     COMMS shows "remembered · N" for a run by fetching that run's batch. notebook.write never registered one, so the
+     fetch found nothing and the server fell back to the agent's LATEST OTHER run — COMMS printed the previous run's
+     memories as this run's, then suppressed this run's real reflection receipts. These two pure helpers are the fix:
+     a run's batch MERGES every save made for it (mid-run notebook.write + post-run reflection/failure review, each
+     item keyed by `key || id` so a later state of the same record replaces the earlier line), and a lookup for a
+     named run returns exactly that run's batch or nothing. */
+  function mergeReceipts(prev, items) {
+    const out = [], at = new Map();
+    for (const p of [].concat(Array.isArray(prev) ? prev : [], Array.isArray(items) ? items : [])) {
+      if (!p || typeof p !== 'object') continue;
+      const k = String(p.key || p.id || '');
+      if (k && at.has(k)) { out[at.get(k)] = p; continue; }
+      if (k) at.set(k, out.length);
+      out.push(p);
+    }
+    return out;
+  }
+  function receiptBatchFor(byRun, latestByAgent, agentId, runId) {
+    const rid = String(runId || '');
+    // a NAMED run gets exactly its own batch — never another run's (the wrong-receipt bug). Only an un-named fetch
+    // (legacy callers) may fall back to the agent's newest pending batch.
+    const key = rid || (latestByAgent && typeof latestByAgent.get === 'function' ? latestByAgent.get(agentId) : '');
+    const batch = key && byRun && typeof byRun.get === 'function' ? byRun.get(key) : null;
+    return (batch && batch.agentId === agentId) ? batch : null;
+  }
+
+  return { TRUST_STEP, TRUST_HALFLIFE_MS, clamp01, nextTrust, decayTrust, tokenJaccard, findSimilar, nextNoteId, originOf, reduceStats, applyPin, applyEdit, applyForget, projectRecord, mergeReceipts, receiptBatchFor };
 });

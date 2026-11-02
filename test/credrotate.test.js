@@ -4,6 +4,7 @@
    the loop rotates to the next key, the run completes, the failed key is reported to onFallback and cooled in
    credpool so it isn't tried first next run. No real keys / no network. */
 'use strict';
+const { readSidecarSource } = require('./helpers/source');
 const A = require('./_assert.js');
 const events = require('../shared/events.js');
 const { makeEmitter } = require('../shared/emitter.js');
@@ -182,14 +183,15 @@ function okProvider(text) {
   // the same pattern channels.sse.test.js uses for handleChannelEvents)
   {
     const fs = require('fs'); const path = require('path');
-    const src = fs.readFileSync(path.join(__dirname, '..', 'sidecar', 'index.js'), 'utf8');
+    const src = readSidecarSource();
     const at = src.indexOf('let rotationFallbacks = []');
     A.ok(at > 0, 'index.js owns the rotation-fallback build');
     const seg = src.slice(at, at + 2600);
     A.ok(/credPool\.coolingUntil\(runKey\)/.test(seg), 'the run asks whether its OWN primary key is cooling');
     A.ok(/activePrimaryKey = warm/.test(seg), 'and starts on a WARM pool key when it is');
     A.ok(/ordered\.push\(runKey\)/.test(seg), 'demoting the cooling primary to the back rather than dropping it');
-    A.ok(/credKey: providerUnmetered \? null : activePrimaryKey/.test(src),
+    // subscription stacking: an unmetered OAuth subscription still names its ACCOUNT handle, so a spent account cools too
+    A.ok(/credKey: \(providerUnmetered && !oauthAccounts\) \? null : activePrimaryKey/.test(src),
       'and the loop is told the key actually in use, so a failure cools the right credential');
   }
 

@@ -63,7 +63,7 @@ let closes = 0;
 const dock = { contains: () => false };
 const toggle = { contains: () => false, addEventListener() {} };
 const context = {
-  wired: false, open: true,
+  wired: false, open: true, openedAt: 0, pressAt: 0, clock: () => 0,   // #93 opening-press guard state (idle here)
   el: id => id === 'model-dock' ? dock : id === 'model-dock-toggle' ? toggle : null,
   document: { addEventListener: (type, fn) => { listeners[type] = fn; } },
   showTip() {}, hideTip() {}, closeDock: () => closes++
@@ -75,6 +75,13 @@ listeners.click({ target: {}, composedPath: () => [{}, toggle] });
 A.eq(closes, 0, 'the toggle also remains an inside click');
 listeners.click({ target: {}, composedPath: () => [{}] });
 A.eq(closes, 1, 'a genuine outside click still closes');
-listeners.keydown({ key: 'Escape' });
+const esc = { key: 'Escape', defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+listeners.keydown(esc);
 A.eq(closes, 2, 'Escape still closes the selector');
+A.eq(esc.defaultPrevented, true, 'and marks that Escape used, so an offer panel over COMMS never also reads it as its NOT NOW');
+context.open = false;
+const idle = { key: 'Escape', defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+listeners.keydown(idle);
+A.eq(closes, 2, 'a closed selector ignores Escape');
+A.eq(idle.defaultPrevented, false, 'and leaves that Escape unused for its real owner');
 A.report('model-reasoning-presets.test');

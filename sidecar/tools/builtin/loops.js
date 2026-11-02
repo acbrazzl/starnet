@@ -62,7 +62,7 @@ function makeLoopTools(deps) {
   };
 
   const createTool = {
-    name: 'loop.create', capability: 'orchestrator', scope: 'write', requiresConsent: true, timeoutMs: 15000,
+    name: 'loop.create', capability: 'orchestrator', scope: 'write', requiresConsent: true, timeoutMs: 15000, taintLocked: true,
     description: 'Create one durable StarNet LOOP when the Commander asks to keep working, iterate, or continue until an objective/convergence/check passes. Do not use for clock schedules such as “every weekday” (use routine.create). The review gate is fixed: generated changes wait for the Commander. A check command is never model-authored; for exitOn=check-green the host may derive a check only from an already-approved project folder. Repeating the same objective returns the existing loop.',
     schema: {
       type: 'object', required: ['objective'], properties: {
@@ -96,6 +96,9 @@ function makeLoopTools(deps) {
 
   const manageTool = {
     name: 'loop.manage', capability: 'orchestrator', scope: 'write', requiresConsent: true, timeoutMs: 30000,
+    // taint lock per ACTION (taint.js): a run that read outside content may still pause or stop a loop (stopping work
+    // schedules nothing); update/resume/approve re-arm what a later run obeys and remove/reject throw work away
+    taintLocked: (a) => !(a && (a.action === 'pause' || a.action === 'stop')),
     description: 'Manage an EXISTING durable LOOP: update safe objective metadata, pause/resume/stop/remove it, or approve/reject one pending review iteration. Does not lift the global E-STOP and cannot read or change the host-run check command.',
     schema: {
       type: 'object', required: ['loop', 'action'], properties: {

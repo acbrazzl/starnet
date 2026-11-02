@@ -1,4 +1,5 @@
 'use strict';
+const { readSidecarSource } = require('./helpers/source');
 /* settings-p1-backend.test.js — source-lock that the P1 settings rows are wired in the SIDECAR to the REAL code
    paths they claim to control (the honesty law — a knob that does nothing is a bug). Grep-guards over
    sidecar/index.js covering the endpoints + the precedence + the live seams:
@@ -8,7 +9,7 @@
      P1-10 the reflect gate reads the live memoryConfig (on/off + cooldown) + the /api/memory/config routes */
 const assert = require('assert');
 const fs = require('fs'); const path = require('path');
-const src = fs.readFileSync(path.join(__dirname, '..', 'sidecar', 'index.js'), 'utf8');
+const src = readSidecarSource({ except: ['sidecar/tools/builtin/station-control.js'] });   // the host; station-control.js names the same routes as a client
 const importStart = src.indexOf('async function handleConfigImport');
 const importEnd = src.indexOf('/* POST /api/config/reset', importStart);
 const importBody = importStart >= 0 && importEnd > importStart ? src.slice(importStart, importEnd) : '';
@@ -38,19 +39,26 @@ ok(/handleConfigReset[\s\S]{0,2200}unknown or non-resettable section/.test(src),
 ok(/function resolveKnob\(/.test(src), 'P1-9: resolveKnob implements the precedence');
 ok(/resolveKnob\('MAX_ITERS', 'maxIters', 0\)/.test(src), 'P1-9: maxIters defaults to unlimited and resolves via resolveKnob');
 ok(/resolveKnob\('MAX_CONCURRENT_AGENTS', 'maxConcurrentAgents', 0\)/.test(src), 'P1-9: maxConcurrentAgents defaults to unlimited and resolves via resolveKnob');
-ok(/perRun:\s*num\(ENV\('BUDGET_PER_RUN'\), 0\)/.test(src), 'P1-9: the per-run spend ceiling defaults off');
+// 2026-09-17: the four caps read their defaults from ONE shipped table (budgetcaps.SHIPPED_DEFAULTS) so the
+// runaway-loop day rail and the still-off per-run ceiling cannot drift apart. Per-run stays off — asserted on
+// the table itself, not on a literal the source no longer carries.
+ok(/perRun:\s*num\(ENV\('BUDGET_PER_RUN'\), BUDGET_SHIPPED\.perRun\)/.test(src), 'P1-9: the per-run spend ceiling resolves env > shipped default');
+ok(require('../sidecar/budgetcaps.js').shippedDefaults().perRun === 0, 'P1-9: the per-run spend ceiling defaults off');
+ok(require('../sidecar/budgetcaps.js').shippedDefaults().perDay === 25, 'the per-day rail ships ON at $25 (the 2026-09-17 runaway-loop incident)');
 ok(/ORCH_PER_WORKER\s*=\s*num\(ENV\('BUDGET_PER_WORKER'\), 0\)/.test(src), 'P1-9: the delegated-worker spend ceiling defaults off');
 ok(/ORCH_WORKER_MAX_ITERS\s*=\s*num\(ENV\('WORKER_MAX_ITERS'\), 0\)/.test(src), 'P1-9: the delegated-worker iteration ceiling defaults off');
 ok(/maxConcurrent:\s*\(\)\s*=>\s*num\(ENV\('V1_MAX_CONCURRENT'\), 0\)/.test(src), 'P1-9: the external API concurrency ceiling defaults off');
 ok(/CRON_MAX_PARALLEL\s*=\s*num\(ENV\('CRON_MAX_PARALLEL'\), 0\)/.test(src), 'P1-9: scheduled-work concurrency defaults to unlimited');
 ok(/LOOP_MAX_PARALLEL\s*=\s*num\(ENV\('LOOP_MAX_PARALLEL'\), 0\)/.test(src), 'P1-9: standing-loop concurrency defaults to unlimited');
-// ---- managed credits stay functional with no opt-in cap: an uncapped run reserves the WALLET, never refuses ----
-ok(/runCapUsd = \(isFinite\(avail\) && avail > 0\) \? avail : 0;/.test(src), 'managed credits: an uncapped run reserves the full available balance (wallet is the only ceiling)');
+// ---- managed credits stay functional with no opt-in cap: an uncapped run reserves min(managed default, wallet),
+// never refuses a funded wallet — and never the WHOLE wallet (issue #53: one prompt drained a $10 top-up) ----
+ok(/runCapUsd = budgetCaps\.managedRunCapUsd\(\(runCapUsd > 0 && isFinite\(runCapUsd\)\) \? runCapUsd : 0, avail, MANAGED_PER_RUN_DEFAULT\);/.test(src),'managed credits: an uncapped run reserves the managed per-run default, clamped to the available balance');
+ok(require('../sidecar/budgetcaps.js').managedRunCapUsd(0, 0.5, 2) === 0.5, 'managed credits: a wallet below the default still runs (clamped, not refused)');
 ok(!/Managed credits need a per-run budget cap/.test(src), 'managed credits: the set-an-env-var refusal is gone — no cap is required to run');
 ok(/if \(!\(runCapUsd > 0\)\) \{[\s\S]{0,1200}return;[\s\S]{0,300}const adm = credits\.beginRun\(\{ runId, agentId, capUsd: runCapUsd \}\);/.test(src), 'managed credits: an unknown/empty balance still fails CLOSED before any reservation (never spends against an unknown wallet)');
 ok(/resolveKnob\('CONSENT_TIMEOUT_MS', 'consentTimeoutMs', 120000\)/.test(src), 'P1-9: consent timeout is now env>saved>default (was hardcoded)');
 ok(/resolveKnob\('CRON_TICK_MS', 'cronTickMs', 60000\)/.test(src), 'P1-9: cron tick resolves via resolveKnob');
-ok(/function knobEnvLocked\(/.test(src) && /envLocked: locked/.test(src), 'P1-9: the status reports which knobs are env-locked');
+ok(/function knobEnvLocked\(/.test(src) && /fields\[d\.key\] = \{[^}]*envLocked: locked/.test(src), 'P1-9: the status reports which knobs are env-locked');
 ok(/'\/api\/runtime\/knobs'/.test(src), 'P1-9: the runtime-knobs routes are registered');
 // an env-locked knob can't be overwritten from the UI
 ok(/if \(knobEnvLocked\(d\.env\)\) continue/.test(src), 'P1-9: a POST cannot override an env-locked knob');

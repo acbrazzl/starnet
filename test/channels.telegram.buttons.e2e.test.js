@@ -20,6 +20,9 @@ const os = require('os');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const { bootToken } = require('./_httpToken.js');
+// the run-context note is the leading text of the newest user message on a non-Claude chat wire: key on the Commander's own words
+const { userWords } = require('./helpers/host-notes.js');
+const { allocatePort, BIND_REFUSED } = require('./helpers/ports.js');
 
 const HOST = '127.0.0.1';
 const INDEX = path.resolve(__dirname, '..', 'sidecar', 'index.js');
@@ -43,7 +46,7 @@ function readJsonBody(req) {
 function startMockOpenRouter() {
   const requests = [], script = [];
   const lastUser = (msgs) => {
-    for (let i = (msgs || []).length - 1; i >= 0; i--) if (msgs[i].role === 'user') return String(msgs[i].content || '');
+    for (let i = (msgs || []).length - 1; i >= 0; i--) if (msgs[i].role === 'user') return userWords(msgs[i]);
     return '';
   };
   return new Promise(resolve => {
@@ -154,9 +157,9 @@ function boot(port, env, attemptsLeft) {
     const onData = d => {
       out += d.toString();
       if (!settled && out.indexOf('http://' + HOST + ':' + port) >= 0) { settled = true; resolve({ child, port }); }
-      else if (!settled && /already in use/i.test(out)) {
+      else if (!settled && BIND_REFUSED.test(out)) {
         settled = true; try { child.kill(); } catch (_) {}
-        if (attemptsLeft > 0) resolve(boot(port + 1, env, attemptsLeft - 1)); else reject(new Error('no free port'));
+        if (attemptsLeft > 0) resolve(allocatePort().then(next => boot(next, env, attemptsLeft - 1))); else reject(new Error('no free port'));
       }
     };
     child.stdout.on('data', onData);
@@ -175,7 +178,7 @@ async function waitUntil(fn, ms, label) {
 // request" is NOT reliably the Telegram turn. Callers search ALL requests for the one they mean instead.
 const lastUserTurn = (req) => {
   const m = (req && req.messages) || [];
-  for (let i = m.length - 1; i >= 0; i--) if (m[i].role === 'user') return m[i].content;
+  for (let i = m.length - 1; i >= 0; i--) if (m[i].role === 'user') return userWords(m[i]);
   return null;
 };
 
@@ -191,7 +194,7 @@ const lastUserTurn = (req) => {
     SKYNET_TELEGRAM_TOKEN: 'TESTTOKEN', STARNET_TELEGRAM_TOKEN: 'TESTTOKEN',
     SKYNET_TELEGRAM_API_BASE: tg.base, STARNET_TELEGRAM_API_BASE: tg.base
   };
-  const { child, port } = await boot(9040 + (process.pid % 50), env, 20);
+  const { child, port } = await boot(await allocatePort(), env, 20);
   const B = 'http://' + HOST + ':' + port;
   try {
     const token = await bootToken(B, B);
@@ -278,12 +281,25 @@ const lastUserTurn = (req) => {
     // (permissions.js tier 4) and the REAL fail-closed waiter (consentwait.js) — only the network is faked.
     // Give this chat's agent a CABINET. Capability projection is what decides which tools exist at all, so
     // without a placed cabinet there is no fs.write for the broker to pause on, and a bay projects PURE room objects with no baseline, so it needs its own computer to run at all (a bare workspace offers only
-    // the consent-free skill tools) and this would silently prove nothing.
+    // the consent-free skill tools) and this would silently prove nothing. The room is bounded by the SAVED station (a
+    // posted plan may narrow a bay's grant, never widen it — qa/bugs/a9a4f53c): save the bay, its workstation and the
+    // cabinet, then post the plan that names the bay with the room objects the page lists for it.
+    const WM = require('../frontend/app/worldmodel.js');
+    const saveHeaders = { 'Content-Type': 'application/json', 'X-StarNet-Token': token, Origin: B };
+    const stDoc = WM.defaultDoc();
+    stDoc.props.push({ id: 'bay1', t: 'bay', x: 4, y: 1, w: 2, h: 2, agentId: 'tg_4242' });
+    stDoc.props.push({ id: 'pc1', t: 'console', x: 7, y: 1, w: 2, h: 1, agentId: 'tg_4242' });
+    stDoc.props.push({ id: 'cab1', t: 'war_intelcab', x: 10, y: 1, w: 1, h: 2 });
+    stDoc._nid = 4;
+    const prior = ((await (await fetch(B + '/api/save?agent=agent', { headers: saveHeaders })).json()) || {}).save;
+    const sv = await fetch(B + '/api/save', { method: 'POST', headers: saveHeaders,
+      body: JSON.stringify({ schema: 'starnet.save', version: 5, _saveRevision: (prior && prior._saveRevision) || 0, updatedAt: Date.now(), agent: { id: 'agent' }, station: stDoc }) });
+    A.ok(sv.status === 200 && ((await sv.json()) || {}).ok === true, 'the station with tg_4242\'s bay, workstation and cabinet is saved');
     const rr = await fetch(B + '/api/routing', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-StarNet-Token': token, Origin: B },
-      body: JSON.stringify({ errors: [], hash: 'buttons-e2e', bays: [], dockBays: [{ agentId: 'tg_4242', objects: ['computer', 'cabinet'] }] })
+      method: 'POST', headers: saveHeaders,
+      body: JSON.stringify({ errors: [], hash: 'buttons-e2e', bays: [], dockBays: [{ agentId: 'tg_4242', propId: 'bay1', objects: ['computer', 'cabinet'] }] })
     });
-    A.eq(rr.status, 200, 'routing plan accepted (computer + cabinet projected onto tg_4242)');
+    A.eq(rr.status, 200, 'routing plan accepted (tg_4242 docked at its saved bay: computer + cabinet)');
 
     const sendsBeforeOptIn = tg.sends.length;
     tg.pushText(4242, 99, '/approvals on');

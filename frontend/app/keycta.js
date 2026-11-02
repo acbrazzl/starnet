@@ -24,15 +24,16 @@ const KeyCTA = (() => {
     if (p === 'codex' || p === 'openai-codex') return 'codex';
     if (p === 'grok' || p === 'grok-oauth' || p === 'supergrok') return 'grok';
     if (p === 'kimi' || p === 'moonshot' || p === 'kimi-for-coding') return 'kimi';
-    if (p === 'claudecode' || p === 'claude-code' || p === 'claude-cli' || p === 'claude-login') return 'claudecode';   // the local claude CLI login (subscription, no key)
+    if (p === 'claudecode' || p === 'claude-login') return 'claude-cli';   // the fork's old id for the Claude login (saved configs) -> upstream's claude-cli
     if (p === 'ollama' || p === 'ollama-local') return 'ollama';
+    if (p === 'claude-cli' || p === 'claude-code' || p === 'claude-code-cli') return 'claude-cli';
     if (p === 'custom' || p === 'openai-compatible' || p === 'local' || p === 'vllm' || p === 'lmstudio') return 'custom';
     return p;
   }
   function providerNeedsKey(p) {
     p = normProv(p);
     // codex/grok/kimi are keyless OAuth sign-ins; ollama/custom are keyless-by-design endpoints.
-    return p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'custom' && p !== 'claudecode';
+    return p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'custom' && p !== 'claude-cli';
   }
   function activeProvider() {
     return normProv((typeof Harness !== 'undefined' && Harness.getProv) ? Harness.getProv() : 'openrouter');

@@ -17,9 +17,10 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  const CP = require('child_process');
+  const CP = require('../child-env.js').guardChildProcess(require('node:child_process'));   // the stdio child's env is built explicitly below; helpers get the station-free default
   const P = require('path');
   const JSONRPC = '2.0';
+  const LOCAL_ERROR = Symbol.for('starnet.mcp.localTransportError');   // read by client.js safeRpcError
   const DEFAULT_ALLOWED = [
     'node', 'node.exe',
     'npx', 'npx.cmd',
@@ -31,9 +32,19 @@
   ];
   const BASE_ENV_KEYS = [
     'PATH', 'Path', 'PATHEXT', 'SystemRoot', 'WINDIR', 'TEMP', 'TMP',
-    'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA'
+    'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA',
+    // Windows system locations (never secrets): without them a native/GPU child (a browser an MCP server
+    // drives) resolves "%ProgramData%\..." caches as RELATIVE paths and litters its cwd.
+    'SystemDrive', 'ProgramData', 'ALLUSERSPROFILE'
   ];
   const SECRET_ENV_RE = /(TOKEN|KEY|SECRET|PASSWORD|PASS|AUTH|BEARER|CREDENTIAL|COOKIE)/i;
+  // the longest single JSON-RPC line a stdio server may send (chars). Far above any real reply (a base64
+  // screenshot is a few MB), far below V8's ~512M-char string limit, where an unbounded line crashed the host.
+  const MAX_LINE_CHARS = 64 * 1024 * 1024;
+  // what each kept chunk of the open line is charged on top of its characters (the SSE transport's PIECE_COST):
+  // about what V8 spends on one short string plus its array slot, so a drip of tiny chunks cannot hold far more
+  // memory than the cap
+  const PIECE_COST = 48;
 
   function commandBase(command) {
     const s = String(command || '').trim();
@@ -146,7 +157,10 @@
 
     const ledger = deps.ledger;
     const ledgerCommand = String(deps.ledgerCommand || safeLedgerCommand(command, args)).slice(0, 400);
-    let child = null, onMsg = null, closed = false, stdoutBuf = '', stderrBuf = '';
+    const maxLineChars = (typeof deps.maxLineChars === 'number' && deps.maxLineChars > 0) ? deps.maxLineChars : MAX_LINE_CHARS;
+    let child = null, onMsg = null, closed = false, stderrBuf = '', overflowed = false;
+    // the unterminated tail of stdout, kept as the chunks that carried it (joined once, when its newline lands)
+    let lineParts = [], lineChars = 0;
     const pendingIds = new Set();
 
     function deliver(msg) {
@@ -154,24 +168,54 @@
       if (onMsg) { try { onMsg(msg); } catch (e) { onError(e); } }
     }
     function failTo(id, message) {
-      if (id != null) deliver({ jsonrpc: JSONRPC, id: id, error: { code: -32000, message: message } });
+      if (id != null) deliver({ jsonrpc: JSONRPC, id: id, error: { code: -32000, message: message, [LOCAL_ERROR]: true } });
       else onError(new Error(message));
     }
     function failAll(message) {
       const ids = Array.from(pendingIds);
       pendingIds.clear();
-      for (const id of ids) deliver({ jsonrpc: JSONRPC, id: id, error: { code: -32000, message: message } });
+      for (const id of ids) deliver({ jsonrpc: JSONRPC, id: id, error: { code: -32000, message: message, [LOCAL_ERROR]: true } });
     }
+    /* A line too long to be a message: the server is broken or hostile. Its bytes are dropped, every waiting
+       call fails with that reason, the manager is told the connection died, and the child is stopped. Stops
+       reading at once — the child may still be writing. */
+    function overflow() {
+      overflowed = true;
+      lineParts = []; lineChars = 0;
+      const cap = maxLineChars >= 1048576 ? Math.round(maxLineChars / 1048576) + ' MiB' : maxLineChars + ' characters';
+      const msg = 'mcp stdio server sent a line with no newline past the ' + cap + ' limit (each chunk held counts its characters plus ' + PIECE_COST + '): connection closed';
+      failAll(msg);
+      onError(new Error(msg));
+      close();
+    }
+    /* Newline-framed JSON-RPC, scanned INCREMENTALLY: only the NEW chunk is searched for '\n', and the open line
+       is kept as its chunks until its newline arrives. This used to append to one string and re-run a regex over
+       the whole unterminated line on every 64 KB chunk (quadratic: a 16 MB reply cost 2.5 s of CPU) with no
+       ceiling, so a server streaming one endless line grew the host until V8's string limit crashed it.
+       THE CAP BOUNDS MEMORY, NOT JUST CHARACTERS (review 2026-10-21): every kept chunk is charged PIECE_COST on top
+       of its length. Counting characters alone, a server writing an endless line 2 characters at a time held 32M
+       strings under a 64 MiB cap — about 1.7 GB for one connector. */
     function parseStdoutChunk(chunk) {
-      stdoutBuf += String(chunk || '');
+      if (overflowed) return;
+      const s = String(chunk || '');
+      let from = 0;
       for (;;) {
-        const i = stdoutBuf.search(/\r?\n/);
-        if (i < 0) break;
-        const line = stdoutBuf.slice(0, i);
-        stdoutBuf = stdoutBuf.slice(stdoutBuf.charAt(i) === '\r' && stdoutBuf.charAt(i + 1) === '\n' ? i + 2 : i + 1);
+        const nl = s.indexOf('\n', from);
+        if (nl < 0) break;
+        if (lineChars + (nl - from) > maxLineChars) return overflow();
+        let line = s.slice(from, nl);
+        if (lineParts.length) { lineParts.push(line); line = lineParts.join(''); lineParts = []; lineChars = 0; }
+        if (line.charCodeAt(line.length - 1) === 13) line = line.slice(0, -1);   // CRLF framing
+        from = nl + 1;
         if (!line.trim()) continue;
         try { deliver(JSON.parse(line)); }
         catch (e) { onError(new Error('mcp stdio returned non-JSON line')); }
+        if (overflowed) return;
+      }
+      if (from < s.length) {
+        lineChars += s.length - from + PIECE_COST;
+        if (lineChars > maxLineChars) return overflow();
+        lineParts.push(from ? s.slice(from) : s);
       }
     }
     function noteStderr(chunk) {
@@ -206,11 +250,14 @@
         });
         child.on('exit', (code, signal) => {
           if (ledger && ownedChild.pid) { try { ledger.release(ownedChild.pid); } catch (_) {} }
-          const detail = 'mcp stdio process exited' + (code == null ? '' : ' code=' + code) + (signal ? ' signal=' + signal : '') + (stderrBuf.trim() ? ': ' + stderrBuf.trim().slice(0, 200) : '');
+          const exited = 'mcp stdio process exited' + (code == null ? '' : ' code=' + code) + (signal ? ' signal=' + signal : '');
+          const detail = exited + (stderrBuf.trim() ? ': ' + stderrBuf.trim().slice(0, 200) : '');
           const hadPending = pendingIds.size > 0;
           const wasClosed = closed;                 // true only when OUR close() asked the child to go
           closed = true;
-          failAll(detail);
+          // the RPC error is shown to the model and in status: the server's own stderr stays out of it (it is
+          // server-authored text and may echo a token); the exit code is ours.
+          failAll(exited);
           // ANY exit we did not request is a transport death — a clean idle code-0 self-exit included.
           // Skipping onError for those left the manager at state 'up' over a dead child: ensureLive
           // short-circuits on 'up', the stdio call path has no CALL_FAIL_LIMIT net (that lives in
@@ -265,5 +312,5 @@
     return { send, onMessage, close, isClosed: function () { return closed; }, get childPid() { return child && child.pid; } };
   }
 
-  return { makeStdioTransport, _internals: { commandBase, assertAllowedCommand, normalizeArgs, normalizeEnv, buildChildEnv, hostStdioAllowed, redactEnv, safeLedgerCommand } };
+  return { makeStdioTransport, _internals: { commandBase, assertAllowedCommand, normalizeArgs, normalizeEnv, buildChildEnv, hostStdioAllowed, redactEnv, safeLedgerCommand, MAX_LINE_CHARS, PIECE_COST } };
 });

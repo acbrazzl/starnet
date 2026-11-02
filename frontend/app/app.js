@@ -129,6 +129,13 @@ const App = (() => {
     if (!logo || !anchor || !bar) return;
     const game = el('screen-game');
     if (!game || !game.classList.contains('active')) return;   // hidden screens have no geometry
+    // ...and neither does a hidden MARK. REFIT (body.refit-on) and HUD mode display:none #logo
+    // while the game screen stays active, so a resize in there (window drag, TEXT SIZE, fullscreen)
+    // used to measure a 0×0 box: the anchor collapsed to 0px (the widget rail slid into the
+    // seat) and the correction pass below read got=0 and parked the mark at 2× its seat — on top
+    // of the CREW header once it came back (2026-10-03 report). Leave the last good seat alone;
+    // the ResizeObserver below re-seats the moment the mark renders again.
+    if (!logo.getClientRects().length) return;
     anchor.style.width = logo.offsetWidth + 'px';
     // TEXT SIZE coordinate law (stationui.js uiZoom): rects are VISUAL px, but #logo's style.left/
     // top are its OWN layout px — divide by whatever zoom it actually renders at, or on any station
@@ -191,6 +198,12 @@ const App = (() => {
     if (typeof setTimeout === 'function') setTimeout(run, 120);
   }
   if (typeof window !== 'undefined') window.addEventListener('resize', positionLogo);
+  // display:none → shown (leaving REFIT / HUD) moves no window and fires no resize, but it does
+  // take the mark's box from 0×0 to its real size — which is exactly what a ResizeObserver reports.
+  if (typeof document !== 'undefined' && typeof ResizeObserver === 'function') {
+    const logoEl = el('logo');
+    if (logoEl) new ResizeObserver(() => positionLogo()).observe(logoEl);
+  }
   // One watcher covers the whole window lifecycle: childList = open/close, style = drag + resize
   // + placeTerm, class = minimize/restore. animationend catches the power-on scale settling, which
   // moves no attribute and so fires no mutation of its own.
@@ -421,7 +434,7 @@ const App = (() => {
       }
       if (typeof patch.personaId === 'string' && typeof Personas !== 'undefined' && Personas.exists(patch.personaId)) {
         a.personaId = Personas.resolve ? Personas.resolve(patch.personaId) : patch.personaId;
-        if (focused && typeof Voice !== 'undefined' && Voice.init) Voice.init({ name: a.name, personaId: a.personaId, resumeCue: false });
+        if (focused && typeof Voice !== 'undefined' && Voice.setPersona) Voice.setPersona(a.personaId, a.name);
       }
       if (typeof patch.approvalMode === 'string') {
         a.approvalMode = patch.approvalMode === 'full' ? 'full' : 'ask';
@@ -444,8 +457,14 @@ const App = (() => {
       // pushRoster (below) so the consent broker can honor it; the backend lane (W1) reads it there.
       if (typeof patch.workshop === 'boolean') a.workshop = patch.workshop;
     }
-    if (typeof DossierStore !== 'undefined') DossierStore.syncDocs(d);   // seed the dossier from any newly-authored onboarding doc (first-seed-wins per doc) BEFORE the recompose
+    // seed the dossier from any newly-authored onboarding doc (first-seed-wins per doc) BEFORE the recompose; the
+    // Overseer's own docs (id 'agent', the station's standing orders) also refresh a still-untouched seed after an edit
+    const dossierWas = (typeof DossierStore !== 'undefined') ? DossierStore.composeBlock() : '';
+    if (typeof DossierStore !== 'undefined') DossierStore.syncDocs(d, { canonical: a.id === 'agent' });
     a.systemPrompt = composeSystemPrompt(a);
+    // the COMMANDER block rides EVERY agent's stored prompt: when this edit changed it (a resynced seed), the whole crew
+    // is recomposed (pushRoster below carries it to the sidecar) — or the crew keeps reading the old standing order
+    if (typeof DossierStore !== 'undefined' && DossierStore.composeBlock() !== dossierWas) recomposeAllPrompts();
     if (focused && typeof Chat !== 'undefined' && Chat.setSystem) Chat.setSystem(a.systemPrompt);
     if (focused) syncChannels();   // keep a connected Telegram bot on the SAME (updated) identity — no reconnect needed
     // THE CACHED-PROMPT TRAP (roster-clause.test §D): rosterRole() reads a crew member's specialty/purpose, and the
@@ -474,9 +493,14 @@ const App = (() => {
     const e = String(effort || '').trim();
     if (hasEffort) a.reasoningEffort = (m && e) ? e : null;
     if (agent && a.id === agent.id) {   // focused agent — apply live so the next run reflects the pin at once
-      if (m && typeof Harness !== 'undefined' && Harness.setModel) Harness.setModel(m);
-      if (p && typeof Harness !== 'undefined' && Harness.setProv) Harness.setProv(p);
-      if (hasEffort && a.reasoningEffort && typeof Harness !== 'undefined' && Harness.setReasoningEffort) Harness.setReasoningEffort(a.reasoningEffort);
+      if (m) {
+        if (typeof Harness !== 'undefined' && Harness.setModel) Harness.setModel(m);
+        noteWirePin(a);
+        if (p && typeof Harness !== 'undefined' && Harness.setProv) Harness.setProv(p);
+        if (hasEffort && a.reasoningEffort && typeof Harness !== 'undefined' && Harness.setReasoningEffort) Harness.setReasoningEffort(a.reasoningEffort);
+      } else {
+        applyWire(focusWire(a));   // a CLEARED pin follows the station default now, not the pin it just dropped (#24)
+      }
       if (typeof ModelDock !== 'undefined' && ModelDock.reflect) ModelDock.reflect();
     }
     pushRoster();   // the pin reaches the sidecar roster (honored by runOnce + cron)
@@ -500,7 +524,7 @@ const App = (() => {
     a.systemPrompt = composeSystemPrompt(a);
     if (agent && a.id === agent.id) {   // focused agent — the live COMMS session adopts the voice at once
       if (typeof Chat !== 'undefined' && Chat.setSystem) Chat.setSystem(a.systemPrompt);
-      if (typeof Voice !== 'undefined' && Voice.init) Voice.init({ name: a.name, personaId: a.personaId, resumeCue: false });
+      if (typeof Voice !== 'undefined' && Voice.setPersona) Voice.setPersona(a.personaId, a.name);
       syncChannels();   // a connected Telegram bot keeps speaking as the SAME agent, new voice
     }
     pushRoster();
@@ -536,13 +560,35 @@ const App = (() => {
   // the only post-create path was the /yolo slash command; a creation-time control with no live equivalent is
   // the same escape class as the genesis-only codex sign-in). No dedicated endpoint exists or is needed:
   // approvalMode rides pushRoster (the sidecar roster persists it and runOnce reads it per run) + persist.
-  function setAgentApproval(agentId, mode) {
+  function setAgentApproval(agentId, mode, opts) {
     const a = agents.get(String(agentId || '')) || (agent && agent.id === agentId ? agent : null);
     if (!a) return false;
-    a.approvalMode = mode === 'full' ? 'full' : 'ask';
-    pushRoster();
+    const before = a.approvalMode === 'full' ? 'full' : 'ask', next = mode === 'full' ? 'full' : 'ask';
+    a.approvalMode = next;
+    const pushed = pushRoster();
     persist();
+    /* THE POSTURE ON SCREEN IS THE ONE THE STATION RECORDED (sweep/safecell 2026-10-20). A refused roster push (the
+       sidecar unreachable, or its durable write failing) left this row saying "asks first" while the roster the runs
+       read still said full — and the next run went ahead unasked. Put back what the station still enforces, repaint,
+       and say so. `recorded`: the station already persisted this posture itself (the permission card's FULL ACCESS). */
+    if (!(opts && opts.recorded) && before !== next) Promise.resolve(pushed).then(ok => {
+      if (ok || a.approvalMode !== next) return;
+      a.approvalMode = before; persist();
+      if (typeof StationUI === 'undefined') return;
+      if (StationUI.setRoster) StationUI.setRoster(liveAgents());
+      if (StationUI.notify) StationUI.notify('The station did not record that change — ' + (a.name || a.id) + (before === 'full' ? ' still has FULL POWER' : ' still asks first') + '. ' + rosterRefusalWords(), 'bad');
+    });
     return true;
+  }
+
+  // why the last roster push was not recorded, from what the station said (rosterRefusal) — or that it did not answer
+  function rosterRefusalWords() {
+    const r = rosterRefusal;
+    if (!r) return 'Try again once the station is reachable.';
+    if (r.degraded) return 'This station’s data was written by a newer StarNet — update the app.';
+    if (r.behind) return 'Another window saved newer station changes first; try again in a moment.';
+    if (r.stale) return 'Another window sent a newer crew list first; try again in a moment.';
+    return 'The station refused it' + (r.error ? ' (' + r.error.slice(0, 120) + ')' : '') + '.';
   }
 
   // Execution profile is runtime/capability/filesystem scope only. It never changes approvalMode and never
@@ -635,7 +681,7 @@ const App = (() => {
         if (typeof World !== 'undefined' && World.despawnAgent) World.despawnAgent(id);   // pull its floor body
         // unbind every prop still assigned to the gone agent (its bay above all): a stale bay→agentId binding
         // re-mints a floor body for a DELETED agent on the next floor rederive (ghost crew) and keeps claiming
-        // the dock in REFIT. assignPropAgent fires station.onChange, so the world rederives on its own.
+        // the dock in BUILD MODE. assignPropAgent fires station.onChange, so the world rederives on its own.
         try {
           if (station && station.propsByAgent && station.assignPropAgent) {
             for (const p of station.propsByAgent(id)) station.assignPropAgent(p.id, '');
@@ -676,12 +722,101 @@ const App = (() => {
   // changes shape (summon; crew rehydrate on resume; a crew rename) — this is the cached-systemPrompt trap: the
   // composed prompt is a stored snapshot, not a live view. Callers still pushRoster()/persist() themselves, since
   // every roster-change site already does both right after.
+  // memory-truth (2026-10-11): the dossier's COMMANDER block is baked into EVERY agent's stored systemPrompt, and a
+  // dossier change used to recompose only the focused/edited agent — a specialist kept the old standing order until
+  // something else happened to recompose it. Callers pushRoster()/persist() themselves.
+  function recomposeAllPrompts() {
+    for (const x of agents.values()) {
+      if (!x) continue;
+      x.systemPrompt = composeSystemPrompt(x);
+      if (agent && agent.id === x.id && typeof Chat !== 'undefined' && Chat.setSystem) Chat.setSystem(x.systemPrompt);
+    }
+  }
   function recomposeOrchestrators() {
     for (const a of agents.values()) {
       if (!a || a.role !== 'orchestrator') continue;
       a.systemPrompt = composeSystemPrompt(a);
       if (agent && agent.id === a.id && typeof Chat !== 'undefined' && Chat.setSystem) Chat.setSystem(a.systemPrompt);   // focused: the live COMMS session follows
     }
+  }
+  /* THE STATION DEFAULT IS THE OVERSEER'S WIRE (issue #24). Focusing an agent writes its model/provider/effort into
+     the ONE global wire every COMMS run reads (Harness). A pinned agent brings its own wire; an agent with no pin
+     ("Follow station default") must get the Overseer's, because nothing else resets the global. Before this, a
+     specialist summoned while the station ran on StarNet credits kept a `starnet` pin; the Commander switched the
+     station to OpenRouter, focused that specialist, cleared its pin, and every run after that still went out as
+     `starnet` — refused at 0s with "Out of managed credit" on a funded BYOK station. */
+  function stationDefaultWire() {
+    const hero = agents.get('agent') || null;
+    return { model: (hero && hero.model) || '', provider: (hero && hero.provider) || '', effort: (hero && hero.reasoningEffort) || '' };
+  }
+  // A save's top-level `prov` used to record the FOCUSED agent's pin; the hero's own provider is the station's truth.
+  function savedStationProv(saved) { return (saved && saved.agent && saved.agent.provider) || (saved && saved.prov) || ''; }
+  /* 0.12.5 REASONING MIGRATION, once per save (persist() writes `reasoningMigrated` on every save from the first
+     0.12.5 persist, so an explicit 0.12.5 choice is never touched). 0.12.4's model dock could not read a reasoning
+     dial for OpenAI-API, xAI/Grok, DeepSeek or StarNet Managed models: it showed them locked at OFF and saved that,
+     while the adapter sent no reasoning_effort at all. 0.12.5 reads their real dials and sends the saved level, which
+     would silently change what an upgraded station runs:
+       - OpenAI-API / xAI / Grok / DeepSeek ran at the MODEL's default reasoning. The inherited 'none' would now turn it
+         off, so it is dropped and the provider default applies (the dock clamps it to a level the model accepts).
+       - StarNet Managed sent nothing. The Overseer's onboarding MEDIUM would now switch paid thinking on, so a Managed
+         pin keeps OFF (nothing is sent) until someone picks a level. */
+  const REASONING_MIGRATION = '0125';
+  const LEGACY_DIAL_LOCKED = ['openai', 'xai', 'grok', 'deepseek'];
+  function migrateLegacyReasoning(saved) {
+    if (!saved || typeof saved !== 'object' || saved.reasoningMigrated === REASONING_MIGRATION) return false;
+    const station = normalizeProviderId(savedStationProv(saved) || 'openrouter');
+    const settle = (prov, effort) => {
+      const p = normalizeProviderId(prov || station);
+      const e = String(effort || '').trim().toLowerCase();
+      if (LEGACY_DIAL_LOCKED.indexOf(p) >= 0) return (e === 'none' || e === 'off') ? null : (effort || null);
+      if (p === 'starnet') return 'none';
+      return effort || null;
+    };
+    const fix = a => { if (a && typeof a === 'object' && a.model) a.reasoningEffort = settle(a.provider, a.reasoningEffort); };
+    fix(saved.agent);
+    if (Array.isArray(saved.agents)) saved.agents.forEach(fix);
+    if (saved.reasoningEffort != null) {
+      const top = settle(station, saved.reasoningEffort);
+      if (top == null) delete saved.reasoningEffort; else saved.reasoningEffort = top;
+    }
+    // the page's own per-provider wire (localStorage) inherited the same OFF from 0.12.4's locked dock
+    if (typeof Harness !== 'undefined' && Harness.clearLegacyReasoningOff) Harness.clearLegacyReasoningOff(LEGACY_DIAL_LOCKED);
+    if (typeof Harness !== 'undefined' && Harness.setReasoningEffort) Harness.setReasoningEffort('none', 'starnet');
+    saved.reasoningMigrated = REASONING_MIGRATION;
+    return true;
+  }
+  function focusWire(a) {
+    const station = stationDefaultWire();
+    if (!(a && a.model)) return station;
+    return { model: a.model, provider: a.provider || station.provider, effort: a.reasoningEffort || '', owner: a.id };
+  }
+  // The crew agent whose OWN pin the global model wire holds ('' = the station's model). With an Overseer that has no
+  // model, an unpinned agent used to keep that pin, e.g. a StarNet slug that then ran on managed credits or reconciled
+  // to "no model selected" under CLAUDE CODE (2026-10-21 user report). Only a crew pin is cleared: an older station whose
+  // model lives in the wire alone (no hero model) keeps it.
+  let wirePinOwner = '';
+  function noteWirePin(a) { wirePinOwner = (a && a.id !== 'agent' && a.model) ? String(a.id) : ''; }
+  // SETTINGS -> PROVIDERS picks the STATION's provider, and the station default IS the Overseer's pin
+  // (stationDefaultWire). The card used to move only the global wire, so the Overseer kept the provider the station
+  // had just left: unpinned agents, their roster rows and a restore all followed it (the #24 "Out of managed credit"
+  // symptom through a Settings switch from StarNet credits to a BYOK key). An invalid model under the new provider is
+  // reconciled by the dock the next time the Overseer is focused, exactly as a dock provider pick is.
+  function setStationProvider(p) {
+    const hero = agents.get('agent');
+    const next = p ? normalizeProviderId(p) : '';
+    if (!hero || !next || hero.provider === next) return false;
+    hero.provider = next;
+    pushRoster();
+    persist();
+    return true;
+  }
+  function applyWire(w) {
+    if (typeof Harness === 'undefined') return;
+    if (w.model && Harness.setModel) Harness.setModel(w.model);
+    else if (wirePinOwner && Harness.setModel) Harness.setModel('');
+    wirePinOwner = (w.model && w.owner && w.owner !== 'agent') ? String(w.owner) : '';
+    if (w.provider && Harness.setProv) Harness.setProv(w.provider);
+    if (w.effort && Harness.setReasoningEffort) Harness.setReasoningEffort(w.effort);
   }
   function focusAgent(id) {
     // P1.2 (UPDATE_STATE_SAFETY_AUDIT) — end silent impersonation. The old `agents.get(id) || agents.get('agent')`
@@ -701,15 +836,15 @@ const App = (() => {
     if (!a) return;
     if (typeof Chat !== 'undefined' && Chat.setRosterStatus) Chat.setRosterStatus('');   // a real agent is focused — clear any prior honest-miss notice
     agent = a;
-    if (a.model && typeof Harness !== 'undefined' && Harness.setModel) Harness.setModel(a.model);
     // #4: provider + reasoning-effort are PER-AGENT, not one global — restore them on focus so switching to an
     // Anthropic agent right after a Codex one doesn't run the Anthropic model through the codex provider (and the
-    // dock label match). Only set when the agent actually carries them, so older agents keep today's behavior.
-    if (a.provider && typeof Harness !== 'undefined' && Harness.setProv) Harness.setProv(a.provider);
-    if (a.reasoningEffort && typeof Harness !== 'undefined' && Harness.setReasoningEffort) Harness.setReasoningEffort(a.reasoningEffort);
+    // dock label match). An agent with no pin FOLLOWS THE STATION DEFAULT (issue #24): it gets the Overseer's wire,
+    // never the leftover pin of whichever agent was focused before it.
+    const wire = focusWire(a);
+    applyWire(wire);
     if (typeof Chat !== 'undefined' && Chat.setSystem) Chat.setSystem(a.systemPrompt);   // runs carry the FOCUSED agent's identity
     const gtA = el('gt-agent'); if (gtA) gtA.textContent = a.name;
-    const gtM = el('gt-model'); if (gtM) gtM.textContent = a.model;
+    const gtM = el('gt-model'); if (gtM) gtM.textContent = wire.model || '';
     if (typeof World !== 'undefined' && World.focusBody) World.focusBody(a.id);   // Phase C: reframe the camera onto this body
     if (typeof ModelDock !== 'undefined' && ModelDock.reflect) ModelDock.reflect();
   }
@@ -741,7 +876,7 @@ const App = (() => {
       cerebras: 'CEREBRAS',
       starnet: 'STARNET MANAGED',
       ollama: 'OLLAMA',
-      claudecode: 'CLAUDE LOGIN',
+      'claude-cli': 'CLAUDE CODE',
       custom: 'CUSTOM'
     };
     return map[provider] || String(provider || 'openrouter').toUpperCase();
@@ -766,18 +901,19 @@ const App = (() => {
     if (p === 'cerebras') return 'cerebras';
     // managed credits — its bearer is the linked device token, never a key the user pastes
     if (p === 'starnet' || p === 'starnet-cloud' || p === 'managed') return 'starnet';
-    if (p === 'claudecode' || p === 'claude-code' || p === 'claude-cli' || p === 'claude-login') return 'claudecode';   // the local claude CLI login (subscription, no key)
+    if (p === 'claudecode' || p === 'claude-login') return 'claude-cli';   // the fork's old id for the Claude login (saved configs) -> upstream's claude-cli
     if (p === 'ollama' || p === 'ollama-local') return 'ollama';
+    if (p === 'claude-cli' || p === 'claude-code' || p === 'claude-code-cli') return 'claude-cli';
     if (p === 'custom' || p === 'openai-compatible' || p === 'local' || p === 'vllm' || p === 'lmstudio') return 'custom';
     return 'openrouter';
   }
   function providerNeedsKey(provider) {
     const p = normalizeProviderId(provider);
-    return p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'custom' && p !== 'starnet' && p !== 'claudecode';
+    return p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'custom' && p !== 'starnet' && p !== 'claude-cli';
   }
   function providerUsesKeyBox(provider) {
     const p = normalizeProviderId(provider);
-    return p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'starnet' && p !== 'claudecode';
+    return p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'starnet' && p !== 'claude-cli';
   }
   function providerNeedsBaseUrl(provider) {
     return normalizeProviderId(provider) === 'custom';
@@ -842,6 +978,7 @@ const App = (() => {
       if (typeof Harness !== 'undefined' && Harness.setProv) Harness.setProv(provider);
       if (typeof Harness !== 'undefined' && Harness.setModel) Harness.setModel(model);
       agent.model = model; agent.provider = provider; agent.reasoningEffort = effort;   // #4: keep model+provider+effort TOGETHER on the agent
+      noteWirePin(agent);
       const stored = agents.get(agent.id);
       if (stored) { stored.model = model; stored.provider = provider; stored.reasoningEffort = effort; }
       const gtM = el('gt-model'); if (gtM) gtM.textContent = model;
@@ -860,7 +997,11 @@ const App = (() => {
           : sel.reason === 'effort'
             ? 'REASONING: ' + effortLabel(effort)
             : 'MODEL: ' + providerLabel(provider) + ' / ' + shortModelLabel(model) + ' / ' + effortLabel(effort);
-      StationUI.notify(msg, 'good');
+      // a dock pick ('model'/'effort') is the user's own press — silent receipt; a catalog-driven change keeps its bell.
+      // One receipt card for every pick (live walk 10-14: LOW, MED, HIGH, MAX stacked four cards over the CREW column):
+      // the next press updates the card already up instead of stacking another.
+      const userPick = sel.reason === 'model' || sel.reason === 'effort';
+      StationUI.notify(msg, 'good', undefined, userPick ? { silent: true, key: 'model-pick' } : undefined);
     }
   }
   // the persisted shape of a crew member (systemPrompt is derived, recomposed on rehydrate).
@@ -877,8 +1018,14 @@ const App = (() => {
     if (!Array.isArray(savedAgents)) return;
     for (const s of savedAgents) {
       if (!s || !s.id || s.id === 'agent' || agents.has(s.id)) continue;   // hero already registered; skip dups (so the 'specialist' default below is always correct here — the orchestrator never routes through this path)
-      const a = { id: s.id, name: s.name, color: s.color, skin: s.skin || DATA.DEFAULT_SKIN, model: s.model || (agent && agent.model),
-                  provider: s.provider || (agent && agent.provider) || null, reasoningEffort: s.reasoningEffort || (agent && agent.reasoningEffort) || null,   // #4: per-agent provider+effort (fall back to the hero's)
+      // An empty model is the durable "Follow station default" choice, not a missing pin
+      // to replace with a snapshot of the hero. Preserve it across reload/provider changes.
+      const a = { id: s.id, name: s.name,
+                  // a saved suit tint lands in style attrs: hex only, else a palette suit (security audit 2026-09-23)
+                  color: /^#[0-9a-f]{3,8}$/i.test(String(s.color || '')) ? String(s.color) : (typeof SUITS !== 'undefined' ? SUITS[agents.size % SUITS.length] : '#6fb3bf'),
+                  skin: s.skin || DATA.DEFAULT_SKIN, model: s.model || null,
+                  provider: s.model ? (s.provider || (agent && agent.provider) || null) : null,
+                  reasoningEffort: s.model ? (s.reasoningEffort || (agent && agent.reasoningEffort) || null) : null,
                   personaId: (typeof Personas !== 'undefined' ? Personas.resolve(s.personaId) : s.personaId), role: s.role || 'specialist', voiceTraits: s.voiceTraits || null, customVoice: s.customVoice || '',
                   approvalMode: s.approvalMode || 'ask', executionProfile: executionProfileOf(s), workshop: !!s.workshop, purpose: s.purpose || null, specialtyId: s.specialtyId || null,
                   skills: Array.isArray(s.skills) ? s.skills.slice() : [],   // Class Loadouts S1: restore the per-agent skill package
@@ -896,8 +1043,10 @@ const App = (() => {
      specialty. Voice + spend are left untouched — deploy re-shapes the job, not the personality. */
   function openDeployBay(startTab) {
     if (typeof Marketplace === 'undefined' || !agent) return;
+    if (typeof Systems !== 'undefined') Systems.opened(startTab === 'recipes' ? 'mywork' : 'recruit');   // door law (RECIPES is a MY WORK tab)
     SFX.click();
     Marketplace.open({
+      intent: (startTab === 'recipes') ? 'recipes' : 'respec',   // the door's intent (Marketplace BAY_INTENTS, gh#117)
       mode: 'deploy',
       tab: (startTab === 'recipes') ? 'recipes' : 'agents',   // the bay opens on this tab (RECIPES = the mission library)
       agentName: agent.name,
@@ -920,6 +1069,7 @@ const App = (() => {
     if (typeof Marketplace === 'undefined' || !agent || !recipeId) return;
     SFX.click();
     Marketplace.open({
+      intent: 'recipe-launch',
       mode: 'deploy',
       tab: 'recipes',
       agentName: agent.name,
@@ -979,9 +1129,15 @@ const App = (() => {
       return (m && typeof m === 'object') ? m : {};
     } catch (_) { return {}; }
   }
-  function resolveTierModel(tier, baseModel) {
+  // the SETTINGS › New agent defaults pin for a class tier, or null — the ONE reader the summon path and the
+  // Recruitment Bay's MODEL helper share, so the bay never promises a copy that applyLoadout then replaces.
+  function tierModelFor(tier) {
     const pinned = tier && tierModelMap()[tier];
-    if (pinned && String(pinned).trim()) return String(pinned).trim();
+    return (pinned && String(pinned).trim()) ? String(pinned).trim() : null;
+  }
+  function resolveTierModel(tier, baseModel) {
+    const pinned = tierModelFor(tier);
+    if (pinned) return pinned;
     return baseModel || ((typeof Harness !== 'undefined' && Harness.getModel) ? Harness.getModel() : null) || null;
   }
   // fold the class loadout (model tier + effort + skills) onto an agent record. A class's `kit` is NOT placed
@@ -1060,10 +1216,14 @@ const App = (() => {
     if (typeof StationUI !== 'undefined' && StationUI.setRoster) StationUI.setRoster(liveAgents());
     else console.warn('[summon] StationUI.setRoster missing — crew manifest not refreshed');
     try { if (window.__STARNET_DEV__) console.log('[summon]', JSON.stringify({ id, name: a.name, skin: a.skin, hadHero: !!agent, worldSpawn: _spawned, crew: (typeof World !== 'undefined' && World.crewCount) ? World.crewCount() : '?', roster: agents.size })); } catch (e) {}
-    // a fresh workstream BOUND to the new agent, but inactive by default. Activation is the explicit
-    // "talk to this specialist directly" action; summon itself only expands the crew/roster.
+    // ORG P25 — FEWER EMPTY SESSIONS: a session is made only when someone is going to talk in it. An ACTIVATED summon (the
+    // bay's RECRUIT: "talk to this specialist now") opens its own session; a background hire (the overseer's team.summon,
+    // a workflow RECRUIT) makes NONE — it only grows the crew. Its first session is minted when it is first needed:
+    // ON THE LINE (selectAgent's "a specialist that has no stream yet gets a fresh one"), the narrowed rail's START ONE,
+    // a delegation's own worker thread. Every reader takes "no session yet" (waitingSessionOf walks pending asks, the
+    // HUD falls back to selectAgent, channels are keyed by session id, group add is by agent id).
     const activate = opts.activate === true;
-    const ws = (typeof Workstreams !== 'undefined') ? Workstreams.create(a.name, { agentId: id, activate }) : null;
+    const ws = (activate && typeof Workstreams !== 'undefined') ? Workstreams.create(a.name, { agentId: id, activate }) : null;
     // the COMMS "who you're talking to" selector reads App.agents() but only rebuilds inside renderIdBar —
     // without this, a summon leaves the selector stale (missing the new agent) until some other stream
     // switch happens, while the toast says "switch to its stream". Refresh it the moment the roster grows.
@@ -1079,10 +1239,10 @@ const App = (() => {
     if (activate) {
       // ACTIONABLE FOLLOW-UP (audit B-1): a summoned specialist can't take FLOOR work until it has its own DESK
       // (a seated workstation). The old copy buried this required step in a passing remark ("give it its OWN PC")
-      // with no way to act. Now the agent says it plainly — "desk", never "OWN PC" — and a chip opens REFIT with
+      // with no way to act. Now the agent says it plainly — "desk", never "OWN PC" — and a chip opens BUILD MODE with
       // desk placement teed up. FINALE (Lane D): the toast is ONE line now — the desk requirement + its door move
       // into the diegetic line + chip below (the standing record no longer duplicates the whole instruction).
-      _notify(a.name + ' summoned — type to task it now.', 'good');
+      _notify(a.name + ' recruited — type to task it now.', 'good');
       // WHERE THAT LINE COMES FROM (2026-08-03): the Chat.load(ws) above opened the new agent's session, and the
       // desk prompt is now a property of THAT SESSION (chat.js maybeDeskPrompt → App.needsWorkstation), not a
       // one-shot printed here. It used to be printed once, DOM-only: the first stream switch (or any reload) wiped
@@ -1096,11 +1256,11 @@ const App = (() => {
       setTimeout(() => { const ci = el('chat-input'); if (ci && ci.offsetParent !== null) { try { ci.focus(); } catch (_) {} } }, 0);
     } else {
       // say WHERE its desk landed when one was seeded — the Commander needs to be able to go look at it (and
-      // move it in REFIT). Only claimed when the placement actually returned ok; a failed seed says nothing.
+      // move it in BUILD MODE). Only claimed when the placement actually returned ok; a failed seed says nothing.
       // "took the free desk" vs "desk placed": ensureWorkstation may ADOPT an unbound workstation instead of
       // building one, and saying "placed" for a desk that was already there is a small lie about the floor.
       const deskLine = (desk && desk.ok) ? ((desk.adopted ? 'took the free desk' : 'desk placed') + (deskRoom ? ' in ' + deskRoom : '') + '. ') : '';
-      _notify(a.name + ' summoned — ' + deskLine + 'switch to its stream to task it, or let the overseer delegate.', 'good');
+      _notify(a.name + ' recruited — ' + deskLine + 'pick it ON THE LINE in COMMS to talk to it, or let the overseer delegate.', 'good');
     }
     // ONE loadout beat: state plainly what the class summon actually applied — the skills enabled, the effort
     // applied, and the STATION GEAR the class draws on (honest present/missing under the overseer, NOT per-agent
@@ -1122,16 +1282,19 @@ const App = (() => {
     if (!station || typeof station.propsByAgent !== 'function' || typeof station.capForProp !== 'function') return false;
     try { return !station.propsByAgent(id).some(p => station.capForProp(p.t) === 'computer'); } catch (_) { return false; }
   }
-  // OPEN REFIT WITH DESK PLACEMENT TEED UP — the target of the post-summon "PLACE ITS DESK" chip. Opens the
+  // OPEN BUILD MODE WITH DESK PLACEMENT TEED UP — the target of the post-summon "PLACE ITS DESK" chip. Opens the
   // builder (the same door the ⚒ BUILD dock opens) and, once its DOM is up, drives it to the PROP tool on the
   // WORKSTATIONS category so the very next floor-click drops a desk (a workstation is editable, so it can't be
   // auto-requisitioned — it opens the agent-binding picker on placement; the Commander places + binds it by hand,
-  // which is the honest one desk-per-agent path). Degrades safely: if any control isn't found we still leave REFIT
-  // open on its default tool, which is already a real improvement over the old unclickable "Open REFIT" sentence.
-  function openDeskPlacement() {
+  // which is the honest one desk-per-agent path). Degrades safely: if any control isn't found we still leave BUILD MODE
+  // open on its default tool, which is already a real improvement over the old unclickable "Open BUILD MODE" sentence.
+  function openDeskPlacement(agentId) {
     if (typeof Build === 'undefined' || !Build.open) return;
+    // (2026-10-07) BUILD MODE arms the desk FOR this agent: the next floor click drops it and seats them there —
+    // no CONFIGURE step. The DOM drive below stays only as the fallback for a Build without placeDeskFor.
+    if (agentId && Build.placeDeskFor) { try { if (Build.placeDeskFor(agentId)) return; } catch (_) {} }
     try { if (!Build.isOpen || !Build.isOpen()) Build.open(); } catch (_) { return; }
-    // REFIT builds its palette synchronously in open()->buildDOM, but retarget across a couple of rAFs to be safe
+    // BUILD MODE builds its palette synchronously in open()->buildDOM, but retarget across a couple of rAFs to be safe
     // against any deferred render. Each pass clicks only what isn't already active, so it's idempotent + cheap.
     let tries = 0;
     const arm = () => {
@@ -1158,7 +1321,7 @@ const App = (() => {
     } catch (_) { return []; }
   }
   // Compose the one-line summon loadout beat from what was ACTUALLY applied: the skills enabled, the effort, and
-  // — honestly — the STATION GEAR the class draws on that the station is MISSING (add it in REFIT for the class to
+  // — honestly — the STATION GEAR the class draws on that the station is MISSING (add it in BUILD MODE for the class to
   // work its best). Present gear needs no callout (it just works). Reads skills/effort off the record applyLoadout
   // wrote. Returns '' when there is nothing to say.
   function loadoutSummary(a, spec) {
@@ -1170,7 +1333,7 @@ const App = (() => {
     if (gear.length) {
       const have = new Set(stationGearTypes());
       const missing = gear.filter(g => !have.has(g));
-      if (missing.length) parts.push('station lacks ' + missing.join(', ') + ' — add ' + (missing.length === 1 ? 'it' : 'them') + ' in REFIT for its full toolkit');
+      if (missing.length) parts.push('station lacks ' + missing.join(', ') + ' — add ' + (missing.length === 1 ? 'it' : 'them') + ' in BUILD MODE for its full toolkit');
     }
     return parts.join(' · ');
   }
@@ -1191,8 +1354,10 @@ const App = (() => {
   }
   function openSummonBayWith(classSeed) {
     if (typeof Marketplace === 'undefined' || !agent) return;
+    if (typeof Systems !== 'undefined') Systems.opened('recruit');   // door law: whoever opened the bay, RECRUIT is online
     SFX.click();
     const go = () => Marketplace.open({
+      intent: 'recruit',   // the door's intent: this bay RECRUITS (RE-SPEC … INSTEAD is its second verb) — gh#117
       mode: 'pick', summon: true, concurrentCap: concurrentCap,
       classSeed: classSeed || null,   // one-shot: the bay focuses this class's dossier on open (maybeConsumeClassSeed)
       notify: (typeof StationUI !== 'undefined') ? StationUI.notify : null,
@@ -1267,6 +1432,7 @@ const App = (() => {
     if (typeof Marketplace === 'undefined' || !agent || !proposal) return;
     SFX.click();
     Marketplace.open({
+      intent: 'recipe-mint',
       mode: 'deploy',
       tab: 'recipes',
       recipeMint: proposal,                 // ← the R2 editor opens pre-filled from this draft (additive ctx seed)
@@ -1354,6 +1520,12 @@ const App = (() => {
   // the full backoff loop (the roster is re-derivable from local state and re-pushed constantly): track a
   // single failed flag, warn EXACTLY once on the healthy→failing edge, and let the next persist re-attempt.
   let rosterPushFailed = false;
+  // what the station said when it last refused a roster push ({ degraded, stale, behind, error }), null when no answer came —
+  // so a reverted control says what actually happened, never "try again once the station is reachable" when it answered
+  let rosterRefusal = null;
+  // the rows of this page's last ACCEPTED roster push (agentId -> its JSON): a page behind the station sends which rows it
+  // changed since, so the station merges them row by row instead of refusing it (sidecar handleRoster, mergeRosterRows)
+  let rosterAccepted = new Map();
   /* S3 — MAKE THE METERS LOAD-BEARING (without gating anything).
      Until now every reader of an agent's stats was a display surface: the level chip, the dossier, /whoami.
      Nothing in the station ACTED on them, so a TRUSTED veteran and a stranger were identical to delegation —
@@ -1377,7 +1549,9 @@ const App = (() => {
   }
   function pushRoster() {
     try {
-      const fallbackProv = (typeof Harness !== 'undefined' && Harness.getProv) ? Harness.getProv() : 'openrouter';
+      // An unpinned row follows the STATION DEFAULT (the Overseer's provider), never the global wire — that is the
+      // focused agent's pin, and stamping it onto every unpinned agent sent their routines/channel runs to it (#24).
+      const fallbackProv = stationDefaultWire().provider || ((typeof Harness !== 'undefined' && Harness.getProv) ? Harness.getProv() : 'openrouter');
       const list = liveAgents().map(a => ({ agentId: a.id, system: a.systemPrompt || '', name: a.name || a.id, model: a.model || '', provider: a.provider || fallbackProv, role: rosterRole(a), approvalMode: (a.approvalMode === 'full' ? 'full' : 'ask'), executionProfile: executionProfileOf(a),
         track: rosterTrack(a),    // S3: this agent's EARNED track record, so the lead's dispatch briefing can pick on evidence (see rosterTrack)
         workshop: !!a.workshop,   // W3: the away-build grant travels with the roster so the consent broker can honor it
@@ -1387,7 +1561,14 @@ const App = (() => {
       // sidecar records the stamp of the last accepted write and 200s { ok:false, stale:true } on an older one;
       // a legacy stamp-less push still writes as before (backward compatible). Date.now() is monotonic-enough for
       // this last-write anti-clobber (mirrors save.js's own updatedAt stamp).
-      lastRosterPush = fetch('/api/roster', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ agents: list, updatedAt: Date.now() }) })
+      // saveRevision/saveClient (save-latch-kill): the station revision this crew view is built on and the window it writes as,
+      // so the station refuses a roster from a window behind it (another window or a merge wrote since) instead of letting
+      // the newest page clock win (sidecar handleRoster's revision check)
+      // rosterBase: the rows of the last accepted push and the ones changed since — a page behind the station is merged with it
+      const rows = new Map(list.map(r => [r.agentId, JSON.stringify(r)]));
+      const rosterBase = { known: Array.from(rosterAccepted.keys()), changed: list.filter(r => rosterAccepted.get(r.agentId) !== rows.get(r.agentId)).map(r => r.agentId) };
+      const base = (typeof CloudSave !== 'undefined' && CloudSave.revision && CloudSave.writerId) ? { saveRevision: CloudSave.revision(), saveClient: CloudSave.writerId(), rosterBase } : {};
+      lastRosterPush = fetch('/api/roster', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(Object.assign({ agents: list, updatedAt: Date.now() }, base)) })
         .then(async r => {
           if (r && r.ok === false) throw new Error('roster HTTP ' + r.status);
           // EL-11 FIX 1: the sidecar answers REFUSALS as HTTP 200 { ok:false, ... } (degraded workspace /
@@ -1398,12 +1579,15 @@ const App = (() => {
           try { body = await r.json(); } catch (_) { body = null; }
           if (body && typeof body === 'object' && body.ok === false) {
             if (body.degraded === true && typeof CloudSave !== 'undefined' && CloudSave.markDegraded) CloudSave.markDegraded();
+            rosterRefusal = { degraded: body.degraded === true, behind: body.behind === true, stale: body.stale === true, error: String(body.error || '') };
             throw new Error('roster refused: ' + (body.error || (body.stale ? 'stale push' : 'unknown')));
           }
+          rosterAccepted = rows; rosterRefusal = null;
           if (rosterPushFailed) { rosterPushFailed = false; try { console.info('[roster] sidecar roster sync recovered.'); } catch (_) {} }
           return true;
         })
-        .catch(() => {
+        .catch(e => {
+          if (!/^roster refused/.test(String(e && e.message))) rosterRefusal = null;   // no answer: nothing the station said
           if (!rosterPushFailed) { rosterPushFailed = true; try { console.warn('[roster] sidecar roster sync failed; will retry on next persist. Local roster is intact.'); } catch (_) {} }
           return false;
         });
@@ -1429,7 +1613,7 @@ const App = (() => {
     });
     // desk:true — this summon IS the answer to "create me an agent", so the worker arrives with the one
     // per-agent prop it needs to sit and work. See summonAgent: the seed is that agent's desk and nothing
-    // else; the Commander can move or reclaim it in REFIT like any placed prop.
+    // else; the Commander can move or reclaim it in BUILD MODE like any placed prop.
     let a = null;
     try { a = summonAgent(spec, { activate: false, desk: true }); } catch (_) { a = null; }
     if (!a) return null;
@@ -1459,8 +1643,54 @@ const App = (() => {
       stationSaveQueued = true;
       // Coalesce the synchronous mutations of one gesture (e.g. place + assign a desk),
       // but save before the next browser event. Do not wait for SAVE & EXIT or a chat turn.
-      queueMicrotask(() => { stationSaveQueued = false; persist(); });
+      queueMicrotask(() => {
+        stationSaveQueued = false; persist();
+        // a desk that just landed (a WHO SITS HERE chip, PLACE ITS DESK, the overseer's station op) retires the open
+        // COMMS "nowhere to sit" line now, not only when BUILD MODE closes: it is a derived floor claim (chat.js re-reads it)
+        if (typeof Chat !== 'undefined' && Chat.retireDeskPrompt) { try { Chat.retireDeskPrompt(); } catch (_) {} }
+      });
     });
+  }
+
+  /* THE MERGE NOTICES, worded only from what the station answered (cloudsave mergeNotice / onMerged):
+     • inSession — another window saved past this one while it was open; its saves are merged three-way into the station file
+       (sidecar/save-merge.js): what it changed lands, the other window's changes stay. Its view does not show the other
+       window's changes until it is reloaded. Changes the station could not take (a session or crew member another window
+       deleted) are named, with the copy of this window's save kept beside the station.
+     • reentered — the same, for a window whose base was not known: merged on the boot merge's rules (sessions only) and
+       reopened on the station file — its crew, settings and floor changes are NOT in the station file, only in the kept copy.
+     • otherwise the boot merge of a reopening window's unsent save (cloudsave reconcile → POST /api/save/adopt). */
+  let mergeListenerWired = false;
+  function mergeNoticeLine(merge) {
+    const count = v => (Number.isFinite(Number(v)) ? Number(v) : 0);
+    const n = count(merge.added) + count(merge.extended) + count(merge.copied), s = k => k === 1 ? '' : 's';
+    if (merge.inSession) {
+      const lost = Array.isArray(merge.lost) ? merge.lost : [];
+      const head = merge.first
+        ? 'Another window saved station changes while this one was open. From now on this window’s changes are merged into the station file as it saves, without undoing the other window’s; this window does not show the other window’s changes until you reload it.'
+        : '';
+      if (!lost.length) return head;
+      const names = lost.slice(0, 3).map(x => '“' + String(x.name || x.id).slice(0, 40) + '”').join(', ') + (lost.length > 3 ? ' and ' + (lost.length - 3) + ' more' : '');
+      return (head ? head + ' ' : '') + lost.length + ' change' + s(lost.length) + ' from this window could not go into the station file, because another window deleted ' + names + '.'
+        + (merge.kept ? ' This window’s whole save is kept beside the station as ' + merge.kept + '.' : '');
+    }
+    if (merge.threeWay) {
+      // a reopening window's unsent save merged three-way from its journal's own merge description (cloudsave writeSide)
+      const lost = Array.isArray(merge.lost) ? merge.lost : [];
+      const names = lost.slice(0, 3).map(x => '“' + String(x.name || x.id).slice(0, 40) + '”').join(', ') + (lost.length > 3 ? ' and ' + (lost.length - 3) + ' more' : '');
+      return (merge.unchanged ? '' : 'Your unsent changes from last time were merged into the station file.')
+        + (lost.length ? (merge.unchanged ? '' : ' ') + lost.length + ' change' + s(lost.length) + ' from last time could not go into the station file, because another window deleted ' + names + '.' + (merge.kept ? ' This window’s whole save is kept beside the station as ' + merge.kept + '.' : '') : '');
+    }
+    if (merge.reentered) {
+      return merge.base === 'window'
+        ? 'Another window saved station changes while this one was open. This window’s newest changes are in the station file' + (n ? ', with ' + n + ' session' + s(n) + ' only the station file held' : '') + ', and it reopened on it. The station file from before is kept as ' + (merge.backup || 'a backup beside it') + '.'
+        : 'Another window saved station changes while this one was open, so this window reopened on the station file' + (n ? ' with ' + n + ' session' + s(n) + ' from this window added' : '') + '. Its other unsent changes (crew, settings, floor, renames) are not in the station file' + (merge.kept ? ': this window’s whole save is kept beside it as ' + merge.kept : '') + '.';
+    }
+    return merge.late
+      ? 'Your unsent changes from last time were merged into the station file before this window opened. The station file from before is kept beside it.'
+      : merge.base === 'window'
+      ? 'Your newest changes from last time had not reached the station file; they are in it now' + (n ? ', with ' + n + ' session' + s(n) + ' only the station file held' : '') + '. The station file from before is kept as ' + (merge.backup || 'a backup beside it') + '.'
+      : 'The station file was kept over this window’s unsent changes from last time' + (n ? ', with ' + n + ' session' + s(n) + ' from this window added' : '') + '. This window’s whole save is kept beside it' + (merge.kept ? ' as ' + merge.kept : '') + '.';
   }
 
   let saveFailureNotified = false;
@@ -1470,18 +1700,36 @@ const App = (() => {
     // persist while a summoned agent is focused would overwrite the hero identity and corrupt resume.
     const hero = agents.get('agent') || agent;
     const stationStats = (typeof XpStore !== 'undefined') ? XpStore.stationStats() : undefined;
-    const prov = (typeof Harness !== 'undefined' && Harness.getProv) ? Harness.getProv() : undefined;   // persist the provider so a codex agent resumes without a key prompt after a wipe/origin-reset
+    // persist the provider so a codex agent resumes without a key prompt after a wipe/origin-reset. Like the root, it is
+    // the STATION's (the hero's), never the focused crew member's pin — a saved pin reloaded as the station provider (#24).
+    const prov = (hero && hero.provider) || ((typeof Harness !== 'undefined' && Harness.getProv) ? Harness.getProv() : undefined);
     const reasoningEffort = (typeof Harness !== 'undefined' && Harness.getReasoningEffort) ? Harness.getReasoningEffort() : undefined;
     const profile = (typeof ProfileStore !== 'undefined') ? ProfileStore.serialize() : undefined;
     const worksignal = (typeof WorkSignalStore !== 'undefined') ? WorkSignalStore.serialize() : undefined;   // the capability-usage histogram (adaptive recruitment)
     const roster = liveAgents();
     const dossier = (typeof DossierStore !== 'undefined') ? DossierStore.serialize() : undefined;   // the station-wide Commander model
-    const doc = Save.write(Object.assign({ _saveDirty: true, _saveRevision: typeof CloudSave !== 'undefined' && CloudSave.revision ? CloudSave.revision() : 0, agent: hero, agents: roster.length > 1 ? roster.map(serializeAgentLite) : undefined, usage: Harness.totals(), prov, reasoningEffort, station: station ? station.serialize() : undefined, stationStats, profile, worksignal, dossier }, Workstreams.serialize()));
-    if (doc && typeof CloudSave !== 'undefined') CloudSave.push(doc);   // durable write-through to the sidecar (debounced, best-effort)
+    // _saveClient: the window whose work this is (CloudSave.writerId), in the browser cache too, so a reopened window can
+    // prove a cached save left behind by a crash is that window's newer work (cloudsave reconcile)
+    const saveState = Object.assign({ _saveDirty: true, _saveRevision: typeof CloudSave !== 'undefined' && CloudSave.revision ? CloudSave.revision() : 0, _saveClient: typeof CloudSave !== 'undefined' && CloudSave.writerId ? CloudSave.writerId() : undefined, agent: hero, agents: roster.length > 1 ? roster.map(serializeAgentLite) : undefined, usage: Harness.totals(), prov, reasoningEffort, reasoningMigrated: '0125' /* = REASONING_MIGRATION; a literal so persist() also runs when lifted alone */, station: station ? station.serialize() : undefined, stationStats, profile, worksignal, dossier }, Workstreams.serialize());
+    // #121 WRITE-THROUGH: build the envelope ONCE and always queue it for the station file. The browser cache holds the
+    // whole save under one key and refuses it past the browser's per-site cap; gating the station file on that write
+    // froze BOTH copies at the first failure, so every restart reverted the station.
+    const envelope = Save.envelope ? Save.envelope(saveState) : saveState;
+    const doc = Save.write(envelope);
+    // raw: the exact string Save.write just produced for this envelope, so CloudSave clones it with one parse instead of a
+    // second whole-save stringify (idle CPU piece 3, 2026-10-20)
+    const raw = Save.takeWriteRaw ? Save.takeWriteRaw() : null;
+    if (typeof CloudSave !== 'undefined') CloudSave.push(doc || envelope, { cacheFailed: !doc, cacheError: doc ? null : (Save.writeError ? Save.writeError() : null), raw });   // durable write-through to the sidecar (debounced, best-effort)
     if (rosterPushFailed) pushRoster();   // a prior roster POST failed — retry it opportunistically on this persist
     if (!doc) {
-      if (!saveFailureNotified && typeof StationUI !== 'undefined') StationUI.notify('Could not save station changes. Keep this window open and free storage before trying again.', 'warn');
+      // #121: the cache refused this save (the browser's per-site cap). It was queued for the station file above; the save
+      // light tracks the station file's confirmation. Freeing disk space never helps, so the notice no longer asks for it.
+      const why = (!Save.writeQuotaFull || Save.writeQuotaFull()) ? 'Browser storage for this window is full (a browser limit — freeing disk space will not help).' : 'Browser storage refused this window’s save.';
+      if (!saveFailureNotified && typeof StationUI !== 'undefined') StationUI.notify(why + ' Station changes now go to the station file only; the ● save light in the top bar says whether your latest change is confirmed there.', 'warn', undefined, { kind: 'alert', key: 'save-failed' });
       saveFailureNotified = true;
+      // repaint the light NOW (no green flash: nothing reached the cache) — waiting for its 1 s tick left "autosave" or
+      // "confirmed in the station file" showing for a change the station file has not confirmed yet (live proof 10-15)
+      if (typeof StationUI !== 'undefined' && StationUI.refreshSave) StationUI.refreshSave();
       return false;
     }
     saveFailureNotified = false;
@@ -1496,7 +1744,8 @@ const App = (() => {
     grok: ['grok-4', 'grok-3', 'grok-code-fast-1'],
     kimi: ['kimi-for-coding', 'kimi-for-coding-highspeed', 'k3'],
     openai: ['gpt-5.5', 'gpt-5.4', 'gpt-4.1'],
-    anthropic: ['claude-sonnet-4-5', 'claude-opus-4-1', 'claude-3-5-haiku-latest'],
+    // current ids (2026-10): claude-opus-4-1 retired 2026-08-05 and Haiku 3.5 is retired — an offline pick of either 404s
+    anthropic: ['claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-4-5'],
     gemini: ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.0-flash'],
     xai: ['grok-4.3', 'grok-4-fast', 'grok-4'],
     groq: ['openai/gpt-oss-120b', 'llama-3.3-70b-versatile', 'meta-llama/llama-4-scout-17b-16e-instruct'],
@@ -1506,9 +1755,12 @@ const App = (() => {
     fireworks: ['accounts/fireworks/models/deepseek-v3p1', 'accounts/fireworks/models/kimi-k2p5', 'accounts/fireworks/models/llama-v3p3-70b-instruct'],
     perplexity: ['sonar-pro', 'sonar', 'sonar-reasoning-pro'],
     cerebras: ['llama-4-scout-17b-16e-instruct', 'llama3.1-8b', 'qwen-3-coder-480b'],
-    ollama: ['llama3.1', 'qwen2.5-coder', 'mistral'],
-    claudecode: ['sonnet', 'opus', 'haiku'],
-    openrouter: ['gpt-5.5', 'anthropic/claude-sonnet-4.6', 'anthropic/claude-opus-4.8', 'openai/gpt-5', 'google/gemini-2.5-pro']
+    ollama: ['qwen3:8b', 'llama3.1', 'qwen2.5-coder', 'mistral'],
+    'claude-cli': ['claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-4-5-20251001'],   // [0] = the default pick; the live catalog adds the rest
+    openrouter: ['gpt-5.5', 'anthropic/claude-sonnet-4.6', 'anthropic/claude-opus-4.8', 'openai/gpt-5', 'google/gemini-2.5-pro'],
+    // #93: STARNET MANAGED's catalog is the routed vendor/model lineup — a bare 'gpt-5.5' (the openrouter row it used
+    // to borrow) is "not in the catalog" there and the dock cleared it. Its own list saves a catalog-shaped id.
+    starnet: ['openai/gpt-5.5', 'anthropic/claude-sonnet-4.6', 'anthropic/claude-opus-4.8', 'openai/gpt-5', 'google/gemini-2.5-pro']
   });
   // The genesis model catalog for the ACTIVE provider — {id, name, pricing, context_length, fallback?} items
   // feeding the themed #model-pop popover (which replaced the native <datalist>). genesisOffline flags a
@@ -1516,6 +1768,21 @@ const App = (() => {
   // (mirrors ModelDock's E4 honesty). Harness.listModels() populates the price/context map priceOf reads.
   let genesisModels = [];
   let genesisOffline = false;
+  /* Why this page's keyed /api calls are refused, in one short phrase ('' = they are not, as far as the page knows).
+     A page the station KEPT its key from (Harness.tokenWithheld: it could not prove this browser runs as the owner's OS
+     user, sidecar/peerowner.js) is checked FIRST: it is not a restarted station (review threads-backend-05 /
+     sidecar-index-06). A reload re-runs the check, so it is offered only for a transient reason
+     (Harness.tokenWithheldRetryable: the lookup failed or the connection could not be traced), before the hatch that
+     turns the check off; for another account it would re-run the same failing check, so it is never offered. */
+  function refusedPageLine() {
+    if (Harness.tokenWithheld && Harness.tokenWithheld()) {
+      return 'this browser was not verified as running under your own user account, so StarNet won’t take commands from it — '
+        + (Harness.tokenWithheldRetryable && Harness.tokenWithheldRetryable() ? 'reload this page to run the check again; if it keeps failing and it is yours, ' : 'if it is yours, ')
+        + 'restart StarNet with STARNET_TRUST_LOCAL_PEERS=1';
+    }
+    if (Harness.sessionStale && Harness.sessionStale()) return 'the station restarted; reload this page';
+    return '';
+  }
   async function loadModels(provider) {
     const p = normalizeProviderId(provider || pickedProvider);
     const countEl = el('model-count'), inp = el('in-model');
@@ -1526,7 +1793,14 @@ const App = (() => {
     // drifted onto stale slugs while the right answer sat one inch below in the picks). defaultModelFor() covers
     // providers without a curated pick (custom / ollama).
     const picks = MODEL_PICKS[p];
-    const defId = (picks && picks[0] && picks[0].id) || defaultModelFor(p);
+    let defId = (picks && picks[0] && picks[0].id) || defaultModelFor(p);
+    // A LOCAL catalog is exactly what is installed. The seed slug ('llama3.1') is only a name Ollama resolves if that
+    // exact tag was pulled; prefilling it over a machine that has only qwen3:8b woke the agent on a model that does not
+    // exist and failed its first run. Default to an installed model instead — one Ollama says can call tools.
+    if (p === 'ollama' && list.length && !list.some(m => m && m.id === defId)) {
+      const usable = list.find(m => m && m.supportsTools !== false) || list[0];
+      if (usable && usable.id) defId = usable.id;
+    }
     if (list.length) {
       genesisModels = list; genesisOffline = false;
       countEl.textContent = '(' + list.length + ' in catalog)';
@@ -1541,7 +1815,10 @@ const App = (() => {
       const FALLBACK = FALLBACK_MODELS[p] || FALLBACK_MODELS.openrouter;
       genesisModels = FALLBACK.map(id => ({ id, name: id, fallback: true }));
       genesisOffline = true;
-      countEl.textContent = '(catalog offline — type or pick a slug)';
+      // #39: a refused page (a stale token after a sidecar restart, or a key the station withheld) is NOT an offline
+      // catalog — say the one thing that fixes it.
+      const refused = refusedPageLine();
+      countEl.textContent = refused ? '(' + refused + ')' : '(catalog offline — type or pick a slug)';
       if (!inp.value) inp.value = defId || FALLBACK[0];   // default-fill even offline so WAKE works; the Commander can overtype
       inp.placeholder = 'type a model slug — e.g. ' + (defId || 'gpt-5.5');
     }
@@ -1566,10 +1843,12 @@ const App = (() => {
      curated FALLBACK list loadModels() already ships, so nothing new is fabricated. Codex hides them —
      its menu is discovered live per-account (loadCodexModels), so a static list there could mislead. */
   const MODEL_PICKS = Object.freeze({
-    claudecode: [
-      { label: 'Sonnet', id: 'sonnet', tag: 'balanced' },
-      { label: 'Opus', id: 'opus', tag: 'deepest' },
-      { label: 'Haiku', id: 'haiku', tag: 'fastest' }
+    // #93: managed ids are vendor/model, like OpenRouter's; [0] is the default a fresh STARNET setup saves.
+    starnet: [
+      { label: 'GPT-5.5', id: 'openai/gpt-5.5', tag: '' },
+      { label: 'Sonnet 4.6', id: 'anthropic/claude-sonnet-4.6', tag: 'balanced' },
+      { label: 'Opus 4.8', id: 'anthropic/claude-opus-4.8', tag: 'deepest' },
+      { label: 'Gemini 2.5 Pro', id: 'google/gemini-2.5-pro', tag: '' }
     ],
     openrouter: [
       { label: 'Opus 4.8', id: 'anthropic/claude-opus-4.8', tag: 'deepest' },
@@ -1582,8 +1861,8 @@ const App = (() => {
       { label: 'GPT-5.4', id: 'gpt-5.4', tag: '' }
     ],
     anthropic: [
-      { label: 'Sonnet 4.5', id: 'claude-sonnet-4-5', tag: 'balanced' },
-      { label: 'Opus 4.1', id: 'claude-opus-4-1', tag: 'deepest' }
+      { label: 'Sonnet 5.5', id: 'claude-sonnet-5-5', tag: 'balanced' },
+      { label: 'Opus 5.5', id: 'claude-opus-5-5', tag: 'deepest' }   // was Opus 4.1 — retired 2026-08-05, the chip 404'd
     ],
     gemini: [
       { label: 'Gemini 2.5 Pro', id: 'gemini-2.5-pro', tag: 'deepest' },
@@ -1836,19 +2115,28 @@ const App = (() => {
     syncModelPicks();   // keep the recommended-chip highlight in lockstep with whatever's in the field
     if (isOAuthProviderId(pickedProvider)) { hint.textContent = 'included in your ' + OAUTH_GENESIS[pickedProvider].sub.replace(/ subscription$/, '') + ' subscription'; return; }
     if (!id) { hint.textContent = 'pick or type a model slug'; return; }
-    const limit = Harness.contextLimitOf ? Harness.contextLimitOf(id) : 0;
+    // the PICKED card's own catalog row (genesisModels = Harness.listModels(pickedProvider)): the Harness lookups prefer
+    // the station's stored provider, which only WAKE sets, and two routes can list one id with different run windows
+    // (StarNet credits work in a 200k tier, OpenRouter in the whole window) — final-polish 10-23
+    const row = genesisModels.find(m => m && m.id === id) || null;
+    const limit = (row && +row.context_length) || (Harness.contextLimitOf ? Harness.contextLimitOf(id) : 0);
     const price = Harness.priceOf ? Harness.priceOf(id) : null;
     if (limit || price) {
       // the catalog knows this model — surface BOTH context window and $/M in/out (previously ctx only)
       const fmt = (typeof CtxGauge !== 'undefined' && CtxGauge.fmtTokens) ? CtxGauge.fmtTokens : (n => String(n || 0));
       const bits = [];
-      if (limit) bits.push('remembers up to ' + fmt(limit) + ' tokens of chat');
+      // a route that bills a dearer rate past a prompt size runs in a window stopped at it (the picked row's runWindow, the
+      // sidecar's runWindow): name THAT window and why, never the 1M a 200k-tier run folds inside (final-polish 10-23). The
+      // tier belongs to the ROUTE: an id the picked catalog does not list names none (only another route's catalog has it)
+      const run = row ? (Number(row.runWindow) || 0) : 0;
+      if (limit && run > 0 && run < limit) bits.push('remembers up to ' + fmt(run) + ' tokens of chat (the model can hold ' + fmt(limit) + ', but it bills a higher rate for a prompt over ' + fmt(run) + ')');
+      else if (limit) bits.push('remembers up to ' + fmt(limit) + ' tokens of chat');
       if (price) bits.push('costs ' + usdPerM(price.in) + ' in · ' + usdPerM(price.out) + ' out per million tokens (a token ≈ ¾ of a word)');
       hint.textContent = bits.join('  ·  ');
       return;
     }
     // the catalog has NO data for this slug — split the honest reasons instead of one vague "custom model slug":
-    if (genesisOffline) { hint.textContent = 'catalog offline — this slug runs as-is (no price/context data here)'; return; }
+    if (genesisOffline) { hint.textContent = 'price and memory size unknown for this model — it will still run'; return; }
     if (genesisModels.some(m => m.id === id)) { hint.textContent = 'custom model — not priced in the catalog'; return; }
     hint.textContent = 'not in the catalog — double-check the slug, or it runs as a custom model';
   }
@@ -1924,10 +2212,13 @@ const App = (() => {
     // repainted by loadModels() from the sidecar's live catalog for 127.0.0.1:11434.
     const isOllama = pickedProvider === 'ollama';
     { const ob = el('ollama-block'); if (ob) ob.classList.toggle('hidden', !isOllama); }
+    const isClaudeCli = pickedProvider === 'claude-cli';
+    { const cb = el('claude-cli-block'); if (cb) cb.classList.toggle('hidden', !isClaudeCli); }
+    if (isClaudeCli) refreshClaudeCliStatus(); else stopClaudeCliTimer();   // an in-flight sign-in resumes on re-pick
     // the BYOK note talks about your key on 127.0.0.1 / the OS keychain — irrelevant and contradictory on the
     // keyless subscription paths (no key at all), so hide the whole disclosure there. On BYOK it stays collapsed
     // behind its toggle (progressive disclosure) — the note's own .hidden is owned by #byok-toggle, not this switch.
-    { const bd = el('byok-disclose'); if (bd) bd.classList.toggle('hidden', isOAuth || isStarnet || isOllama || pickedProvider === 'claudecode'); }   // ollama: no key exists to ask about
+    { const bd = el('byok-disclose'); if (bd) bd.classList.toggle('hidden', isOAuth || isStarnet || isOllama || isClaudeCli); }   // ollama: no key exists to ask about
     // Switching providers must drop any OTHER provider's in-flight device-code poll — a code minted for the
     // previous pick has no business connecting the new one's block. The active pick's own poll survives a re-click.
     cancelOAuthPolls(isOpenAI ? 'codex' : pickedProvider);   // the OPENAI card's sign-in IS the codex poll — keep it alive
@@ -2076,12 +2367,28 @@ const App = (() => {
         ? 'Uses the ChatGPT Plus/Pro account you already have — no API key, no billing setup. Prefer a key? Paste an OpenAI API key above instead.'
         : 'Uses the ' + c.sub + ' you already have — no API key, no billing setup. Prefer a key? Switch to OPENROUTER (or any provider) above.';
     }
+    paintKimiRegion(pid);
     // a stale code/status from the previously picked provider must never dress this one's block
     const codeEl = el('codex-code'), openBtn = el('btn-codex-open');
     if (codeEl) codeEl.classList.add('hidden');
     if (openBtn) openBtn.classList.add('hidden');
     const statusEl = el('codex-status');
     if (statusEl) { statusEl.textContent = 'checking…'; statusEl.className = 'codex-status'; }
+  }
+
+  // KIMI ACCOUNT REGION (#70): shown only while Kimi is picked. The pick is what the NEXT sign-in sends (the shared
+  // engine reads KimiRegion.get()); the sidecar stores it with the credential and routes refresh + inference to it.
+  function paintKimiRegion(pid) {
+    const box = el('kimi-region');
+    if (!box) return;
+    const on = pid === 'kimi' && typeof KimiRegion !== 'undefined';
+    box.classList.toggle('hidden', !on);
+    if (!on) return;
+    const cur = KimiRegion.get();
+    box.querySelectorAll('[data-kimi-region]').forEach(b => {
+      b.setAttribute('aria-pressed', String(b.dataset.kimiRegion === cur));
+      b.onclick = () => { if (KimiRegion.set(b.dataset.kimiRegion)) { SFX.click(); paintKimiRegion('kimi'); } };
+    });
   }
 
   // GET /api/auth/<pid>/status → paint the shared sign-in block for THIS provider (mirrors refreshCodexStatus,
@@ -2093,7 +2400,9 @@ const App = (() => {
     try { const r = await fetch('/api/auth/' + pid + '/status'); j = await r.json(); } catch (_) {}
     oauthConnected[pid] = !!j.connected;
     if (typeof Harness !== 'undefined' && Harness.setDesktopConfigured) Harness.setDesktopConfigured(pid, oauthConnected[pid]);
+    if (pid === 'kimi' && j.region && typeof KimiRegion !== 'undefined') KimiRegion.noteSignedIn(j.region);   // #70: default the next sign-in to the stored one's region
     if (pickedProvider !== pid) return;   // the pick moved on while we awaited — never paint another provider's block
+    if (pid === 'kimi') paintKimiRegion('kimi');
     const statusEl = el('codex-status'), signinBtn = el('btn-codex-signin'), logoutBtn = el('btn-codex-logout');
     if (!statusEl || !signinBtn || !logoutBtn) return;
     if (oauthConnected[pid]) {
@@ -2101,7 +2410,7 @@ const App = (() => {
         statusEl.innerHTML = '<span class="conn-dot"></span>connected to ' + esc(c.name) + ' — but the sign-in could not be saved to disk; you may need to re-sign in after a restart';
         statusEl.className = 'codex-status warn';
       } else {
-        statusEl.innerHTML = '<span class="conn-dot"></span>connected to ' + esc(c.name) + ' — your agents can run on your subscription';
+        statusEl.innerHTML = '<span class="conn-dot"></span>connected to ' + esc(c.name) + (pid === 'kimi' && j.region && typeof KimiRegion !== 'undefined' ? ' (' + esc(KimiRegion.label(j.region)) + ')' : '') + ' — your agents can run on your subscription';
         statusEl.className = 'codex-status ok';
       }
       signinBtn.textContent = '↻ RE-SIGN IN';
@@ -2174,6 +2483,156 @@ const App = (() => {
     refreshOAuthGenesisStatus(pid);
   }
 
+  /* ---------- CLAUDE CLI on the genesis screen ----------
+     SIGN IN WITH CLAUDE, as smooth as the ChatGPT/Grok doors without StarNet ever holding the credential: the
+     sidecar runs the user's own `claude auth login` (it opens the browser and keeps the token) and this tile only
+     paints /api/auth/claude-cli/* truth. States:
+       checking · missing (install command + guide; re-checks itself, so installing flips the tile on its own)
+       · signedout (SIGN IN) · signing (browser opened; OPEN SIGN-IN PAGE + paste-a-code fallback; CANCEL)
+       · connected — said ONLY after `claude auth status` proved it · offline/error (the fix, never a dead end). */
+  let claudeCliState = null;   // last /status answer from the sidecar
+  let claudeCliFlow = null;    // { login_id, url } while a sign-in child runs
+  let claudeCliTimer = null, claudeCliSeq = 0;
+  const CLAUDE_INSTALL_GUIDE = 'https://code.claude.com/docs/en/setup';
+  function claudeCliInstallCommand() {
+    const ua = String(navigator.userAgent || '') + ' ' + String(navigator.platform || '');
+    if (/Win/i.test(ua)) return { shell: 'PowerShell', cmd: 'irm https://claude.ai/install.ps1 | iex' };
+    return { shell: 'Terminal', cmd: 'curl -fsSL https://claude.ai/install.sh | bash' };
+  }
+  function stopClaudeCliTimer() { if (claudeCliTimer) { clearTimeout(claudeCliTimer); claudeCliTimer = null; } }
+  // a WAKE refusal ('sign in with Claude first') is answered the moment the Commander acts on it
+  function clearClaudeWakeMsg() { const m = el('connect-msg'); if (m && /Claude/.test(m.textContent)) { m.textContent = ''; m.className = 'msg'; } }
+  function paintClaudeCli(mode, text) {
+    const st = el('claude-cli-status'); if (!st) return;
+    const show = (id, on) => { const n = el(id); if (n) n.classList.toggle('hidden', !on); };
+    st.textContent = text;
+    st.className = 'codex-status' + (mode === 'connected' ? ' ok' : (mode === 'error' || mode === 'offline') ? ' bad' : '');
+    show('claude-cli-install', mode === 'missing');
+    show('btn-claude-copy', mode === 'missing');
+    show('btn-claude-guide', mode === 'missing');
+    show('btn-claude-recheck', mode === 'missing' || mode === 'offline');
+    show('btn-claude-signin', mode === 'signedout' || mode === 'error');
+    show('btn-claude-open', mode === 'signing' && !!(claudeCliFlow && claudeCliFlow.url));
+    show('btn-claude-cancel', mode === 'signing');
+    show('claude-cli-code-row', mode === 'signing');
+    if (mode === 'missing') {
+      const ic = claudeCliInstallCommand();
+      const c = el('claude-cli-install-cmd'); if (c) c.textContent = ic.cmd;
+      const sh = el('claude-cli-shell'); if (sh) sh.textContent = ic.shell;
+    }
+  }
+  async function claudeCliCall(verb, body) {
+    try {
+      const r = await fetch('/api/auth/claude-cli/' + verb, body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      return await r.json();
+    } catch (_) { return null; }
+  }
+  function claudeCliWho(j) {
+    if (j.authMethod === 'api_key' || j.authMethod === 'apiKey') return ' with an Anthropic API key';
+    const plan = j.subscription ? ' (' + String(j.subscription).charAt(0).toUpperCase() + String(j.subscription).slice(1) + ')' : '';
+    return (j.email ? ' as ' + j.email : '') + plan;
+  }
+  async function refreshClaudeCliStatus() {
+    const seq = ++claudeCliSeq;
+    stopClaudeCliTimer();
+    if (!claudeCliState) paintClaudeCli('checking', 'checking for Claude Code on this computer…');
+    const j = await claudeCliCall('status');
+    if (seq !== claudeCliSeq || pickedProvider !== 'claude-cli') return claudeCliState;
+    if (!j || typeof j.installed !== 'boolean') { paintClaudeCli('offline', '○ couldn’t check Claude Code right now — press CHECK AGAIN.'); return null; }
+    claudeCliState = j;
+    if (claudeCliFlow && j.signingIn) { paintClaudeCli('signing', '◐ finish signing in in the browser window Claude Code opened…'); pollClaudeCli(); return j; }
+    claudeCliFlow = null;
+    if (!j.installed) {
+      paintClaudeCli('missing', '○ Claude Code isn’t installed on this computer yet.');
+      claudeCliTimer = setTimeout(refreshClaudeCliStatus, 5000);   // installing it flips this tile on its own
+      return j;
+    }
+    if (!j.loggedIn) { paintClaudeCli('signedout', '○ Claude Code is installed — sign in with your Claude account.'); return j; }
+    paintClaudeCli('connected', '● Signed in to Claude' + claudeCliWho(j) + ' — pick a model and WAKE.');
+    return j;
+  }
+  // THE STATUS IS THE TRUTH: before any sign-in error is painted, ask the CLI. A sign-in that already landed (the
+  // browser callback beat a paste, or a second press found the first flow finished) reads as connected, never 'not running'.
+  async function claudeCliProvenSignedIn() {
+    const st = await claudeCliCall('status');
+    if (st && st.loggedIn && pickedProvider === 'claude-cli') { onClaudeCliConnected(st); return true; }
+    return false;
+  }
+  function onClaudeCliConnected(j) {
+    claudeCliFlow = null; stopClaudeCliTimer();
+    claudeCliState = Object.assign({ installed: true, loggedIn: true, signingIn: false }, j);
+    SFX.open(); clearClaudeWakeMsg();
+    paintClaudeCli('connected', '● Signed in to Claude' + claudeCliWho(claudeCliState) + ' — pick a model and WAKE.');
+    loadModels('claude-cli');   // the catalog was offline while signed out; it is live now
+  }
+  async function startClaudeSignIn() {
+    SFX.click(); stopClaudeCliTimer(); clearClaudeWakeMsg();
+    claudeCliFlow = null;
+    paintClaudeCli('starting', '◐ starting Claude sign-in…');
+    const j = await claudeCliCall('start', {});
+    if (pickedProvider !== 'claude-cli') return;
+    if (!j) { paintClaudeCli('error', '○ couldn’t start the Claude sign-in — press SIGN IN WITH CLAUDE to try again.'); return; }
+    if (j.status === 'connected') { onClaudeCliConnected(j); return; }
+    if (j.status !== 'pending') {
+      if (j.code === 'not_installed') { claudeCliState = null; refreshClaudeCliStatus(); return; }
+      paintClaudeCli('error', '○ ' + (j.error || 'Claude sign-in failed') ); return;
+    }
+    claudeCliFlow = { login_id: j.login_id, url: j.url || '' };
+    paintClaudeCli('signing', '◐ finish signing in in the browser window Claude Code just opened…');
+    pollClaudeCli();
+  }
+  function pollClaudeCli() {
+    stopClaudeCliTimer();
+    claudeCliTimer = setTimeout(async () => {
+      claudeCliTimer = null;
+      const f = claudeCliFlow; if (!f || pickedProvider !== 'claude-cli') return;
+      const j = await claudeCliCall('poll', { login_id: f.login_id });
+      if (claudeCliFlow !== f || pickedProvider !== 'claude-cli') return;
+      if (!j || j.status === 'pending') { pollClaudeCli(); return; }   // a transient network blip keeps polling
+      claudeCliFlow = null;
+      if (j.status === 'connected') { onClaudeCliConnected(j); return; }
+      if (await claudeCliProvenSignedIn()) return;   // a flow that ended on a finished sign-in is not an error
+      paintClaudeCli('error', '○ ' + (j.error || 'Claude sign-in did not finish — press SIGN IN WITH CLAUDE to try again.'));
+    }, 1500);
+  }
+  async function cancelClaudeSignIn() {
+    SFX.click();
+    const f = claudeCliFlow; claudeCliFlow = null; stopClaudeCliTimer();
+    if (f) await claudeCliCall('cancel', { login_id: f.login_id });
+    refreshClaudeCliStatus();
+  }
+  async function submitClaudeCode() {
+    const inp = el('in-claude-code'); const f = claudeCliFlow;
+    const code = inp ? inp.value.trim() : '';
+    if (!f || !code) return;
+    SFX.click();
+    const j = await claudeCliCall('code', { login_id: f.login_id, code });
+    if (claudeCliFlow !== f) return;
+    const st = el('claude-cli-status');
+    if (j && j.ok) { if (inp) inp.value = ''; if (st) { st.textContent = '◐ checking the code with Claude…'; st.className = 'codex-status'; } pollClaudeCli(); }
+    else if (await claudeCliProvenSignedIn()) return;
+    else if (st) { st.textContent = '○ ' + ((j && j.error) || 'that code didn’t go through — try pasting it again.'); st.className = 'codex-status bad'; }
+  }
+  function copyClaudeInstall() {
+    const cmd = claudeCliInstallCommand().cmd, btn = el('btn-claude-copy');
+    const done = ok => { if (!btn) return; btn.textContent = ok ? '✓ COPIED' : 'SELECT IT ABOVE'; setTimeout(() => { btn.textContent = '⧉ COPY INSTALL COMMAND'; }, 2000); };
+    // the shared clipboard helper (Clipboard API, then the execCommand fallback a locked-down WebView still allows)
+    const copy = (typeof Diag !== 'undefined' && Diag.copyText) ? Diag.copyText : (t => navigator.clipboard.writeText(t).then(() => true));
+    try { Promise.resolve(copy(cmd)).then(ok => done(ok !== false), () => done(false)); } catch (_) { done(false); }
+  }
+  function wireClaudeCliTile() {
+    const on = (id, fn) => { const n = el(id); if (n) n.onclick = fn; };
+    on('btn-claude-signin', startClaudeSignIn);
+    on('btn-claude-cancel', cancelClaudeSignIn);
+    on('btn-claude-open', () => { if (claudeCliFlow && claudeCliFlow.url) openExternalUrl(claudeCliFlow.url); });
+    on('btn-claude-recheck', () => { SFX.click(); claudeCliState = null; refreshClaudeCliStatus(); });
+    on('btn-claude-guide', () => openExternalUrl(CLAUDE_INSTALL_GUIDE));
+    on('btn-claude-copy', copyClaudeInstall);
+    on('btn-claude-code', submitClaudeCode);
+    const ci = el('in-claude-code');
+    if (ci) ci.onkeydown = e => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); submitClaudeCode(); } };
+  }
+
   /* ---------- STARNET MANAGED on the genesis screen ----------
      The subscription path for people who never want to see an API key: buy on starnetos.com, then the
      connect screen links this station to that account with ONE confirmed code — the same sidecar engine
@@ -2199,7 +2658,8 @@ const App = (() => {
   }
   async function revealStarnetGenesis(autoPick) {
     let linked = false, linkable = false;
-    try { const j = await Harness.api.get('/api/credits?history=0'); linked = !!(j && j.configured); } catch (_) {}
+    // the same wait as WAKE's status read below: the first read can be the one that self-heals the link (~16s)
+    try { const j = await Harness.api.get('/api/credits?history=0', { timeoutMs: 20000 }); linked = !!(j && j.configured); } catch (_) {}
     if (!linked) { try { const j = await Harness.api.get('/api/credits/linkable'); linkable = !!(j && j.available); } catch (_) {} }
     starnetLinked = linked;
     const b = document.querySelector('.provider-row .prov[data-prov="starnet"]');
@@ -2219,9 +2679,13 @@ const App = (() => {
     const priorLinked = starnetLinked, priorPurchaseUrl = starnetPurchaseUrl;
     let timeout = null;
     try {
+      // The wait must outlast the sidecar's own bounded worst case, so its answer always lands first: a link
+      // self-heal retry's /v1/whoami (8s) + one /v1/balance read (8s). 10s used to lose that race on WAKE.
+      // api.get's OWN deadline (15s by default) is the one that fires, so it carries the 20s (E29, 10-07); the race
+      // below is only a backstop at the same bound, for an api.get that ever loses its deadline.
       j = await Promise.race([
-        Harness.api.get('/api/credits?history=0'),
-        new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('credits status timeout')), 10000); })
+        Harness.api.get('/api/credits?history=0', { timeoutMs: 20000 }),
+        new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('credits status timeout')), 20000); })
       ]);
       answered = !!(j && typeof j.configured === 'boolean');
     }
@@ -2316,8 +2780,12 @@ const App = (() => {
     if (progress) { progress.className = 'msg'; progress.textContent = 'Opening your StarNet account…'; }
     const fail = t => { statusEl.textContent = t; statusEl.className = 'codex-status bad'; codeEl.classList.add('hidden'); openBtn.classList.add('hidden'); if (progress) { progress.className = 'msg bad'; progress.textContent = t; } };
     statusEl.textContent = 'requesting a link code…'; statusEl.className = 'codex-status';
+    // A failure keeps WHAT failed (Friendly.linkStartFailure words it): the station's own POST never answering is a
+    // local-engine fault, not "the link service"; a sidecar reply carries its classification of the cloud failure.
+    const startFail = info => Object.assign(new Error('start failed'), { linkStart: info });
     Harness.api.post('/api/credits/link/start', { deviceName: 'StarNet Station' })
-      .then(r => { if (generation !== _starnetLinkGeneration) return null; if (!r || !r.ok) throw new Error('start failed'); return r.j; })
+      .then(r => { if (generation !== _starnetLinkGeneration) return null; if (!r || !r.ok) throw startFail({ status: r && r.status, j: r && r.j }); return r.j; },
+        () => { throw startFail({ local: true }); })
       .then(j => {
         if (generation !== _starnetLinkGeneration) return;
         if (!j || !j.code) throw new Error('no code');
@@ -2365,7 +2833,10 @@ const App = (() => {
         };
         _starnetLinkPoll = setInterval(tick, 2000);
       })
-      .catch(() => { if (generation === _starnetLinkGeneration) fail('could not reach the link service — try again'); })
+      .catch(e => {
+        if (generation !== _starnetLinkGeneration) return;
+        fail((typeof Friendly !== 'undefined' && Friendly.linkStartFailure) ? Friendly.linkStartFailure(e && e.linkStart) : 'could not reach the link service — try again');
+      })
       .finally(() => { if (generation === _starnetLinkGeneration) _starnetLinkStarting = false; });
   }
 
@@ -2563,6 +3034,7 @@ const App = (() => {
     // On the merged OPENAI card the sign-in half IS ChatGPT/codex.
     const codexHere = () => pickedProvider === 'codex' || pickedProvider === 'openai';
     el('btn-codex-signin').onclick = () => (codexHere() ? startCodexSignIn() : startOAuthSignIn(pickedProvider));
+    wireClaudeCliTile();
     el('btn-codex-logout').onclick = () => (codexHere() ? codexLogout() : oauthGenesisLogout(pickedProvider));
     // STARNET MANAGED: reveal the hero only when this station actually has a cloud seam, and wire its link
     // flow. On a fresh create the revealed hero also becomes the default pick (the promoted easiest start);
@@ -2643,10 +3115,20 @@ const App = (() => {
   // BACK from the connect screen. With the title screen gone there's nowhere to retreat TO, so BACK is a
   // context move: in RESUME it re-runs auto-resume (a fresh credential check may now pass straight in); on a
   // fresh first run it's a no-op beyond dropping any in-flight codex poll (the create screen is the root).
-  function onConnectBack() {
+  async function onConnectBack() {
     SFX.click(); stopCodexPoll();
-    const saved = Save.has() ? Save.load() : null;
-    if (saved && saved.agent) { reentry(); return; }
+    const saved = resumableSave().doc;   // #121: the in-memory save when the browser cache could not hold it
+    if (saved && saved.agent) {
+      // RETRY must re-ask, not re-read. A StarNet station's "configured" flag is read ONCE at boot; when the
+      // account service was down then (issue #76), retry kept consulting that stale false and bounced straight
+      // back to this screen even after the link was healthy again. Re-read the sidecar's live answer first.
+      if (savedStationProv(saved) === 'starnet' && Harness.refreshCreditsConfigured) {
+        const back = el('btn-back'); if (back) back.disabled = true;
+        try { await Harness.refreshCreditsConfigured(); } catch (_) {}
+        finally { if (back) back.disabled = false; }
+      }
+      reentry(); return;
+    }
     // fresh first run — nothing behind the create screen; just stay put.
   }
 
@@ -2654,14 +3136,26 @@ const App = (() => {
   // (disconnect, recovery, back). Preserves the agent ALWAYS: if creds are in hand it resumes straight into the
   // station; otherwise it shows the connect screen in RESUME mode. Only a genuine no-save state falls through
   // to a fresh creation.
+  // #121: the save a re-entry resumes. Normally the browser cache. When the cache could not hold this station (the
+  // browser's per-site storage cap), the cache is stale or already removed and the newest save lives in memory:
+  // the envelope this page last queued for the station file, or the station file's copy that boot resumed.
+  // Never read the cache then — it would revert the station, or (removed) open a brand-new creation over it.
+  function resumableSave() {
+    const mem = (typeof CloudSave !== 'undefined' && CloudSave.memorySave) ? CloudSave.memorySave() : null;
+    if (mem && mem.agent) return { doc: mem, memory: true };
+    return { doc: Save.has() ? Save.load() : null, memory: false };
+  }
+
   function reentry() {
+    const resumable = resumableSave();
     // FORWARD-VERSION GATE (P0.3): a re-entry (disconnect / back / recovery) must not fall through to a fresh
     // create when the stored save is from a NEWER build — Save.load() returns null for it, which would look like
     // "no save" and clobber it on first persist(). Stop at the honest update gate; the save stays untouched.
-    if (Save.isFuture && Save.isFuture()) { showFutureSaveGate(Save.loadStatus().version); return; }
-    const saved = Save.has() ? Save.load() : null;
+    if (!resumable.memory && Save.isFuture && Save.isFuture()) { showFutureSaveGate(Save.loadStatus().version); return; }
+    const saved = resumable.doc;
     if (saved && saved.agent) {
-      if (saved.prov && Harness.setProv) Harness.setProv(saved.prov);
+      migrateLegacyReasoning(saved);   // before any saved effort reaches the wire (0.12.5 reasoning migration)
+      if (savedStationProv(saved) && Harness.setProv) Harness.setProv(savedStationProv(saved));
       if (saved.reasoningEffort && Harness.setReasoningEffort) Harness.setReasoningEffort(saved.reasoningEffort);
       if (Harness.getKey() || (Harness.configured && Harness.configured()) || Harness.getProv() === 'codex') {
         resumingSaved = null; resumeInto(saved); return;
@@ -2692,7 +3186,9 @@ const App = (() => {
       if (!entered) { waking = false; wakeBtnBusy(false); }   // validation bounce (absent/edited key or model) — release so the user can retry
     } catch (e) {
       waking = false; wakeBtnBusy(false);
-      const msg = el('connect-msg'); if (msg) { msg.className = 'msg bad'; msg.textContent = 'could not start — ' + ((e && e.message) || 'try again'); }
+      // #39: after a sidecar restart the refusal surfaced as "Failed to fetch", which reads like the user's own network.
+      const refused = refusedPageLine();
+      const msg = el('connect-msg'); if (msg) { msg.className = 'msg bad'; msg.textContent = 'could not start — ' + (refused || ((e && e.message) || 'try again')); }
     }
   }
   // THE WIRE PREFLIGHT — one real reason-only round-trip through the exact path the awakening will use
@@ -2701,7 +3197,8 @@ const App = (() => {
   async function preflightWire() {
     try {
       if (typeof Harness === 'undefined' || !Harness.chat) return { ok: false, why: 'the harness is not loaded (reload the app)' };
-      const call = Harness.chat({ system: '', messages: [{ role: 'user', content: 'Reply with exactly: OK' }], agentId: 'agent', isTask: false, placed: [], internal: true })
+      // keepEffort: the Commander's own reasoning effort, the one the awakening runs on — not the aux effort self-talk uses
+      const call = Harness.chat({ system: '', messages: [{ role: 'user', content: 'Reply with exactly: OK' }], agentId: 'agent', isTask: false, placed: [], internal: true, keepEffort: true })
         .catch(e => ({ error: true, text: String((e && e.message) || e) }));
       const res = await Promise.race([call, new Promise(r => setTimeout(() => r(null), 30000))]);
       if (!res) return { ok: false, why: 'no reply within 30 seconds (network or provider stall)' };
@@ -2764,9 +3261,17 @@ const App = (() => {
         msg.textContent = 'StarNet couldn’t confirm your credit balance right now. Your credits are safe — try WAKE again in a moment.';
         return false;
       }
-      if (!creditState.linked) { msg.textContent = 'link your StarNet account first — press 🔗 LINK YOUR STARNET ACCOUNT above.'; return false; }
+      if (!creditState.linked) { msg.textContent = 'link your StarNet account first — press CONNECT STARNET ACCOUNT above.'; return false; }
       if (!(creditState.balanceUsd > 0)) { msg.className = 'msg bad'; msg.textContent = 'your StarNet account has no credits yet — waking your agent uses credits right away. Press ＄ ADD CREDITS above, then WAKE again.'; return false; }
       Harness.setModel(model); Harness.setProv('starnet');
+    } else if (pickedProvider === 'claude-cli') {
+      const cst = (claudeCliState && claudeCliState.loggedIn) ? claudeCliState : await refreshClaudeCliStatus();
+      if (!cst || !cst.loggedIn) {
+        msg.textContent = (cst && cst.installed === false) ? 'install Claude Code first — the command is above — then sign in with Claude.' : 'sign in with Claude first — press ⏼ SIGN IN WITH CLAUDE above.';
+        return false;
+      }
+      Harness.setModel(model); Harness.setProv('claude-cli');
+      wireVia = 'your Claude sign-in';
     } else if (isOAuthProviderId(pickedProvider)) {
       if (!oauthConnected[pickedProvider]) { msg.textContent = 'sign in with ' + OAUTH_GENESIS[pickedProvider].name + ' first, or switch to OpenRouter.'; return false; }
       Harness.setModel(model); Harness.setProv(pickedProvider);
@@ -2778,8 +3283,11 @@ const App = (() => {
       wireVia = 'your ChatGPT sign-in';
     } else {
       const key = el('in-key').value.trim();
+      // #89 (browser build): each save also hands the station its copy for routines; when it could not, the same
+      // warning SETTINGS shows says so — the wake goes on (chat carries its key), but routines would not have it
+      const warnStation = res => { if (typeof StationUI !== 'undefined' && StationUI.warnIfStationLacksKey) StationUI.warnIfStationLacksKey(res); };
       if (providerNeedsBaseUrl(pickedProvider)) {
-        if (Harness.setBaseUrl) await Harness.setBaseUrl(baseUrl, pickedProvider);
+        if (Harness.setBaseUrl) warnStation(await Harness.setBaseUrl(baseUrl, pickedProvider));
       }
       // DEV auto-resume eligibility is not proof of a credential for the chosen provider.
       const configured = !!(Harness.hasStoredCredential && Harness.hasStoredCredential(pickedProvider));
@@ -2806,7 +3314,7 @@ const App = (() => {
       }
       // Only (re)store when a key was actually typed — desktop keeps the existing keychain key on blank.
       // setKey is async in desktop (writes the keychain + pushes it to the sidecar); await so the run has it.
-      if (key) await (Harness.validateAndSetKey ? Harness.validateAndSetKey(key, pickedProvider) : Harness.setKey(key, pickedProvider));
+      if (key) warnStation(await (Harness.validateAndSetKey ? Harness.validateAndSetKey(key, pickedProvider, model) : Harness.setKey(key, pickedProvider)));
       Harness.setModel(model); Harness.setProv(pickedProvider);
       if (pickedProvider === 'openai') wireVia = key ? 'the OpenAI API key you typed' : 'the OpenAI API key stored on this station';
     }
@@ -2825,6 +3333,22 @@ const App = (() => {
       // a BILLING refusal is not a model failure: managed admission refused the run before any model was
       // reached. Name the real cause and the real fix; "your model didn't answer" sends people model-hopping.
       if (/managed credit|Managed credits/i.test(wire.why)) {
+        // the account REFUSED this station's link: retrying can't fix it and the wallet isn't empty — relink is the
+        // door (friendlyerror's managed_credit_link; `.?` because a quote in a regex mis-slices the fnBody test helper)
+        if (/refused this station.?s link|relink/i.test(wire.why)) {
+          msg.textContent = 'your StarNet account no longer accepts this station’s link (it was unlinked, or belongs to another account) — your credits are safe. '
+            + (pickedProvider === 'starnet' ? 'Press CONNECT STARNET ACCOUNT above, then WAKE again.' : 'Relink this station to your StarNet account, or use your own provider key.');
+          refreshStarnetGenesisStatus();
+          return false;
+        }
+        // the balance is HELD by this station's own running StarNet runs (friendlyerror's managed_credit_held, audit
+        // B11): it reads $0 but it was read, so it is neither "no credits" nor "couldn't read" — waiting frees it
+        if (/Managed credits are held|balance is held by/i.test(wire.why)) {
+          msg.textContent = 'your StarNet balance is held by runs still working on this station — each refunds what it doesn’t spend. Wait for them to finish, then WAKE again'
+            + (pickedProvider === 'starnet' ? ' (or press ＄ ADD CREDITS above).' : ', or use your own provider key.');
+          refreshStarnetGenesisStatus();
+          return false;
+        }
         msg.textContent = /Out of managed credit/i.test(wire.why)
           ? 'your StarNet account has no credits — waking your agent uses credits right away. Press ＄ ADD CREDITS above, then WAKE again.'
           : 'StarNet couldn’t read your credit balance right now — try WAKE again in a moment, or use your own provider key.';
@@ -2850,6 +3374,10 @@ const App = (() => {
     // leaves the prior station intact, and keeps its confirmed grant visible instead of commissioning a fresh
     // Commander who silently inherited cabinet:write. Saved-station resume returns above and keeps its grants.
     if (typeof PermissionsStore !== 'undefined') await PermissionsStore.reset();
+    if (typeof AutonomyStore !== 'undefined') {
+      const autonomyReset = await AutonomyStore.reset();
+      if (!autonomyReset.ok) { wakeBtnBusy(false); msg.className = 'msg bad'; msg.textContent = autonomyReset.error; return false; }
+    }
     const newCommanderEpoch = Date.now();
     if (typeof JourneyStore !== 'undefined' && JourneyStore.reset) {
       const journeyResetResult = await JourneyStore.reset(newCommanderEpoch);
@@ -2884,6 +3412,7 @@ const App = (() => {
     if (typeof RecQualityStore !== 'undefined') RecQualityStore.reset();   // …and no inherited recommendation-quality history (own key)
     if (typeof StudyStore !== 'undefined') StudyStore.reset();   // …and a fresh STUDY state — a new Commander never inherits the prior hero's studyDeclined denylist / ignore tallies / rating streaks (own key)
     if (typeof ThreadStore !== 'undefined') ThreadStore.reset();   // …and a fresh THREAD turn-in gate — a new Commander never inherits the prior hero's resolved/ignored mined ideas (the ledger itself is server-side, station-wide)
+    try { localStorage.removeItem('starnet.battlepass.v1'); } catch (_) {}   // …and no inherited battle-pass CLAIM marks — a new Commander claims their own tiers (stationui THE PASS)
     if (typeof QuestStateStore !== 'undefined') QuestStateStore.reset();   // …and a fresh quest memory — a new Commander never inherits dismissed/completed quest history (own key)
     if (typeof QuestLedgerStore !== 'undefined') QuestLedgerStore.reset();  // …and a clean ledger cache — the sidecar ledger is station-wide, but the session cache/notify set starts empty
     if (typeof QuestRefreshStore !== 'undefined') QuestRefreshStore.reset();  // …and a clean refresh-status cache — the engine state is station-wide/server-side, but the session cache starts empty
@@ -2893,9 +3422,9 @@ const App = (() => {
     if (typeof UnderstandingStore !== 'undefined' && UnderstandingStore.reset) UnderstandingStore.reset();   // …and no inherited rating corroboration — a new Commander never inherits the prior hero's 👍/👎 confidence signal (own key)
     if (typeof MaintQuestStore !== 'undefined') MaintQuestStore.reset();   // …and no inherited maintenance quests — a new Commander never sees the prior hero's slag/jam backlog (own key)
     if (typeof MintStore !== 'undefined') MintStore.reset();   // …no inherited recurring-task shapes — these feed the seed shelf, so a leak would offer a prior Commander's chores (own key)
-    if (typeof AutonomyStore !== 'undefined') AutonomyStore.reset();   // …and a fresh autonomy posture (safe floor) — a new Commander is never handed the previous one's free-range grant (own key)
     if (typeof AutoJobStore !== 'undefined') AutoJobStore.reset();   // …and re-arm the one-time standing-jobs proposal (own key; server-side routines are separate)
     if (typeof AutopilotStore !== 'undefined') AutopilotStore.reset();   // …and a fresh idle autopilot (no inherited idle/armed state — its decision is re-earned by the new Commander's posture + dossier)
+    if (typeof Briefing !== 'undefined') Briefing.reset();
     if (typeof ReturnStore !== 'undefined') ReturnStore.reset();   // …and no inherited return-ritual trail — a fresh Commander gets no prior hero's pending OUTBOX crates or attendance stamp (own key)
     if (typeof NightDraftNudge !== 'undefined') NightDraftNudge.reset();   // …and no inherited night-shift seen-stamp / spent nudge — a fresh Commander re-earns the unseen-drafts nudge (own key)
     if (typeof WorkshopStore !== 'undefined') WorkshopStore.reset();   // W3: no inherited "later" list or seen-ledger for a fresh Commander (own key)
@@ -2926,17 +3455,20 @@ const App = (() => {
     agentDocs(agent);                              // seed config docs for older saves that predate them
     stripLegacyVoiceBlock(agent);                  // one-time: drop the old awakening's inline VOICE & MANNER so it doesn't double up with the archetype layer
     stripLegacySoloClause(agent);                  // one-time: swap the frozen "right now its only agent" identity block for the timeless clause (crew truth now rides rosterClause)
+    // a saved hero tint lands in style attributes (crew list, dossier, GROWTH gauge): hex only, else the Orchestrator's
+    // gold — the SAME rule rehydrateRoster applies to the crew. Inline (no module const): fixtures lift this function alone.
+    if (!/^#[0-9a-f]{3,8}$/i.test(String(agent.color || ''))) agent.color = (typeof ORCH_COLOR !== 'undefined') ? ORCH_COLOR : '#ffd34a';
     agent.systemPrompt = composeSystemPrompt(agent);
     registerHero(agent);                           // found the registry with the hero…
     rehydrateRoster(saved.agents);                 // …then restore any summoned crew (older saves: no-op)
     recomposeOrchestrators();                      // …and only NOW does the hero's YOUR CREW clause see them (composing above sees an empty registry)
-    if (saved.prov && Harness.setProv) Harness.setProv(saved.prov);   // keep the provider with the agent (codex vs openrouter)
+    if (savedStationProv(saved) && Harness.setProv) Harness.setProv(savedStationProv(saved));   // keep the provider with the agent (codex vs openrouter)
     if (saved.reasoningEffort && Harness.setReasoningEffort) Harness.setReasoningEffort(saved.reasoningEffort);
     if (!agent.provider && saved.prov) agent.provider = saved.prov;   // #4: older hero saves stored provider only at the top level — stamp it onto the hero object so focusAgent restores it
     if (!agent.reasoningEffort && saved.reasoningEffort) agent.reasoningEffort = saved.reasoningEffort;
     Harness.setModel(agent.model || Harness.getModel());
     Harness.setTotals(saved.usage || { tokens: 0, cost: 0, calls: 0 });
-    Workstreams.init({ workstreams: saved.workstreams, activeId: saved.activeId, generalId: saved.generalId, sessionUndo: saved.sessionUndo, deletedIds: saved.deletedIds });
+    Workstreams.init({ workstreams: saved.workstreams, activeId: saved.activeId, generalId: saved.generalId, sessionUndo: saved.sessionUndo, deletedIds: saved.deletedIds, forgetIds: saved.forgetIds });
     pendingStationDoc = saved.station || null;   // restore the built station (if any)
     pendingStationStats = saved.stationStats || null;   // restore the station-growth rollup (XP/level/confidence)
     pendingGrowthSyncAt = Math.max(0, Number((saved.stationStats && saved.stationStats.runSyncAt) || saved.updatedAt || 0));
@@ -2966,13 +3498,37 @@ const App = (() => {
     World.spawn(agent);
     World.setOnClick(openWorldAgent);
     World.setOnArcade(() => { if (typeof StationUI !== 'undefined' && StationUI.openArcade) StationUI.openArcade(); });   // click a cabinet → BREACH PROTOCOL
-    // 2026-07-16 UX fix: the OUTBOX click opens the OUTBOX window — one clean list of ALL uncollected
-    // finished work, readable + rateable in place (the old path fired a one-crate chat beat, which read
-    // as a context-free popup). The window's footer links to the LOGBOOK for the full run history.
-    if (World.setOnOutbox) World.setOnOutbox(() => { if (typeof StationUI !== 'undefined' && StationUI.openTerm) StationUI.openTerm('outbox'); });
+    // A FLOOR OUTBOX IS ITS OWN LINE'S (Andrew 10-03): the click opens the workflow that ships into THAT OUTBOX — its
+    // newest result, its last jobs — never DELIVERABLES (every finished run on the station) and never another line's work.
+    if (World.setOnOutbox) World.setOnOutbox(ob => { if (typeof WorkflowsWindow !== 'undefined' && WorkflowsWindow.openOutbox) WorkflowsWindow.openOutbox(ob && ob.id); });
     if (World.setOnMissionBoard) World.setOnMissionBoard(() => { if (typeof StationUI !== 'undefined' && StationUI.openTerm) StationUI.openTerm('quests'); });   // G1b: click the MISSION BOARD → the QUEST LOG (the board is a projection, never a gate)
     if (World.setOnTrophyCase) World.setOnTrophyCase(() => { if (typeof StationUI !== 'undefined' && StationUI.openTerm) StationUI.openTerm('trophies'); });   // G3b: click the TROPHY CASE → the TROPHY surface (a projection of real completions, never a gate)
-    if (World.setOnBayAssign) World.setOnBayAssign(pid => { if (typeof Build !== 'undefined' && Build.openAssign) Build.openAssign(pid); });   // belt legibility: click an unbound BAY's "NO AGENT" nag → REFIT opens straight into its agent picker
+    // a PLUGIN TERMINAL is the plugin's body: a click opens its window. An unbound or turned-off one says so and opens
+    // EXTENSIONS, where plugins are approved — never a dead click.
+    if (World.setOnPluginTerminal) World.setOnPluginTerminal(async (p) => {
+      const pid = p && p.pluginId;
+      const host = typeof PluginHost !== 'undefined' ? PluginHost : null;
+      if (pid && host) { try { await host.refresh(); } catch (_) { /* open() below still uses the last known list */ } }
+      if (pid && host && host.open(pid)) return;
+      if (typeof StationUI === 'undefined') return;
+      const info = pid && host ? host.list().find(x => x.id === pid) : null;
+      const say = !pid ? 'This terminal is not bound to a plugin yet. Bind it in BUILD MODE, or create a plugin in ABILITIES → EXTENSIONS.'
+        : !info ? 'This terminal\'s plugin was removed. Rebind it in BUILD MODE or remove the terminal.'
+        : !info.active ? (info.name || pid) + ' is off' + (info.pending ? ' — it changed since you approved it' : '') + '. Turn it on in ABILITIES → EXTENSIONS.'
+        : (info.name || pid) + ' has no window. Its tools are available to agents in this room.';
+      if (StationUI.notify) StationUI.notify(say, info && info.active ? 'good' : 'warn');
+      if (!(info && info.active) && StationUI.openTerm) StationUI.openTerm('connectors', 'extensions');
+    });
+    // DESK SCREEN: click an agent's workstation → the DESK SCREEN window (docked from the bottom like every window) on
+    // that agent's computer. The fold starts here so a desk opened mid-run already holds every step this page has seen.
+    if (typeof DeskScreen !== 'undefined' && World.setOnDesk) {
+      DeskScreen.init({
+        // the run's own conversation when this page launched it, else the agent's (selectAgent never rebinds a thread with content)
+        openChat: (aid, wsId) => { if (wsId && Workstreams.get(wsId)) openWorkstream(wsId); else selectAgent(aid); }
+      });
+      World.setOnDesk(o => DeskScreen.open(o.agentId));
+    }
+    if (World.setOnBayAssign) World.setOnBayAssign(pid => { if (typeof Build !== 'undefined' && Build.openAssign) Build.openAssign(pid); });   // belt legibility: click an unbound BAY's "NO AGENT" nag → BUILD MODE opens straight into its agent picker
     if (World.setOnIntakeFeed) World.setOnIntakeFeed(() => { if (typeof StationUI !== 'undefined' && StationUI.openTerm) StationUI.openTerm('messaging'); });   // belt legibility: click a starved INTAKE's "NO FEED" nag → the CHANNELS panel (wire a real feed)
     if (World.setOnIntakeSample) World.setOnIntakeSample(o => { if (typeof Chat !== 'undefined' && Chat.sampleCard) Chat.sampleCard(o); });   // guided workflow Phase 4: click the INBOX on a COMPLETE line → the RUN-A-SAMPLE-JOB card (POST /api/routing/sample)
     if (opts.awaitingPurpose) World.beginAwakening();        // wake in darkness — the awakening lifts the room to first light (set BEFORE start so there's no flash of the lit room)
@@ -2984,21 +3540,20 @@ const App = (() => {
     // types ARE tables. The model deliberately never imports the catalog, so this injection is the single
     // seam between the two — installed before the station exists so the very first placement is validated.
     if (typeof PropSprites !== 'undefined' && WorldModel.setPropRules) {
-      WorldModel.setPropRules((t) => {
-        const s = PropSprites.spec(t);
-        return s ? { mount: s.mount || null, stack: !!s.stack, surface: !!s.surface, flat: !!s.flat, footprintMigration:s.footprintMigration } : null;
-      });
+      // ruleFor keeps a player-made prop (user_…) even before its art registers, so a slow boot fetch can never
+      // prune paid work out of the save; retired built-in types still come back null and are dropped.
+      WorldModel.setPropRules((t) => PropSprites.ruleFor(t));
     }
     // STATION IDENTITY: did the save we are loading already carry one? (worldmodel stamps meta.createdAt
     // at create AND backfills it on migrate — a stamp that is never SAVED would re-roll on every reload,
-    // and every per-station REFIT latch keyed on it would be lost. Read before deserialize mutates it.)
+    // and every per-station BUILD MODE latch keyed on it would be lost. Read before deserialize mutates it.)
     const hadStationId = !!(pendingStationDoc && pendingStationDoc.meta && pendingStationDoc.meta.createdAt);
     station = (pendingStationDoc && pendingStationDoc.rooms) ? WorldModel.deserialize(pendingStationDoc) : WorldModel.create(WorldModel.starterDoc());
     pendingStationDoc = null;
     watchStationSave();
     // THE OVERSEER'S DESK IS A REAL PROP: materialize the starter workstation the world used to merely
     // DRAW (synthetic auto-desk) as a real hero-assigned desk in the doc, BEFORE the world derives its
-    // floor — so bayObjects/REFIT/dossier see the same PC the player sees (kills the fresh-install
+    // floor — so bayObjects/BUILD MODE/dossier see the same PC the player sees (kills the fresh-install
     // "NO COMPUTE beside the visible PC" lie). Idempotent per load; world keeps its synthetic fallback
     // only for the pathological no-space floor.
     if (agent && agent.id && typeof station.ensureWorkstation === 'function') {
@@ -3017,17 +3572,19 @@ const App = (() => {
       // agents: the live multi-agent roster the BAY agent-picker / builder offer. The bay->agent binding
       // persists via station.serialize (prop.agentId round-trips), so the routing floor is saved per agent.
       Build.init({ getStation: () => station, persist: persist, world: World,
-        agents: () => liveAgents().map(a => ({ id: a.id, name: a.name, color: a.color, model: a.model })),
+        agents: () => liveAgents().map(a => ({ id: a.id, name: a.name, color: a.color, model: a.model, skin: a.skin || DATA.DEFAULT_SKIN })),   // skin: the Workflow panel shows each agent by its body
         // A workstation can be placed while its owning COMMS stream stays open. Reconcile the derived
-        // "nowhere to sit" row after REFIT commits so the transcript cannot outlive the floor truth.
+        // "nowhere to sit" row after BUILD MODE commits so the transcript cannot outlive the floor truth.
         onClose: () => { if (typeof Chat !== 'undefined' && Chat.retireDeskPrompt) Chat.retireDeskPrompt(); } });
       const bbBuild = el('bb-build');
       if (bbBuild) {
         let seenBuild = false; try { seenBuild = !!localStorage.getItem('starnet.refit.seen'); } catch (e) {}
         if (!seenBuild) bbBuild.classList.add('refit-nudge');   // pulse the dock button until first opened
-        bbBuild.onclick = () => { SFX.click(); bbBuild.classList.remove('refit-nudge'); Build.toggle(); if (typeof Tutorial !== 'undefined' && Tutorial.onBuildOpen && Build.isOpen && Build.isOpen()) Tutorial.onBuildOpen(); };
+        bbBuild.onclick = () => { SFX.click(); bbBuild.classList.remove('refit-nudge'); if (typeof Systems !== 'undefined') Systems.opened('refit'); Build.toggle(); if (typeof Tutorial !== 'undefined' && Tutorial.onBuildOpen && Build.isOpen && Build.isOpen()) Tutorial.onBuildOpen(); };
       }
     }
+    // WORK › AUTOMATE › WORKFLOWS (2026-09-30) is its own docked window (frontend/app/windows/workflows.js, data-term="workflows"): the dock binds it
+    // like every other window — it no longer opens Build Mode. The full editor is that window's EDIT WORKFLOW key.
     const bbRecruit = el('bb-recruit');
     if (bbRecruit) bbRecruit.onclick = openSummonBay;   // the ONE recruit door — bay carries both verbs (summon new / deploy to current)
 
@@ -3051,6 +3608,11 @@ const App = (() => {
       });
       // Presence is already proven by the live roster, link indicator, and COMMS state. Do not
       // create a fresh persistent notification every time an existing station is reloaded.
+    }
+    // STATION SYSTEMS ONLINE: a station whose awakening starts now grows its dock as it is used; one that was
+    // already awake opens with everything online. Keyed by the hero's epoch so a fresh start grows again.
+    if (typeof Systems !== 'undefined' && Systems.init) {
+      try { Systems.init({ epoch: agent && agent.createdAt != null ? agent.createdAt : 'legacy', fresh: !!(opts && opts.awaitingPurpose), crewCount: () => agents.size }); } catch (e) { console.warn('[systems] init failed', e); }
     }
     // AGENT GROWTH: subscribe XP/Level/Confidence to the real run-outcome bus. Seeds agent.stats +
     // the station rollup, pushes the live numbers to the world HUD, and fires level-up celebrations.
@@ -3099,8 +3661,9 @@ const App = (() => {
     // prompt so a freshly-deployed agent already knows the Commander. A panel edit recomposes the live prompt.
     if (typeof DossierStore !== 'undefined') {
       DossierStore.init({
-        dossier: pendingDossier, docs: agentDocs(agent), persist: persist,
-        onMutate: () => { if (!agent) return; agent.systemPrompt = composeSystemPrompt(agent); if (typeof Chat !== 'undefined' && Chat.setSystem) Chat.setSystem(agent.systemPrompt); persist(); }
+        dossier: pendingDossier, docs: agentDocs(agent), canonical: !!(agent && agent.id === 'agent'), persist: persist,
+        // a dossier edit reaches EVERY agent's stored prompt (and the sidecar roster), not only the focused one
+        onMutate: () => { if (!agent) return; recomposeAllPrompts(); pushRoster(); persist(); }
       });
       pendingDossier = null;
       agent.systemPrompt = composeSystemPrompt(agent);   // include the dossier block before Chat.init reads it below
@@ -3313,12 +3876,15 @@ const App = (() => {
     // AutonomyStore. The level chooser ties grant + posture so the Commander dials never→fully-autonomous.
     if (typeof PermissionsStore !== 'undefined') PermissionsStore.init({
       getPosture: () => (typeof AutonomyStore !== 'undefined' && AutonomyStore.summary) ? AutonomyStore.summary() : null,
-      applyPreset: (id) => {
-        if (typeof AutonomyStore !== 'undefined' && AutonomyStore.applyPreset) AutonomyStore.applyPreset(id);
+      applyPreset: async (id) => {
+        if (typeof AutonomyStore === 'undefined' || !AutonomyStore.applyPreset) return { ok: false };
+        const result = await AutonomyStore.applyPreset(id);
+        if (!result.ok) return result;
         // GROWTH Tier 3: a permissions-LEVEL change is a NON-DIAL posture writer — reconcile the earned-rung record
         // against the rung the preset just set (a diverged record retires; user override wins), so a stale record
         // can never later demote FROM a rung the dial isn't at (the silent-escalation blocker).
         try { if (typeof TrustStore !== 'undefined' && TrustStore.onManualInitiative && typeof AutonomyStore !== 'undefined' && AutonomyStore.get) TrustStore.onManualInitiative((AutonomyStore.get() || {}).initiative); } catch (_) {}
+        return result;
       },
       api: {
         load: () => Harness.api.get('/api/permissions'),
@@ -3338,7 +3904,7 @@ const App = (() => {
       now: () => Date.now(),
       getStats: () => { const a = agents.get('agent'); return (a && a.stats && typeof Xp !== 'undefined' && Xp.compute) ? Xp.compute(a.stats) : (a ? a.stats : null); },
       getPosture: () => (typeof AutonomyStore !== 'undefined' && AutonomyStore.summary) ? AutonomyStore.summary() : null,
-      setInitiative: (level) => { if (typeof AutonomyStore !== 'undefined' && AutonomyStore.setInitiative) AutonomyStore.setInitiative(level); persist(); },
+      setInitiative: async (level) => { if (typeof AutonomyStore === 'undefined' || !AutonomyStore.setInitiative) return false; const result = await AutonomyStore.setInitiative(level); if (result.ok) persist(); return result; },
       // the ONLY capabilities a grant offer may pre-bless — the sidecar's curated GRANTABLE (cabinet:write today).
       grantable: (typeof SK !== 'undefined' && SK.permgrants && Array.isArray(SK.permgrants.GRANTABLE)) ? SK.permgrants.GRANTABLE.slice() : (typeof Permissions !== 'undefined' && Permissions.grantableKeys ? Permissions.grantableKeys() : ['cabinet:write']),
       getGrants: () => { try { return (typeof PermissionsStore !== 'undefined' && PermissionsStore.snapshot) ? (PermissionsStore.snapshot().grants || []) : []; } catch (_) { return []; } },
@@ -3372,6 +3938,12 @@ const App = (() => {
     // recovers sessions for routines that finished while the browser was closed. Read-only on U.bus. Init AFTER
     // Chat.init + App is fully formed (this returns App) so the module's App.refreshRail/persist bridges resolve.
     if (typeof AutoSessions !== 'undefined') AutoSessions.init();
+    // THE ONE RETURN REPORT: boot + the first input after a real absence ask the sidecar for ONE briefing of every
+    // unattended outcome (routines, builds, loops, drafts, failures) and deliver it into ONE pinned session. The
+    // older per-surface return beats (digest, morning report, drafts nudge, workshop reveal) stand down while it is live.
+    if (typeof Briefing !== 'undefined') Briefing.init({ enabled: !opts.awaitingPurpose, agentId: agent.id });
+    if (typeof RemoteView !== 'undefined') RemoteView.init();   // the station picture a paired phone sees (drawn only while one is looking)
+    if (typeof RemoteSessions !== 'undefined') RemoteSessions.init();   // phone conversations show up as desk sessions
     // Delegated-session recovery: if no page received the live delivery (or another open page won the ACK race
     // with a divergent local id), fold the durable run envelope into the matching named session exactly once.
     if (typeof StationCommands !== 'undefined' && StationCommands.reconcile) StationCommands.reconcile();
@@ -3406,7 +3978,7 @@ const App = (() => {
       // writeFile = the token-gated, consent-broker-gated, checkpointed server write (/api/autonomy/write). A failed
       // or denied write just degrades to a desk draft (the act() branch handles the fallback).
       canWriteFiles: () => { try { return (typeof PermissionsStore !== 'undefined' && PermissionsStore.snapshot) ? (PermissionsStore.snapshot().grants || []).indexOf('cabinet:write') >= 0 : false; } catch (_) { return false; } },
-      hasCabinet: () => { try { return (typeof World !== 'undefined' && World.heroCaps) ? (World.heroCaps((agent && agent.id) || 'agent') || []).indexOf('cabinet') >= 0 : false; } catch (_) { return false; } },
+      hasCabinet: () => { try { return (typeof World !== 'undefined' && World.heroCaps) ? (World.heroCaps((agent && agent.id) || 'agent') || []).some(c => (c && (c.objectType || c)) === 'cabinet') : false; } catch (_) { return false; } },   // heroCaps returns [{objectType}]: an indexOf('cabinet') never matched
       writeFile: (req) => fetch('/api/autonomy/write', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ agentId: (agent && agent.id) || 'agent', path: req.path, content: req.content }) }).then(r => r.ok ? r.json() : { ok: false }).catch(() => ({ ok: false })),
       // leave the result on the Commander's desk: a persistent toast + the live "working" cue + a gentle COMMS beat
       // that, on accept, posts the work into the feed. If it WROTE a real file (B2) the copy says so + names the path;
@@ -3418,7 +3990,7 @@ const App = (() => {
         // (no Chat yet), so the same draft is never announced twice (toast + nudge was the "pushy" double).
         // World.say stays: an ambient in-world cue, not a popup. The return digest recaps everything anyway.
         const canNudge = typeof Chat !== 'undefined' && Chat.nudge;
-        if (!canNudge && typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify((didWrite ? 'wrote a file while you were away: ' : 'drafted while you were away: ') + d.title, 'gold', 'cronDigest');   // P1-8 category: autonomous run
+        if (!canNudge && typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify((didWrite ? 'wrote a file while you were away: ' : 'drafted while you were away: ') + d.title, 'gold', 'cronDigest', { go: { term: 'automation', section: 'away' } });   // P1-8 category: autonomous run
         if (typeof World !== 'undefined' && World.say) World.say(didWrite ? '✦ saved a file to your workspace' : '✦ left a draft on your desk');
         if (canNudge) Chat.nudge(
           didWrite
@@ -3481,7 +4053,7 @@ const App = (() => {
         // richer than a toast (show me / undo) and it fires at the same instant the toast used to, saying the
         // SAME sentence. The toast is now only the FALLBACK when the nudge can't render (no Chat), so the
         // Commander's first interaction back is greeted once, not twice.
-        if ((typeof Chat === 'undefined' || !Chat.nudge) && typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify('while you were away (' + mins + 'm): ' + headline, 'gold', 'cronDigest');   // P1-8 category: autonomous digest
+        if ((typeof Chat === 'undefined' || !Chat.nudge) && typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify('while you were away (' + mins + 'm): ' + headline, 'gold', 'cronDigest', { go: { term: 'deliverables', section: 'review' } });   // P1-8 category: autonomous digest
         // DEFERRED a beat: this fires from the capture phase of the Commander's first pointerdown/keydown back.
         // Posting the nudge synchronously would clearNudge()/clearChoices() an in-flight answer on a live beat
         // (e.g. the per-draft "show me" chip) mid-press — the very tap that woke the digest would be eaten.
@@ -3495,7 +4067,7 @@ const App = (() => {
       onReturn: () => { try { if (typeof WorkshopStore !== 'undefined' && WorkshopStore.presentOnReturn) WorkshopStore.presentOnReturn(); } catch (_) {} }
     });
     if (typeof Voice !== 'undefined') Voice.init({ name: agent.name, personaId: agent.personaId, resumeCue: !opts.awaitingPurpose });   // mic + this agent's per-persona voice; offer hands-free resume except during the awakening
-    if (typeof ModelDock !== 'undefined') ModelDock.init({ apply: applyQuickModel, identity: () => (agent && agent.id) || '' });
+    if (typeof ModelDock !== 'undefined') ModelDock.init({ apply: applyQuickModel, identity: () => (agent && agent.id) || '', agentName: () => (agent && agent.name) || '' });
     syncChannels();   // if a Telegram bot auto-started from saved config, refresh it to THIS agent's live identity
     pushRoster();     // Stage 2: seed the sidecar with the live crew so the lead can delegate (no-op for a solo station)
     renderRail();
@@ -3518,6 +4090,18 @@ const App = (() => {
         persona: (typeof Personas !== 'undefined') ? Personas.get(agent.personaId) : null,   // the voice was chosen on the create screen — the awakening acknowledges it instead of re-asking
         specialty: opts.specialty || null,                   // (reserved) a pre-specced wake skips re-asking the mission; the orchestrator authors it live
         commit: applyAgentConfig,                            // each answer folds a real doc into the live prompt + persists
+        /* CHOOSE YOUR STATION (2026-09-28): the awakening's last question builds a work preset over the UNTOUCHED
+           starter room, through the same StationTemplates.build + replaceLayout path Build mode's Presets use
+           (one undo slot; the lead keeps its desk). fresh() = still the one-room starter no preset has built. */
+        stations: (typeof StationTemplates !== 'undefined' && typeof WorldModel !== 'undefined' && typeof PropSprites !== 'undefined') ? {
+          catalog: () => StationTemplates.catalog,
+          recommend: text => (StationTemplates.recommend ? StationTemplates.recommend(text) : null),
+          fresh: () => { const d = station && station.doc(); return !!d && !(d.meta && d.meta.templateId) && station.rooms().filter(r => r.kind !== 'corridor').length === 1; },
+          apply: id => {
+            try { return station.replaceLayout(StationTemplates.build(id, WorldModel, PropSprites, station.doc()._nid + 100)); }
+            catch (e) { return { ok: false, msg: e && e.message }; }
+          }
+        } : null,
         getSystem: () => agent ? agent.systemPrompt : '',    // Interview 2.0: the generated beats (wakemind.js) reason on the LIVE prompt (persona + dossier already folded in)
         done: () => { if (agent) agent.onboarded = true; persist(); if (typeof KeyCTA !== 'undefined' && KeyCTA.arm) KeyCTA.arm(); },   // the awakening landed — mark onboarded so a later refresh resumes into the game, not back into the ceremony; arm the keyless-brain CTA (shows only if no key is truly stored)
         notify: (typeof StationUI !== 'undefined') ? StationUI.notify : null,
@@ -3563,33 +4147,97 @@ const App = (() => {
   let railTicker = 0;
   let railShowArchived = false;   // when true the rail also lists archived (put-away) sessions, dimmed
   let railFocusId = null;         // roving-tabindex cursor: one rail stop regardless of session count
-  let railAttentionOnly = false;
+  let railLineObserver = null;    // re-fits each group row's names line when its room changes (fitRailAgentLines)
   let railAttentionKey = '';
+  // PER-AGENT THREADS: a crew-row click narrows the rail to that agent's sessions — the streams bound to it
+  // plus group chats and conversations holding its delegated work. The SESSIONS tab, the chip's ✕,
+  // or the same crew row again clears it. View state only: never persisted, never touches a stream.
+  let railAgentFilter = null;
+  function railHasAgent(w, id) {
+    return Workstreams.hasAgent(w, id, typeof GroupChat !== 'undefined' ? GroupChat.membersOf : null);
+  }
+  function setRailAgentFilter(id) {
+    id = id && agents.has(String(id)) ? String(id) : null;
+    if (id && id === railAgentFilter) id = null;   // the same crew row again = back to every session
+    railAgentFilter = id;
+    if (id && railView !== 'sessions') setRailView('sessions', { keepAgentFilter: true });
+    renderSessionSearch();   // a typed search re-scopes to (or back out of) the chosen agent
+    renderRail();
+    if (typeof StationUI !== 'undefined' && StationUI.refreshCrew) StationUI.refreshCrew();
+    return railAgentFilter;
+  }
+  // the chip under the rail head names whose sessions are showing; clicking it shows every session again
+  function syncRailAgentChip(count) {
+    let chip = el('ws-agent-filter');
+    if (!chip) {
+      const anchor = el('ws-needs'); if (!anchor) return;
+      chip = document.createElement('button');
+      chip.id = 'ws-agent-filter'; chip.type = 'button'; chip.className = 'ws-agent-filter';
+      chip.onclick = () => { SFX.click(); setRailAgentFilter(null); };
+      anchor.parentNode.insertBefore(chip, anchor);
+    }
+    const a = railAgentFilter && agents.get(railAgentFilter);
+    const hide = !a || railView !== 'sessions';
+    if (chip.hidden !== hide) chip.hidden = hide;
+    if (!a) return;
+    const name = a.name || a.id, key = railAgentFilter + '|' + name + '|' + count;
+    if (chip.dataset.key === key) return;
+    chip.dataset.key = key;
+    const thumb = typeof AgentPortraits !== 'undefined' && AgentPortraits.thumbHTML ? AgentPortraits.thumbHTML(a, 18, 22, 'waf-thumb') : '';
+    chip.innerHTML = thumb + '<span class="waf-name" style="color:' + U.esc(a.color || '') + '">' + U.esc(name) + '</span>'
+      + '<span class="waf-count">' + count + '</span><span class="waf-clear" aria-hidden="true">✕</span>';
+    chip.setAttribute('aria-label', 'Showing ' + name + "'s " + count + ' session' + (count === 1 ? '' : 's') + '. Show all sessions');
+    chip.setAttribute('data-tip', 'Showing only ' + name + "'s sessions — click to show all");
+  }
   // Pending consent belongs to a session. Multiple sessions on one agent remain distinct;
   // deleted/orphaned channels cannot contribute a count with nowhere to open.
   function railPendingIds() {
-    return new Set(typeof Channels === 'undefined' ? [] : Channels.pendingIds().filter(id => Workstreams.get(id)));
+    const ids = typeof Channels === 'undefined' ? [] : Channels.pendingIds().filter(id => Workstreams.get(id));
+    // a GROUP waiting on the Commander (a question, an approval that expires in 5 minutes) — read off the backend's
+    // group list (group-chat.js watch), since group runs never pass through Channels
+    if (typeof GroupChat !== 'undefined' && GroupChat.attentionIds) for (const id of GroupChat.attentionIds()) if (Workstreams.get(id) && !ids.includes(id)) ids.push(id);
+    return new Set(ids);
+  }
+  /* where an agent is WAITING on the Commander (an approval or a question) — the crew card's "needs your OK" opens
+     it in one click instead of narrowing the rail and leaving you to find it (2026-10-09). The pending prompt names
+     its agent (a delegated worker's ask can surface in the conversation that dispatched it); else the session's own
+     agent/members. null = nothing waiting for that agent. */
+  function waitingSessionOf(agentId) {
+    if (!agentId || typeof Workstreams === 'undefined') return null;
+    for (const id of railPendingIds()) {
+      const w = Workstreams.get(id); if (!w) continue;
+      const asks = typeof Channels === 'undefined' ? [] : (Channels.pendingAllOf ? Channels.pendingAllOf(id) : [Channels.pendingOf ? Channels.pendingOf(id) : null]).filter(Boolean);
+      // Participation finds past work, but an attention shortcut must name the agent who is asking now.
+      if (asks.some(p => (p.workerAgentId || p.agentId || w.agentId) === agentId)) return id;
+      if (!asks.length && w.conversationMode === 'group' && railHasAgent(w, agentId)) return id;
+    }
+    return null;
+  }
+  // NEEDS YOU (needsyou.js, 2026-10-11) replaced the "Waiting for you" filter: one pinned list of every ask and failure
+  // on the station, each with its own action. It lives in the SESSIONS view only.
+  /* station.show 'needs-you' (org P01): put the SESSIONS view (where NEEDS YOU lives) in front and bring the list into view.
+     open = the rail is on screen (BUILD MODE or a hidden crew rail is not); waiting = how many rows it holds right now. */
+  function showNeedsYou() {
+    if (railView !== 'sessions') setRailView('sessions');
+    if (typeof NeedsYou !== 'undefined' && NeedsYou.render) NeedsYou.render();
+    const left = el('left'), host = el('ws-needs');
+    const railShown = !!(left && left.getClientRects && left.getClientRects().length);
+    const waiting = typeof NeedsYou !== 'undefined' && NeedsYou.items ? NeedsYou.items().length : 0;
+    if (railShown && host && !host.hidden && host.scrollIntoView) host.scrollIntoView({ block: 'nearest' });
+    return { open: railShown, key: 'needs-you', waiting };
   }
   function syncRailAttention(pending) {
     railAttentionKey = [...pending].sort().join('\n');
-    if (!pending.size) railAttentionOnly = false;
-    const btn = el('ws-attention'); if (!btn) return;
-    const hide = !pending.size || railView !== 'sessions';
-    if (hide && document.activeElement === btn) el('ws-search')?.focus();
-    if (btn.hidden !== hide) btn.hidden = hide;
-    const pressed = String(railAttentionOnly);
-    if (btn.getAttribute('aria-pressed') !== pressed) btn.setAttribute('aria-pressed', pressed);
-    const label = 'Waiting for you · ' + pending.size + ' session' + (pending.size === 1 ? '' : 's') + ' waiting for your response. ' + (railAttentionOnly ? 'Show all sessions' : 'Show waiting sessions');
-    if (btn.getAttribute('aria-label') !== label) btn.setAttribute('aria-label', label);
-    const count = el('ws-attention-count'), clear = el('ws-attention-clear');
-    if (count && count.textContent !== String(pending.size)) count.textContent = pending.size;
-    if (clear) clear.hidden = !railAttentionOnly;
+    const host = el('ws-needs'); if (!host) return;
+    if (railView !== 'sessions') { host.hidden = true; return; }
+    if (typeof NeedsYou !== 'undefined' && NeedsYou.render) NeedsYou.render();
   }
   let railKind = 'all';
   const railExpanded = new Set();
   try {
     const saved = JSON.parse(localStorage.getItem('skynet.session-view') || '{}');
-    if (['all', 'automated'].includes(saved.kind)) railKind = saved.kind;
+    // the ALL / AUTOMATED switch was removed (Andrew 10-01): the rail always shows every session; a saved
+    // 'automated' view is ignored so nobody is left on a filter they can no longer change
     if (Array.isArray(saved.expanded)) saved.expanded.slice(0, 200).forEach(k => { if (typeof k === 'string') railExpanded.add(k); });
   } catch (_) {}
   function saveRailView() {
@@ -3620,6 +4268,13 @@ const App = (() => {
       const question = pending.tool === 'brief.ask';
       return { dot: question ? 'ws-dot needsyou reply' : 'ws-dot needsyou approval', meta: question ? 'Reply needed' : 'Approval needed', busy: Channels.isBusy(w.id), attn: true, status: question ? 'waiting for your answer' : 'awaiting your approval' };
     }
+    // a GROUP's runs live in the group coordinator, not Channels: its row reads the backend group state instead
+    const gs = w.conversationMode === 'group' && typeof GroupChat !== 'undefined' && GroupChat.stateOf ? GroupChat.stateOf(w.id) : null;
+    if (gs && (gs.approvals || gs.questions)) {
+      const ask = !gs.approvals;
+      return { dot: ask ? 'ws-dot needsyou reply' : 'ws-dot needsyou approval', meta: ask ? 'Reply needed' : 'Approval needed', busy: !!gs.busy, attn: true, status: ask ? 'waiting for your answer' : 'awaiting your approval' };
+    }
+    if (gs && gs.busy) return { dot: 'ws-dot working', meta: 'Working', busy: true, attn: false, status: 'agents are working in this group' };
     if (typeof Channels !== 'undefined' && Channels.isBusy(w.id)) {
       if (!Channels.runIdOf(w.id)) {
         return { dot: 'ws-dot connecting', meta: 'Connecting', busy: true, attn: false, status: 'connecting to the model' };
@@ -3628,36 +4283,126 @@ const App = (() => {
       const started = Channels.startedAtOf(w.id);
       return { dot: 'ws-dot working', meta: started ? railFmtElapsed(Channels.elapsedOf(w.id, Date.now())) : '…', busy: true, attn: false, status };
     }
+    // its delegated crew still at work (a background worker outlives the reply that started it). Workers' own threads
+    // are not in SESSIONS, so the asking conversation's lamp carries it — from the durable ledger, never a guess.
+    const ov = typeof Overseer !== 'undefined' && Overseer.snapshot ? Overseer.snapshot() : null;
+    const crew = ((ov && ov.workers) || []).filter(x => x && x.status === 'running' && x.parentStreamId === w.id).length;
+    // …a ledger the station has stopped answering for cannot vouch that they still run: say unknown, never "working"
+    if (crew && Overseer.fresh && !Overseer.fresh()) return { dot: 'ws-dot', meta: 'crew · unknown', busy: false, attn: false, status: 'station unreachable — crew state unknown' };
+    if (crew) return { dot: 'ws-dot working', meta: crew + ' working', busy: true, attn: false, status: crew + ' of the crew working on what you delegated' };
     // A settled failure uses the crossed lamp; only a live approval/question earns the action row.
     if (w.lastRunOk === false) return { dot: 'ws-dot failed', meta: railRelTime(w.lastActiveAt), busy: false, attn: false, status: 'last run failed — open to inspect' };
     // a DELIVERY session ('workshop-<runId>' — idle-built work) that hasn't been reviewed is a decision the
-    // Commander owes, not just an unread chat: say REVIEW on the row itself (2026-07-15 UX audit — the ⚒ prefix
-    // alone didn't distinguish "your agent made you something" from ordinary unread activity).
+    // Commander owes: its lamp is unseen like any new reply, and its hover/label says what is waiting. The row
+    // itself keeps the time — a "⚒ REVIEW" tag there read as clutter (Andrew 10-27).
     if (String(w.id).indexOf('workshop-') === 0 && Workstreams.unread(w)) {
-      return { dot: 'ws-dot unseen', meta: '⚒ REVIEW', busy: false, attn: false, status: 'a build is waiting for your review' };
+      return { dot: 'ws-dot unseen', meta: railRelTime(w.lastActiveAt), busy: false, attn: false, status: 'a build is waiting for your review' };
     }
     // UNSEEN vs SEEN is the whole idle axis now. `unread` is two real stored timestamps
     // (lastActiveAt > lastReadAt) and is never true for the stream you have open, so the dot goes
     // faded the instant you actually look at it — which is what makes a glance down the rail mean
-    // something. The ⚒ REVIEW branch above keeps its own wording: a BUILD waiting is a different
+    // something. The build branch above keeps its own status wording: a BUILD waiting is a different
     // errand from a reply waiting, even though both are "unseen".
     if (Workstreams.unread(w)) return { dot: 'ws-dot unseen', meta: railRelTime(w.lastActiveAt), busy: false, attn: false, status: 'unread activity' };
     return { dot: 'ws-dot seen', meta: railRelTime(w.lastActiveAt), busy: false, attn: false, status: 'read' };
   }
-  /* ---------- INBOX row extras (SESSION ROWS = inbox) ----------
-     Both lines are rendered ALWAYS and hidden by CSS in COMPACT, so the setting is a pure repaint —
+  /* ---------- INBOX row extras (SESSION ROWS = inbox) + shared group identity ----------
+     Both spans are rendered ALWAYS; CSS keeps group identity visible in every row layout, so switching is a pure repaint —
      no re-render, no lost rail focus/scroll, and updateRailLive keeps working untouched.
      Every value is a read of state that already exists; nothing here is derived or guessed. */
   function railAgentName(w) {
+    // a group row names everyone in it (lead first), since the per-agent view lists it under each of them
+    const members = w.conversationMode === 'group' && typeof GroupChat !== 'undefined' && GroupChat.membersOf ? GroupChat.membersOf(w.id) : null;
+    if (members && members.length > 1) {
+      const ids = [w.agentId].concat(members.filter(id => id !== w.agentId)).filter(id => members.includes(id));
+      return ids.map(id => { const m = agents.get(id); return (m && m.name) || id; }).join(' + ');
+    }
     const a = agents.get(w.agentId);                      // the live registry, same one the world reads
     return (a && a.name) ? a.name : (w.agentId || 'AGENT');
   }
+  // the row's agent line: a group shows its first two members by name and counts the rest ("ULTRON, CYPHER +3"); the
+  // count sits in its own span so a long pair of names ellipsizes without ever cutting off the +N
+  function railAgentLine(w) {
+    const members = w.conversationMode === 'group' && typeof GroupChat !== 'undefined' && GroupChat.membersOf ? GroupChat.membersOf(w.id) : null;
+    if (!members || members.length < 2) return U.esc(railAgentName(w));
+    const ids = [w.agentId].concat(members.filter(id => id !== w.agentId)).filter(id => members.includes(id));
+    const names = ids.slice(0, 2).map(id => { const m = agents.get(id); return (m && m.name) || id; }).join(', ');
+    const more = ids.length - 2;
+    return '<span class="ws-agent-names">' + U.esc(names) + '</span>' + (more > 0 ? '<span class="ws-agent-more">+' + more + '</span>' : '');
+  }
+  /* A GROUP SHOWS ITS CREW (Andrew 10-27: the names alone, "ULTRON, CYPHER", read as a line of text, not a group). The
+     first three members' own skin thumbs, lead first — the same portraits their CREW cards show — ahead of the names
+     line; the names and the +N stay as they are. '' for a one-on-one row or an unknown membership. */
+  function railAgentFaces(w) {
+    const members = w.conversationMode === 'group' && typeof GroupChat !== 'undefined' && GroupChat.membersOf ? GroupChat.membersOf(w.id) : null;
+    if (!members || members.length < 2 || typeof AgentPortraits === 'undefined' || !AgentPortraits.thumbHTML) return '';
+    const ids = [w.agentId].concat(members.filter(id => id !== w.agentId)).filter(id => members.includes(id)).slice(0, 3);
+    return '<span class="ws-faces" aria-hidden="true">' + ids.map(id => AgentPortraits.thumbHTML(agents.get(id) || null, 20, 24, 'ws-face')).join('') + '</span>';
+  }
+  /* WHOLE NAMES (walk 10-14 #6): the row gives the names line its whole first line (app.css / pipglass.css), and this
+     picks the reading that fits it — "ULTRON, CYPHER +3", else "ULTRON +4" — so a name is never cut mid-word
+     ("ULTRON, CYP… +3", "ULTR… +3"). The full reading rides data-full, so a wider rail or the COMPACT/INBOX switch
+     brings the second name back. A line that is not laid out is left alone (a zero measure is not "too narrow").
+     A names line that WRAPS at a space (the glass INBOX headline, pipglass.css — rc walk 10-14) already shows every
+     name whole on its own lines: it keeps the full reading and never folds. */
+  function fitRailAgentLine(line) {
+    const names = line && line.querySelector ? line.querySelector('.ws-agent-names') : null;
+    if (!names || !line.getClientRects().length) return;
+    if (names.dataset.full == null) {
+      const more0 = line.querySelector('.ws-agent-more');
+      names.dataset.full = names.textContent;
+      names.dataset.more = String(more0 ? (parseInt(more0.textContent.replace('+', ''), 10) || 0) : 0);
+    }
+    const full = names.dataset.full, extra = +names.dataset.more || 0, parts = full.split(', ');
+    const show = (text, n) => {
+      if (names.textContent !== text) names.textContent = text;
+      let more = line.querySelector('.ws-agent-more');
+      if (n > 0) {
+        if (!more) { more = document.createElement('span'); more.className = 'ws-agent-more'; line.appendChild(more); }
+        if (more.textContent !== '+' + n) more.textContent = '+' + n;
+      } else if (more) more.remove();
+    };
+    show(full, extra);
+    if (typeof getComputedStyle === 'function' && getComputedStyle(names).whiteSpace !== 'nowrap') return;
+    if (parts.length > 1 && names.scrollWidth > names.clientWidth + 1) show(parts[0], extra + parts.length - 1);
+  }
+  function fitRailAgentLines() {
+    const lines = document.querySelectorAll('#workstreams .ws-agent-group');
+    lines.forEach(fitRailAgentLine);
+    // the rail's width and the row layout (COMPACT/INBOX) change the room without a re-render: re-fit on resize
+    if (typeof ResizeObserver === 'undefined') return;
+    if (!railLineObserver) railLineObserver = new ResizeObserver(entries => { for (const e of entries) fitRailAgentLine(e.target); });
+    railLineObserver.disconnect();
+    lines.forEach(l => railLineObserver.observe(l));
+  }
+  // the INBOX row names its agent in that agent's own colour, exactly as its CREW card does (a group row: the lead's)
+  function railAgentColorAttr(w) {
+    const a = agents.get(w.agentId);
+    return a && a.color ? ' style="color:' + U.esc(a.color) + '"' : '';
+  }
   // Compact excerpt of the latest visible turn; never an invented completion claim.
   // Share search/export filtering so hidden tool/system chatter stays hidden.
+  // The rail's 1s heartbeat asks this twice per row (the receipt line and the hover tip): read the newest message
+  // from the end of the history and re-excerpt only when that message's text changed (a 26-agent station spent
+  // ~18ms of every second copying whole histories and re-running these regexes over the same text).
+  const railExcerpts = new WeakMap();
   function railReceipt(w) {
-    const messages = Workstreams.visibleMessages ? Workstreams.visibleMessages(w) : [];
-    const latest = messages.slice().reverse().find(m => m.content.trim());
+    const latest = Workstreams.latestVisibleMessage ? Workstreams.latestVisibleMessage(w)
+      : (Workstreams.visibleMessages ? Workstreams.visibleMessages(w) : []).slice().reverse().find(m => m.content.trim());
     if (!latest) return 'No messages yet';
+    const memo = railExcerpts.get(latest);
+    if (memo && memo.content === latest.content && memo.role === latest.role) return memo.out;
+    const out = railExcerpt(latest);
+    railExcerpts.set(latest, { content: latest.content, role: latest.role, out });
+    return out;
+  }
+  function railExcerpt(latest) {
+    // a goal-loop step is the station's line, never "You:" + the internal continuation prompt (org P29-sys wiring)
+    const step = (typeof GoalLoop !== 'undefined' && GoalLoop.stepOfTurn) ? GoalLoop.stepOfTurn(latest) : null;
+    if (step != null) {
+      const g = step.replace(/\s+/g, ' ').trim();
+      return '↻ Goal step: ' + (g.length > 147 ? g.slice(0, 146).trimEnd() + '…' : g);
+    }
     const text = latest.content
       .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
       .replace(/(^|\n)\s{0,3}(?:#{1,6}\s+|[-*+]\s+|>\s*)/g, ' ')
@@ -3670,23 +4415,41 @@ const App = (() => {
   }
   function railModelFull(w) { return (w.lastModel || '').trim(); }
   function railRowLabel(w, st, project = false) {
-    const title = w.title || 'General', name = railAgentName(w);
-    return title + ' session' + (name === title ? '' : ', ' + name) + (st.status ? ', ' + st.status : '')
+    const title = Workstreams.titleOf(w), name = railAgentName(w);
+    return title + (w.conversationMode === 'group' ? ' group chat' : ' session') + (name === title ? '' : ', ' + name) + (st.status ? ', ' + st.status : '')
       + (Workstreams.unread(w) && !st.dot.includes('unseen') ? ', unread activity' : '')
       + (project ? '; Enter to open' : '; Enter to open; Shift+F10 for actions');
   }
   function railRowTip(w, st, project = false) {
     const full = railModelFull(w);
-    return (w.title || 'General') + (w.archived ? ' · archived' : '') + (st.status ? ' · ' + st.status : '')
+    // the latest line rides the hover tip: the row itself is name + agent + time (NO SENTENCES UNDER TILES)
+    const latest = !project && typeof railReceipt === 'function' ? railReceipt(w) : '';
+    return Workstreams.titleOf(w) + (latest ? ' — ' + latest : '') + (w.archived ? ' · archived' : '') + (st.status ? ' · ' + st.status : '')
       + (Workstreams.unread(w) && !st.dot.includes('unseen') ? ' · unread activity' : '')
       + (w.kind === 'task' ? ' · board: ' + w.lane : '')
       + (full ? ' · last run on ' + full : '')
       + (project ? ' — open this session' : ' — Shift+F10 or right-click for actions');
   }
+  /* a routine's rows on the rail, head first: its NEWEST run carries the runs key, the rest list under it as older.
+     Workstreams.list sorts pinned rows first, so a pinned OLDER run arrived first, took the head and the key, and the
+     newest run was drawn set in under it as "older" (delta review 10-15). Equal times keep the order they came in. */
+  function railRunRows(visible) {
+    const head = visible.reduce((a, b) => (+b.lastActiveAt || 0) > (+a.lastActiveAt || 0) ? b : a);
+    return [head].concat(visible.filter(w => w !== head));
+  }
   function rowClass(w, st, activeId) {
     return 'ws-row' + (w.id === activeId ? ' sel' : '') + (st.busy ? ' busy' : '') + (st.attn ? ' attn' : '')
       + (w.pinned ? ' pinned' : '') + (w.archived ? ' archived' : '')
       + (Workstreams.unread(w) ? ' unread' : '');   // real unseen activity (lastActiveAt > lastReadAt, never the open stream)
+  }
+  /* the name the rail printed for a session on its last pass — the D12 disambiguation ("New session · NOVA", "… 2") included —
+     else Workstreams.titleOf. A printed name is used only while its base still matches titleOf, so a session titled since the
+     last pass never shows the stale one. Chat.sessionTitleText (the COMMS title) and the busy row read this. */
+  let railShownNames = new Map();
+  function sessionDisplayName(w) {
+    if (!w || typeof Workstreams === 'undefined') return '';
+    const base = Workstreams.titleOf(w), hit = railShownNames.get(w.id);
+    return hit && hit.base === base ? hit.shown : base;
   }
   function renderRail() {
     const ul = el('workstreams');
@@ -3697,45 +4460,81 @@ const App = (() => {
     if (oldFocus && oldFocus.dataset.id) railFocusId = oldFocus.dataset.id;
     const pending = railPendingIds();
     syncRailAttention(pending);
+    if (railAgentFilter && !agents.has(railAgentFilter)) railAgentFilter = null;   // that agent left the station
     const allRows = Workstreams.list({ includeArchived: true }).filter(w =>
-      railAttentionOnly ? pending.has(w.id) : (!w.archived || railShowArchived || pending.has(w.id)));
-    const grouped = railAttentionOnly ? allRows.map(w => ({ type: 'session', w })) : Workstreams.railGroups(allRows, { view: railKind, activeId, expanded: [...railExpanded], urgent: allRows.filter(w => railRowState(w).busy || pending.has(w.id)).map(w => w.id) });
+      (!railAgentFilter || railHasAgent(w, railAgentFilter))
+      && (!w.archived || railShowArchived || pending.has(w.id)));
+    syncRailAgentChip(allRows.length);
+    const grouped = Workstreams.railGroups(allRows, { view: railKind, activeId, expanded: [...railExpanded], urgent: allRows.filter(w => railRowState(w).busy || pending.has(w.id)).map(w => w.id) });
     const headers = new Map();
+    // delegated workers' threads are never rows (Workstreams.list hides them): their work is on the asking
+    // conversation's delegation card, and a running crew shows on that conversation's own lamp (railRowState reads the ledger)
+    const olderRuns = new Set();   // a routine's runs listed under its newest one, while its history is open
     const rows = grouped.flatMap(item => {
       if (item.type === 'session') return [item.w];
-      headers.set(item.visible[0].id, item);
-      return item.visible;
+      const runs = railRunRows(item.visible);
+      headers.set(runs[0].id, item);
+      runs.slice(1).forEach(w => olderRuns.add(w.id));
+      return runs;
     });
     const filters = el('ws-kind-filter');
-    if (filters) filters.hidden = railAttentionOnly;
     if (filters) filters.querySelectorAll('[data-ws-kind]').forEach(button => {
       button.setAttribute('aria-pressed', String(button.dataset.wsKind === railKind));
-      button.onclick = () => { railAttentionOnly = false; railKind = button.dataset.wsKind; saveRailView(); renderRail(); };
+      button.onclick = () => { railKind = button.dataset.wsKind; saveRailView(); renderRail(); };
     });
     if (!rows.some(w => w.id === railFocusId)) railFocusId = rows.some(w => w.id === activeId) ? activeId : (rows[0] && rows[0].id);
     ul.setAttribute('role', 'listbox');
     ul.setAttribute('aria-label', 'Sessions');
-    ul.innerHTML = rows.map((w, index) => {
-      const title = w.title || 'General';
+    // two untitled sessions both read "New session" and could not be told apart: a repeated untitled name carries
+    // whose session it is ("New session · MIRA"), and a number when the same agent has more than one.
+    const baseTitles = rows.map(w => Workstreams.titleOf(w));
+    const untitledName = (w, t) => !w.title && baseTitles.filter(x => x === t).length > 1 ? t + ' · ' + railAgentName(w) : t;
+    const shownTitles = rows.map((w, i) => untitledName(w, baseTitles[i]));
+    const seenTitle = new Map();
+    const titles = shownTitles.map((t, i) => {
+      if (rows[i].title || shownTitles.filter(x => x === t).length < 2) return t;
+      const n = (seenTitle.get(t) || 0) + 1; seenTitle.set(t, n);
+      return n === 1 ? t : t + ' ' + n;
+    });
+    // ONE name per session on every surface (org D12 x P26 x P25): the COMMS title and the busy row read the name this pass
+    // printed (sessionDisplayName), so a disambiguated "New session · NOVA" is never a bare "New session" over the transcript
+    railShownNames = new Map(rows.map((w, i) => [w.id, { base: baseTitles[i], shown: titles[i] }]));
+    if (typeof Chat !== 'undefined' && Chat.paintTitle) Chat.paintTitle();   // ORG P26: a rename / auto-title / group change renames the COMMS title too
+    ul.innerHTML = rows.map((w, i) => {
+      const title = titles[i];   // only the General home reads "General"; an untitled other session is a "New session"
       const st = railRowState(w);
       const group = headers.get(w.id);
-      const groupHead = group ? '<li class="ws-auto-group" role="presentation"><button type="button" data-ws-group="' + U.esc(group.key) + '" aria-expanded="' + railExpanded.has(group.key) + '"><span>' + U.esc(group.name) + '</span><small>' + U.esc(railAgentName(w)) + ' · ' + group.rows.length + ' run' + (group.rows.length === 1 ? '' : 's') + ' · ' + (railExpanded.has(group.key) ? 'collapse' : 'show history') + '</small></button></li>' : '';
+      // a routine is ONE row (Andrew 10-15: a header over its own newest run said the name twice, in an older style): its
+      // newest run, with the run count as its fold key; its older runs list under it, set in, while the history is open
+      const open = !!group && railExpanded.has(group.key), runs = group ? group.rows.length : 0;
+      const runsKey = group && runs > 1 ? '<button type="button" class="ws-runs" data-ws-group="' + U.esc(group.key) + '" aria-expanded="' + open + '" aria-label="' + U.esc((open ? 'Hide the older runs of ' : 'Show every run of ') + group.name) + '">' + runs + ' runs</button>' : '';
+      const runAttr = group ? ' data-runs="head"' : olderRuns.has(w.id) ? ' data-runs="older"' : '';
       const tip = railRowTip(w, st);
-      return groupHead + '<li class="' + rowClass(w, st, activeId) + '" data-id="' + U.esc(w.id) + '" tabindex="' + (w.id === railFocusId ? '0' : '-1') + '" role="option" aria-selected="' + (w.id === activeId ? 'true' : 'false') + '" aria-posinset="' + (index + 1) + '" aria-setsize="' + rows.length + '" aria-label="' + U.esc(railRowLabel(w, st)) + '" aria-keyshortcuts="Shift+F10" title="' + U.esc(tip) + '">' +
+      return '<li class="' + rowClass(w, st, activeId) + '" data-id="' + U.esc(w.id) + '"' + runAttr + ' tabindex="' + (w.id === railFocusId ? '0' : '-1') + '" role="option" aria-selected="' + (w.id === activeId ? 'true' : 'false') + '" aria-posinset="' + (i + 1) + '" aria-setsize="' + rows.length + '" aria-label="' + U.esc(railRowLabel(w, st)) + '" aria-keyshortcuts="Shift+F10" title="' + U.esc(tip) + '">' +
         '<span class="' + st.dot + '" aria-hidden="true"></span>' +
         (w.pinned ? '<span class="ws-pin" aria-hidden="true">★</span>' : '') +
-        '<span class="ws-agent" aria-hidden="true">' + U.esc(railAgentName(w)) + '</span>' +
-        '<span class="ws-title">' + U.esc(title) + '</span>' +
+        '<span class="ws-agent' + (w.conversationMode === 'group' ? ' ws-agent-group' : '') + '" aria-hidden="true"' + railAgentColorAttr(w) + '>' + railAgentFaces(w) + railAgentLine(w) + '</span>' +
+        '<span class="ws-title">' + U.esc(title) + '</span>' + runsKey +
         '<span class="ws-meta">' + U.esc(st.meta) + '</span>' +
         '<span class="ws-receipt" aria-hidden="true">' + U.esc(railReceipt(w)) + '</span>' +
         '<button class="ws-kebab" tabindex="-1" aria-label="session actions" title="session actions">⋯</button>' +
         '</li>';
     }).join('');
-    if (!rows.length && railKind === 'automated' && !railAttentionOnly) {
+    if (!rows.length && railAgentFilter) {
+      const a = agents.get(railAgentFilter), name = U.esc((a && (a.name || a.id)) || railAgentFilter);
+      // an agent whose sessions are all ARCHIVED has had sessions: never "yet" above "▸ 2 archived" (QA 2026-10-02)
+      let archivedHere = 0; for (const w of Workstreams.list({ includeArchived: true })) if (w.archived && railHasAgent(w, railAgentFilter)) archivedHere++;
+      ul.innerHTML = '<li class="proj-empty ws-agent-empty" role="presentation"><span role="status">No '
+        + (railKind === 'automated' ? 'automation ' : '') + (archivedHere ? 'open sessions with ' + name + ' — ' + archivedHere + ' archived below.' : 'sessions with ' + name + ' yet.') + '</span>'
+        + '<button type="button" class="btn ws-agent-start">START ONE</button></li>';
+      const start = ul.querySelector('.ws-agent-start'); if (start) start.onclick = () => newWorkstream();
+    } else if (!rows.length && railKind === 'automated') {
       ul.innerHTML = '<li class="proj-empty" role="presentation"><span role="status">No automation sessions yet.</span></li>';
     }
+    fitRailAgentLines();
     ul.querySelectorAll('[data-ws-group]').forEach(button => {
-      button.onclick = () => {
+      button.onclick = e => {
+        e.stopPropagation();   // the key sits on the routine's row: folding its runs never also opens that run
         const key = button.dataset.wsGroup;
         if (railExpanded.has(key)) railExpanded.delete(key); else railExpanded.add(key);
         saveRailView();
@@ -3794,6 +4593,8 @@ const App = (() => {
     if (!ul || typeof Workstreams === 'undefined' || !game || !game.classList.contains('active')) { stopRailTicker(); return; }
     const pending = railPendingIds();
     if ([...pending].sort().join('\n') !== railAttentionKey) { renderRail(); return; }
+    if (railView === 'sessions' && typeof NeedsYou !== 'undefined' && NeedsYou.render) NeedsYou.render();   // ages tick, failures arrive
+    if (typeof StationUI !== 'undefined' && StationUI.badges) StationUI.badges();   // org P01: the bell adds the live NEEDS YOU count, in every rail view
     const activeId = Workstreams.activeId();
     document.querySelectorAll('#workstreams .ws-row,#projects .proj-sess-full').forEach(li => {
       if (li.querySelector('.ws-rename')) return;   // leave a row alone while its title is being edited in place
@@ -3815,8 +4616,10 @@ const App = (() => {
       if (card && !card.hidden && li.getAttribute('aria-describedby') === 'station-tip' && card.textContent !== tip) card.textContent = tip;
     });
   }
-  function armRailTicker() { if (!railTicker) railTicker = setInterval(updateRailLive, 1000); }
-  function stopRailTicker() { if (railTicker) { clearInterval(railTicker); railTicker = 0; } }
+  // through PollGate (idle CPU piece 3, 2026-10-20): 1 s while the rail can be seen, a 30 s floor while the Commander is
+  // away, one beat at once on return (the visibilitychange renderRail below also snaps every row back to truth)
+  function armRailTicker() { if (!railTicker) railTicker = (typeof PollGate !== 'undefined' && PollGate.every) ? PollGate.every(updateRailLive, { ms: 1000, immediate: false }) : setInterval(updateRailLive, 1000); }
+  function stopRailTicker() { if (railTicker) { if (railTicker.stop) railTicker.stop(); else clearInterval(railTicker); railTicker = 0; } }
   // A backgrounded tab FREEZES/intensively-throttles its timers, so the live clock stalls while you're away. The
   // instant the station is visible again, snap every row back to truth (and re-arm the heartbeat) so the elapsed
   // and "last worked" stamps are never caught stale — they jump straight to correct, not after the next tick.
@@ -3828,12 +4631,25 @@ const App = (() => {
       if (game && game.classList.contains('active')) renderRail();
     });
   }
+  /* THE COMMANDER PICKED A CONVERSATION (gh#158, review 10-27). Chat.load steps an offer over COMMS aside when ANOTHER conversation
+     goes on screen; a pick that lands on the one already there (its rail row, + NEW over an untouched blank, the crew member whose
+     session is open) is the same explicit act, so it asks the arbiter too (Dialogue.preempt: an offer steps aside, the quick tour
+     yields, the awakening holds). Called only from the Commander's pick paths below, never from Chat.load's re-syncs. */
+  function yieldCommsToPick() { try { if (typeof Dialogue !== 'undefined' && Dialogue.preempt) Dialogue.preempt('session'); } catch (_) {} }
   // switching mid-run is fine now: each workstream keeps its own run-state in Channels (channels.js) and
   // Chat.load re-renders the in-flight stream on switch — the run you left keeps streaming in the background.
   function switchWorkstream(id) {
+    if (typeof StationUI !== 'undefined' && StationUI.seenSession) StationUI.seenSession(id);   // you're in it now: its notifications are read
+    // a delegated worker's thread is not a conversation: opening it (a search hit, a deliverable, a desk screen) lands on
+    // the conversation that asked, with that worker's work unfolded on its card
+    const home = Workstreams.homeOf ? Workstreams.homeOf(id) : id;
+    if (home !== id) { switchWorkstream(home); if (typeof Delegated !== 'undefined' && Delegated.reveal) Delegated.reveal(id); return; }
     if (typeof ProjectHome !== 'undefined') ProjectHome.onSession(id);
-    if (id === Workstreams.activeId()) return;
+    if (id === Workstreams.activeId()) { yieldCommsToPick(); return; }   // re-picked the one on screen: the panel over it steps aside
     const ws = Workstreams.switch(id); if (!ws) return;
+    // opened from elsewhere (a notification, the COMMS picker, the HUD) onto a session the narrowed rail
+    // doesn't list: show every session again, so the open one is never missing from the rail
+    if (railAgentFilter && !railHasAgent(ws, railAgentFilter)) { railAgentFilter = null; if (typeof StationUI !== 'undefined' && StationUI.refreshCrew) StationUI.refreshCrew(); }
     SFX.click();
     focusAgent(ws.agentId || 'agent');   // the focused agent follows the stream's binding (multi-agent COMMS)
     if (typeof World !== 'undefined' && World.lockBody) World.lockBody(ws.agentId || 'agent');   // Commander PICKED this session → the camera follow-locks its agent (any wheel/drag releases it)
@@ -3843,7 +4659,15 @@ const App = (() => {
   }
   function openWorkstream(id) { switchWorkstream(id); }
   function newWorkstream() {
-    const ws = Workstreams.startSession();
+    yieldCommsToPick();   // + NEW over an untouched blank reuses the session on screen (startSession): still the Commander's pick
+    let ws = Workstreams.startSession();
+    // + NEW while the rail shows one agent's sessions starts a session WITH that agent: a blank line is
+    // rebound (no transcript to corrupt); the General home stream never is, so that case mints a fresh one.
+    const f = railAgentFilter && agents.has(railAgentFilter) ? railAgentFilter : null;
+    if (f && ws && (ws.agentId || 'agent') !== f && (ws.id === Workstreams.generalId() || !Workstreams.setAgent(ws.id, f))) {
+      ws = Workstreams.create(null, { agentId: f });
+    }
+    if (f && ws) { focusAgent(f); if (typeof World !== 'undefined' && World.lockBody) World.lockBody(f); }
     SFX.open(); Chat.load(ws); refreshUsage(); renderRail(); persist();
   }
   /* Rail search + per-session export — what survived the SESSION TOOLS window (retired 2026-07-17).
@@ -3864,7 +4688,7 @@ const App = (() => {
   function exportSession(id, format) {
     const w = Workstreams.get(id), bundle = w && Workstreams.exportConversation(id, format);
     const ok = sessionDownload(bundle); if (ok) SFX.click(); else SFX.bad();
-    if (typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify(ok ? ('exported “' + ((w && w.title) || 'General') + '” — hidden data and secrets excluded') : 'nothing to export in “' + ((w && w.title) || 'General') + '”', ok ? '' : 'warn', undefined, { transient: true });
+    if (typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify(ok ? ('exported “' + Workstreams.titleOf(w) + '” — hidden data and secrets excluded') : 'nothing to export in “' + Workstreams.titleOf(w) + '”', ok ? '' : 'warn', undefined, { transient: true });
   }
   function renderSessionSearch() {
     const input = el('ws-search'), out = el('ws-search-results'), sessions = el('workstreams'); if (!input || !out) return;
@@ -3873,13 +4697,16 @@ const App = (() => {
     // matches" while unrelated sessions stayed selectable directly underneath it.
     if (sessions) sessions.hidden = railView !== 'sessions' || !!q;
     if (!q) return;
-    const hits = Workstreams.search(q);
+    // narrowed to one agent, search stays inside that agent's sessions (the chip above still names it)
+    const hits = Workstreams.search(q).filter(hit => { if (!railAgentFilter) return true; const w = Workstreams.get(hit.id); return !!(w && railHasAgent(w, railAgentFilter)); });
     for (const hit of hits) {
       const li = document.createElement('li'); li.className = 'ws-search-hit'; li.tabIndex = 0; li.dataset.id = hit.id;
-      const title = document.createElement('b'); title.textContent = hit.title || 'General';
+      // a delegated worker's words are found in its CONVERSATION: say whose work it was, and open it unfolded there
+      const worker = hit.match === 'delegated' && hit.workerId ? Workstreams.get(hit.workerId) : null;
+      const title = document.createElement('b'); title.textContent = (hit.title || Workstreams.titleOf(hit.id)) + (worker ? ' · ' + (((agents.get(worker.agentId) || {}).name) || worker.agentId) + '\'s work' : '');
       const snippet = document.createElement('small'); snippet.textContent = hit.snippet;
       li.append(title, snippet);
-      const open = () => { switchWorkstream(hit.id); input.value = ''; renderSessionSearch(); };
+      const open = () => { switchWorkstream(hit.id); if (worker && typeof Delegated !== 'undefined' && Delegated.reveal) Delegated.reveal(worker.id); input.value = ''; renderSessionSearch(); };
       li.onclick = open; li.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } };
       out.appendChild(li);
     }
@@ -3890,40 +4717,39 @@ const App = (() => {
   function wireRailSearch() {
     const q = el('ws-search'); if (!q || q.__wired) return;
     q.__wired = true;
-    q.oninput = () => { if (railAttentionOnly) { railAttentionOnly = false; renderRail(); } renderSessionSearch(); };
+    q.oninput = () => { renderSessionSearch(); };
     q.onkeydown = e => { if (e.key === 'Escape') { e.preventDefault(); q.value = ''; renderSessionSearch(); q.blur(); } };
-    const attention = el('ws-attention');
-    if (attention) attention.onclick = () => {
-      railAttentionOnly = !railAttentionOnly;
-      q.value = ''; renderSessionSearch(); renderRail(); SFX.click();
-    };
   }
   // COMMS AGENT SELECTOR: put the Commander on the line with agent <agentId>. Selecting an agent must never
   // silently rebind an existing conversation to a different agent (that would corrupt whose transcript it is);
   // instead we switch to the agent's most-recent live workstream, or MINT a fresh one bound to that agentId
   // (the same Workstreams.create({agentId}) seam summon uses). switchWorkstream then repoints the focused agent
   // (its model/provider/effort) + Chat.load. Returns the target workstream id, or null for an unknown agent.
+  // a 1:1 agent pick never lands in (or rebinds) a GROUP that agent happens to lead: a group's agentId is only its lead
+  function isGroupWs(w) { return !!w && w.conversationMode === 'group'; }
   function selectAgent(agentId) {
     const id = String(agentId || '');
     const a = agents.get(id); if (!a) return null;
+    yieldCommsToPick();   // an agent pick can land on the session already on screen (rebind, "already here"): still a pick
     // A BRAND-NEW empty session is a blank line the Commander just opened: picking an agent puts THAT agent
     // on THIS line instead of teleporting to the agent's latest old stream (the Commander keeps the freedom
     // to start a fresh chat with anyone). Rebinding a blank stream corrupts no transcript — the no-rebind
     // law above only protects conversations with content. General (the hero's home) and any stream with
     // history / runs / a live run keep their binding and fall through to the switch-or-mint path.
     const cur = Workstreams.active();
-    if (cur && cur.id !== Workstreams.generalId() && (cur.agentId || 'agent') !== id
+    if (cur && cur.id !== Workstreams.generalId() && !isGroupWs(cur) && (cur.agentId || 'agent') !== id
         && !(cur.history && cur.history.length) && !(cur.runIds && cur.runIds.length)
         && !(typeof Channels !== 'undefined' && Channels.isBusy(cur.id))
         && Workstreams.setAgent(cur.id, id)) {
       focusAgent(id); if (typeof World !== 'undefined' && World.lockBody) World.lockBody(id);   // explicit agent pick → camera follow-lock
+      if (railAgentFilter && railAgentFilter !== id) { railAgentFilter = null; if (typeof StationUI !== 'undefined' && StationUI.refreshCrew) StationUI.refreshCrew(); }   // the open line must stay on the rail
       Chat.load(cur); refreshUsage(); renderRail(); persist();
       return cur.id;
     }
     // prefer this agent's existing streams (most-recently-active first — Workstreams.list() is already sorted
     // pinned>recent); the General default stream (title==null) is only NOVA/hero's home, so a specialist that
     // has no stream yet gets a fresh one titled with its name (mirrors summon's Workstreams.create).
-    const mine = Workstreams.list().filter(w => (w.agentId || 'agent') === id);
+    const mine = Workstreams.list().filter(w => (w.agentId || 'agent') === id && !isGroupWs(w));
     let ws = mine[0] || null;
     if (!ws) ws = Workstreams.create(a.name, { agentId: id, activate: false });
     if (!ws) return null;
@@ -4010,7 +4836,7 @@ const App = (() => {
     if (act === 'export-json') { exportSession(id, 'json'); return; }
     if (act === 'archive') {
       const wasActive = (id === Workstreams.activeId());
-      const nowArchived = !w.archived, label = w.title || 'General';
+      const nowArchived = !w.archived, label = Workstreams.titleOf(w);
       if (nowArchived && w.conversationMode === 'group' && typeof GroupChat !== 'undefined') {
         try { await GroupChat.pause(id); } catch (e) { StationUI.notify(e.message, 'bad'); return; }
       }
@@ -4021,8 +4847,43 @@ const App = (() => {
       if (typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify((nowArchived ? 'archived ' : 'restored ') + '“' + label + '”', '', undefined, { transient: true });
     }
   }
+  /* SESSION CONTROL for the lead's station.control: the rail's ⋯ menu without the clicks. Same store calls, the same
+     group-chat pause/rename/remove first, the same busy guard on delete, then the rail repaints and the save persists.
+     Each returns true only when the store accepted the change; the caller proves it durable by reading the save back. */
+  async function renameSession(id, title) {
+    const w = Workstreams.get(id); if (!w) return false;
+    const v = String(title || '').trim().slice(0, 80);
+    if (!v) return false;
+    if (w.conversationMode === 'group' && typeof GroupChat !== 'undefined') await GroupChat.rename(id, v);
+    if (!Workstreams.rename(id, v)) return false;
+    persist();
+    if (id === Workstreams.activeId() && typeof Chat !== 'undefined' && Chat.load) { const a = Workstreams.active(); if (a) Chat.load(a); }
+    renderRail();
+    return true;
+  }
+  function pinSession(id, pinned) {
+    const w = Workstreams.get(id); if (!w) return false;
+    if (!!w.pinned !== !!pinned) Workstreams.pin(id, !!pinned);
+    renderRail(); persist();
+    return true;
+  }
+  async function archiveSession(id, archived) {
+    const w = Workstreams.get(id); if (!w || id === Workstreams.generalId()) return false;
+    if (!!w.archived === !!archived) return true;
+    const wasActive = (id === Workstreams.activeId());
+    if (archived && w.conversationMode === 'group' && typeof GroupChat !== 'undefined') await GroupChat.pause(id);
+    if (!Workstreams.archive(id, !!archived)) return false;
+    if (wasActive && Workstreams.activeId() !== id) loadActiveStream();
+    renderRail(); persist();
+    return true;
+  }
+  async function removeSession(id) {
+    const w = Workstreams.get(id); if (!w || id === Workstreams.generalId()) return false;
+    if (w.conversationMode === 'group' && typeof GroupChat !== 'undefined') { await GroupChat.remove(id); return deleteWorkstream(id, true); }
+    return deleteWorkstream(id);
+  }
   function deleteWorkstream(id, groupDeleted) {
-    const w = Workstreams.get(id); const label = w ? (w.title || 'General') : '';
+    const w = Workstreams.get(id); const label = w ? Workstreams.titleOf(w) : '';
     if (w && w.conversationMode === 'group' && !groupDeleted && typeof GroupChat !== 'undefined') {
       GroupChat.remove(id).then(() => deleteWorkstream(id, true)).catch(e => StationUI.notify(e.message, 'bad'));
       return false;
@@ -4035,7 +4896,9 @@ const App = (() => {
       return false;
     }
     const wasActive = (id === Workstreams.activeId());
-    if (!Workstreams.del(id)) { SFX.bad(); return false; }
+    // the Commander's Delete of a conversation: the sidecar forgets it (forget: true — qa/bugs/3e926b6a). DELETE AGENT's
+    // removeByAgent and a task card's remove only hide rows.
+    if (!Workstreams.del(id, { forget: true })) { SFX.bad(); return false; }
     SFX.bad();
     if (wasActive) loadActiveStream();   // deleting the OPEN stream falls back to General
     renderRail(); persist();
@@ -4064,7 +4927,7 @@ const App = (() => {
     const w = Workstreams.get(id); if (!w) return;
     const input = document.createElement('input');
     input.type = 'text'; input.className = 'ws-rename'; input.maxLength = 80;
-    input.value = w.title || ''; input.placeholder = 'General';
+    input.value = w.title || ''; input.placeholder = Workstreams.titleOf(w);
     li.classList.add('renaming');
     titleSpan.replaceWith(input);
     input.focus(); input.select();
@@ -4099,9 +4962,9 @@ const App = (() => {
   function updateArchivedToggle() {
     const ul = el('workstreams'); if (!ul) return;
     const old = ul.querySelector('.ws-arch-row'); if (old) old.remove();
-    if (railAttentionOnly) return;
-    let n = 0; for (const w of Workstreams.list({ includeArchived: true })) if (w.archived) n++;
-    if (!n) { railShowArchived = false; return; }
+    // narrowed to one agent, count only that agent's archived sessions — "1 archived" must open onto one
+    let n = 0; for (const w of Workstreams.list({ includeArchived: true })) if (w.archived && (!railAgentFilter || railHasAgent(w, railAgentFilter))) n++;
+    if (!n) { if (!railAgentFilter) railShowArchived = false; return; }
     const li = document.createElement('li');
     li.className = 'ws-arch-row' + (railShowArchived ? ' on' : '');
     li.textContent = railShowArchived ? '▾ hide archived' : '▸ ' + n + ' archived';
@@ -4153,8 +5016,15 @@ const App = (() => {
       b.title = 'bless a folder as a trusted project';
     }
   }
-  function setRailView(view) {
+  function setRailView(view, opts) {
     view = (view === 'projects') ? 'projects' : 'sessions';
+    // the SESSIONS tab is also the way back from one agent's sessions to the full list
+    if (railAgentFilter && !(opts && opts.keepAgentFilter)) {
+      railAgentFilter = null;
+      if (typeof StationUI !== 'undefined' && StationUI.refreshCrew) StationUI.refreshCrew();
+      if (view === railView) { SFX.click(); renderRail(); renderSessionSearch(); return; }
+      syncRailAgentChip(0);
+    }
     if (view === railView) return;
     railView = view;
     syncRailAttention(railPendingIds());
@@ -4631,8 +5501,11 @@ const App = (() => {
   // But if a resume is mid-flight (resumingSaved set, e.g. recovery), do NOT clear it from here — the connect
   // screen must keep its RESUME binding so a key re-entry continues the saved agent rather than re-speccing one.
   function startCreation() {
+    // #121: a station this page holds only in memory (resumed from the station file because the browser cache could not
+    // take it) is never replaced by a new creation: re-enter it. reentry() resumes that save and never comes back here.
+    if (typeof CloudSave !== 'undefined' && CloudSave.memorySave && CloudSave.memorySave()) { reentry(); return; }
     SFX.boot(); SFX.open();
-    const hasSave = Save.has() && !!Save.load();
+    const hasSave = !!resumableSave().doc;
     if (!resumingSaved || !hasSave) resumingSaved = null;
     show('screen-connect'); initConnect();
   }
@@ -4653,6 +5526,28 @@ const App = (() => {
     const msg = el('future-msg');
     const btn = el('btn-future-update');
     const hasUpdater = (typeof Updates !== 'undefined') && (typeof window !== 'undefined' && window.__TAURI__ && window.__TAURI__.core);
+    // #91: Updates.install() PAUSES by RETURNING its snapshot (a failed pre-update recovery point, an unverified save,
+    // an agent still working) instead of throwing, and the Update Center is unreachable from this gate. Name the pause
+    // here; when the in-app path failed, offer the full installer beside UPDATE STARNET (reinstalling keeps the station).
+    const offerInstaller = () => {
+      let dl = el('btn-future-download');
+      if (!dl && btn && btn.parentNode) {
+        dl = document.createElement('button');
+        dl.id = 'btn-future-download'; dl.className = 'btn-xl'; dl.textContent = 'DOWNLOAD LATEST ▸';
+        btn.parentNode.appendChild(dl);
+      }
+      if (dl) dl.onclick = () => { SFX.click && SFX.click(); try { Updates.openReleasesPage(); } catch (_) {} };
+    };
+    const installOutcome = (snap, thrown) => {
+      if (!msg) return;
+      const runs = (snap && snap.confirmRuns) | 0;
+      if (thrown || (snap && snap.error)) {
+        msg.textContent = 'the update could not install' + (snap && snap.error ? ' — ' + snap.error : '') + '. Download the full installer instead: reinstalling over the top keeps your station.';
+        offerInstaller();
+      } else if (runs > 0) msg.textContent = (runs === 1 ? '1 agent is' : runs + ' agents are') + ' still working — installing now would kill ' + (runs === 1 ? 'its run' : 'their runs') + '. Try again when ' + (runs === 1 ? 'it finishes.' : 'they finish.');
+      else if (snap && /^(downloading|installing|restarting)$/.test(String(snap.phase || ''))) msg.textContent = 'installing the update — StarNet restarts on its own when it is done.';
+      else msg.textContent = 'the update did not start — try again in a moment.';
+    };
     if (btn) {
       btn.onclick = async () => {
         SFX.click && SFX.click();
@@ -4667,7 +5562,7 @@ const App = (() => {
             // re-click while a check is in flight returns the busy snapshot immediately). This gate is a HARD
             // STOP on a save this build cannot read: a false "check back shortly" strands the user with no
             // idea that the one action on the screen didn't work. Name each state for what it is.
-            if (phase === 'available') { try { await Updates.install(); } catch (e) { if (msg) msg.textContent = 'update found, but the install failed — open the Update Center and retry.'; } }
+            if (phase === 'available') { let after = null, thrown = false; try { after = await Updates.install(); } catch (e) { thrown = true; } installOutcome(after, thrown); }
             else if (phase === 'current') { if (msg) msg.textContent = 'no newer build is published yet — check back shortly.'; }
             else if (phase === 'error') { if (msg) msg.textContent = 'the update check failed' + (snap && snap.error ? ' — ' + snap.error : '') + '. Check your connection and try again.'; }
             else if (phase === 'checking' || phase === 'downloading' || phase === 'installing' || phase === 'restarting') { if (msg) msg.textContent = 'an update check is already running — one moment…'; }
@@ -4711,27 +5606,37 @@ const App = (() => {
   function showSaveUnreachableGate(reason) {
     gateActive = true;
     try { if (World && World.stop) World.stop(); } catch (_) {}
-    const sub = el('unreachable-sub');
-    if (sub) sub.textContent = reason === 'forbidden' ? 'station service refused this window (stale session) — a relaunch usually clears it' : 'station service not answering';
-    if (sub && reason === 'unreadable') sub.textContent = 'saved station temporarily unreadable — retry without resetting';
-    if (sub && reason === 'cache') sub.textContent = 'saved station could not be restored into this window — retry without resetting';
-    // Screenshot-readable diagnosis for a stranded beginner: support can distinguish an alive sidecar refusing
-    // stale window auth from a fetch that died after the page loaded without asking for Terminal logs.
-    const diagnosis = reason === 'forbidden'
-      ? { code: 'SAVE-403 · STALE WINDOW SESSION', text: 'the station service is running, but it refused this app window' }
-      : reason === 'unreadable'
-        ? { code: 'SAVE-READ · STATION FILE UNAVAILABLE', text: 'the station service is running, but could not read the saved station; your existing files are preserved' }
-        : reason === 'cache'
-          ? { code: 'SAVE-CACHE · LOCAL RESTORE FAILED', text: 'the saved station was received, but this window could not store or read it; the durable station is preserved' }
-          : { code: 'SAVE-NET · SAVE REQUEST LOST', text: 'the app loaded, but its saved-station request did not return' };
-    const code = el('unreachable-code');
-    if (code) code.innerHTML = '<b>RECOVERY CODE: ' + diagnosis.code + '</b><br>' + diagnosis.text + '. Send a screenshot of this code to support.';
+    const sub = el('unreachable-sub'), code = el('unreachable-code');
+    // BROWSER MODE (no desktop shell, see below): the subtitle says so on every repaint, not only the first
+    const core = tauriCore();
+    const notAnswering = 'station service not answering' + (core ? '' : ' (browser mode)');
+    let diagnosis;
+    // A retry can reach a different failure boundary; keep the screenshot and copied report current.
+    const paintDiagnosis = reason => {
+      if (sub) sub.textContent = reason === 'forbidden' ? 'station service refused this window (stale session) — a relaunch usually clears it' : notAnswering;
+      if (sub && reason === 'unreadable') sub.textContent = 'saved station temporarily unreadable — retry without resetting';
+      if (sub && reason === 'cache') sub.textContent = 'saved station could not be restored into this window — retry without resetting';
+      // Screenshot-readable diagnosis for a stranded beginner: support can distinguish an alive sidecar refusing
+      // stale window auth from a fetch that died after the page loaded without asking for Terminal logs.
+      diagnosis = reason === 'forbidden'
+        ? { code: 'SAVE-403 · STALE WINDOW SESSION', text: 'the station service is running, but it refused this app window' }
+        : reason === 'unreadable'
+          ? { code: 'SAVE-READ · STATION FILE UNAVAILABLE', text: 'the station service is running, but could not read the saved station; your existing files are preserved' }
+          : reason === 'cache'
+            ? { code: 'SAVE-CACHE · LOCAL RESTORE FAILED', text: 'the saved station was received, but this window could not store or read it; the durable station is preserved' }
+            : { code: 'SAVE-NET · SAVE REQUEST LOST', text: 'the app loaded, but its saved-station request did not return' };
+      if (code) code.innerHTML = '<b>RECOVERY CODE: ' + diagnosis.code + '</b><br>' + diagnosis.text + '. Send a screenshot of this code to support.';
+    };
+    paintDiagnosis(reason);
     const reportBtn = el('btn-unreachable-report'), reportHost = el('unreachable-report');
     if (reportBtn) reportBtn.onclick = () => {
       SFX.click && SFX.click();
       if (typeof Diag === 'undefined' || !Diag.copy) { if (status) status.textContent = '＋ recovery details unavailable — send a screenshot of ' + diagnosis.code; return; }
       reportBtn.disabled = true; reportBtn.textContent = '⧉ COPYING…';
-      Diag.copy({ notify: false, context: { kind: diagnosis.code, error: diagnosis.text, engineAlive: true }, onDone: (ok, text) => {
+      // No engineAlive here: this page is bundled into the desktop shell, so the gate rendering proves nothing about
+      // the sidecar. Left unset, the report MEASURES /api/health (Harness.pingEngine) instead of always printing
+      // "REACHABLE" — a 10-08 support report claimed a live engine while its crash ledger was still being written.
+      Diag.copy({ notify: false, context: { kind: diagnosis.code, error: diagnosis.text }, onDone: (ok, text) => {
         reportBtn.disabled = false; reportBtn.textContent = ok ? '✓ RECOVERY DETAILS COPIED' : '⧉ RECOVERY DETAILS SHOWN BELOW';
         if (!ok && reportHost && Diag.showBlock) Diag.showBlock(reportHost, { text });
       } });
@@ -4744,29 +5649,24 @@ const App = (() => {
     // and a verbatim reason. Show THAT reason on this screen instead of the generic "not answering": the text is
     // produced by the sidecar from its own ledger, so it is proof, not a guess. Likewise, if the desktop guardian
     // has HALTED respawns (starnet_sidecar_status.halted), say so — the retry poll can never heal that on its own.
-    let degradedReason = '';
+    // The reading itself is shared with the in-game LINK DOWN chip (Harness.engineState): the same verbatim 503 text
+    // or guardian halt, now bounded so a hung service cannot leave the probe pending.
     const probeDegraded = async () => {
       let reason = '';
-      try {
-        const r = await fetch('/api/health', { cache: 'no-store' });
-        if (r && r.status === 503) { const t = String(await r.text() || '').trim(); if (/^degraded/i.test(t)) reason = t; }
-      } catch (_) { reason = ''; }
-      if (!reason && core && core.invoke) {
-        try { const g = await core.invoke('starnet_sidecar_status'); if (g && g.halted && g.reason) reason = 'station service halted: ' + String(g.reason); } catch (_) {}
+      try { reason = String(((await Harness.engineState()) || {}).reason || ''); } catch (_) { reason = ''; }
+      // Reapply a persistent degraded verdict after the retry refreshed its save-request diagnosis.
+      if (sub) { if (reason) sub.textContent = reason; else if (/^(degraded|station service halted)/i.test(sub.textContent)) sub.textContent = notAnswering; }
+      if (reason) {
+        diagnosis = { code: /owner unavailable/i.test(reason) ? 'SAVE-OWNER · WORKSPACE OWNED BY ANOTHER PROCESS' : /crash-loop/i.test(reason) ? 'SAVE-LOOP · STATION SERVICE CRASH LOOP' : 'SAVE-DEGRADED · STATION SERVICE DEGRADED', text: reason };
+        if (code) code.innerHTML = '<b>RECOVERY CODE: ' + diagnosis.code + '</b><br>' + diagnosis.text.replace(/&/g, '&amp;').replace(/</g, '&lt;') + '<br>Send a screenshot of this code to support.';
       }
-      if (reason === degradedReason) return reason;
-      degradedReason = reason;
-      if (sub) { if (reason) sub.textContent = reason; else if (/^(degraded|station service halted)/i.test(sub.textContent)) sub.textContent = 'station service not answering'; }
-      if (code && reason) code.innerHTML = '<b>RECOVERY CODE: ' + (/owner unavailable/i.test(reason) ? 'SAVE-OWNER · WORKSPACE OWNED BY ANOTHER PROCESS' : /crash-loop/i.test(reason) ? 'SAVE-LOOP · STATION SERVICE CRASH LOOP' : 'SAVE-DEGRADED · STATION SERVICE DEGRADED') + '</b><br>' + reason.replace(/</g, '&lt;') + '<br>Send a screenshot of this code to support.';
       return reason;
     };
     // BROWSER MODE (no desktop shell): there is no sidecar to restart and no workspace to quarantine, so this
     // screen used to offer nothing but the 5s poll — a dead end (audit: "first run fails silently"). Say plainly
-    // where the service lives, on the subtitle AND on every poll line, so the exit is never a mystery.
-    const core = tauriCore();
+    // where the service lives, on the subtitle (paintDiagnosis) AND on every poll line, so the exit is never a mystery.
     const BROWSER_HINT = 'the station service isn\'t answering. if you launched with `npm start`, check that terminal; otherwise open the desktop app.';
     if (!core) {
-      if (sub && reason !== 'forbidden' && reason !== 'unreadable' && reason !== 'cache') sub.textContent = 'station service not answering (browser mode)';
       if (reason === 'cache') setStatus('Your durable save is untouched. Retry after browser storage becomes available.');
       else if (reason === 'unreadable') setStatus('Your save is untouched. Retry when the station file becomes readable.');
       else setStatus(BROWSER_HINT);
@@ -4788,6 +5688,7 @@ const App = (() => {
         try { location.reload(); } catch (_) {}
         return;
       }
+      paintDiagnosis(r.reason);
       const degraded = await probeDegraded();
       const unreadable = r.reason === 'unreadable', cacheFailed = r.reason === 'cache';
       setStatus((degraded ? degraded + ' — ' : unreadable ? 'saved station still unreadable — ' : cacheFailed ? 'local restore still unavailable — ' : 'still unreachable — ') + 'retrying every 5s (attempt ' + attempts + '). Your save is untouched.' + (core || unreadable || cacheFailed ? '' : ' ' + BROWSER_HINT));
@@ -4807,7 +5708,7 @@ const App = (() => {
       if (restartBtn) restartBtn.disabled = true;
       setStatus((auto ? 'still unreachable — ' : '') + 'restarting the station service…');
       let up = false;
-      try { up = await core.invoke('starnet_restart_sidecar'); } catch (_) { up = false; }
+      try { up = await Harness.restartEngine(); } catch (_) { up = false; }   // the same single-flight door the LINK DOWN chip uses
       if (up) { setStatus('station service restarted — reconnecting…'); attempt(); }
       else setStatus('the station service could not be restarted — quit StarNet fully (Cmd+Q / tray → Quit) and open it again. Your save is untouched.');
       restarting = false;
@@ -4995,6 +5896,9 @@ const App = (() => {
         const timer = setInterval(async () => {
           try {
             const probe = await fetch('/api/save?agent=agent', { cache: 'no-store' });
+            // #39: a 403 that survives Harness's in-place token recovery means only a reload can reconnect — and the
+            // recovery itself is already done. Reload once (the timer dies here, so it can never loop).
+            if (probe.status === 403) { clearInterval(timer); location.reload(); return; }
             const body = probe.ok ? await probe.json() : null;
             if (body && body.save && body.save.agent) { clearInterval(timer); location.reload(); }
           } catch (_) {}
@@ -5010,7 +5914,7 @@ const App = (() => {
       if (status) status.textContent = '＋ preparing redacted recovery report…';
       try {
         const response = await fetch('/api/lineage/report', { cache: 'no-store' });
-        if (!response.ok) throw new Error('report unavailable');
+        if (!response.ok) throw new Error(refusedPageLine() || 'report unavailable');
         const blob = await response.blob();
         const url = URL.createObjectURL(blob), a = document.createElement('a');
         a.href = url; a.download = 'starnet-recovery-report.json'; a.style.display = 'none';
@@ -5021,7 +5925,27 @@ const App = (() => {
       } finally { report.disabled = false; }
     };
     const retry = el('btn-lineage-retry');
-    if (retry) retry.onclick = () => { SFX.click && SFX.click(); try { location.reload(); } catch (_) {} };
+    // RETRY re-runs the gate. With nothing recoverable a bare reload lands on this same screen and reads as a dead
+    // button (#39 minor), so ask the sidecar first and only reload when its answer changed; otherwise SAY so.
+    if (retry) retry.onclick = async () => {
+      SFX.click && SFX.click();
+      if (validCandidates.length) { try { location.reload(); } catch (_) {} return; }
+      retry.disabled = true;
+      if (status) status.textContent = '＋ checking again…';
+      try {
+        const response = await fetch('/api/lineage', { cache: 'no-store' });
+        const body = response.ok ? await response.json().catch(() => null) : null;
+        const next = body && body.lineage;
+        const nextRec = next && next.recovery && Array.isArray(next.recovery.candidates) ? next.recovery.candidates : [];
+        if (next && (next.priorInstallEvidence === false || nextRec.some(row => row && row.recoverable))) { location.reload(); return; }
+        if (status) status.textContent = next
+          ? '＋ checked again — still nothing recoverable here. START FRESH sets the leftovers aside; RESTORE BACKUP loads a backup file.'
+          : '＋ could not check again — ' + (refusedPageLine() || 'the station service did not answer');
+      } catch (_) {
+        if (status) status.textContent = '＋ could not check again — the station service did not answer';
+      }
+      retry.disabled = false;
+    };
     const restore = el('btn-lineage-restore');
     if (restore) restore.onclick = () => {
       SFX.click && SFX.click();
@@ -5060,6 +5984,11 @@ const App = (() => {
           const timer = setInterval(async () => {
             try {
               const probe = await fetch('/api/lineage', { cache: 'no-store' });
+              // #39: this poll used to swallow a 403 as "not ready yet" — but START FRESH's own restart mints a new token,
+              // so the poll could never answer and the button greyed out forever after a SUCCESS. Harness now re-reads
+              // the token and replays; a 403 that still gets here means only a reload can reconnect, and the work is
+              // already done — reload once (the timer dies here, so it can never loop).
+              if (probe.status === 403) { clearInterval(timer); location.reload(); return; }
               const body = probe.ok ? await probe.json() : null;
               if (body && body.lineage && body.lineage.priorInstallEvidence === false) { clearInterval(timer); location.reload(); }
             } catch (_) {}
@@ -5092,11 +6021,12 @@ const App = (() => {
           fetch('/api/plugins').then(r => r.ok ? r.json() : null).catch(() => null)
         ]);
         const waiting = ((h && h.pending) || []).length + (((p && p.plugins) || []).filter(x => x && x.pending).length);
-        if (!waiting || typeof StationUI === 'undefined' || !StationUI.notify) return;
+        if (!h || !p || typeof StationUI === 'undefined' || !StationUI.notify) return;   // a failed read says nothing either way
+        if (!waiting) { if (StationUI.settleNotifs) StationUI.settleNotifs('extensions-pending'); return; }   // approved since: it leaves NEEDS YOU
         StationUI.notify(
           waiting + ' extension' + (waiting === 1 ? '' : 's') + ' awaiting your approval — click to review',
           'warn', 'needsApproval',
-          { onClick: () => { try { StationUI.openTerm('connectors', 'extensions'); } catch (_) {} } }
+          { kind: 'needs', key: 'extensions-pending', go: { term: 'connectors', section: 'extensions' } }
         );
       } catch (_) { /* a station that cannot answer is a station with nothing to approve yet */ }
     })();
@@ -5110,7 +6040,8 @@ const App = (() => {
       SFX.click(); dataStatus('exporting…');
       const r = await Backup.exportAll();
       dataStatus(r && r.ok
-        ? 'saved ' + r.file + ' — secrets excluded; ' + r.records + ' records' + (r.notes ? ' + ' + r.notes + ' memories' : '')
+        // #134: the page only HANDS the file over (where it lands is never reported back) — name it, never claim "saved"
+        ? 'handed ' + r.file + ' to your downloads — secrets excluded; ' + r.records + ' records' + (r.notes ? ' + ' + r.notes + ' memories' : '')
         : 'export failed');
     };
     const fileImport = el('file-import');
@@ -5126,7 +6057,9 @@ const App = (() => {
       const mem = (typeof r.memoriesRestored === 'number') ? r.memoriesRestored
         : (r.memories ? r.memories + ' in file' : 0);
       dataStatus('restored ' + (r.agentName || 'agent') + ' — ' + (r.records == null ? r.keys : r.records) + ' records'
-        + (mem ? ' + ' + mem + ' memories' : ''));
+        + (mem ? ' + ' + mem + ' memories' : '')
+        // a memory the Commander forgot is not resurrected by an old backup (Memory Core › declined can restore it)
+        + (r.memoriesForgotten ? ' · ' + r.memoriesForgotten + ' forgotten ' + (r.memoriesForgotten > 1 ? 'memories' : 'memory') + ' left out' : ''));
       gateActive = false;
       reentry();   // resume straight into the restored agent (or its RESUME screen if creds are still missing)
     };
@@ -5135,6 +6068,9 @@ const App = (() => {
     // call site can adopt/re-save it), which would otherwise look like "no save" here and fall through to a fresh
     // create that clobbers the newer save on first persist(). Check the honest status BEFORE reconcile and stop:
     // the gate returns without ever touching the stored doc.
+    // THIS WINDOW'S CRASH JOURNAL first (cloudsave openJournal, save-latch-kill): the local save read below is this window's
+    // own — a dead window's it continues, never another live tab's — and every other dead window's unsent work is merged in
+    try { if (typeof CloudSave !== 'undefined' && CloudSave.openJournal) await CloudSave.openJournal(); } catch (_) {}
     const localStatus = Save.loadStatus ? Save.loadStatus() : { status: (Save.load() ? 'ok' : 'none'), version: 0 };
     if (localStatus.status === 'future') { showFutureSaveGate(localStatus.version); return; }
 
@@ -5173,9 +6109,24 @@ const App = (() => {
         try { if (typeof CloudSave !== 'undefined' && CloudSave.ackRecovery) CloudSave.ackRecovery(); } catch (_) {}
       }, 1500);
     }
+    // A REOPENING WINDOW'S UNSENT SAVE WAS MERGED into the station file (cloudsave reconcile → POST /api/save/adopt): say so
+    // once, with where the copies from before the merge are kept. Never claims more than the station's answer.
+    const merge = (typeof CloudSave !== 'undefined' && CloudSave.mergeNotice) ? CloudSave.mergeNotice() : null;
+    if (merge) setTimeout(() => { try { if (typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify(mergeNoticeLine(merge), 'warn'); } catch (_) {} }, 1500);
+    // ANOTHER WINDOW SAVED PAST THIS ONE while it is open (cloudsave `merging`): its saves are merged into the station file from
+    // then on. Said once, and every change the station could not take is named once, with where this window's save is kept.
+    if (typeof CloudSave !== 'undefined' && CloudSave.onMerged && !mergeListenerWired) {
+      mergeListenerWired = true;
+      CloudSave.onMerged(note => { try { if (typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify(mergeNoticeLine(note), note && note.lost && note.lost.length ? 'bad' : 'warn'); } catch (_) {} });
+    }
+    // a window's refused save left on the station may hold sessions this station lacks: offer them back once it is up
+    // (held in 0.14.0; back in 0.14.1 — a copy the station could not read this instant is never settled as empty, and
+    // "Not now" stays the review's watermark: no copy saved at or before the declined one is offered again)
+    if (saved && saved.agent) setTimeout(() => { try { if (typeof StationUI !== 'undefined' && StationUI.offerPreservedSaves) StationUI.offerPreservedSaves(); } catch (_) {} }, 2500);
     // restore the provider BEFORE the credential check so a codex agent (tokens server-side) jumps straight
     // in after a wipe/origin-reset instead of being misrouted to an OpenRouter key prompt.
-    if (saved && saved.prov && Harness.setProv) Harness.setProv(saved.prov);
+    if (saved && saved.agent) migrateLegacyReasoning(saved);   // before any saved effort reaches the wire (0.12.5 reasoning migration)
+    if (saved && savedStationProv(saved) && Harness.setProv) Harness.setProv(savedStationProv(saved));
     if (saved && saved.reasoningEffort && Harness.setReasoningEffort) Harness.setReasoningEffort(saved.reasoningEffort);
     if (saved && saved.agent) {
       // AUTO-RESUME: a saved station goes STRAIGHT back into the world when creds are available — an OpenRouter
@@ -5216,8 +6167,11 @@ const App = (() => {
   // (never an id in the UI) and keys its standing candidates against the focused hero.
   // currentAgent/agents/applyConfig (slash-plan): the slash-command suite reads/writes the live roster
   // and per-agent config (/agents, /model, /personality, …).
-  return { show, refreshUsage, persist, pushRoster, refreshRail: renderRail, openWorkstream, launchRecipe, summonAgent, summonForRequest, crewCount: () => agents.size,
-    agentName: id => { const a = agents.get(id); return a ? (a.name || a.id) : null; },
+  return { show, refreshUsage, persist, pushRoster, refreshRail: renderRail, sessionDisplayName, openWorkstream, waitingSessionOf, launchRecipe, summonAgent, summonForRequest, crewCount: () => agents.size,
+    tierModelFor,   // org P22 fix: the bay's MODEL helper names a SETTINGS tier pin instead of promising a copy
+    // a team.spawn clone ('sub-<id>', never on the roster) is a HELPER: its raw id was the name on its approval card and NEEDS
+    // YOU once its ask could outlive the lead's turn (live walk 2026-10-14); the sidecar says "a helper" for it too
+    agentName: id => { const a = agents.get(id); return a ? (a.name || a.id) : (/^sub-/.test(String(id || '')) ? 'HELPER' : null); },
     // WORK LINES: a downstream stage runs as ANOTHER agent, so the chat host needs THAT agent's composed
     // prompt — never the focused one's. Read-only; null for an id that is not on the live roster.
     systemFor: id => { const a = agents.get(id); return a ? (a.systemPrompt || '') : null; },
@@ -5225,16 +6179,33 @@ const App = (() => {
     currentAgent: () => agent,
     agents: () => liveAgents().map(serializeAgentLite),
     selectAgent: selectAgent,   // COMMS top-bar agent selector: switch to (or mint) a workstream bound to agentId
+    // PER-AGENT THREADS: the CREW roster narrows the SESSIONS rail to one agent (same id again / null = all)
+    filterRailByAgent: setRailAgentFilter,
+    showNeedsYou: showNeedsYou,   // station.show 'needs-you' (app/places.js)
+    // NEEDS YOU lives in the SESSIONS view only: needsyou.js reads this before it shows its block (a build landing, a STEP-IN,
+    // a dismiss from NOTIFICATIONS re-render it from any view, and must never un-hide it above PROJECTS)
+    railView: () => railView,
+    railAgentFilter: () => railAgentFilter,
+    // NEEDS YOU names a group chat that waits on you by the SAME line its session row reads ("ULTRON, CYPHER +3")
+    railAgentLine,
     // THE POST-SUMMON DESK STEP, owned by the session (chat.js maybeDeskPrompt): the read that decides whether a
-    // stream still owes its agent a workstation, and the door its chip opens (REFIT, armed on WORKSTATIONS).
+    // stream still owes its agent a workstation, and the door its chip opens (BUILD MODE, armed on WORKSTATIONS).
     needsWorkstation: needsWorkstation,
     openDeskPlacement: openDeskPlacement,
+    openRecipes: () => openDeployBay('recipes'),   // WORK › MY WORK › RECIPES tab (stationui FAMILIES)
     openSummonBay: openSummonBay,   // adaptive-recruitment beat: accepting the recruit nudge deep-links into the bay's summon flow
     openClassDossier: openClassDossier,   // intent-offer beat: accepting a class offer opens the bay ON that class's dossier
     openRecipeLaunch: openRecipeLaunch,   // routine-nudge beat (lane D): accepting deep-links into the recipe's SCHEDULE IT form
     applyConfig: applyAgentConfig,
     // Model-facing edits wait for the same roster write used by the Dossier UI.
     configSynced: () => lastRosterPush,
+    // The live WorldModel station, for model-facing READS of the floor (station.layout). Readers never mutate it.
+    station: () => station,
     setApproval: setAgentApproval,
-    setExecutionProfile: setAgentExecutionProfile };
+    setExecutionProfile: setAgentExecutionProfile,
+    setStationProvider: setStationProvider,
+    // station.control (the lead changes the station for the Commander): the Dossier CONFIG card's own setters and the
+    // session rail's ⋯ menu, so a change asked for in chat takes the exact path the buttons take
+    agentConfig: { setModel: setAgentModelPin, setPersona: setAgentPersona, setName: setAgentName, setSkin: setAgentSkin, setWorkshop: setAgentWorkshop, deleteAgent: deleteAgent },
+    sessionControl: { rename: renameSession, pin: pinSession, archive: archiveSession, remove: removeSession } };
 })();

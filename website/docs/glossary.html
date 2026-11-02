@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Glossary — StarNet Docs</title>
-<meta name="description" content="The StarNet vocabulary in plain English: agents, bays, belts, lines, filters, joiners, the dossier, memory, Night Shift, the leash, the sidecar, and more.">
+<meta name="description" content="The StarNet vocabulary in plain English: agents, bays, belts, lines, filters, joiners, the dossier, memory, autonomy, the leash, the sidecar, and more.">
 <link rel="canonical" href="https://starnetos.com/docs/glossary.html">
 <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg">
 <link rel="stylesheet" href="docs.css?v=20260913-brand-nav">
@@ -20,6 +20,8 @@
   <nav class="topnav" aria-label="Site">
     <a href="../index.html#station">Product</a>
     <a href="index.html" class="on">Docs</a>
+    <a href="../market.html">Skills</a>
+    <a href="../maps.html">Maps</a>
     <a href="../pricing.html" data-pricing-link>Pricing</a>
     <a href="https://github.com/androoAGI/starnet" target="_blank" rel="noopener">GitHub<svg class="nav-external" aria-hidden="true" focusable="false" viewBox="0 0 16 16" width="12" height="12"><path d="M3 13 13 3M4 3h9v9" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></a>
   </nav>
@@ -63,7 +65,7 @@
     <summary class="side-title">Repeat &amp; automate</summary>
     <a href="guides/routines.html">Create repeatable work</a>
     <a href="skills.html">Skills &amp; routines reference</a>
-    <a href="guides/night-shift.html">Set up Night Shift</a>
+    <a href="guides/night-shift.html">Set up autonomy</a>
     <a href="autonomy.html">Autonomy controls</a>
     </details>
     <details class="side-group">
@@ -95,16 +97,16 @@
   <dt>AGENT</dt><dd>One AI worker with a name, a class, a model, a desk, and its own memory. Every sprite on the floor is one. Runs are real model calls with real tools.</dd>
   <dt>OVERSEER</dt><dd>The first agent you create. It runs the station and recruits every agent after it. It can&rsquo;t be deleted.</dd>
   <dt>COMMANDER</dt><dd>You. The dossier the crew keeps on its commander is what &ldquo;it studies you&rdquo; means.</dd>
-  <dt>CLASS <span class="app">RECRUITMENT BAY</span></dt><dd>A head start, not a cage: a Researcher comes tuned for digging, an Engineer for code. 35 curated classes on the roster, a 20-deep <b>SPECIALIST ARCHIVE</b>, plus any custom classes you build or save from an agent.</dd>
+  <dt>CLASS <span class="app">RECRUITMENT BAY</span></dt><dd>A head start, not a cage: a Researcher comes tuned for digging, an Engineer for code. 35 curated classes on the roster, a 20-deep <b>CLASS ARCHIVE</b>, plus any custom classes you build or save from an agent.</dd>
   <dt>CREW</dt><dd>All your agents together. Gear you place is shared by the whole crew; only a computer is per agent.</dd>
-  <dt>SKIN</dt><dd>The character an agent wears. 36 to pick from, any class, changeable any time in the agent&rsquo;s CONFIG tab. Cosmetic only.</dd>
+  <dt>SKIN</dt><dd>The character an agent wears. 53 to pick from, any class, changeable any time in the agent&rsquo;s CONFIG tab. Cosmetic only.</dd>
   <dt>DELEGATION</dt><dd>One agent dispatching subtasks to crew it summons, then folding the results back. You watch the whole tree run on the floor.</dd>
 </dl>
 
 <h2 id="floor">The floor</h2>
 <dl class="gloss">
   <dt>STATION</dt><dd>Your whole world: rooms, hallways, decks, props, belts, and the crew inside it. Its layout is real configuration, not decoration.</dd>
-  <dt>REFIT <span class="app">REFIT STATION</span></dt><dd>Build mode. Ten tools on keys <kbd>0</kbd>&ndash;<kbd>9</kbd>: select, room, hallway, surface, move, delete, prop, belt, dupe, lines. Undo always works.</dd>
+  <dt>REFIT <span class="app">BUILD &rsaquo; BUILD MODE</span></dt><dd>Build mode. Nine tools on keys <kbd>0</kbd>&ndash;<kbd>3</kbd> and <kbd>5</kbd>&ndash;<kbd>9</kbd>: select, room, hallway, surface, delete, props, belt, copy, conveyor lines. On the Conveyors tab, <kbd>1–8</kbd> pick conveyor pieces instead. Select also moves: drag a selected piece (or a selected room) to move it. Undo always works.</dd>
   <dt>GEAR / PROP</dt><dd>A placed object. Some gear grants a real ability to the whole crew: <b>DISH</b> = WEB, <b>INTEL CAB</b> = FILES, <b>WORKBENCH</b> = TERMINAL, <b>CORE</b> = MEMORY, <b>STUDIO</b> = IMAGES, <b>CONSOLE</b> = COMPUTE. Place one of each and the station is fully powered.</dd>
   <dt>BAY <span class="app">a desk</span></dt><dd>Where one agent sits. Every bay is another agent working in parallel. An agent&rsquo;s bay needs a computer in its room, or the floor says <b>NO COMPUTE</b>.</dd>
   <dt>COMMS</dt><dd>The chat panel where you direct the station and where every beat &mdash; rate the work, keep this memory, confirm this quest &mdash; arrives.</dd>
@@ -113,18 +115,18 @@
 
 <h2 id="belts">Belts and lines</h2>
 <dl class="gloss">
-  <dt>BELT</dt><dd>The path work takes across the floor. Laid with the BELT tool (<kbd>7</kbd>): click one machine, then another. Lit means &ldquo;this will run&rdquo;; dark means something is missing.</dd>
+  <dt>BELT</dt><dd>The path work takes across the floor. Drag one machine onto the next, or use BELT to click one machine then another. Lit means &ldquo;this will run&rdquo;; dark means something is missing.</dd>
   <dt>LINE</dt><dd>A whole job&rsquo;s route from front door to out tray: machines plus the belts between them. Every line has a budget ($2.00 per job unless you raise it).</dd>
   <dt>BOX <span class="app">WORK ITEM</span></dt><dd>One job in transit. When you see a box move, an agent is really working right then. The app&rsquo;s tooltips call it a work item.</dd>
   <dt>INBOX <span class="app">the front door</span></dt><dd>Where outside work &mdash; a routine, a message from a paired chat &mdash; enters and drops onto a belt. Its card holds the line&rsquo;s name and budget. COMMS orders skip it and land at the agent&rsquo;s bay.</dd>
-  <dt>OUTBOX <span class="app">the out tray</span></dt><dd>Where finished work leaves the line. Click it to read and rate finished runs.</dd>
+  <dt>OUTBOX <span class="app">the out tray</span></dt><dd>Where finished work leaves the line. Click it to read and rate finished runs. With SEND TO, each job that finishes cleanly here starts a separate job on another line; one that can’t go is marked NOT sent on, with the reason.</dd><dt>SEND TO</dt><dd>An OUTBOX’s onward destination: another line’s INBOX. Drag the OUTBOX onto it, or choose it in the Workflow panel. The target runs its own job with its own crew and budget. Choose NOWHERE to stop sending. Circles are refused; no belt leaves an OUTBOX.</dd>
   <dt>FILTER <span class="app">a signpost</span></dt><dd>Reads each job&rsquo;s text and sends it down a lane: CODE, RESEARCH, or EVERYTHING ELSE. Never drops work. Needs a default lane.</dd>
-  <dt>SPLITTER</dt><dd>Fans work across its lanes. Alone: jobs take turns (load-balance). With a JOINER downstream: every lane gets the same job (fan-out).</dd>
+  <dt>SPLITTER</dt><dd>Fans work across its lanes. Click it and pick in the Workflow panel: COPY TO EACH (every lane gets the same job; a JOINER combines the results), SPLIT THE JOB (each lane gets only its own part; a JOINER puts them back together), or TAKE TURNS (each job goes down one lane; a MERGER passes it on).</dd>
   <dt>JOINER</dt><dd>A barrier that waits for every branch (10 minutes for a late one, adjustable), then sends one merged crate on.</dd>
   <dt>MERGER</dt><dd>A lane funnel: several belts in, one belt out, every crate rides straight through. Combines lanes, never jobs. Nothing to configure.</dd>
   <dt>LOOP</dt><dd>The one tile that makes a cycle legal: a DONE lane and a BACK lane, up to 5 passes by default (20 max), optionally until a reviewer says APPROVED.</dd>
   <dt>LANE</dt><dd>One belt leaving a signpost&rsquo;s tile. A filter or splitter needs at least two; a joiner needs at least two coming in.</dd>
-  <dt>LINES / BLUEPRINT <span class="app">LINES tool, key 9</span></dt><dd>Nineteen ready-made layouts &mdash; FRONT DESK, RESEARCH LINE, REVISION LOOP, SORTING OFFICE, PARALLEL CREW, THE GAUNTLET and more &mdash; dropped in one click.</dd>
+  <dt>LINES / BLUEPRINT <span class="app">CONVEYOR LINES tool, key 9</span></dt><dd>Twenty ready-made layouts &mdash; FRONT DESK, RESEARCH LINE, REVISION LOOP, SORTING OFFICE, PARALLEL CREW, THE GAUNTLET and more &mdash; dropped in one click.</dd>
   <dt>ROUTING PLAN</dt><dd>What your belts compile into: the exact plan the server executes. The box you watch and the run that happens are the same plan.</dd>
 </dl>
 
@@ -133,15 +135,15 @@
   <dt>RUN</dt><dd>One agent doing one job: a real model call with real tools, a real timer, and a real cost line in the ledger.</dd>
   <dt>DELIVERY</dt><dd>What a run produced &mdash; a file, a report, a reply. Lands in the OUTBOX or in COMMS for you to read and rate.</dd>
   <dt>RATE THE WORK</dt><dd>The beat after any run that did real work: <b>&#9650; nailed it</b> mints XP; <b>&#9670; close</b> and <b>&#9660; missed</b> are noted with no XP and no penalty.</dd>
-  <dt>RECIPE <span class="app">WORK &rsaquo; RECIPES</span></dt><dd>WHAT to run: a ready-made job with a small form. 101 built in; save your own.</dd>
-  <dt>ROUTINE <span class="app">WORK &rsaquo; AUTOMATION</span></dt><dd>WHEN it runs: a job on a schedule. Drops in at the INBOX. Only fires while scheduling is enabled.</dd>
-  <dt>SKILL <span class="app">BUILD &rsaquo; ABILITIES</span></dt><dd>HOW to do it: a procedure an agent consults mid-task when the work matches. 73 built in, more written by agents themselves or installed from a SKILL.md you inspected.</dd>
+  <dt>RECIPE <span class="app">WORK &rsaquo; MY WORK &rsaquo; RECIPES</span></dt><dd>WHAT to run: a ready-made job with a small form. 45 built in; save your own.</dd>
+  <dt>ROUTINE <span class="app">WORK &rsaquo; AUTOMATE &rsaquo; SCHEDULES</span></dt><dd>WHEN it runs: a job on a schedule. Runs a whole line only when started from that line&rsquo;s INBOX. Only fires while scheduling is enabled.</dd>
+  <dt>SKILL <span class="app">BUILD &rsaquo; CONNECT &rsaquo; ABILITIES</span></dt><dd>HOW to do it: a procedure an agent consults mid-task when the work matches. 74 built in, more written by agents themselves or installed from a SKILL.md you inspected.</dd>
   <dt>TASKS</dt><dd>Where live work sits &mdash; the queue you can see.</dd>
 </dl>
 
 <h2 id="learning">Learning</h2>
 <dl class="gloss">
-  <dt>DOSSIER <span class="app">CREW &rsaquo; COMMANDER</span></dt><dd>What the station has learned about you, in nine dimensions (identity, stack, goals, working style, standing orders, pain points, ambitions, people, schedule). Every agent&rsquo;s briefing folds it in. Local-first; pin, edit, or forget anything.</dd>
+  <dt>DOSSIER <span class="app">CREW &rsaquo; YOU</span></dt><dd>What the station has learned about you, in nine dimensions (identity, stack, goals, working style, standing orders, pain points, ambitions, people, schedule). Every agent&rsquo;s briefing folds it in. Local-first; pin, edit, or forget anything.</dd>
   <dt>BELIEF</dt><dd>One thing the dossier holds, traced to where it came from. Proposed after runs; you <b>Keep</b>, <b>Edit</b>, or <b>Discard</b>.</dd>
   <dt>MEMORY CORE <span class="app">AGENT DOSSIER &rsaquo; MEMORY</span></dt><dd>An agent&rsquo;s own long-term notebook. Each memory traces to the run that earned it. Trust grows with use and halves every 30 days unused; low trust is de-weighted, never silently dropped.</dd>
   <dt>XP / LEVEL</dt><dd>Minted only by your <b>nailed it</b> verdict. Levels record what shipped and gate nothing. Level 2 at 50 XP, 5 at 500, 10 at 2,250.</dd>
@@ -151,9 +153,9 @@
 
 <h2 id="autonomy">Autonomy</h2>
 <dl class="gloss">
-  <dt>NIGHT SHIFT</dt><dd>The station choosing a small grounded job while you&rsquo;re away (30 minutes idle), about every 45 minutes, inside your leash. Off by default.</dd>
-  <dt>INITIATIVE</dt><dd>Does it start work on its own? <b>WAIT</b> (default) &middot; <b>SUGGEST</b> &middot; <b>BUILD</b> &middot; <b>FREE</b>.</dd>
-  <dt>REACH</dt><dd>How far an unattended action may go. <b>OBSERVE</b> (read only) &middot; <b>SANDBOX</b> (default; nothing leaves the machine) &middot; <b>SEND &amp; PUBLISH</b>.</dd>
+  <dt>AUTONOMY <span class="app">WHILE YOU&rsquo;RE AWAY</span></dt><dd>The station choosing a small grounded job while you&rsquo;re away (30 minutes idle), about every 45 minutes, inside your leash. Off by default.</dd>
+  <dt>ON ITS OWN</dt><dd>What it does while you are away. <b>WAIT</b> &middot; <b>SUGGEST</b> (default) &middot; <b>SMALL JOBS</b> &middot; <b>FREE</b>.</dd>
+  <dt>REACH</dt><dd>How far an unattended action may go. <b>OBSERVE</b> (read only) &middot; <b>LOCAL ONLY</b> (default; nothing leaves the machine) &middot; <b>SEND &amp; PUBLISH</b>.</dd>
   <dt>PACE / LEASH</dt><dd>How many unattended jobs per day: LIGHT 1, STANDARD 3 (default), BUSY 6, MAX 12.</dd>
   <dt>MORNING REPORT</dt><dd>What COMMS prints when you return: what fired, what was skipped and why, drafts to review. Every line maps to a real record.</dd>
   <dt>DECISION LEDGER <span class="app">RECENT DECISIONS</span></dt><dd>An append-only trail of every autonomous fire, skip, and defer with the gate that decided it.</dd>
@@ -162,15 +164,15 @@
 
 <h2 id="plumbing">Plumbing</h2>
 <dl class="gloss">
-  <dt>SIDECAR</dt><dd>The small local server that does the actual work, on <code>127.0.0.1</code>. The app window talks to it; nothing talks to a StarNet server.</dd>
-  <dt>WORKSPACE</dt><dd>Where your station state lives on disk: transcripts, memory, ledgers, routines. On Windows under <code>%LOCALAPPDATA%\StarNet</code>; on macOS under <code>~/Library/Application Support</code>.</dd>
-  <dt>PROVIDER</dt><dd>Who runs the model. Eighteen supported, OpenRouter by default; three sign in with no key; Ollama is free and fully local. <b>STARNET</b> is the optional prepaid one.</dd>
+  <dt>SIDECAR</dt><dd>The small local server that does the actual work, on <code>127.0.0.1</code>. The app window talks to it. It reaches a StarNet server only for the Skill Market, Remote, and StarNet credits.</dd>
+  <dt>WORKSPACE</dt><dd>Where your station state lives on disk: transcripts, memory, ledgers, routines. On Windows under <code>%APPDATA%\ai.skynet.harness</code>; on macOS under <code>~/Library/Application Support/ai.skynet.harness</code>.</dd>
+  <dt>PROVIDER</dt><dd>Who runs the model. Eighteen supported, OpenRouter by default; four sign in with no key; Ollama is free and fully local. <b>STARNET</b> is the optional prepaid one.</dd>
   <dt>BYOK</dt><dd>Bring your own key. Your key, your provider&rsquo;s bill, real cost shown per run. No markup.</dd>
   <dt>LEDGER</dt><dd>The append-only record of every run&rsquo;s true spend. What the cost readouts are read from.</dd>
   <dt>CHANNEL</dt><dd>A paired chat app &mdash; Telegram, Discord, Slack, Matrix, Signal &mdash; where your agents appear as contacts and take orders.</dd>
-  <dt>OWNER PAIRING</dt><dd>Telegram only: a one-time 10-minute code you send the bot as <code>/pair</code>, so the first stranger to message it doesn&rsquo;t own it.</dd>
+  <dt>OWNER PAIRING</dt><dd>Every channel: a one-time 10-minute code you send the bot as <code>/pair</code>, so the first stranger to message it doesn&rsquo;t own it.</dd>
   <dt>CONNECTOR / MCP</dt><dd>A way to plug in an outside service (Gmail, a calendar, a docs tool) or to let another harness drive your station. Granted explicitly, never assumed.</dd>
-  <dt>SERVICE KEYS <span class="app">the KEYS tab</span></dt><dd>Keys for the services your agents call &mdash; kept locally, separate from your model provider key.</dd>
+  <dt>SERVICE KEYS <span class="app">CONNECTED &rsaquo; API KEYS</span></dt><dd>Keys for the services your agents call &mdash; kept locally, separate from your model provider key.</dd>
   <dt>LIVE VOICE</dt><dd>Hands-free talking to the station on a speech engine built into the app. No key, no account, your voice never leaves the machine.</dd>
 </dl>
 <nav class="doc-pager" aria-label="More in Troubleshooting &amp; help"><a class="pg prev" href="shortcuts.html"><span class="pg-k">&larr; PREVIOUS</span><span class="pg-t">Keyboard shortcuts</span></a><a class="pg next" href="index.html#help"><span class="pg-k">Explore this topic &rarr;</span><span class="pg-t">Troubleshooting &amp; help</span></a></nav>
@@ -185,6 +187,8 @@
     <a href="https://github.com/androoAGI/starnet-releases/releases/latest" target="_blank" rel="noopener">RELEASES</a>
     <a href="../pricing.html" data-pricing-link>PRICING</a>
     <a href="index.html">DOCS</a>
+    <a href="../market.html">SKILLS</a>
+    <a href="../maps.html">MAPS</a>
     <a href="help.html">HELP</a>
     <a href="https://github.com/androoAGI/starnet/issues" target="_blank" rel="noopener">COMMUNITY</a>
     <a href="../legal/privacy.html">PRIVACY</a>

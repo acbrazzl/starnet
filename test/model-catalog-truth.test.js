@@ -1,9 +1,10 @@
 'use strict';
+const { readSidecarSource } = require('./helpers/source');
 const A = require('./_assert.js');
 const fs = require('fs');
 const vm = require('vm');
 const path = require('path');
-const backend = fs.readFileSync(path.join(__dirname, '../sidecar/index.js'), 'utf8');
+const backend = readSidecarSource();
 const frontend = fs.readFileSync(path.join(__dirname, '../frontend/app/harness.js'), 'utf8');
 function region(source, marker, closing) {
   const start = source.indexOf(marker), end = source.indexOf(closing, start);
@@ -13,6 +14,7 @@ function region(source, marker, closing) {
 let models = [], failure = null;
 const sandbox = {
   ensureCodexAccessToken: async () => { if (failure) throw failure; return 'fixture-token'; },
+  extraAccountProviderFor: () => null,   // subscription stacking: no extra sign-in here, the primary serves the catalog
   forceRefreshCodexAccessToken: async () => 'fixture-token',
   ensureOAuthAccessToken: async () => { if (failure) throw failure; return 'fixture-token'; },
   selectProvider: () => ({ listModels: async () => models }),

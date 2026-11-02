@@ -94,6 +94,32 @@ const DOCX = (body) => zip({ '[Content_Types].xml': '<x/>', 'word/document.xml':
     A.eq(q3.length, 3, 'a fully empty row is dropped rather than emitted as a line of blank tabs');
     A.ok(/inline!/.test(text), 'an inlineStr cell is read');
     A.ok(/^### Notes$/m.test(text), 'the second sheet is present, under its own name');
+    A.eq(text, '### Q3 Actuals\nRegion\tRev\nEMEA\t1250.5\ninline!\n\n### Notes\n42', 'the dense fixture reads byte-identical to before the sparse-row fix');
+  }
+
+  // ---- 2b. SPARSE ROWS (2026-10-20): Excel omits blank cells, so a cell belongs to the column its r= names ----
+  {
+    const budget = zip({
+      'xl/workbook.xml': '<workbook><sheets><sheet name="Budget" sheetId="1"/></sheets></workbook>',
+      'xl/sharedStrings.xml': '<sst><si><t>Item</t></si><si><t>Q1</t></si><si><t>Q2</t></si><si><t>Q3</t></si><si><t>Rent</t></si><si><t>Ads</t></si></sst>',
+      'xl/worksheets/sheet1.xml': '<worksheet><sheetData>' +
+        '<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c><c r="C1" t="s"><v>2</v></c><c r="D1" t="s"><v>3</v></c></row>' +
+        '<row r="2"><c r="A2" t="s"><v>4</v></c><c r="D2"><v>900</v></c></row>' +                                    // Q1, Q2 blank: omitted
+        '<row r="3"><c r="A3" t="s"><v>5</v></c><c r="B3" s="1"/><c r="C3"><v>50</v></c><c r="D3"><v>70</v></c></row>' + // B3 formatted-empty
+        '</sheetData></worksheet>'
+    });
+    A.eq(doc.extract(budget, 'xlsx'), '### Budget\nItem\tQ1\tQ2\tQ3\nRent\t\t\t900\nAds\t\t50\t70',
+      'Rent 900 stays under Q3 and Ads 50/70 under Q2/Q3 (trunk read "Rent\\t900" and "Ads\\t50\\t70": numbers under the wrong header)');
+
+    const formula = zip({ 'xl/worksheets/sheet1.xml': '<worksheet><sheetData><row r="1"><c r="B1"><f t="shared" ref="B1:B3" si="0">A1*2</f><v>4</v></c></row></sheetData></worksheet>' });
+    A.eq(doc.extract(formula, 'xlsx'), '### sheet1\n\t4', 'a formula cell keeps its column and its <f t="shared"> is not read as the cell type');
+
+    const wide = zip({ 'xl/worksheets/sheet1.xml': '<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="IW1"><v>257th</v></c></row></sheetData></worksheet>' });
+    const wideText = doc.extract(wide, 'xlsx');
+    A.ok(/^### sheet1 \(columns past 256 not shown\)\n1$/.test(wideText), 'a cell past column 256 is dropped and the label SAYS so: ' + JSON.stringify(wideText));
+
+    const noRefs = zip({ 'xl/worksheets/sheet1.xml': '<worksheet><sheetData><row><c><v>a</v></c><c><v>b</v></c></row><row r="2"><c r="B2"><v>x</v></c><c r="A2"><v>y</v></c></row></sheetData></worksheet>' });
+    A.eq(doc.extract(noRefs, 'xlsx'), '### sheet1\na\tb\n\tx\ty', 'cells without a ref (or out of order) fall back to the next column, as before');
   }
 
   // ---- 3. IPYNB: source AND outputs — the RESULT is usually the answer, not the code ----
@@ -165,6 +191,20 @@ const DOCX = (body) => zip({ '[Content_Types].xml': '<x/>', 'word/document.xml':
       const b = await bare.readTool.run({ path: 'r.docx' }, CTX);
       A.ok(b.content.indexOf('from disk') < 0, 'with no docExtract wired, a .docx still decodes as raw bytes (unchanged)');
     } finally { await fsp.rm(ROOT, { recursive: true, force: true }); }
+  }
+
+  // ---- ZIP BOMB (security audit 2026-09-25): inflate output is capped per entry and per document ----
+  {
+    const seen = [];
+    const spy = makeDocExtract({ inflateRaw: (b, o) => { seen.push(o && o.maxOutputLength); return zlib.inflateRawSync(b, o); } });
+    spy.extract(zip({ 'word/document.xml': '<w:document><w:body><w:p><w:r><w:t>hi</w:t></w:r></w:p></w:body></w:document>' }), 'docx');
+    A.ok(seen.length === 1 && seen[0] > 0 && seen[0] <= 32 * 1024 * 1024, 'every inflate is called with a bounded maxOutputLength');
+    const huge = '<w:document><w:body><w:p><w:r><w:t>' + 'a'.repeat(33 * 1024 * 1024) + '</w:t></w:r></w:p></w:body></w:document>';
+    const bomb = zip({ 'word/document.xml': huge });
+    A.ok(bomb.length < 200 * 1024, 'the bomb is small on disk (' + bomb.length + ' bytes)');
+    let threw = null;
+    try { doc.extract(bomb, 'docx'); } catch (e) { threw = e; }
+    A.ok(!!threw, 'a document inflating past the ceiling is refused, not expanded (' + (threw && (threw.code || threw.message)) + ')');
   }
 
   A.report('docextract.test');

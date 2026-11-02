@@ -21,9 +21,11 @@ function extract(name) {
 const escSrc = /const HTML_ESC = \{[^}]*\};/.exec(src);
 A.ok(escSrc, 'chat.js still defines HTML_ESC');
 // eslint-disable-next-line no-new-func
+const relSrc = /  const REL_PATH = [^\n]*;/.exec(src);
+A.ok(relSrc, 'chat.js still defines REL_PATH (relative file links)');
 const renderMarkdown = new Function(
-  escSrc[0] + '\n' + extract('escapeHtml') + '\n' + extract('linkify') + '\n' +
-  extract('mdInline') + '\n' + extract('reportInline') + '\n' + extract('renderFence') + '\n' + extract('renderMarkdown') +
+  escSrc[0] + '\n' + relSrc[0] + '\n' + extract('escapeHtml') + '\n' + extract('linkify') + '\n' +
+  extract('mdInline') + '\n' + extract('hostOf') + '\n' + extract('linkHostNote') + '\n' + extract('appFileRef') + '\n' + extract('fileRefLink') + '\n' + extract('fileRefImage') + '\n' + extract('reportInline') + '\n' + extract('renderFence') + '\n' + extract('renderMarkdown') +
   '\nreturn renderMarkdown;'
 )();
 
@@ -71,7 +73,7 @@ A.ok(/messageCopyText\(bodyEl\)/.test(clickBody),'message button uses the source
 // Exercise the public renderer too: its fast-path marker gate must agree with the
 // block parser, for both streamed prose and restored history.
 const markerSource = /const MD_MARKERS = [^;]+;/.exec(src)[0];
-const renderProse = new Function('renderMarkdown', markerSource + '\n' + extract('renderProse') + '\nreturn renderProse;')(renderMarkdown);
+const renderProse = new Function('renderMarkdown', 'hydrateFileRefs', markerSource + '\n' + extract('renderProse') + '\nreturn renderProse;')(renderMarkdown, () => {});
 for (const marker of ['+', '-', '*', '1.', '1)']) {
   for (const gap of [' ', '\t']) {
     const raw = marker + gap + 'First\n' + marker + gap + 'Second';
@@ -80,5 +82,27 @@ for (const marker of ['+', '-', '*', '1.', '1)']) {
     A.eq((body.innerHTML.match(/<li>/g) || []).length, 2, 'public prose renderer recognizes ' + JSON.stringify(marker + gap));
     A.eq(copySource(body), raw, 'list copy preserves the original marker and spacing');
   }
+}
+const loose = renderMarkdown('Intro\n\n1. **First** details\n\n2. Second\n\n3. Third\n\nConclusion');
+A.eq((loose.match(/<ol /g)||[]).length,1,'blank-separated ordered items share one semantic list');
+A.eq((loose.match(/<li>/g)||[]).length,3,'loose list retains every item');
+A.ok(!/<\/ol>\n|\n<ol/.test(loose),'block boundaries do not emit pre-wrap whitespace rows');
+A.ok(loose.startsWith('<span class="md-p">Intro</span>'),'intro has its own paragraph');
+A.ok(loose.endsWith('<span class="md-p">Conclusion</span>'),'closing prose stays outside the list');
+const nestedLoose=renderMarkdown('1. Parent\n\n   - Child\n\n   - Sibling\n\n2. Next');
+A.ok(/<li>Parent<ul[\s\S]*<li>Child<\/li><li>Sibling<\/li><\/ul><\/li><li>Next/.test(nestedLoose),'blank lines retain nested list ownership');
+const mixed=renderMarkdown('- Bullet\n\n1. Number\n\nParagraph\nline two\n\n\n## Heading');
+A.ok(mixed.includes('</ul><ol'),'switching list type starts a separate list');
+A.ok(mixed.includes('<span class="md-p">Paragraph\nline two</span>'),'intentional paragraph line breaks survive');
+A.ok(!mixed.includes('\n\n'),'extra blank separators do not add empty rendered rows');
+const whitespaceCode=renderMarkdown('Before\n\n```\n  one\n\n\n  two\n```\n\nAfter');
+A.ok(whitespaceCode.includes('<span class="md-pre">  one\n\n\n  two</span>'),'code indentation and empty lines remain exact');
+A.eq(renderMarkdown('1. One\r\n\r\n2. Two'),renderMarkdown('1. One\n\n2. Two'),'CRLF lists match LF lists');
+for (const separator of ['\n\n', '\r\n\r\n', '\n   \n']) {
+  const raw = 'First paragraph' + separator + 'Second paragraph';
+  const body = { textContent: '', innerHTML: '' };
+  renderProse(body, raw);
+  A.eq((body.innerHTML.match(/class="md-p"/g) || []).length, 2, 'plain prose uses the same paragraph structure: ' + JSON.stringify(separator));
+  A.eq(copySource(body), raw, 'paragraph copy preserves original line endings and spaces');
 }
 A.report('chat-report-structure');

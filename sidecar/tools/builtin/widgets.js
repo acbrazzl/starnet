@@ -115,6 +115,24 @@
         + 'Include sourceUrl when the app supplies a link to the source. If you cannot read it, call widget.set with the same id/version and error explaining why, preserving the last reading. '
         + 'A chat reply alone does not update the widget.';
     }
+    /* THE WIDGET'S OWN UPDATE RUN (releases#6, 2026-10-17). A refresh is sent to the agent open in COMMS on the
+       widget's own conversation ('widget-' + id, frontend/app/widgets.js openWidgetTask); a scheduled update is a
+       routine whose job meta names the widget. widget.get/widget.set ride the NOTEBOOK prop (memory), which an
+       interactive run holds only while one is placed and the MEMORY switch is on, so the refresh demanded a tool the
+       run did not have and the agent searched for it until stopped. The host grants the two widget tools to the run
+       whose purpose IS a configured widget, and to no other run. Returns that widget's id, or null. */
+    function updateRunOf(run) {
+      run = run || {};
+      const stream = String(run.streamId || '');
+      const id = String(run.widgetId || (stream.indexOf('widget-') === 0 ? stream.slice(7) : ''));
+      if (!ID_RE.test(id)) return null;
+      return listOf().some(w => w.id === id && w.config) ? id : null;
+    }
+    // ...and that run reads and publishes its OWN widget only: the host stamps the id on the tool ctx (widgetScope).
+    function assertScope(id, ctx) {
+      const own = ctx && ctx.widgetScope ? String(ctx.widgetScope) : '';
+      if (own && id !== own) throw new Error('This run updates widget "' + own + '" only; it cannot read or publish widget "' + id + '".');
+    }
 
     const setTool = {
       // NO consent gate: a widget record is a sandboxed local write to the station's OWN chrome
@@ -127,26 +145,26 @@
          max lengths this prose did not). What survives is what a per-field description structurally cannot
          say: what the instrument IS, the cross-turn freshness contract, the cross-field "only when the data
          has that shape" rule, and SKIP — which has no runtime guard behind it, so it stays spelled out. */
-      description: 'Publish or update a small named readout on the station’s widget rails — a live instrument the Commander can pin ' +
-        'on screen (e.g. app revenue, top AI headlines, subscriber count). The display always carries YOUR name and the time you ' +
-        'set it, so a stale figure is attributable to you: re-set the same id whenever you have a newer one (a routine is the ' +
-        'natural driver), and setting an existing id overwrites it. Reach for tone/spark/progress only when the data genuinely ' +
-        'has that shape — a real trend series, a real completion fraction — never as decoration. ' +
+      description: 'Publish or update a small named readout on the station\'s widget rails: a live instrument the Commander can pin ' +
+        'on screen (e.g. app revenue, top AI headlines, subscriber count). It always shows YOUR name and the time you set it, ' +
+        'so a stale figure is attributable to you: re-set the same id (it overwrites) whenever you have a newer one; a routine ' +
+        'is the natural driver. Use tone/spark/progress only when the data genuinely has that shape (a real trend series, a ' +
+        'real completion fraction), never as decoration. ' +
         'SKIP: secrets, walls of text, anything you cannot back with a real source when asked.',
       schema: {
         type: 'object', required: ['id'],
         properties: {
-          id: { type: 'string', description: 'Stable slug for this readout: lowercase letters/digits/dashes, max 24 chars (e.g. "app-revenue").' },
-          label: { type: 'string', description: 'The instrument’s small caption label, e.g. "APP REVENUE" (max 28 chars).' },
-          value: { type: 'string', description: 'The big figure, kept short (max 24 chars), e.g. "$​1,240".' },
-          sub: { type: 'string', description: 'Optional small line under/next to the value, e.g. "today" (max 28 chars).' },
-          list: { type: 'array', items: { type: 'string' }, description: 'Up to 5 short lines rendered as a cycling ticker (headlines). Use INSTEAD of value.' },
-          tone: { type: 'string', enum: ['ok', 'warn', 'bad'], description: 'Optional semantic tint for the figure: "ok" (good), "warn", "bad". Omit for neutral.' },
-          spark: { type: 'array', items: { type: 'number' }, description: 'Optional trend series (2-24 numbers, oldest first) drawn as a tiny sparkline beside the value.' },
-          progress: { type: 'number', description: 'Optional completion fraction 0-100 drawn as a small bar (e.g. a goal or quota).' },
-          version: { type: 'integer', description: 'For a user-configured widget, the exact version supplied in its refresh request. Prevents outdated runs overwriting changed widgets.' },
-          error: { type: 'string', description: 'For a configured widget, report why data could not be read. Keeps the last reading and its original timestamp.' },
-          sourceUrl: { type: 'string', description: 'Optional http(s) link returned by the source app, so the user can inspect the underlying information.' },
+          id: { type: 'string', description: 'Stable slug: lowercase letters/digits/dashes, max 24 chars, e.g. app-revenue.' },
+          label: { type: 'string', description: 'Caption, e.g. APP REVENUE (max 28 chars).' },
+          value: { type: 'string', description: 'The big figure (max 24 chars), e.g. "$​1,240".' },
+          sub: { type: 'string', description: 'Small line beside the value, e.g. today (max 28 chars).' },
+          list: { type: 'array', items: { type: 'string' }, description: 'Up to 5 short lines shown as a cycling ticker (headlines), INSTEAD of value.' },
+          tone: { type: 'string', enum: ['ok', 'warn', 'bad'], description: 'Tint for the figure (ok = good); omit for neutral.' },
+          spark: { type: 'array', items: { type: 'number' }, description: 'Trend series (2-24 numbers, oldest first) drawn as a sparkline.' },
+          progress: { type: 'number', description: 'Completion 0-100 drawn as a small bar (a goal or quota).' },
+          version: { type: 'integer', description: 'User-configured widget: the exact version from its refresh request (stops an outdated run overwriting a changed widget).' },
+          error: { type: 'string', description: 'Configured widget: why its data could not be read (keeps the last reading and its timestamp).' },
+          sourceUrl: { type: 'string', description: 'http(s) link from the source app, so the user can inspect the data.' },
           clear: { type: 'boolean', description: 'true = remove this readout from the rails.' }
         }
       },
@@ -154,6 +172,7 @@
         const id = args && String(args.id || '').toLowerCase().trim();
         // error paths THROW — the registry turns a throw into an isError result the model can react to.
         if (!ID_RE.test(id)) throw new Error('id must be 1-24 chars of lowercase letters/digits/dashes, e.g. "app-revenue"');
+        assertScope(id, ctx);
         const aid = (ctx && ctx.agentId) || 'agent';
 
         if (args.clear === true) {
@@ -226,11 +245,11 @@
       name: 'widget.get', capability: 'memory', scope: 'read', requiresConsent: false,
       description: 'Read the latest user-owned definition and refresh instructions for a saved widget. Call before a scheduled update; if removed, stop without fetching data or recreating it.',
       schema: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } },
-      run: async args => ({ content: instruction(String(args && args.id || '')), summary: 'widget definition' })
+      run: async (args, ctx) => { const id = String(args && args.id || ''); assertScope(id, ctx); return { content: instruction(id), summary: 'widget definition' }; }
     };
 
     return {
-      setTool, getTool, configure, remove, instruction,
+      setTool, getTool, configure, remove, instruction, updateRunOf,
       list: listOf,   // the GET /api/widgets read surface (host route) — same records, no reshaping
       register(reg) { reg.register(setTool); reg.register(getTool); return reg; }
     };

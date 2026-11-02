@@ -3,6 +3,7 @@
    hardline floor sits BELOW the bypass flag, mutations default-deny under an autonomous surface,
    grants are per-session (not process-global), and an 'always' grant only sticks if it persisted. */
 'use strict';
+const { readSidecarSource } = require('./helpers/source');
 const A = require('./_assert.js');
 const { makeConsentBroker, ANTI_RETRY, SILENCE } = require('../sidecar/permissions.js');
 
@@ -232,13 +233,13 @@ const hardline = (call) => (call && call.args && /(^|\/)(\.env|permissions\.allo
   // Structural wiring lock: the endpoint persists roster Full Access and run authority reads it live.
   {
     const fs = require('fs'); const path = require('path');
-    const src = fs.readFileSync(path.join(__dirname, '..', 'sidecar', 'index.js'), 'utf8');
+    const src = readSidecarSource();
     A.ok(/persistAgentFullAccess\(agentId\)/.test(src), 'the permission-card endpoint persists Full Access');
     A.ok(/fullAccess: agentFullAccessNow/.test(src), 'run authority receives the live per-agent predicate');
     A.ok(/agentFullAccessNow\(\)/.test(src), 'the consent broker reads that posture on every call');
     A.ok(!/grantsBlanketByAgent|blanketSetFor|grantsBlanket:/.test(src), 'the obsolete process-memory wildcard is gone');
     const ui = fs.readFileSync(path.join(__dirname, '..', 'frontend', 'app', 'chat.js'), 'utf8');
-    A.ok(/App\.setApproval\([^\n]+, 'full'\)/.test(ui), 'the confirmed permission-card choice updates the visible roster posture');
+    A.ok(/App\.setApproval\([^\n]+, 'full', \{ recorded: true \}\)/.test(ui), 'the confirmed permission-card choice updates the visible roster posture (already recorded by the station)');
   }
 
   A.report('permissions.test');

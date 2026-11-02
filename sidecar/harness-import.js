@@ -16,7 +16,7 @@
    SECURITY LAW (mirrors configexport's philosophy — non-negotiable): this module NEVER sees or emits a secret.
    It extracts only the MODEL id from a config; if that config carries any key-shaped field (an `env` section,
    `api_key`, or a key matching /(token|secret|key|password|auth|bearer|credential)/i) it pushes ONE warning
-   ("API keys never transfer — re-enter them in the KEYS tab") and drops it on the floor — no secret value ever
+   ("API keys never transfer — re-enter them in CONNECT › ABILITIES › CONNECTED › API KEYS") and drops it on the floor — no secret value ever
    enters the returned object. Fail-soft everywhere: a missing/unparseable file is skipped + noted, never thrown.
 
    filesWanted(harness) returns [{ rel, base:'root'|'state' }] so index.js knows which directory each rel resolves
@@ -38,7 +38,7 @@
 
   // key-name secrets: the SAME family configexport redacts. `env` is caught explicitly (a whole section of secrets).
   const SECRET_KEY_RE = /(token|secret|key|password|passwd|pwd|auth|bearer|credential)/i;
-  const SECRET_WARNING = 'API keys never transfer — re-enter them in the KEYS tab';
+  const SECRET_WARNING = 'API keys never transfer — re-enter them in CONNECT › ABILITIES › CONNECTED › API KEYS';
 
   function isObj(x) { return x != null && typeof x === 'object' && !Array.isArray(x); }
   function clampStr(s, max) { return String(s == null ? '' : s).slice(0, max || TEXT_MAX); }
@@ -52,6 +52,18 @@
     const b = String(base).replace(/[\\/]+$/, '');
     const s = String(seg).replace(/^[\\/]+/, '');
     return b + sep + s;
+  }
+
+  /* ---- nonLocalPathReason(raw) — '' for a path that names THIS machine's filesystem, else why not (audit
+     2026-09-25 #19). A UNC root (\\server\share, //host/share) makes even a stat() an SMB connection that can leak
+     the user's NTLM hash to whoever runs the server; device-namespace forms (\\?\, \\.\, \??\) bypass Win32 path
+     normalization. Checked on the RAW string, before path.resolve can reshape it. ---- */
+  function nonLocalPathReason(raw) {
+    const s = String(raw == null ? '' : raw);
+    if (s.indexOf('\0') >= 0) return 'the path contains a NUL byte';
+    if (/^[\\/]{2}[?.](?:[\\/]|$)/.test(s) || /^[\\/]\?\?[\\/]/.test(s)) return 'device paths (\\\\?\\, \\\\.\\) are not accepted here — use an ordinary local folder path';
+    if (/^[\\/]{2}/.test(s)) return 'network (UNC) paths are not accepted here — use a folder on this computer';
+    return '';
   }
 
   /* ---- detectCandidates({ platform, env }) — build the BASE candidate roots purely from env. No existence checks
@@ -396,7 +408,7 @@
 
   return {
     TEXT_MAX,
-    detectCandidates, filesWanted, scanProfile,
+    detectCandidates, filesWanted, scanProfile, nonLocalPathReason,
     // parseJson5 + openclawAgents power index.js's detect enumeration; openclawModel/hermesModel ride along for
     // the pure tests. Everything else stays internal.
     parseJson5, openclawAgents, openclawModel, hermesModel

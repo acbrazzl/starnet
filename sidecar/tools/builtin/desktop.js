@@ -29,7 +29,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  const CP = require('node:child_process');
+  const CP = require('../../child-env.js').guardChildProcess(require('node:child_process'));   // no station secrets in the launched app's env
   const browser = require('./browser.js');
   const defaultAssertSafeUrl = browser._internals.assertSafeUrl;
 
@@ -70,9 +70,14 @@
       }
       return 'launched';
     }
+    // Windows: the opener runs outside the station's job (sidecar/breakaway.js), so the window it opens for the person
+    // is theirs — closing or crashing StarNet never closes it. A pass-through everywhere else.
+    const breakaway = deps.breakaway || require('../../breakaway.js').makeBreakaway({ platform });
+    const execFile = typeof deps.execFile === 'function' ? deps.execFile : CP.execFile.bind(CP);
     function runViaExecFile(cmd, args) {
       return new Promise((resolve, reject) => {
-        CP.execFile(cmd, args, { encoding: 'utf8', timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
+        const w = breakaway.wrap(cmd, args, { encoding: 'utf8', timeout: timeoutMs, windowsHide: true });
+        execFile(w.file, w.args, w.options, (err, stdout, stderr) => {
           if (err) {
             // execFile surfaces a non-zero exit / spawn failure / timeout as err; mirror the old error text shape.
             return reject(new Error((stderr || stdout || (err && err.message) || (cmd + ' failed')).toString().trim()));

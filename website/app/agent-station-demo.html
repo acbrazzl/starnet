@@ -47,6 +47,7 @@
 <link rel="stylesheet" href="css/readability.css"><!-- Shared readable text roles at STANDARD; cabinet and CRT geometry are unchanged. -->
 <link rel="stylesheet" href="css/beat-cards.css"><!-- Transient work cards share glass materials and semantic text sizes. -->
 <link rel="stylesheet" href="css/overseer-setup.css">
+<link rel="stylesheet" href="css/linewatch.css"><!-- LINE WATCH: the crate-inspect card on the live floor -->
 
 <link rel="stylesheet" href="css/titlebar.css"><!-- custom window chrome (Windows desktop shell): themed titlebar + MIN/MAX/CLOSE; inert unless body.sn-chrome (titlebar.js) -->
 
@@ -278,7 +279,7 @@
             <div id="ollama-block" class="hidden">
               <div class="codex-signin">
                 <div id="ollama-status" class="codex-status">checking for ollama on this machine…</div>
-                <div class="dim hint" id="ollama-hint">Free and fully local — no key, no account, no bill. Needs <b>Ollama</b> installed and running on this machine (ollama.com), with at least one model pulled (e.g. <code>ollama pull llama3.1</code>). Honest caveat: local models are smaller than the cloud ones — expect slower, rougher work on long tasks.</div>
+                <div class="dim hint" id="ollama-hint">Free and fully local — no key, no account, no bill. Needs <b>Ollama</b> installed and running on this machine (ollama.com), with at least one model pulled (e.g. <code>ollama pull qwen3:8b</code>). Honest caveat: local models are smaller than the cloud ones — expect slower, rougher work on long tasks.</div>
               </div>
             </div>
 
@@ -782,6 +783,7 @@
 <script src="js/sprite-load-plan.js"></script>
 <script src="agent-demo/sprites.js"></script>
 <script src="app/harness.js"></script>
+<script src="app/apiticket.js"></script><!-- scoped short-lived URL tickets: links/tabs/SSE/beacon never carry the master API token (sidecar/apitickets.js verifies) -->
 <script src="app/queryspine.js"></script><!-- keyed Harness.api GET state: in-flight dedupe, last-good truth, TTL + subscriber-owned polling; MUST load before cron consumers -->
 <script src="app/updatecore.js"></script>
 <script src="app/updates.js"></script>
@@ -790,6 +792,8 @@
 <script src="app/titlebar.js"></script><!-- custom window chrome: renders the themed titlebar ONLY when the desktop shell sets __STARNET_CUSTOM_CHROME__ (Windows, decorations off) -->
 <script src="app/ctxgauge.js"></script>
 <script src="app/floorstats.js"></script>
+<script src="app/linewatch.js"></script><!-- LINE WATCH (pure): bay status lamps, the crate card resolver, per-line plate text -->
+<script src="app/cratecard.js"></script><!-- LINE WATCH: the crate-inspect station card (DOM) -->
 <script src="app/slaglog.js"></script>
 <script src="app/xp.js"></script>
 <script src="app/returns.js"></script><!-- pure return-ritual engine: while-away digest rows + the pending OUTBOX-crate ledger -->
@@ -802,6 +806,7 @@
 <script src="app/dossier.js"></script>
 <script src="app/understanding.js"></script><!-- NORTH STAR: pure "how well the station understands its Commander" read-model over the dossier (per-dim + overall confidence, weakest = the VOI question target) -->
 <script src="app/fork.js"></script><!-- R1 MID-TASK FORK: pure engine for the earned preference-fork (directive + FORK-marker parser + confidence gate); self-retiring once style is well-grounded -->
+<script src="app/memtruth.js"></script><!-- memory-truth: the ONE similarity + subject key every memory writer shares (study.js reads it); MUST load before study.js -->
 <script src="app/study.js"></script><!-- GROWTH Tier 1: pure STUDY engine (dossier Phase B) — parse/salience/dedup for work→belief proposals + ratings-taste + archetype classifier -->
 <script src="app/beatcard.js"></script><!-- shared COMMS post-run lifecycle; MUST load before chat.js -->
 <script src="app/recommend.js"></script><!-- THE RECOMMENDATION SPINE: pure one-voice arbiter over every proactive channel (evidence-or-silence); MUST load before chat.js -->

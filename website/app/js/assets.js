@@ -74,18 +74,28 @@ const SPRITES = (() => {
      anchor the FEET to the floor instead. Auto-derived so new skins self-correct. */
   const footPad = {};                 // set -> transparent rows below the feet, in master px
   const DEFAULT_FOOT = 23;            // crew authoring constant; only used if a frame can't be read
+  /* (2026-10-10) a big crew shows 700+ distinct frames, each measured the first time it is drawn — ~14 a second for
+     minutes after boot, every one a fresh canvas plus a whole-frame readback (~5% of the main thread). One reused
+     scratch canvas, and the bottom band first: the feet sit within ~23 rows of the bottom, so the full frame is read
+     only when the band is empty. Same answer. */
+  let padScratch = null, padCtx = null;
+  const PAD_BAND = 48;
   function measureFootPad(img) {
     try {
       const w = img.width | 0, h = img.height | 0;
       if (!w || !h) return DEFAULT_FOOT;
-      const c = document.createElement('canvas'); c.width = w; c.height = h;
-      const x = c.getContext('2d', { willReadFrequently: true });
+      if (!padScratch) { padScratch = document.createElement('canvas'); padScratch.width = padScratch.height = 1; padCtx = padScratch.getContext('2d', { willReadFrequently: true }); }
+      if (padScratch.width < w || padScratch.height < h) { padScratch.width = Math.max(padScratch.width, w); padScratch.height = Math.max(padScratch.height, h); }
+      const x = padCtx;
+      x.clearRect(0, 0, w, h);
       x.drawImage(img, 0, 0);
-      const data = x.getImageData(0, 0, w, h).data;
-      for (let y = h - 1; y >= 0; y--) {
-        const row = y * w * 4;
-        for (let px = 0; px < w; px++) {
-          if (data[row + px * 4 + 3] > 16) return (h - 1) - y;   // first opaque row from the bottom
+      for (const band of h > PAD_BAND ? [PAD_BAND, h] : [h]) {
+        const top = h - band, data = x.getImageData(0, top, w, band).data;
+        for (let y = band - 1; y >= 0; y--) {
+          const row = y * w * 4;
+          for (let px = 0; px < w; px++) {
+            if (data[row + px * 4 + 3] > 16) return (h - 1) - (top + y);   // first opaque row from the bottom
+          }
         }
       }
       return DEFAULT_FOOT;
@@ -208,10 +218,20 @@ const SPRITES = (() => {
      authored emissive spill, such as ULTRON's red pool, stays part of the skin's presentation.
      Direction points FROM the body TOWARD the source in world axes. Quantize small changes before
      caching at native sprite resolution, shared across agents. No scene readback or canvas filter.
-     The 128-frame LRU bounds GPU/bitmap storage even when the whole skin catalog is in view. */
-  const BODY_LIGHT_LIMIT = 128;
-  const bodyLights = new Map(), frameIds = new WeakMap();
-  let nextFrameId = 1, bodyLightScratch = null, bodyLightBuilds = 0;
+     TWO TIERS (2026-10-07, "laggy" on a 26-agent station): a fixed 128-frame LRU was smaller than one second
+     of a big crew — a WALKING body crosses a colour/strength/sector step ~5x a second and every walk frame is
+     a different master, so each (frame, light) pair was drawn exactly once: ~230 fresh canvases a second,
+     each a new GPU texture, and every one of them evicted a sitting body's frame so that rebuilt too.
+       probation — a pair's first build lands here (a small ring); its canvases are RECYCLED, never
+                   re-allocated, so a walker's one-off frames cost no allocation and no texture churn.
+       kept      — a pair still being drawn BODY_LIGHT_PROMOTE_MS after it was built is promoted; bounded
+                   by PIXELS (16 MB of bitmap). A walk frame is on screen ~100ms (re-asked 2-3 times, then
+                   never again), so it is served from probation and never floods the kept tier.
+     An idle or seated body is promoted within a second and is never rebuilt again; walkers cycle the ring
+     and can no longer push it out. Time is the caller's nowMs (deterministic, like the rest of drawBody). */
+  const BODY_LIGHT_LIMIT = 4096, BODY_LIGHT_PIXELS = 4194304, BODY_LIGHT_PROBATION = 96, BODY_LIGHT_POOL = 8, BODY_LIGHT_PROMOTE_MS = 600;
+  const bodyLights = new Map(), probation = new Map(), lightPool = [], frameIds = new WeakMap();
+  let nextFrameId = 1, bodyLightScratch = null, bodyLightBuilds = 0, bodyLightPixels = 0, bodyLightRecycled = 0;
   const clamp01 = n => Math.max(0, Math.min(1, Number(n) || 0));
   function bodyLight(raw) {
     if (!raw || !Array.isArray(raw.color) || raw.color.length < 3) return null;
@@ -227,25 +247,52 @@ const SPRITES = (() => {
       key: color.join(',') + '|' + strength + '|' + sector };
   }
   function releaseBodyLight(canvas) { canvas.width = canvas.height = 1; }
-  function lightFrame(frame, light) {
+  function dropBodyLight(key, canvas) { bodyLights.delete(key); bodyLightPixels -= canvas.width * canvas.height; releaseBodyLight(canvas); }
+  function lightLive(c) { const g = c.getContext('2d'); return !!(g && !(g.isContextLost && g.isContextLost())); }
+  /* A GPU reset (sleep, driver update) loses every canvas at once, and a RESTORED context comes back blank while
+     isContextLost() reads false again: a kept frame would then draw an idle body as nothing, for as long as it stays
+     kept. Any light canvas reporting loss or restoration drops both tiers — every pair rebuilds on its next draw. */
+  function flushBodyLights() {
+    for (const c of bodyLights.values()) releaseBodyLight(c);
+    for (const t of probation.values()) releaseBodyLight(t.c);
+    bodyLights.clear(); probation.clear(); lightPool.length = 0; bodyLightPixels = 0;
+  }
+  function watchLight(c) {
+    try { c.addEventListener('contextlost', flushBodyLights); c.addEventListener('contextrestored', flushBodyLights); } catch (_) {}
+    return c;
+  }
+  function lightFrame(frame, light, nowMs) {
     if (!light) return frame;
     let id = frameIds.get(frame);
     if (!id) { id = nextFrameId++; frameIds.set(frame, id); }
     const key = id + '|' + light.key;
     const hit = bodyLights.get(key);
     if (hit) {
-      const context = hit.getContext('2d');
-      if (context && !(context.isContextLost && context.isContextLost())) {
-        bodyLights.delete(key); bodyLights.set(key, hit);
-        return hit;
+      if (lightLive(hit)) { bodyLights.delete(key); bodyLights.set(key, hit); return hit; }
+      dropBodyLight(key, hit);
+    }
+    const trial = probation.get(key);
+    if (trial) {
+      probation.delete(key);
+      const kept = trial.c;
+      if (!lightLive(kept)) releaseBodyLight(kept);
+      else if (!(nowMs - trial.at >= BODY_LIGHT_PROMOTE_MS)) { probation.set(key, trial); return kept; }
+      else {   // still in use long after its build: this pair is worth keeping
+        bodyLights.set(key, kept); bodyLightPixels += kept.width * kept.height;
+        while (bodyLights.size > 1 && (bodyLights.size > BODY_LIGHT_LIMIT || bodyLightPixels > BODY_LIGHT_PIXELS)) {
+          const oldest = bodyLights.keys().next().value;
+          dropBodyLight(oldest, bodyLights.get(oldest));
+        }
+        return kept;
       }
-      bodyLights.delete(key); releaseBodyLight(hit);
     }
     let canvas;
     try {
       const w = frame.width | 0, h = frame.height | 0;
       if (!w || !h || w * h > 262144) return frame;
-      canvas = document.createElement('canvas'); canvas.width = w; canvas.height = h;
+      canvas = lightPool.pop();
+      if (canvas) bodyLightRecycled++; else canvas = watchLight(document.createElement('canvas'));
+      canvas.width = w; canvas.height = h;   // also clears a recycled bitmap and resets its state
       const g = canvas.getContext('2d');
       if (!g || (g.isContextLost && g.isContextLost())) { releaseBodyLight(canvas); return frame; }
       g.drawImage(frame, 0, 0);
@@ -269,10 +316,12 @@ const SPRITES = (() => {
         g.globalAlpha = 0.42 * light.strength; g.drawImage(bodyLightScratch, 0, 0);
       }
       g.globalAlpha = 1; g.globalCompositeOperation = 'source-over';
-      bodyLights.set(key, canvas); bodyLightBuilds++;
-      while (bodyLights.size > BODY_LIGHT_LIMIT) {
-        const oldest = bodyLights.keys().next().value;
-        releaseBodyLight(bodyLights.get(oldest)); bodyLights.delete(oldest);
+      probation.set(key, { c: canvas, at: +nowMs || 0 }); bodyLightBuilds++;
+      // the ring's oldest pair was drawn BODY_LIGHT_PROBATION builds ago — long after any body used it this frame
+      while (probation.size > BODY_LIGHT_PROBATION) {
+        const oldest = probation.keys().next().value, c = probation.get(oldest).c;
+        probation.delete(oldest);
+        if (lightPool.length < BODY_LIGHT_POOL) lightPool.push(c); else releaseBodyLight(c);
       }
       return canvas;
     } catch (e) {
@@ -281,7 +330,8 @@ const SPRITES = (() => {
     }
   }
   function bodyAppearanceStats() {
-    return { cachedFrames: bodyLights.size, limit: BODY_LIGHT_LIMIT, builds: bodyLightBuilds };
+    return { cachedFrames: bodyLights.size + probation.size, kept: bodyLights.size, probation: probation.size, limit: BODY_LIGHT_LIMIT,
+      builds: bodyLightBuilds, recycled: bodyLightRecycled, pixels: bodyLightPixels, pixelLimit: BODY_LIGHT_PIXELS };
   }
 
   /* ---------- deck contact and directional body shadow ----------
@@ -372,10 +422,19 @@ const SPRITES = (() => {
   const TURN_STEP_W = 1.2;       // rad/s a standing body must exceed before its feet shuffle
   const TURN_STEP_FRAMES = 4 / Math.PI;   // walk frames per radian swept ≈ 2 frames per 90° pivot
   const DIR8_HYST = 0.10;        // rad a sector holds past its boundary (sectors are π/8 half-width)
+  const POSE_FADE_MS = 110;      // outgoing pose dissolves under the incoming one (drawBody)
+  const WALK_FACE_TRUST = 0.9;   // rad: walking art follows the eased facing unless displacement disagrees by more
   const ang = a => Math.atan2(Math.sin(a), Math.cos(a));
   function renderDir8(b, dir, glancing, nowMs) {
     // while walking (and not glancing) follow the true continuous heading; otherwise the game dir
-    const travel = b._resolvedTravelHeading ?? b.faceA;
+    // Arcing bodies travel ALONG their eased facing, so faceA is the smooth truth; raw displacement carries
+    // every separation nudge and flipped the 8-way pose back and forth within a frame or two. Displacement
+    // still wins when the two genuinely disagree (a shove, a chord step) so art never walks backwards.
+    // A displacement that matches the step the gait itself chose (b._travelHeading) is not evidence against
+    // the facing: that is a slow chord step while the body is still turning (the first steps of a U-turn).
+    const moved = b._resolvedTravelHeading, faced = b.faceA, own = b._travelHeading;
+    const shoved = moved != null && (own == null || Math.abs(ang(moved - own)) > 0.5);
+    const travel = moved == null ? faced : faced == null || shoved && Math.abs(ang(moved - faced)) > WALK_FACE_TRUST ? moved : faced;
     const want = (!glancing && b.state === 'walk' && travel != null) ? ang(travel) : DIR8_A[dir];
     if (want == null) return dir;
     const dt = Math.max(0, Math.min(100, nowMs - (b._rAt || 0)));   // clamp: first frame / tab-restore must not spin
@@ -397,7 +456,9 @@ const SPRITES = (() => {
       b._turnAng = (b._turnAng || 0) + swept;
     }
     const cur = b._rD8;
-    if (b.state !== 'walk' && cur && DIR8_A[cur] != null && Math.abs(ang(b._rA - DIR8_A[cur])) < Math.PI / 8 + DIR8_HYST) return cur;
+    // Walking holds its sector past the boundary too: an arcing body sweeps through every sector once,
+    // and separation nudges near a 22.5° edge used to flip the pose back and forth frame to frame.
+    if (cur && DIR8_A[cur] != null && Math.abs(ang(b._rA - DIR8_A[cur])) < Math.PI / 8 + DIR8_HYST) return cur;
     let best = dir, bd = Infinity;
     for (const d in DIR8_A) {
       const t = Math.abs(ang(b._rA - DIR8_A[d]));
@@ -416,10 +477,40 @@ const SPRITES = (() => {
     return pick(set, names, dir);
   }
 
+  /* one walk in-between: drawing a crossfaded into drawing c by t, composed in PREMULTIPLIED space
+     ('lighter' adds a·(1-t) + c·t) so pixels both drawings cover stay fully opaque mid-blend. Two
+     plain alpha draws over the floor would let the floor show through the body at t = 0.5. One
+     shared scratch canvas: drawBody copies it out synchronously before the next body is drawn. */
+  let tweenCanvas = null;
+  function tweenFrame(a, c, t) {
+    const w = Math.max(a.width, c.width) | 0, h = Math.max(a.height, c.height) | 0;
+    if (!tweenCanvas) tweenCanvas = document.createElement('canvas');
+    if (tweenCanvas.width !== w || tweenCanvas.height !== h) { tweenCanvas.width = w; tweenCanvas.height = h; }
+    const g = tweenCanvas.getContext('2d');
+    if (!g || (g.isContextLost && g.isContextLost())) return t < 0.5 ? a : c;
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.globalCompositeOperation = 'source-over'; g.globalAlpha = 1;
+    g.clearRect(0, 0, w, h);
+    g.globalAlpha = 1 - t; g.drawImage(a, 0, 0);
+    g.globalCompositeOperation = 'lighter'; g.globalAlpha = t; g.drawImage(c, 0, 0);
+    g.globalCompositeOperation = 'source-over'; g.globalAlpha = 1;
+    return tweenCanvas;
+  }
+
+  /* STRAINED DETAIL (2026-10-10, "1 frame per hour — can't navigate"). On a weak or GPU-less machine a big crew
+     costs the floor 80+ ms a draw and the frame budget parks it at its 5 fps floor; every pan and zoom then lands
+     five times a second. Per body, the cost is the extra passes, not the drawing: the walk in-between (two lit
+     frames composed through one shared scratch canvas), the pose dissolve (a second body) and the local light
+     (a re-lit copy of every frame). A/B on a 26-agent station at CPU×4: dropping them cut the floor draw ~2.5×.
+     world.js turns this on only for a draw whose pacer says the floor can't hold its budget; while it is on,
+     a body draws its plain master — same pose, same frame, same anchor — and a healthy machine never sees it. */
+  let strained = false;
+  function setStrained(on) { strained = !!on; }
+
   /* main draw: foot-anchored at (x, y) */
   function drawBody(ctx, b, nowMs, appearance) {
     const reduced = !!(appearance && appearance.reducedMotion);
-    const light = bodyLight(appearance && appearance.light);
+    const light = strained ? null : bodyLight(appearance && appearance.light);
     const set = setForBody(b);
     if (!loadedSets.has(set)) { loadSet(set); return null; }
     const glancing = b.state !== 'walk' && b.glance && b.glance.until > nowMs;   // brief look-up: overrides facing & typing
@@ -487,7 +578,7 @@ const SPRITES = (() => {
        an attempt to reuse it on demand (reaching for a prop, working an arcade cabinet, waving)
        was removed 2026-08-08 because a stretch played at those moments reads as a glitch. New
        meanings need new frames, not this one re-labelled. */
-    let fixedIdx = null;
+    let fixedIdx = null, clockNext = Infinity;   // clockNext: the next time this body's drawn frame changes on the clock alone (see _renderNextAt)
     if (!reduced && key && key.indexOf('.rot.') !== -1 && b.state !== 'walk'
         && !b.working && !b.sitting && !b.speaking && !meeting && !glancing) {
       // EXACT direction only — never fall back to another facing. Most sets ship the stretch
@@ -510,7 +601,8 @@ const SPRITES = (() => {
         if (gt < gdur) {
           key = gk; fixedIdx = Math.min(glen - 1, Math.floor(gt / (1000 / GFPS)));
           bob = 0;   // the frames carry the motion; bobbing on top reads as jitter
-        }
+          clockNext = nowMs + (1000 / GFPS) - (gt % (1000 / GFPS));   // the stretch's next frame (or its end)
+        } else clockNext = nowMs + (GESTURE_PERIOD - gt);           // the next stretch begins
       }
     }
 
@@ -523,6 +615,7 @@ const SPRITES = (() => {
       if (frames[bk]) {
         const bt = (nowMs + aph * 900) % 3300;
         if (bt < 130) key = bk;
+        clockNext = Math.min(clockNext, nowMs + (bt < 130 ? 130 - bt : 3300 - bt));   // the eyes open / next shut
       }
     }
     if (!key) return null;
@@ -559,7 +652,28 @@ const SPRITES = (() => {
         ? Math.floor(b.odo / stride + aph)
         : Math.floor(nowMs / (1000 / fps) + aph);
     b._renderFrame = fr.length > 1 ? ((idx % fr.length) + fr.length) % fr.length : 0;
+    // STILL PACER readout (world.js, 2026-10-21): when this body's drawn frame next changes on the CLOCK alone — the next frame
+    // of a clock-driven track (sit, type, talk, a meeting), a blink edge, a stretch — so a still floor draws that vsync instead
+    // of up to 33 ms later. Walk and pivot frames follow distance and angle, and read as motion there already. Never drawn from.
+    if (fixedIdx == null && !turnStep && fr.length > 1 && !(key.indexOf('.walk.') !== -1 && b.odo != null && stride > 0)) {
+      const q = nowMs / (1000 / fps) + aph;
+      clockNext = Math.min(clockNext, nowMs + (Math.floor(q) + 1 - q) * (1000 / fps));
+    }
+    b._renderNextAt = clockNext;
     const f = fr.length > 1 ? fr[((idx % fr.length) + fr.length) % fr.length] : fr[0];
+    // WALK IN-BETWEENS (2026-09-22, Andrew: "smooth out the walking frames"). An eight-drawing cycle
+    // cut from one drawing to the next 14-26 times a second, and every cut read as a visible step.
+    // The phase driving it is continuous (distance or swept angle), so the pose at phase k+frac is
+    // drawn as drawing k crossfaded into drawing k+1, eased so each authored drawing still holds
+    // crisp around its own phase. Only neighbouring drawings of ONE cycle blend, the body's position
+    // is untouched (nothing floats), and reduced motion keeps the hard cuts.
+    const phase = fixedIdx != null || reduced || fr.length < 2 || key.indexOf('.walk.') === -1 ? null
+      : turnStep ? (b._turnAng || 0) * TURN_STEP_FRAMES * turnFrameScale + aph
+      : (b.odo != null && stride > 0) ? b.odo / stride + aph : null;
+    const frac = phase == null ? 0 : phase - Math.floor(phase);
+    const tween = frac * frac * (3 - 2 * frac);
+    const fNext = !strained && tween > 0.02 ? fr[(b._renderFrame + 1) % fr.length] : null;
+    b._renderWalkTween = fNext ? +tween.toFixed(3) : null;
     // footprint = native master × per-set scale → identical on-floor size as before, but f is now the
     // full-resolution master. Draw it DOWN to that size with smoothing ON so the detail survives (and
     // stays sharp if the camera zooms in, since it resamples straight from the 92px master each frame).
@@ -593,7 +707,9 @@ const SPRITES = (() => {
     // Walking masters have slightly different packing below their boots. A set-wide idle
     // pad made those differences into floor penetration and floating during the cycle.
     const walking = key.includes('.walk.') && !turnStep;
-    const pad = (walking ? getFramePad(f) : seatLift ? getTrackPad(key) : getFootPad(set)) * sc;
+    // an in-between's boots sit between its two drawings' boots, so its foot line does too
+    const framePad = fNext ? getFramePad(f) + (getFramePad(fNext) - getFramePad(f)) * tween : getFramePad(f);
+    const pad = (walking ? framePad : seatLift ? getTrackPad(key) : getFootPad(set)) * sc;
     // Quiet standing breath changes the torso's height by less than a quarter world unit while
     // its measured foot line stays fixed. Existing walk/pivot, furniture, sleep, talk and gesture
     // tracks own their motion. Portraits keep their established framing. Omitting appearance
@@ -610,12 +726,22 @@ const SPRITES = (() => {
     const speech=planted&&!reduced?(b._speechEase||0)*accent:0;
     b._renderSpeechAccent=speech;
     const breath = planted && !reduced ? Math.sin(nowMs / 1050 + aph) * 0.12 - speech*.18 : 0;
+    // STILL PACER readouts (world.js, 2026-10-21), never drawn from. _renderLive: this body's drawn geometry moves on the clock
+    // between frames — the idle bob (a standing body that is not planted, a glance; snapped to whole device px, and the shadow
+    // under it lifts) or the speech accent while its ease can still show it (the accent rests flat between its lobes and rises
+    // again on the clock, so it is judged by the ease, its ceiling: past 0.001, ~1.2 s after the line, the skew is under 0.002
+    // device px at MAXZ). A body that moves is never drawn at the still pace. _renderDrift: the planted breath (and the accent's
+    // dying tail) — a sub-pixel swell of the smooth-sampled drawn height, under 0.004 x zoom device px between two still
+    // frames, which every still frame draws at its true phase, so it is not motion (review 10-21, option b); an overlay that
+    // rounds to whole px over its head (a bubble, a nameplate) still is, and world.js reads this flag for that.
+    b._renderLive = bob !== 0 || (planted && !reduced && (b._speechEase || 0) > 1e-3);
+    b._renderDrift = breath !== 0 || speech !== 0;
     const breathScale = 1 + breath / Math.max(12, dh - pad);
     const drawHeight = dh * breathScale;
     const y = planted ? snap(b.py + GROUND_BITE - seatLift) - (dh - pad) * breathScale
       : snap(b.py - dh + GROUND_BITE + bob + pad - seatLift);
     // Report the rendered pixel boundary, including snapping and authored margins.
-    b._renderGroundGap = b.py - (y + (dh - getFramePad(f) * sc) * breathScale);
+    b._renderGroundGap = b.py - (y + (dh - framePad * sc) * breathScale);
     b._renderCycleUnits = cycleUnitsFor(set, sc, f.height);
     // the pool's outer half-width, taken from the body's DRAWN footprint. Masters carry side
     // padding, so this lands well under dw/2 — a pool wider than the boots reads as a puddle.
@@ -655,7 +781,24 @@ const SPRITES = (() => {
         ctx.rect(x - 1, y - 1, dw + 2, Math.max(0, floor - y - 5));
         ctx.clip();
       }
-      ctx.drawImage(lightFrame(f, light), x, y, dw, drawHeight);
+      // POSE DISSOLVE (2026-09-22, Andrew: "you can see the frames when they turn"). A change of
+      // POSE — facing sector, walk↔stand, stand↔sit — used to hard-cut between two unrelated
+      // drawings. The outgoing pose now fades out beneath the incoming one for POSE_FADE_MS,
+      // riding the body's position, so a turn reads as a rotation instead of a swap. Frames
+      // WITHIN one walk cycle never dissolve (that smears the legs); reduced motion never fades.
+      const prev = b._poseLast, fadeable = !strained && !reduced && !b.noShadow && prev && prev.key !== key
+        && nowMs - prev.at < 200 && Math.hypot(b.px - prev.px, b.py - prev.py) < 6;
+      if (fadeable) b._poseFade = { f: prev.f, ox: prev.x - prev.px, oy: prev.y - prev.py, w: prev.w, h: prev.h, at: nowMs };
+      const fade = b._poseFade, ft = fade && !reduced ? (nowMs - fade.at) / POSE_FADE_MS : 1;
+      if (fade && ft < 1) {
+        const keep = ctx.globalAlpha;
+        ctx.globalAlpha = keep * (1 - ft) * (1 - ft * 0.35);
+        ctx.drawImage(lightFrame(fade.f, light, nowMs), snap(b.px + fade.ox), snap(b.py + fade.oy), fade.w, fade.h);
+        ctx.globalAlpha = keep;
+      } else if (fade) b._poseFade = null;
+      b._renderPoseFade = fade && ft < 1 ? +ft.toFixed(3) : null;
+      ctx.drawImage(fNext ? tweenFrame(lightFrame(f, light, nowMs), lightFrame(fNext, light, nowMs), tween) : lightFrame(f, light, nowMs), x, y, dw, drawHeight);
+      b._poseLast = { key, f, x, y, px: b.px, py: b.py, w: dw, h: drawHeight, at: nowMs };
       if (tuckDeskFeet) ctx.restore();
       if(speech)ctx.restore();
     }
@@ -745,6 +888,6 @@ const SPRITES = (() => {
     finally { loading = false; }
   }
 
-  return { init, drawBody, groundShadow, ensureSkin, isSkinReady, bodyScale, bodyAppearanceStats, setForBody,
+  return { init, drawBody, setStrained, groundShadow, ensureSkin, isSkinReady, bodyScale, bodyAppearanceStats, setForBody,
     get ready() { return ready; }, get loading() { return loading; } };
 })();

@@ -28,6 +28,44 @@ const Dialogue = (() => {
   let pendingSay = null;       // the in-flight say()'s idempotent finish — teardown flushes it even MID-TYPE
                                // (cancelType drops onDone by design, so without this a close during typing
                                // would strand the awaiting flow forever)
+  let offer = null;            // a MID-GAME OFFER's own ways out { notNow(), stepAside(why) } — see armOffer
+  let offerKey = null, offerUnwatch = null;   // its Esc listener + its layout watcher's teardown
+  let owner = null;            // who owns COMMS while the panel is open: 'ceremony' | 'tour' | 'offer' (see OWNER_RULES)
+
+  /* THE COMMS OWNER ARBITER (wave-1 B8, gh#158). This panel is the one surface that stands over COMMS, and many modules open it
+     (the awakening, the quick tour, the first-task hand-off, the First Pitch, the goal path, routine proposals). Who keeps COMMS
+     when the Commander acts is decided HERE, in one table, never by each caller. A panel's owner kind is fixed when it opens:
+       ceremony — the first-run awakening. It IS the conversation, and the message box answers its question (Dialogue.answer);
+       tour     — the opt-in quick tour and its kit-out beats (opened with tour:true or owner:'tour'). It yields through its own way
+                  out (yieldTour: its skip key, else the key it marks `yield`), with the reason, so the tutorial ends it quietly;
+       offer    — anything offered mid-game (opened with an `offer`): it ends above the message box and steps aside unanswered.
+     The actions: 'session' (the Commander puts another conversation on screen), 'turn' (a turn is sent from COMMS), 'ask' (an
+     approval or question reaches the Commander). An explicit Commander action preempts every owner except the awakening. The tour
+     holds a 'turn' (it covers the message box, so a send under it is its own lesson's file example) and an 'ask' (its file example
+     closes the panel before it runs). test/comms-owner-rules.test.js executes every cell.
+     One older door stays outside the table, on purpose: the INBOX click (chat.js sampleCard) calls yieldTour() with no reason, and
+     that answers a quick-tour PAGE (tour:true) only — never a kit-out beat, never an offer (an offer's "not now" is a real answer
+     the Commander gives, so the INBOX card posts under it and says where it went). */
+  const OWNER_RULES = Object.freeze({
+    ceremony: Object.freeze({ session: 'hold', turn: 'hold', ask: 'hold' }),
+    tour: Object.freeze({ session: 'yield', turn: 'hold', ask: 'hold' }),
+    offer: Object.freeze({ session: 'yield', turn: 'yield', ask: 'yield' })
+  });
+  function ownerOf(opts) {
+    if (opts && opts.offer && typeof opts.offer === 'object') return 'offer';
+    if (opts && (opts.tour || opts.owner === 'tour')) return 'tour';
+    return 'ceremony';
+  }
+  // the one entry point: a Commander action (or an ask reaching them) asks the panel's owner to hand COMMS back. Returns true
+  // when the owner stepped aside, false when it holds (or nothing is open).
+  function preempt(action) {
+    if (!open || !owner) return false;
+    const rule = OWNER_RULES[owner] && OWNER_RULES[owner][String(action || '')];
+    if (rule !== 'yield') return false;
+    if (owner === 'offer') return stepAside(action);
+    if (owner === 'tour') return yieldTour(action);
+    return false;
+  }
 
   // GENESIS never leaves a mind nameless-yet-labelled. If the Commander wakes an overseer without typing a name,
   // the flow used to fall back to the bland literal 'AGENT' (name = n || name) with no nudge — a blank ceremony.
@@ -56,6 +94,13 @@ const Dialogue = (() => {
   const sfx = n => { try { if (typeof SFX !== 'undefined' && SFX[n]) SFX[n](); } catch (_) {} };
   const reduceMotion = () => { try { return matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (_) { return false; } };
   function seg(text, cps, hold) { return { text: String(text == null ? '' : text), cps: cps || 46, holdAfter: hold || 0 }; }
+  /* THE DOOR LAW (systems.js): a line that names a station system brings it online. COMMS lines already did; the awakening and
+     the quick tour speak HERE, so on a fresh station they sent the Commander to WORK › AUTOMATE › WORKFLOWS (or CONNECT ›
+     ABILITIES) while that dock button was still hidden. */
+  function doorLaw(segs, extra) {
+    if (typeof Systems === 'undefined' || !Systems.noticeReply) return;
+    Systems.noticeReply(segs.map(x => x.text).concat(extra || []).join(' '));
+  }
   function norm(lines) {
     if (lines == null) return [];
     if (typeof lines === 'string') return [seg(lines)];
@@ -109,25 +154,110 @@ const Dialogue = (() => {
     name = resolveName(opts && opts.name);
     ensure();
     panel.classList.toggle('fnv-tour', !!(opts && opts.tour));
+    owner = ownerOf(opts);
     open = true;
     if (speakerEl) speakerEl.textContent = name;
     document.body.classList.add('fnv-mode');
     if (panel) panel.classList.add('show');
+    armOffer(opts && opts.offer);
+  }
+
+  /* AN OFFER NEVER STANDS OVER WHAT NEEDS THE COMMANDER (soak 2026-10-15). The goal-path confirm opened over COMMS mid-
+     conversation, and inset:0 covered the transcript AND the message box: a team.dispatch approval that landed under it took
+     19 approve clicks that all hit .fnv-line, a new conversation's message box sat under .fnv-opts, and Esc did nothing. The
+     awakening and the quick tour still own the whole of COMMS — they ARE the conversation (the first-task hand-off is an offer
+     since gh#158). A caller that OFFERS something mid-game passes `offer: { notNow, stepAside }`, and then:
+     · the panel ends above the message box and its queued-message pills, so typing is never covered (refit as they grow);
+     · Esc answers it the way its own "not now" key does (offer.notNow) — but only an Esc aimed at it: nothing focused, its own
+       keys, or the message box. ONE Esc, ONE owner (review 10-15): never a station field's, never one the message box used (it
+       stops a run, closes the / menu), never one on another key (the model dock's chips, Local Live, a transcript card), and
+       never one a document-level owner marked used (the model dock closing, Local Live ending) — that would be a false decline;
+     · Dialogue.stepAside(why) hands the moment back (offer.stepAside): COMMS calls it when an approval or question reaches the
+       Commander and when they send a turn, and the caller closes the panel unanswered, as a delivery landing already does. */
+  function armOffer(o) {
+    disarmOffer();
+    offer = (o && typeof o === 'object') ? o : null;
+    if (!panel) return;
+    panel.classList.toggle('fnv-offer', !!offer);
+    if (!offer) { panel.style.bottom = ''; return; }
+    if (host) host.classList.add('fnv-offer-host');   // app.css lifts the message box over the panel: its / menu and model dock open upward
+    offerKey = e => {
+      if (!open || !offer || !e || e.key !== 'Escape' || e.defaultPrevented) return;
+      const t = e.target;
+      if (fromTextField(e) && !(t && t.id === 'chat-input')) return;   // a station field's Esc is that field's
+      const aimed = !t || t.nodeType !== 1 || t === document.body || t === document.documentElement || t.id === 'chat-input' || (panel && panel.contains(t));
+      if (!aimed) return;   // any other key's Esc (in COMMS or another surface) is that key's
+      e.preventDefault();
+      if (typeof offer.notNow === 'function') offer.notNow();
+    };
+    window.addEventListener('keydown', offerKey);
+    fitOffer();
+    if (!host) return;   // the free-floating fallback is already a small corner panel
+    const refit = () => fitOffer();
+    // the transcript is the stretchy row: it shrinks whenever anything under it grows (pills, the @ menu, a long draft)
+    const watched = [host].concat(OFFER_WATCH.map(id => document.getElementById(id))).filter(Boolean);
+    const ro = typeof ResizeObserver === 'function' ? new ResizeObserver(refit) : null;
+    if (ro) watched.forEach(n => ro.observe(n));
+    window.addEventListener('resize', refit);
+    offerUnwatch = () => { if (ro) ro.disconnect(); window.removeEventListener('resize', refit); };
+  }
+  function disarmOffer() {
+    if (offerKey) { window.removeEventListener('keydown', offerKey); offerKey = null; }
+    if (offerUnwatch) { offerUnwatch(); offerUnwatch = null; }
+    if (host) host.classList.remove('fnv-offer-host');
+    offer = null;
+  }
+  // the composer stack under the transcript: the queued-message pills, the @ menu (group chat puts it above the box), the box
+  const COMPOSER_STACK = ['chat-queued', 'gc-mentions', 'chat-inputrow'];
+  const OFFER_WATCH = ['chat-log', 'group-chat'].concat(COMPOSER_STACK);
+  // the top of the composer stack in the host's own px. Rects are VISUAL px under the TEXT SIZE body zoom while the panel's
+  // style px are layout px: scale once (the uiZoom law). null = no composer laid out (COMMS hidden: the panel keeps inset 0).
+  function composerTop() {
+    if (!host || !host.getBoundingClientRect) return null;
+    const hr = host.getBoundingClientRect();
+    const k = host.offsetHeight ? (hr.height / host.offsetHeight) || 1 : 1;
+    let top = null;
+    for (const id of COMPOSER_STACK) {
+      const n = document.getElementById(id);
+      if (!n || !host.contains(n) || !n.getBoundingClientRect) continue;
+      const r = n.getBoundingClientRect();
+      if (!(r.height > 0)) continue;   // an empty pill strip has no box
+      const y = (r.top - hr.top) / k - (host.clientTop || 0);
+      if (top == null || y < top) top = y;
+    }
+    return top;
+  }
+  function fitOffer() {
+    if (!panel || !offer || !host) return;
+    const top = composerTop();
+    panel.style.bottom = (top != null && top > 0) ? Math.max(0, Math.round(host.clientHeight - top)) + 'px' : '';
+  }
+  // hand the moment back to an open offer's caller (an approval / question landed, the Commander sent a turn). Returns whether
+  // an offer was there to step aside; a panel with no offer (the awakening, the tour) is never yanked here — the arbiter
+  // (preempt, OWNER_RULES above) is the one place that decides whether a tour yields.
+  function stepAside(why) {
+    if (!open || !offer || typeof offer.stepAside !== 'function') return false;
+    offer.stepAside(String(why || ''));
+    return true;
   }
   function flushSay() { if (pendingSay) { const f = pendingSay; pendingSay = null; try { f(); } catch (_) {} } }
 
   function closePanel() {
+    const wasOpen = open;
+    disarmOffer();
     cancelType(); clearKeys(); clearOpts();
     clearGate(true);      // a torn-down panel FLUSHES a waiting narration beat — an awaiting caller must never hang
     flushSay();           // …including one still MID-TYPE (cancelType dropped its onDone, so the gate never armed)
     pendingPick = null;   // a torn-down panel must never leave a stale question armed for Dialogue.answer
-    open = false;
+    open = false; owner = null;
     if (inkTimer) { clearTimeout(inkTimer); inkTimer = null; }
     document.body.classList.remove('fnv-mode');
     if (host) host.classList.remove('fnv-host');
     if (panel) panel.remove();
     panel = speakerEl = lineEl = optsEl = moreEl = inkEl = stageEl = host = null;
     stageTitle = stageDetail = '';
+    // COMMS is uncovered again: a hint that points at COMMS (navdock's coach) waits for this (org P31 review fix).
+    if (wasOpen && typeof document !== 'undefined' && typeof CustomEvent === 'function') document.dispatchEvent(new CustomEvent('starnet:dialogue-closed'));
   }
 
   /* THE INK STAMP — show one line landing in the operating file ("» filed · pain: …"). Non-blocking:
@@ -233,7 +363,8 @@ const Dialogue = (() => {
       let settled = false;
       const finish = () => { if (settled) return; settled = true; if (pendingSay === finish) pendingSay = null; resolve(); };
       pendingSay = finish;   // teardown (closePanel) or a superseding beat flushes this even mid-type
-      typeInto(norm(lines), () => {
+      const segs = norm(lines); doorLaw(segs);
+      typeInto(segs, () => {
         if (auto) { setTimeout(finish, 260); return; }
         armGate(finish);
       });
@@ -250,7 +381,8 @@ const Dialogue = (() => {
       panel.classList.toggle('fnv-text-first', !!(cfg.allowCustom && cfg.customFirst));
       let settled = false;
       const finishPick = res => { if (settled) return; settled = true; pendingPick = null; clearKeys(); sfx('click'); resolve(res); };
-      typeInto(norm(cfg.lines), () => renderOptions(cfg, finishPick));
+      const segs = norm(cfg.lines); doorLaw(segs, (cfg.options || []).map(o => String((o && o.label) || '')));
+      typeInto(segs, () => renderOptions(cfg, finishPick));
     });
   }
 
@@ -319,7 +451,7 @@ const Dialogue = (() => {
       // the flow into the ✎ box mid-sentence (the awakening answer-swallow bug, 2026-07-20).
       const t = e.target;
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
-      if (e.key === 'Escape' && cfg.dismissable) { e.preventDefault(); finishPick({ value: '', skip: true, dismissed: true }); return; }
+      if (e.key === 'Escape' && cfg.dismissable && !e.defaultPrevented) { e.preventDefault(); finishPick({ value: '', skip: true, dismissed: true }); return; }   // an Esc another owner used (the model dock, Local Live) is not a dismiss
       if (e.key === 'Enter' && cfg.allowCustom) { e.preventDefault(); openCustom(cfg, finishPick); return; }
       const n = parseInt(e.key, 10);
       if (!isNaN(n) && n >= 1 && n <= rows.length) { e.preventDefault(); rows[n - 1].click(); }
@@ -401,7 +533,27 @@ const Dialogue = (() => {
   // codename() is also exported so the WAKE funnel (app.js) can persist a real minted name instead of the bland
   // 'AGENT' when the Commander leaves the name blank — keeping the world nameplate / dossier consistent with the
   // speaker label. isUnnamed() lets a caller cheaply detect the blank/placeholder case.
-  return { open: openPanel, close: closePanel, say, node, answer, setName, setStage, ink, isOpen: () => open, codename, isUnnamed };
+  /* THE TOUR YIELDS (2026-09-27 conveyor audit R3). The quick tour's panel covers the COMMS column, and it stays up until one of
+     its options is picked — so a card the Commander explicitly asked for elsewhere (clicking the INBOX on the floor posts the
+     ONE-REAL-JOB card into COMMS) landed hidden under it, and the click read as dead. yieldTour() answers the tour's own way
+     out — its skip option, or the option it marks `yield` (the step that leaves the tour for the first task) — the same pick
+     a click on that button makes, so no new state exists. Returns true when the tour stepped aside.
+     `why` (the arbiter's action, e.g. 'session') rides the pick as `preempted`: the Commander went somewhere else, so the tutorial
+     ends the tour quietly instead of re-offering the first task over the conversation they chose. */
+  function yieldTour(why) {
+    if (!open || !panel || owner !== 'tour' || !pendingPick || !pendingPick.cfg) return false;
+    // no reason = the INBOX door: its old scope, a quick-tour page only. The kit-out beats are tour-owned for the arbiter (a
+    // session pick ends them quietly), but an INBOX click never picks their skip key for the Commander (review 10-27).
+    if (!why && !panel.classList.contains('fnv-tour')) return false;
+    const opts = Array.isArray(pendingPick.cfg.options) ? pendingPick.cfg.options : [];
+    const out = opts.find(o => o && o.skip) || opts.find(o => o && o.yield);
+    if (!out) return false;
+    const res = { value: out.value != null ? out.value : out.label, label: out.label, skip: !!out.skip };
+    if (why) res.preempted = String(why);
+    pendingPick.finishPick(res);
+    return true;
+  }
+  return { open: openPanel, close: closePanel, say, node, answer, setName, setStage, ink, yieldTour, stepAside, preempt, owner: () => (open ? owner : null), OWNER_RULES, isOpen: () => open, codename, isUnnamed };
 })();
 
 if (typeof module !== 'undefined' && module.exports) module.exports = { Dialogue };

@@ -2,16 +2,64 @@ import { createHash } from 'node:crypto';
 
 export const RECEIPT_SCHEMA = 'starnet.update-canary-receipt.v1';
 
-// Legacy ordinary conversations gain these exact neutral defaults during hydration.
-// Keep non-default values and every other field, so lost relationships/content still fail.
+// Legacy ordinary conversations gain these exact neutral defaults during hydration (frontend/app/workstreams.js make()):
+// parentStreamId/projectHome since 0.12.4, and projectRootAt/worker/lastRunReason/pendingJoin since 0.13.5 (a 0.13.3 save
+// has none of the four). Only the exact neutral value is dropped; keep non-default values and every other field, so
+// lost relationships/content still fail.
+const NEUTRAL_WORKSTREAM_DEFAULTS = Object.freeze([
+  ['parentStreamId', null], ['projectHome', false],
+  ['projectRootAt', null], ['worker', false], ['lastRunReason', ''], ['pendingJoin', null]
+]);
 export function normalizeLegacyWorkstreamDefaults(streams) {
   if (!Array.isArray(streams)) return streams;
   return streams.map(stream => {
     const result = structuredClone(stream);
-    if (result.parentStreamId === null) delete result.parentStreamId;
-    if (result.projectHome === false) delete result.projectHome;
+    for (const [field, neutral] of NEUTRAL_WORKSTREAM_DEFAULTS) if (result[field] === neutral) delete result[field];
     return result;
   });
+}
+
+// Roster hydration since 0.12.5 (security audit 2026-09-23, 97a7b612e): a saved agent colour lands in style
+// attributes, so an agent whose save has no valid hex colour is given a crew palette suit instead of carrying
+// undefined. Must equal frontend/app/app.js SUITS (test/update-continuity.test.js pins the two together).
+export const CREW_SUITS = Object.freeze(['#6fb3bf', '#7bc88a', '#d99a5a', '#a888c0', '#cf7d96', '#ffd34a']);
+const HEX_COLOR = /^#[0-9a-f]{3,8}$/i;
+
+// A copy of the `before` projection in which an agent whose colour was missing or non-hex takes the palette suit
+// the upgraded app assigned it (same save, same agent id). A valid colour is never touched, so a real colour
+// change, or a missing colour replaced by anything outside the palette, still fails the comparison.
+export function adoptAssignedSuitColors(before, after) {
+  const out = structuredClone(before);
+  for (const key of ['local', 'durable']) {
+    const prior = out && out[key], next = after && after[key];
+    if (!prior || !next || !Array.isArray(prior.agents) || !Array.isArray(next.agents)) continue;
+    for (const agent of prior.agents) {
+      if (!agent || HEX_COLOR.test(String(agent.color || ''))) continue;
+      const match = next.agents.find(candidate => candidate && candidate.id === agent.id);
+      if (match && CREW_SUITS.includes(String(match.color || '').toLowerCase())) agent.color = match.color;
+    }
+    // the save's top-level lead record gets the same hydration (0.13: the lead with no valid colour is given the
+    // lead's gold, which is the palette's last suit) — the same rule, the same palette, nothing else is adopted
+    const lead = prior.agent, nextLead = next.agent;
+    if (lead && nextLead && lead.id === nextLead.id && !HEX_COLOR.test(String(lead.color || ''))
+      && CREW_SUITS.includes(String(nextLead.color || '').toLowerCase())) lead.color = nextLead.color;
+  }
+  return out;
+}
+
+// The station save's schema 1 → 2 step (0.13, frontend/app/worldmodel.js STATION_VERSION): the version number moves
+// to 2 and a save with no workflow links gains an EMPTY links list. A copy of `before` that takes exactly that step;
+// a station that lost or gained props, or gained real links, still fails the comparison.
+export function adoptStationSchemaV2(before, after) {
+  const out = structuredClone(before);
+  for (const key of ['local', 'durable']) {
+    const prior = out && out[key] && out[key].station, next = after && after[key] && after[key].station;
+    if (!prior || !next || typeof prior !== 'object' || typeof next !== 'object') continue;
+    if (prior.version !== 1 || next.version !== 2) continue;
+    prior.version = 2;
+    if (prior.links === undefined && Array.isArray(next.links) && next.links.length === 0) prior.links = [];
+  }
+  return out;
 }
 
 export function stableJson(value) {

@@ -39,6 +39,7 @@ const Marketplace = (() => {
   // R3 launch/routine state: the live cron jobs (fetched once when the recipes dossier renders) so a recipe can
   // show a "● live — every morning" indicator, and whether the launch pane is in RUN-NOW or MAKE-ROUTINE mode.
   let cronJobs = null, cronArmed = false, launchMode = 'run', launchCadence = null;
+  let launchRunAs = null;   // MAKE ROUTINE's RUN AS pick (an agent id); null = the host's ctx.agentId
   let launchPreviewOpen = false;                  // "WHAT GETS SENT" — open by default: seeing the real directive before you commit IS the point
   let tab = 'agents';                            // 'agents' | 'recipes'
   let glassOpen = false;
@@ -81,8 +82,8 @@ const Marketplace = (() => {
   ];
   function cadenceOpt(id) { return CADENCE_OPTS.filter(c => c.id === id)[0] || null; }
   function cadenceLabel(id) { const c = cadenceOpt(id); return c ? c.label : 'one-shot'; }
-  // the gear objectTypes a recipe editor offers (same pickable set as the class builder — dish/cabinet/notebook/
-  // workbench/studio; computer/connector are per-agent binds, not advisory recipe gear). Labels from the live source.
+  // the gear objectTypes a recipe editor offers (dish/cabinet/notebook/workbench/studio; computer/connector are
+  // per-agent binds, not advisory recipe gear). Labels from the live source.
   const RECIPE_GEAR_PICK = ['dish', 'cabinet', 'notebook', 'workbench', 'studio'];
   // the category buckets the EDITOR offers as authorable browse buckets (the discovery-rail personas).
   const RECIPE_CATEGORIES = ['developer', 'research', 'creator', 'ops', 'business', 'money', 'data', 'general'];
@@ -225,6 +226,43 @@ const Marketplace = (() => {
     return skillCatalogPending;
   }
 
+  /* ---------- the door's INTENT (wave-1 comms-owner-arbiter, gh#117) ----------
+     The bay is opened by several doors, and each used to pick its own mode from a bag of flags (mode / tab / summon). What the
+     window then offered depended on which flags that door remembered: a classes view in deploy mode (re-spec only) still wore
+     the RECRUITMENT BAY nameplate, so a Commander who opened the Recruitment Bay to grow the crew could read it as "this bay can
+     only re-spec" (gh#117, v0.13.3: "the only available option is DEPLOY TO SKYNET"). Now every door names its intent and ONE
+     table decides the mode, the library tab and the nameplate:
+       recruit                          CREW › RECRUIT and every recruit deep link: RECRUIT <NAME> leads, RE-SPEC … INSTEAD is second
+       recipes / recipe-launch /
+       recipe-mint / first-value        WORK › MY WORK's recipe library (and its deep links)
+       respec                           re-spec the agent on the line (no dock door opens this alone today)
+     A context with no intent (an older caller) is read the old way, then held to the same table. The nameplate follows the
+     view: RECRUITMENT BAY only where the bay can recruit, MY WORK on the recipe library, CLASSES on a re-spec-only class list. */
+  const BAY_INTENTS = Object.freeze({
+    recruit: Object.freeze({ mode: 'pick', tab: 'agents', summon: true }),
+    respec: Object.freeze({ mode: 'deploy', tab: 'agents', summon: false }),
+    recipes: Object.freeze({ mode: 'deploy', tab: 'recipes', summon: false }),
+    'recipe-launch': Object.freeze({ mode: 'deploy', tab: 'recipes', summon: false }),
+    'recipe-mint': Object.freeze({ mode: 'deploy', tab: 'recipes', summon: false }),
+    'first-value': Object.freeze({ mode: 'deploy', tab: 'recipes', summon: false })
+  });
+  // the intent a context asks for: its own, else inferred from the legacy flags (pick → recruit; a recipe seed/tab → recipes)
+  function intentOf(c) {
+    c = c || {};
+    if (typeof c.intent === 'string' && BAY_INTENTS[c.intent]) return c.intent;
+    if (c.mode === 'pick') return 'recruit';
+    if (c.launchSeed) return 'recipe-launch';
+    if (c.recipeMint) return 'recipe-mint';
+    if (c.firstValue) return 'first-value';
+    if (c.tab === 'recipes') return 'recipes';
+    return 'respec';
+  }
+  // the nameplate for a view: what the window can actually do there (LABEL LAW: a dock button's name where one opened it)
+  function titleFor(c, onTab, recipesLoaded) {
+    if (onTab === 'recipes' && recipesLoaded && !(c && c.mode === 'pick')) return 'MY WORK';
+    return (c && c.mode === 'pick' && c.summon) ? 'RECRUITMENT BAY' : 'CLASSES';
+  }
+
   /* ---------- open / close ---------- */
   function open(context) {
     if (!has()) return;
@@ -232,8 +270,14 @@ const Marketplace = (() => {
     close();
     opener = trigger;
     ctx = context || {};
+    // the door's intent decides the mode, the library and whether this bay recruits (one table — see BAY_INTENTS)
+    const named = typeof ctx.intent === 'string' && !!BAY_INTENTS[ctx.intent];
+    const intent = intentOf(ctx), row = BAY_INTENTS[intent];
+    ctx.intent = intent; ctx.mode = row.mode; ctx.tab = row.tab;
+    if (!row.summon) delete ctx.summon;
+    else if (named) ctx.summon = true;   // an older pick-mode caller keeps its own summon flag
     view = ctx.firstValue ? 'firstvalue' : 'grid'; editingId = null; editingRecipeId = null; launchId = null; pendingMintKey = null; pendingMintTemplate = null; pendingScoutRecipeId = null; scoutSeedDraft = null;
-    editForkedFrom = null; editSourceRunId = null;
+    editForkedFrom = null; editSourceRunId = null; launchRunAs = null;
     importStep = 'detect'; importFound = null; importDetecting = false; importScanning = false;
     importScan = null; importOrigin = null; importName = ''; importErr = '';
     laneFilter = 'all'; catFilter = 'all'; query = '';
@@ -414,26 +458,32 @@ const Marketplace = (() => {
      recipes tab reads RECIPES — exactly the ❒ RECIPES label. plainTitle() feeds the close button's
      aria-label; title() adds the ▮ nameplate glyph. */
   function plainTitle() {
-    return (!(ctx && ctx.mode === 'pick') && tab === 'recipes' && hasRecipes()) ? 'RECIPES' : 'RECRUITMENT BAY';
+    // ONE MENU (2026-10-01): the recipe library is a tab of WORK › MY WORK, so the window wears its dock button's name; the
+    // class list wears RECRUITMENT BAY only where it can recruit (gh#117 — titleFor, the door intents above)
+    return titleFor(ctx, tab, hasRecipes());
   }
   function title() { return '▮ ' + plainTitle(); }
 
   function subtitle() {
+    // ORG P22 — ONE LANGUAGE: a new agent is RECRUITED from a CLASS; rewriting an existing agent is a RE-SPEC.
     if (ctx && ctx.mode === 'pick') return ctx.summon
-      ? ('summon a new agent onto your crew — it gets its own chat thread'
+      ? ('recruit a new agent onto your crew — it gets its own session'
          + (ctx.concurrentCap > 0 ? ' · up to ' + ctx.concurrentCap + ' run at once' : ''))
-      : 'choose a specialist to wake your agent as';
+      : 'choose a class for your agent';
     const who = (ctx && ctx.agentName) || 'your agent';
     return tab === 'recipes'
       ? 'launch a ready-made recipe — ' + who + ' picks it up in a new task conversation'
-      : 'deploy a specialty onto ' + who + ' — or save this one as a template';
+      : 're-spec ' + who + ' as a class — or save this one as a template';
   }
 
   /* ---------- the bar: tabs + lane filter ---------- */
   function renderBar() {
     const bar = root && root.querySelector('#mkt-bar'); if (!bar) return;
     let html = '';
-    if (!(ctx && ctx.mode === 'pick') && hasRecipes()) {
+    // ONE MENU (front doors, 2026-10-01): RECIPES lives in WORK › MY WORK and CLASSES is CREW › RECRUIT, so the bay no
+    // longer carries a CLASSES / RECIPES tab bar — it opens on the library its door asked for (ctx.tab). The markup is
+    // kept behind ctx.bayTabs for any caller that still wants both.
+    if (ctx && ctx.bayTabs && !(ctx.mode === 'pick') && hasRecipes()) {
       const t = (id, label) => '<button class="mkt-tab' + (tab === id ? ' on' : '') + '" role="tab" aria-selected="' +
         (tab === id ? 'true' : 'false') + '" data-tab="' + id + '">' + label + '</button>';
       // NAV CONDENSE (2026-08-04): the tab is labelled CLASSES, not AGENTS — 'AGENTS' already names the
@@ -564,6 +614,7 @@ const Marketplace = (() => {
       else if (view === 'build') wireBuildForm(stage);
       else if (view === 'harnessImport') wireHarnessImport(stage);
       else wireLaunchForm(stage);
+      wireTaglineCount(stage);
       return;
     }
     if (tab === 'recipes' && hasRecipes()) syncRecipeFocus();
@@ -641,7 +692,7 @@ const Marketplace = (() => {
     // deploy mode keeps the SAVE-THIS-AGENT toolbar; summon drops the stale "pre-fills the wake screen" hint —
     // the subtitle already states the summon promise, and the dossier's CONFIGURE panel + shelves carry the rest.
     const toolbar = deploy
-      ? '<div class="mkt-toolbar"><button class="bb sm mkt-saveas">＋ SAVE THIS AGENT AS A SPECIALTY</button></div>'
+      ? '<div class="mkt-toolbar"><button class="bb sm mkt-saveas">＋ SAVE THIS AGENT AS A CLASS</button></div>'
       : '';
     let html = toolbar;
 
@@ -658,10 +709,10 @@ const Marketplace = (() => {
 
     // MINE view: the Commander's own specialists only (matches the RECIPES-tab MINE chip).
     if (laneFilter === 'mine') {
-      html += sectH('▮ YOUR SPECIALISTS');
+      html += sectH('▮ YOUR CLASSES');
       html += customs.length
         ? '<div class="mkt-grid mkt-rows">' + customs.map(cardHTML).join('') + buildTile + '</div>'
-        : '<p class="mkt-hint mkt-yours-hint">' + (query ? 'none of your specialists match your search — '
+        : '<p class="mkt-hint mkt-yours-hint">' + (query ? 'none of your classes match your search — '
             : 'none yet — ') + 'build one from scratch below.</p><div class="mkt-grid mkt-rows">' + buildTile + '</div>';
       return html;
     }
@@ -671,11 +722,11 @@ const Marketplace = (() => {
     // SPECIALISTS + the build tile sit at the bottom. (audit item 7 reconciled with item 3)
     const pinCustoms = hasAnyCustoms && !query;
     if (pinCustoms) {
-      html += sectH('▮ YOUR SPECIALISTS');
+      html += sectH('▮ YOUR CLASSES');
       html += '<div class="mkt-grid mkt-rows">' + customs.map(cardHTML).join('') + buildTile + '</div>';
     }
 
-    html += sectH('▮ CLASS ROSTER');
+    html += sectH('CLASS ROSTER');
     // truthful telemetry: an EMPTY catalog means the shared catalog script failed to load (a wiring
     // fault), not "no matches" — say so loudly instead of rendering a quietly blank roster.
     if (!allBuiltins.length) html += '<div class="mkt-empty">⚠ the class catalog failed to load (shared/specialties.js unreachable) — the built-in roster is unavailable. Restart the app; if it persists, this build is mis-wired.</div>';
@@ -685,10 +736,10 @@ const Marketplace = (() => {
     html += archiveSectionHTML(filtering);
 
     if (!pinCustoms) {
-      html += sectH('▮ YOUR SPECIALISTS');
+      html += sectH('▮ YOUR CLASSES');
       if (!customs.length) html += '<p class="mkt-hint mkt-yours-hint">' +
-        (query ? 'none of your specialists match your search — ' : 'none yet — ') +
-        'build one from scratch below' + (deploy && !query ? ', or save the live agent as a specialty above' : '') + '.</p>';
+        (query ? 'none of your classes match your search — ' : 'none yet — ') +
+        'build one from scratch below' + (deploy && !query ? ', or save the live agent as a class above' : '') + '.</p>';
       html += '<div class="mkt-grid mkt-rows">' + customs.map(cardHTML).join('') + buildTile + '</div>';
     }
     if (!filtering) html += '<details class="mkt-library-more"><summary>Suggestions for your station</summary>' +
@@ -708,13 +759,13 @@ const Marketplace = (() => {
     if (filtering) {
       // searching / lane-filtering: archetypes participate like any class — matches render expanded, no toggle.
       if (!archs.length) return '';
-      return sectH('▮ SPECIALIST ARCHIVE — deep cuts') + '<div class="mkt-grid mkt-rows">' + archs.map(cardHTML).join('') + '</div>';
+      return sectH('▮ CLASS ARCHIVE — deep cuts') + '<div class="mkt-grid mkt-rows">' + archs.map(cardHTML).join('') + '</div>';
     }
     const head = '<button type="button" class="mkt-sect-h mkt-archive-head" aria-expanded="' + (archiveOpen ? 'true' : 'false') + '">' +
-      '<span aria-hidden="true">' + (archiveOpen ? '▾' : '▸') + '</span> SPECIALIST ARCHIVE (' + all.length + ')</button>';
+      '<span aria-hidden="true">' + (archiveOpen ? '▾' : '▸') + '</span> CLASS ARCHIVE (' + all.length + ')</button>';
     if (!archiveOpen) return head;
     return head +
-      '<p class="mkt-hint">niche classes held off the main roster — fully specified, summon any time. When your real work points at one, the station drafts it onto the shelf above for you.</p>' +
+      '<p class="mkt-hint">niche classes held off the main roster — fully specified, recruit any time. When your real work points at one, the station drafts it onto the shelf above for you.</p>' +
       '<div class="mkt-grid mkt-rows">' + archs.map(cardHTML).join('') + '</div>';
   }
   /* Name and the live character preview lead. Skin choices stay visible; model controls expand
@@ -732,7 +783,7 @@ const Marketplace = (() => {
       '<section class="mkt-appearance" aria-label="Choose a skin"><div class="mkt-appearance-heading">APPEARANCE <span class="mkt-appearance-choice">' +
         esc((typeof DATA !== 'undefined' && DATA.SKINS && DATA.SKINS[pickedSummonSkin || DATA.DEFAULT_SKIN] || {}).name || 'Choose a character') +
         '</span></div>' + summonSkinBarHTML() + '</section>',
-      '<p class="mkt-detail-note">Use the station default, or choose a model for this agent.</p>' + summonModelBarHTML(s),
+      '<p class="mkt-detail-note">Keep the first choice below, or choose a model for this agent.</p>' + summonModelBarHTML(s),
       agentReferenceHTML(s)
     ];
     return '<section class="mkt-config" aria-label="configure this agent">' +
@@ -752,14 +803,28 @@ const Marketplace = (() => {
     const pin = pickedSummonModel;
     if (pin && pin.model) return 'pinned to <b>' + esc(shortModel(pin.model)) + '</b>' +
       (pin.effort ? ' at <b>' + esc(String(pin.effort).toUpperCase()) + '</b> effort' : '') + ' — overrides the class default.';
-    if (pin && pin.effort) return 'the same brain as your orchestrator, at <b>' + esc(String(pin.effort).toUpperCase()) + '</b> effort.';
-    return 'Inherits your orchestrator’s model; tuned for <b>' + esc(clearanceLabel(s && s.model).toLowerCase()) + '</b>' +
-      (s && s.reasoningEffort ? ' · ' + esc(String(s.reasoningEffort).toLowerCase()) + ' effort' : '') + '.';
+    // ORG P22: an unpinned recruit COPIES the model of the agent on the line at recruit time (app.js summonAgent:
+    // pin.model || agent.model) — it does not follow later station-default changes, so the copy never says it does.
+    // UNLESS SETTINGS › New agent defaults pins this class's tier: applyLoadout then replaces the copy with that
+    // model (resolveTierModel), so the helper names the pin instead of promising a copy that will not happen.
+    const tierPin = tierModelOf(s);
+    const tier = '<b>' + esc(clearanceLabel(s && s.model).toLowerCase()) + '</b>';
+    if (tierPin) return 'uses <b>' + esc(shortModel(tierPin)) + '</b>, your ' + tier + ' tier model from SETTINGS › New agent defaults' +
+      (pin && pin.effort ? ', at <b>' + esc(String(pin.effort).toUpperCase()) + '</b> effort' : '') + '.';
+    if (pin && pin.effort) return 'copies the model of the agent on the line now, at <b>' + esc(String(pin.effort).toUpperCase()) + '</b> effort.';
+    // `effort: auto` is what applies the class's own effort (app.js summonAgent), so the line says so in the select's word
+    return 'Copies the model of the agent on the line now; tuned for ' + tier +
+      (s && s.reasoningEffort ? '. Effort auto gives it this class’s <b>' + esc(String(s.reasoningEffort).toLowerCase()) + '</b> effort' : '') + '.';
+  }
+  // the SETTINGS tier pin summon will apply to this class (App.tierModelFor — the same reader applyLoadout uses), or null
+  function tierModelOf(s) {
+    return (s && s.model && typeof App !== 'undefined' && App && typeof App.tierModelFor === 'function') ? App.tierModelFor(s.model) : null;
   }
 
-  function summonModelSummary() {
+  function summonModelSummary(s) {
     const pin = pickedSummonModel;
-    return (pin && pin.model ? shortModel(pin.model) : 'Station default') +
+    const tierPin = tierModelOf(s);
+    return (pin && pin.model ? shortModel(pin.model) : tierPin ? shortModel(tierPin) + ' (tier model)' : 'Copies the agent on the line') +
       (pin && pin.effort ? ' · ' + pin.effort : '');
   }
   function shortModel(m) { return String(m || '').split('/').pop().replace(/[-_]+/g, ' ').trim() || String(m || ''); }
@@ -786,7 +851,7 @@ const Marketplace = (() => {
     // YOUR RECIPES leads the library whenever you HAVE any — the Commander's own work is not an appendix to a
     // 50-card catalog. With none saved, the invitation stays below the library where it reads as a next step.
     if (customs.length) html += yours('top', '');
-    const libLabel = catFilter === 'all' ? '▮ RECIPE LIBRARY' : ('▮ ' + (CAT_LABEL[catFilter] || catFilter) + ' RECIPES');
+    const libLabel = catFilter === 'all' ? 'RECIPE LIBRARY' : ((CAT_LABEL[catFilter] || catFilter) + ' RECIPES');
     html += '<div class="mkt-sect-h">' + libLabel + '</div>';
     html += builtins.length ? '<div class="mkt-grid mkt-rows">' + builtins.map(recipeCardHTML).join('') + '</div>'
       : '<div class="mkt-empty">no recipes match your ' + (query ? 'search' : 'filter') + '.</div>';
@@ -813,8 +878,8 @@ const Marketplace = (() => {
     const used = ((typeof AgentId !== 'undefined' && AgentId.normalizeName) ? AgentId.normalizeName(pickedSummonName) : String(pickedSummonName || '')).length;
     const max = (ctx && ctx.displayNameLimit) || (typeof AgentId !== 'undefined' && AgentId.NAME_MAX) || 18;
     const issue = summonNameIssue(), dup = summonNameConflict();
-    const helper = issue === 'too-long' ? 'too long — shorten this name before summoning'
-      : dup ? 'duplicate name — summon requires a second confirmation; the agent id will remain unique'
+    const helper = issue === 'too-long' ? 'too long — shorten this name before recruiting'
+      : dup ? 'duplicate name — recruiting needs a second confirmation; the agent id will remain unique'
       : 'blank uses the proposed default: ' + summonCandidateName((focusAgent && Specialties.get(focusAgent)) || null);
     return '<div class="mkt-skinbar mkt-namebar"><label class="mkt-skinlabel" for="mkt-summon-name">NAME</label>' +
       '<input class="mkt-in" id="mkt-summon-name" type="text" autocomplete="off" spellcheck="false" aria-invalid="' + (issue ? 'true' : 'false') + '" placeholder="' + esc(summonCandidateName((focusAgent && Specialties.get(focusAgent)) || null)) + '" value="' + esc(pickedSummonName) + '">' +
@@ -856,7 +921,7 @@ const Marketplace = (() => {
     if (!(ctx && ctx.mode === 'pick' && ctx.summon) || typeof ModelPicker === 'undefined') return '';
     return '<div class="mkt-skinbar mkt-modelbar"><div class="mkt-skinlabel">MODEL &amp; EFFORT</div>' +
       '<div class="mkt-modelpick" id="mkt-model-pick">' +
-        ModelPicker.shellHTML({ id: 'mkt-model', inheritLabel: 'Same as the orchestrator', ariaLabel: 'New agent model', effort: true }) +
+        ModelPicker.shellHTML({ id: 'mkt-model', inheritLabel: tierModelOf(s) ? 'Use your ' + clearanceLabel(s.model).toLowerCase() + ' tier model (' + shortModel(tierModelOf(s)) + ')' : 'Copy the model of the agent on the line', ariaLabel: 'New agent model', effort: true }) +
       '</div>' +
       '<div class="mkt-field-help" id="mkt-model-help">' + modelHelpHTML(s) + '</div></div>';
   }
@@ -1113,11 +1178,11 @@ const Marketplace = (() => {
     const deploy = !ctx || ctx.mode !== 'pick';
     const here = !!(ctx && ctx.currentSpecialtyId && ctx.currentSpecialtyId === s.id);
     const badges = (here ? ' <span class="mkt-badge mkt-here">DEPLOYED</span>' : '') + (s.custom ? ' <span class="mkt-badge">CUSTOM</span>' : '');
-    const ctaLabel = deploy ? ('⏼ DEPLOY TO ' + esc(((ctx && ctx.agentName) || 'AGENT')).toUpperCase())
-      : ('⏼ SUMMON <span class="mkt-candidate-name">' + esc(summonCandidateName(s)) + '</span>');
+    const ctaLabel = deploy ? ('⏼ RE-SPEC ' + esc(((ctx && ctx.agentName) || 'AGENT')).toUpperCase())
+      : ('⏼ RECRUIT <span class="mkt-candidate-name">' + esc(summonCandidateName(s)) + '</span>');
     const ctaSub = deploy
-      ? 're-specs ' + esc((ctx && ctx.agentName) || 'your agent') + '’s purpose &amp; standing orders'
-      : 'joins your crew with its own <span data-hint="workstream">chat thread</span>, pre-filled from this class';
+      ? 'replaces ' + esc((ctx && ctx.agentName) || 'your agent') + '’s purpose &amp; standing orders — no new agent'
+      : 'joins your crew with its own <span data-hint="workstream">session</span>, pre-filled from this class';
     const custActs = s.custom
       ? '<div class="mkt-cta-row"><button class="bb sm mkt-edit" data-id="' + esc(s.id) + '">✎ EDIT</button>' +
         '<button class="bb sm danger mkt-del" data-id="' + esc(s.id) + '">⌫ DELETE</button></div>' : '';
@@ -1140,8 +1205,8 @@ const Marketplace = (() => {
       // of a separate dock button. It rides in NORMAL FLOW, outside the sticky block: pinning it too made the
       // permanent footer four elements tall (~190px of a ~660px pane), which is what pushed CONFIGURE off screen.
       (!deploy && ctx && ctx.onDeploy && ctx.agentName && !here
-        ? '<div class="mkt-cta-second"><button class="mkt-cta-alt mkt-deploy-cur" data-id="' + esc(s.id) + '">⏼ DEPLOY TO ' + esc(ctx.agentName).toUpperCase() + ' ▸</button>' +
-          '<div class="mkt-cta-sub">re-specs ' + esc(ctx.agentName) + ' instead — no new crew member</div></div>'
+        ? '<div class="mkt-cta-second"><button class="mkt-cta-alt mkt-deploy-cur" data-id="' + esc(s.id) + '">RE-SPEC ' + esc(ctx.agentName).toUpperCase() + ' INSTEAD ▸</button>' +
+          '<div class="mkt-cta-sub">replaces ' + esc(ctx.agentName) + '’s purpose — no new agent</div></div>'
         : '') +
       '</div><div class="mkt-dos-cta">' + custActs +
         // adopt-voice sits BESIDE the DEPLOY CTA it modifies (audit item 8), not orphaned up in the toolbar.
@@ -1208,16 +1273,23 @@ const Marketplace = (() => {
     const parent = (r.source === 'fork' && r.forkedFrom) ? Recipes.get(r.forkedFrom) : null;
     const forkLine = (r.source === 'fork')
       ? '<div class="mkt-r-fork">⑃ tweaked from <b>' + esc(parent ? parent.name : r.forkedFrom) + '</b></div>' : '';
+    // when YOUR recipe was last saved — tells two similar customs apart. No stamp (saved before 10-03) = no line.
+    const savedLine = (r.custom && r.updatedAt)
+      ? '<div class="mkt-r-fork mkt-r-saved">✎ saved ' + esc(scoutRelTime(r.updatedAt)) + '</div>' : '';
     const cadHint = r.cadence
       ? '<div class="mkt-r-cadhint">◷ naturally recurring — suggests <b>' + esc(cadenceLabel(r.cadence)) + '</b></div>' : '';
     // TWEAK + EXPORT are on EVERY dossier (fork/export any recipe); EDIT/DELETE only on your own customs.
     const tweakBtn = '<button class="bb sm mkt-recipe-tweak" data-id="' + esc(r.id) + '">CUSTOMIZE A COPY</button>';
     const exportBtn = '<button class="bb sm mkt-recipe-export" data-id="' + esc(r.id) + '" title="download this recipe as a portable JSON file">DOWNLOAD RECIPE</button>';
-    const custActs = r.custom
-      ? '<div class="mkt-cta-row">' + tweakBtn +
-        '<button class="bb sm mkt-recipe-edit" data-id="' + esc(r.id) + '">✐ EDIT</button>' + exportBtn +
+    // your own recipe: ✐ EDIT + ⌫ DELETE sit in the dossier header. They used to live in the third tab of a
+    // collapsed details block, behind COPY — users couldn't find delete at all, and a copy saved under the old
+    // name looked exactly like an edit that "didn't stick" next to an unchanged twin (user feedback 10-03).
+    const ownActs = r.custom
+      ? '<div class="mkt-cta-row mkt-own-acts">' +
+        '<button class="bb sm mkt-recipe-edit" data-id="' + esc(r.id) + '" title="change this recipe in place">✐ EDIT</button>' +
         '<button class="bb sm danger mkt-recipe-del" data-id="' + esc(r.id) + '">⌫ DELETE</button></div>'
-      : '<div class="mkt-cta-row">' + tweakBtn + exportBtn + '</div>';
+      : '';
+    const custActs = '<div class="mkt-cta-row">' + tweakBtn + exportBtn + '</div>';
     const intakeRows = (r.intake || []).map(e =>
       '<div class="mkt-intake" data-dim="' + esc(e.dimension) + '"><div class="mkt-lbl">' + esc(e.question) +
         (e.reason ? ' <span class="mkt-lbl-hint">— ' + esc(e.reason) + '</span>' : '') + '</div>' +
@@ -1243,10 +1315,10 @@ const Marketplace = (() => {
     const reuse = '<p class="mkt-detail-note">Make a version of your own, or run this recipe on a schedule.</p>' +
       '<div class="mkt-reuse-actions">' + custActs +
       '<button class="bb sm mkt-launch-options" data-id="' + esc(r.id) + '">SET UP A SCHEDULE</button></div>' +
-      liveRoutineBadgeHTML(r) + forkLine;
+      liveRoutineBadgeHTML(r) + forkLine + savedLine;
     return '<div class="mkt-dos-scroll mkt-recipe-simple"><div class="mkt-dos-hero">' +
       '<div class="mkt-dos-hi"><div class="mkt-dos-name">' + esc(r.name) + '</div>' +
-      '<div class="mkt-dos-tag">' + esc(r.tagline) + '</div></div></div>' +
+      '<div class="mkt-dos-tag">' + esc(r.tagline) + '</div>' + ownActs + '</div></div>' +
       '<div class="mkt-inline-launch">' + requiredFields +
       '<details class="mkt-brief mkt-recipe-details"><summary>Options &amp; recipe details</summary>' +
       '<div class="mkt-recipe-detail-tabs" role="tablist" aria-label="Recipe details">' + tabs + '</div>' +
@@ -1610,7 +1682,11 @@ const Marketplace = (() => {
     // the shared declined read gates the INPUT (see readyShelfHTML): a declined recipe never enters the rank,
     // and the ranker's own spread/top-up keeps the row at three from the recipes that remain — the FOR YOU
     // shelf-sink law (a negative term must never EMPTY the shelf) holds because this excludes, never down-ranks.
-    const pool = Recipes.list().filter(r => !shelfDeclined(r && r.name));
+    let pool = Recipes.list().filter(r => !shelfDeclined(r && r.name));
+    // …and the floor under that law: a Commander who has ✕'d EVERY recipe used to lose the row entirely (live, sweep/
+    // onboarding 2026-10-20: 45 declines → no FOR YOU shelf at all). Show the library again, saying exactly that.
+    const exhausted = !pool.length && Recipes.list().length > 0;
+    if (exhausted) pool = Recipes.list();
     const ranked = Recipes.rankRecipesExplained
       ? Recipes.rankRecipesExplained(pool, rankOpts)
       : { items: Recipes.rankRecipes(pool, rankOpts), personalized: false };
@@ -1643,8 +1719,10 @@ const Marketplace = (() => {
         : noticedHead(scored === 1
           ? 'one pick from your real work, plus starting points'
           : scored + ' picks from your real work, plus starting points');
+    // the declined-everything floor says so instead of any personalized claim (sweep/onboarding 2026-10-20)
+    const shownHead = exhausted ? coldHead('STARTING POINTS — you passed on every recipe, so here is the library again') : head;
     items.forEach((r, i) => trackRecommendation('recipe', r, reasonFor(r), i + 1));
-    return '<div class="mkt-sect-h mkt-foryou-sect">' + head + '</div><div class="mkt-rec-rail">' +
+    return '<div class="mkt-sect-h mkt-foryou-sect">' + shownHead + '</div><div class="mkt-rec-rail">' +
       items.map(r => forYouCardHTML(r, reasonFor(r))).join('') + '</div>';
   }
 
@@ -2147,8 +2225,8 @@ const Marketplace = (() => {
       const issue = summonNameIssue(), dup = summonNameConflict();
       const help = root.querySelector('.mkt-name-help');
       if (help) {
-        help.textContent = issue === 'too-long' ? 'too long — shorten this name before summoning'
-          : dup ? 'duplicate name — summon requires a second confirmation; the agent id will remain unique'
+        help.textContent = issue === 'too-long' ? 'too long — shorten this name before recruiting'
+          : dup ? 'duplicate name — recruiting needs a second confirmation; the agent id will remain unique'
           : 'blank uses the proposed default: ' + summonCandidateName(s);
         help.classList.toggle('warn', !!(issue || dup));
       }
@@ -2197,7 +2275,7 @@ const Marketplace = (() => {
         const help = sc.querySelector('#mkt-model-help');
         if (help) help.innerHTML = modelHelpHTML((focusAgent && Specialties.get(focusAgent)) || null);
         const choice = sc.querySelector('.mkt-model-choice');
-        if (choice) choice.textContent = summonModelSummary();
+        if (choice) choice.textContent = summonModelSummary((focusAgent && Specialties.get(focusAgent)) || null);
       });
     }
   }
@@ -2257,11 +2335,11 @@ const Marketplace = (() => {
             if (input) { try { input.scrollIntoView({ block: 'center' }); } catch (_) {} input.focus(); }
             return;
           }
-          if (ctx.summon && summonNameConflict()) return armDelete(deployBtn, deployBtn.textContent, commit, 'SUMMON DUPLICATE NAME?');
+          if (ctx.summon && summonNameConflict()) return armDelete(deployBtn, deployBtn.textContent, commit, 'RECRUIT DUPLICATE NAME?');
           commit();
         });
       } else {
-        // DEPLOY TO <current> (deploy mode) — a RE-SPEC that rewrites the live agent's purpose + standing orders.
+        // RE-SPEC <current> (deploy mode) — a RE-SPEC that rewrites the live agent's purpose + standing orders.
         // That's consequential, so it arms/confirms ("RE-SPEC <NAME>?") like every other irreversible bay action.
         armCta(deployBtn, 'RE-SPEC ' + String((ctx && ctx.agentName) || 'AGENT').toUpperCase() + '?', () => {
           const s = Specialties.get(deployBtn.dataset.id); if (!s) return;
@@ -2270,19 +2348,19 @@ const Marketplace = (() => {
           sfx('close');
           if (ctx && ctx.onDeploy) ctx.onDeploy(s, { adoptVoice });
           try { if (typeof ProspectStore !== 'undefined' && ProspectStore.recommendationVerdict) { ProspectStore.recommendationVerdict('recruit', s.id, 'completed', 'completed'); ProspectStore.recommendationOutcome('recruit', s.id, { adopted: true, quality: 1, completedAt: Date.now() }); } } catch (_) {}
-          note(s.name + ' deployed to ' + ((ctx && ctx.agentName) || 'your agent') + (adoptVoice ? ' (+ voice)' : ''), 'good');
+          note(((ctx && ctx.agentName) || 'your agent') + ' re-specced as ' + s.name + (adoptVoice ? ' (+ voice)' : ''), 'good');
           close();
         });
       }
     }
-    // second verb on the merged recruit door: DEPLOY TO <current> from summon mode (no voice adoption checkbox in
+    // second verb on the merged recruit door: RE-SPEC <current> INSTEAD from summon mode (no voice adoption checkbox in
     // this pane — deploy keeps the agent's voice; the dossier can retune it). Same re-spec, same arm/confirm.
     const deployCurBtn = sc.querySelector('.mkt-deploy-cur');
     if (deployCurBtn) armCta(deployCurBtn, 'RE-SPEC ' + String((ctx && ctx.agentName) || 'AGENT').toUpperCase() + '?', () => {
       const s = Specialties.get(deployCurBtn.dataset.id); if (!s) return;
       sfx('close');
       if (ctx && ctx.onDeploy) ctx.onDeploy(s, { adoptVoice: false });
-      note(s.name + ' deployed to ' + ((ctx && ctx.agentName) || 'your agent'), 'good');
+      note(((ctx && ctx.agentName) || 'your agent') + ' re-specced as ' + s.name, 'good');
       close();
     });
     const launchBtn = sc.querySelector('.mkt-launch');
@@ -2308,8 +2386,8 @@ const Marketplace = (() => {
     const edit = sc.querySelector('.mkt-edit');
     if (edit) edit.addEventListener('click', () => {
       editingId = edit.dataset.id; sfx('click');
-      // A custom class is a full loadout — edit it in the same builder form (so kit/skills/effort are editable),
-      // prefilling every picker from the saved spec. (Only customs carry an EDIT button; built-ins stay frozen.)
+      // A custom class is edited in the same builder form it was made in. Its carried loadout (kit/skills/effort/tier)
+      // is prefilled from the saved spec so the save round-trips it untouched. (Only customs carry an EDIT button.)
       const s = Specialties.get(editingId);
       buildAccent = (s && s.accent) || '#ffaa33';
       buildModel = (s && s.model) || 'balanced';
@@ -2347,7 +2425,7 @@ const Marketplace = (() => {
       const s = Specialties.get(del.dataset.id);
       Specialties.removeCustom(del.dataset.id);
       if (focusAgent === del.dataset.id) focusAgent = (Specialties.builtins()[0] || {}).id || null;
-      note('removed specialty: ' + ((s && s.name) || del.dataset.id), 'good'); renderStage();
+      note('removed class: ' + ((s && s.name) || del.dataset.id), 'good'); renderStage();
     }));
     const rDel = sc.querySelector('.mkt-recipe-del');
     if (rDel) rDel.addEventListener('click', () => armDelete(rDel, '⌫ DELETE', () => {
@@ -2529,7 +2607,9 @@ const Marketplace = (() => {
         if (!res.ok) { sfx('bad'); note('could not import: ' + (res.error || 'malformed recipe file'), 'bad'); return; }
         // land the Commander on their freshly imported recipe (MINE view, dossier focused on it).
         focusRecipe = res.recipe.id; catFilter = 'mine'; view = 'grid';
-        sfx('click'); note('imported recipe: ' + res.recipe.name + ' — it’s in YOUR RECIPES', 'good');
+        if (res.renamedFrom) {
+          sfx('click'); note('imported as “' + res.recipe.name + '” — “' + res.renamedFrom + '” already exists. to replace it, delete the old one and rename this', 'warn');
+        } else { sfx('click'); note('imported recipe: ' + res.recipe.name + ' — it’s in YOUR RECIPES', 'good'); }
         renderBar(); renderStage();
       };
       reader.onerror = () => { sfx('bad'); note('could not read that file', 'bad'); };
@@ -2541,7 +2621,7 @@ const Marketplace = (() => {
      A one-click path for a Commander arriving from OpenClaw or hermes-agent: detect installs (or pick a folder),
      preview exactly what the scan found, then RECRUIT mints a StarNet agent with the persona/orders/memory
      pre-filled. Every field shown comes straight from /api/harness/scan — nothing is invented (truthful telemetry).
-     Keys are NEVER read or transferred; the preview says so and the KEYS tab is where the Commander re-enters them.
+     Keys are NEVER read or transferred; the preview says so and ABILITIES › CONNECTED › API KEYS is where the Commander re-enters them.
      Backend routes (built in parallel this session): POST /api/harness/detect, POST /api/harness/scan. The folder
      fallback reuses the existing POST /api/projects/pickfolder. If a route is missing the flow degrades to an honest
      empty/error state — it never fakes a detection or a scan. */
@@ -2708,7 +2788,7 @@ const Marketplace = (() => {
     // warnings: render every entry the scan returned verbatim, and ALWAYS state the keys-never-transfer truth
     // (added only if the scan didn't already say it).
     const warns = Array.isArray(s.warnings) ? s.warnings.slice() : [];
-    if (!warns.some(w => /key/i.test(w) && /transfer/i.test(w))) warns.push('keys never transfer — re-enter them in the KEYS tab');
+    if (!warns.some(w => /key/i.test(w) && /transfer/i.test(w))) warns.push('keys never transfer — re-enter them in CONNECT › ABILITIES › CONNECTED › API KEYS');
     const warnHTML = warns.map(w => '<div class="mkt-r-warn dim">⚠ ' + esc(w) + '</div>').join('');
     return '<div class="mkt-save mkt-imp mkt-imp-preview">' +
       '<div class="mkt-save-h">⇪ IMPORT — ' + esc(s.name || H) + '</div>' +
@@ -2813,6 +2893,25 @@ const Marketplace = (() => {
     let html = CADENCE_OPTS.map(c => '<option value="' + esc(c.id) + '"' + (launchCadence === c.id ? ' selected' : '') + '>' + esc(c.label) + '</option>').join('');
     html += '<option value="custom"' + (launchCadence === 'custom' ? ' selected' : '') + '>custom…</option>';
     return html;
+  }
+  // RUN AS — which crew member a scheduled recipe fires as. Before this, MAKE ROUTINE always posted the active
+  // workstream's agent (usually the Overseer) and the only way to move it was asking the lead in COMMS (user
+  // feedback 10-03). The roster is the live crew (StationUI.h.present); the host's ctx.agentId stays the default
+  // and is kept as an option even when it isn't on the roster, so the pick never silently changes the target.
+  function runAsRoster() {
+    const live = (typeof StationUI !== 'undefined' && StationUI.h && Array.isArray(StationUI.h.present)) ? StationUI.h.present : [];
+    const list = live.filter(a => a && a.id).map(a => ({ id: String(a.id), name: String(a.name || a.id) }));
+    const def = (ctx && ctx.agentId) || 'agent';
+    if (!list.some(a => a.id === def)) list.unshift({ id: def, name: (ctx && ctx.agentName) || def });
+    return list;
+  }
+  function runAsId() {
+    const def = (ctx && ctx.agentId) || 'agent';
+    return (launchRunAs && runAsRoster().some(a => a.id === launchRunAs)) ? launchRunAs : def;
+  }
+  function runAsName() {
+    const id = runAsId(), a = runAsRoster().find(x => x.id === id);
+    return (a && a.name) || id;
   }
   /* ---------- TYPED FILL-IN CONTROLS (the launch form's inputs) ----------
      One textarea for every kind of value made the form lie about what it wanted: "point me at a file" meant
@@ -2924,12 +3023,18 @@ const Marketplace = (() => {
     // MAKE ROUTINE panel — revealed when launchMode==='routine'. Cadence defaults to the recipe's suggested one.
     const outbound = hasRecipes() && Recipes.impliesOutbound(r);
     const warnLine = outbound
-      ? '<div class="mkt-r-warn">⚠ this routine runs UNATTENDED. its directive looks like it may SEND or WRITE something — while you’re away it can only reason &amp; draft, so it will leave the result on the desk, not actually send. (a heads-up, not a block.)</div>'
+      // HONEST about the gate (10-03): the backend refuses unattended connector/send calls by default, but an agent
+      // on Full Access, the master bypass, or a routine granted connected tools DOES send — "it will not actually
+      // send" was a promise the harness can't keep. Name the conditions instead.
+      ? '<div class="mkt-r-warn">⚠ this routine runs UNATTENDED and its directive looks like it may SEND or WRITE something. by default unattended sends are refused, so it can only draft — but if this agent has Full Access, or you grant the routine connected tools, it WILL send without asking. (a heads-up, not a block.)</div>'
       : '';
     const armNote = (cronJobs != null && !cronArmed)
-      ? '<div class="mkt-r-warn dim">◷ scheduling is currently OFF — your routine is saved but dormant until you enable the scheduler in ROUTINES.</div>' : '';
+      ? '<div class="mkt-r-warn dim">◷ scheduling is currently OFF — your routine is saved but dormant until you enable the scheduler in AUTOMATE › SCHEDULES.</div>' : '';
     const routinePanel = (launchMode === 'routine')
       ? '<div class="mkt-r-routine">' +
+          '<label class="mkt-lbl">RUN AS<select class="mkt-in" id="mkt-l-runas">' +
+            runAsRoster().map(a => '<option value="' + esc(a.id) + '"' + (a.id === runAsId() ? ' selected' : '') + '>' + esc(a.name) + '</option>').join('') +
+          '</select></label>' +
           '<label class="mkt-lbl">CADENCE<select class="mkt-in" id="mkt-l-cad">' + launchCadenceOptionsHTML() + '</select></label>' +
           '<label class="mkt-lbl mkt-l-custom" id="mkt-l-custom-wrap"' + (launchCadence === 'custom' ? '' : ' hidden') + '>CUSTOM SCHEDULE ' +
             '<span class="mkt-lbl-hint">— “every 6h”, “in 2h”, or a 5-field cron “0 9 * * 1”</span>' +
@@ -2944,9 +3049,9 @@ const Marketplace = (() => {
           '<button class="bb sm mkt-do-routine">◷ SCHEDULE IT</button></div>'
       : '<div class="mkt-save-acts"><button class="bb sm mkt-cancel">‹ BACK</button>' +
           '<button class="bb sm mkt-do-launch">▸ START SESSION</button>' +
-          '<button class="bb sm mkt-do-makeroutine" title="puts this recipe on a schedule — it becomes a ROUTINE you can manage in ⏱ ROUTINES">◷ MAKE ROUTINE</button></div>';
+          '<button class="bb sm mkt-do-makeroutine" title="puts this recipe on a schedule — it becomes a ROUTINE you can manage in AUTOMATE › SCHEDULES">◷ MAKE ROUTINE</button></div>';
     const modeNote = (launchMode === 'routine')
-      ? '◷ fills the blanks ONCE, then runs the same directive on your chosen cadence as <b>' + esc(who) + '</b> — it becomes a ROUTINE (manage or stop it any time in ⏱ ROUTINES).'
+      ? '◷ fills the blanks ONCE, then runs the same directive on your chosen cadence as <b class="mkt-runas-name">' + esc(runAsName()) + '</b> — it becomes a ROUTINE (manage or stop it any time in AUTOMATE › SCHEDULES).'
       : '▸ opens a new session and starts this workflow with <b>' + esc(who) + '</b>.';
     /* WHAT GETS SENT — the filled directive, live. The dossier shows the raw template with its {tokens}; the last
        thing the Commander saw before committing used to be a form full of blanks, so the actual instruction the
@@ -3126,6 +3231,11 @@ const Marketplace = (() => {
       sfx('click'); paintSchedPreview();
     });
     if (customIn) customIn.addEventListener('input', paintSchedPreview);
+    const runAsSel = stage.querySelector('#mkt-l-runas');
+    if (runAsSel) runAsSel.addEventListener('change', () => {
+      launchRunAs = runAsSel.value || null; sfx('click');
+      const nm = stage.querySelector('.mkt-runas-name'); if (nm) nm.textContent = runAsName();
+    });
     if (launchMode === 'routine') paintSchedPreview();
 
     // SCHEDULE IT — fill the params ONCE, convert cadence → schedule, POST /api/cron with meta.recipeId.
@@ -3147,15 +3257,18 @@ const Marketplace = (() => {
   }
   // POST /api/cron for MAKE ROUTINE. The filled directive is the routine's prompt (params filled ONCE, now); the
   // meta.recipeId stamps provenance so the ROUTINES console + the recipe dossier can both show the link. The agentId
-  // targets the current run's agent (ctx.agentId) if the host handed one, else the default 'agent'.
+  // targets the RUN AS pick (runAsId: the chosen crew member, else the host's ctx.agentId, else 'agent').
   function makeRoutine(r, values, schedule) {
     const prompt = Recipes.fillTask(r, values);
     if (!prompt) { sfx('bad'); note('nothing to schedule — the directive is empty', 'bad'); return; }
-    const agentId = (ctx && ctx.agentId) || 'agent';
+    const agentId = runAsId();
     const body = {
       name: r.name, prompt, schedule, agentId,
       enabled: true, deliver: 'local', repeat: { times: null },
-      meta: { recipeId: r.id }
+      meta: { recipeId: r.id },
+      // ONE ARM RULE (org wire AUTO-P16-1): SCHEDULE IT is a save like the SCHEDULES form's — a scheduling switch nobody ever set is
+      // turned on; one the Commander turned off stays off (POST /api/cron arm:true → armOnSaveIfUnset). The reply's `scheduler` says which.
+      arm: true
     };
     // SOP recipes: the acceptance contract rides the routine's meta bag (additive provenance) so every scheduled
     // tick is held to the same host-checked postconditions as an interactive launch (cron-driver passes it through).
@@ -3173,7 +3286,11 @@ const Marketplace = (() => {
         if (d && d.duplicate) { sfx('bad'); note('a similar routine already exists' + (d.job && d.job.name ? (': "' + d.job.name + '"') : '') + ' — nothing new was created', 'warn'); if (btn) { btn.disabled = false; btn.textContent = '◷ SCHEDULE IT'; } return; }
         cronJobs = null;   // invalidate the cache so the dossier's live-routine badge refreshes
         sfx('click');
-        note('routine scheduled: ' + r.name + ' — ' + cadenceLabel(launchCadence === 'custom' ? null : launchCadence).replace('one-shot', 'on your schedule') + '. find it in ROUTINES.', 'good');
+        // said as it happened (the server's verdict, never assumed): a routine that cannot fire never reads as scheduled
+        const sch = (d && d.scheduler) || null, said = r.name + ' as ' + runAsName() + ' — ' + cadenceLabel(launchCadence === 'custom' ? null : launchCadence).replace('one-shot', 'on your schedule');
+        if (sch && sch.halted) note('routine saved: ' + said + ' — scheduling is stopped (E-STOP), so it will not run until you press ▶ TURN SCHEDULING ON in AUTOMATE › SCHEDULES › Scheduled jobs.', 'warn');
+        else if (sch && !sch.armed) note('routine saved: ' + said + ' — scheduling is off' + (sch.offByChoice ? ' (you turned it off)' : '') + ', so it will not run until you press ▶ TURN SCHEDULING ON in AUTOMATE › SCHEDULES › Scheduled jobs.', 'warn');
+        else note('routine scheduled: ' + said + (sch && sch.armedNow ? ' · scheduling is now on' : '') + '. find it in AUTOMATE › SCHEDULES.', 'good');
         launchId = null; launchMode = 'run'; close();
       })
       .catch(() => { sfx('bad'); note('could not reach the scheduler', 'bad'); if (btn) { btn.disabled = false; btn.textContent = '◷ SCHEDULE IT'; } });
@@ -3492,12 +3609,20 @@ const Marketplace = (() => {
     repaint();
 
     const save = stage.querySelector('.mkt-do-recipe-save');
+    let dupArmedFor = null;   // SAME-NAME GUARD: the name the Commander already saw the clash warning for
     if (save) save.addEventListener('click', () => {
       const editing = editingRecipeId && hasRecipes() ? Recipes.get(editingRecipeId) : null;
       const name = (stage.querySelector('#mkt-r-name').value || '').trim();
       const task = (stage.querySelector('#mkt-r-task').value || '').trim();
       if (!name) { sfx('bad'); note('give your recipe a name', 'bad'); stage.querySelector('#mkt-r-name').focus(); return; }
       if (!task) { sfx('bad'); note('write the directive your agent should run', 'bad'); stage.querySelector('#mkt-r-task').focus(); return; }
+      // two recipes with one name can't be told apart in the list — warn once; a second SAVE keeps both on purpose.
+      const clash = Recipes.findByName ? Recipes.findByName(name, editing ? editing.id : null) : null;
+      if (clash && dupArmedFor !== name.toLowerCase()) {
+        dupArmedFor = name.toLowerCase(); sfx('bad');
+        note('a recipe named “' + clash.name + '” already exists — rename this one, or SAVE again to keep both', 'warn');
+        stage.querySelector('#mkt-r-name').focus(); return;
+      }
       syncParamsFromDOM(); syncStepsFromDOM(); syncAcceptFromDOM();
       const explicit = editParams.filter(p => p.key).map(paramOut);
       // an acceptance row that is still blank (no path / no command) is not a check — drop it rather than save a
@@ -3533,23 +3658,38 @@ const Marketplace = (() => {
     if (nameIn) { nameIn.focus(); nameIn.setSelectionRange(nameIn.value.length, nameIn.value.length); }
   }
 
+  /* THE TAGLINE CAP, SHOWN WHILE TYPING (releases#8). The one-line taglines (recipe, saved class, built class) stop at
+     their maxlength — typing halts and a paste is clipped — and nothing on screen said so. Each gets the summon NAME
+     bar's own live count (mkt-name-meta / mkt-name-count, warn colour at the cap), read from the input's real maxlength. */
+  function wireTaglineCount(stage) {
+    stage.querySelectorAll('#mkt-r-tag, #mkt-f-tag, #mkt-b-tag').forEach(input => {
+      const max = input.maxLength;
+      if (!(max > 0)) return;
+      const meta = document.createElement('span'); meta.className = 'mkt-name-meta';
+      const count = document.createElement('span'); count.className = 'mkt-name-count'; meta.appendChild(count);
+      const sync = () => { const n = input.value.length; count.textContent = n + ' / ' + max; count.classList.toggle('over', n >= max); };
+      input.addEventListener('input', sync); sync();
+      input.insertAdjacentElement('afterend', meta);
+    });
+  }
+
   /* ---------- save / edit a specialty ---------- */
   function saveFormHTML() {
     const editing = editingId ? Specialties.get(editingId) : null;
     const d = editing || (ctx && ctx.draftFromAgent && ctx.draftFromAgent()) || { name: 'My Specialist', emoji: '✦', tagline: '', purpose: '', manual: '' };
     const hasMission = (d.purpose && d.purpose.trim()) || (d.manual && d.manual.trim());
-    const title = editing ? 'EDIT SPECIALTY' : ('SAVE ' + (((ctx && ctx.agentName) || 'THIS AGENT')).toUpperCase() + ' AS A SPECIALTY');
+    const title = editing ? 'EDIT CLASS' : ('SAVE ' + (((ctx && ctx.agentName) || 'THIS AGENT')).toUpperCase() + ' AS A CLASS');
     const intro = editing
-      ? 'rename or re-icon this saved specialty — its purpose &amp; standing orders are kept as they are.'
-      : 'captures this agent’s current purpose + standing orders as a reusable template you can deploy later.' +
+      ? 'rename or re-icon this saved class — its purpose &amp; standing orders are kept as they are.'
+      : 'captures this agent’s current purpose + standing orders as a reusable class you can recruit or re-spec an agent as later.' +
         (hasMission ? '' : ' <b>heads up:</b> this agent has no purpose / standing-orders set yet, so the template would be near-empty.');
     const ctaCls = (editing || hasMission) ? '' : ' caution';
-    const ctaText = editing ? '✓ SAVE CHANGES' : (hasMission ? '✓ SAVE SPECIALTY' : '✓ SAVE ANYWAY');
+    const ctaText = editing ? '✓ SAVE CHANGES' : (hasMission ? '✓ SAVE CLASS' : '✓ SAVE ANYWAY');
     return '<div class="mkt-save">' +
       '<div class="mkt-save-h">' + esc(title) + '</div>' +
       '<p class="mkt-hint">' + intro + '</p>' +
       '<div class="mkt-save-row"><label class="mkt-lbl">ICON<input class="mkt-in mkt-emoji-in" id="mkt-f-emoji" maxlength="2" value="' + esc(d.emoji || '✦') + '"></label>' +
-        '<label class="mkt-lbl mkt-grow">NAME<input class="mkt-in" id="mkt-f-name" maxlength="28" value="' + esc(d.name || '') + '" placeholder="e.g. Night-Shift Researcher"></label></div>' +
+        '<label class="mkt-lbl mkt-grow">NAME<input class="mkt-in" id="mkt-f-name" maxlength="28" value="' + esc(d.name || '') + '" placeholder="e.g. Market Researcher"></label></div>' +
       '<label class="mkt-lbl">TAGLINE<input class="mkt-in" id="mkt-f-tag" maxlength="48" value="' + esc(d.tagline || '') + '" placeholder="one line — what it’s for"></label>' +
       '<div class="mkt-save-acts"><button class="bb sm mkt-cancel">‹ BACK</button>' +
         '<button class="bb sm mkt-do-save' + ctaCls + '">' + ctaText + '</button></div></div>';
@@ -3560,7 +3700,7 @@ const Marketplace = (() => {
       const editing = editingId ? Specialties.get(editingId) : null;
       const base = editing || (ctx && ctx.draftFromAgent && ctx.draftFromAgent()) || {};
       const name = (stage.querySelector('#mkt-f-name').value || '').trim();
-      if (!name) { sfx('bad'); note('give your specialty a name', 'bad'); return; }
+      if (!name) { sfx('bad'); note('give your class a name', 'bad'); return; }
       const spec = Object.assign({}, base, {
         name, emoji: (stage.querySelector('#mkt-f-emoji').value || '✦').trim() || '✦',
         tagline: (stage.querySelector('#mkt-f-tag').value || '').trim()
@@ -3569,7 +3709,7 @@ const Marketplace = (() => {
       try {
         const saved = Specialties.saveCustom(spec);
         focusAgent = saved.id;
-        sfx('click'); note((editing ? 'updated' : 'saved') + ' specialty: ' + saved.name, 'good');
+        sfx('click'); note((editing ? 'updated' : 'saved') + ' class: ' + saved.name, 'good');
         editingId = null; view = 'grid'; renderStage();
       } catch (e) { sfx('bad'); note((e && e.message) || 'could not save', 'bad'); }
     });
@@ -3578,147 +3718,87 @@ const Marketplace = (() => {
   }
 
   /* ---------- build a custom class from scratch (the ＋ tile) ----------
-     A full authoring form: icon, name, accent (the seal colour), tagline, clearance tier, purpose +
-     standing orders — saved straight to YOUR SPECIALISTS via Specialties.saveCustom (tags auto-derive
-     from the text, so the new class ranks in the feed and deploys/recruits like any built-in). */
+     ONE friendly page (Andrew 10-04: "out of date and very confusing … it should just have everything built
+     into it"): an icon, a name, the job, optional standing orders, a suit colour. Saved straight to YOUR
+     SPECIALISTS via Specialties.saveCustom (tags auto-derive from the text, so it ranks + recruits like a built-in).
+     NO tool / skill / model / effort pickers. They were never what decided an agent's reach: tools resolve per turn
+     from the station + the agent's power settings (sidecar resolveTools), skills are ADD-only over the ones enabled
+     in SKILLS, and model + effort are picked on the recruit card (applied at summon). The old "choose at least one
+     tool" gate asked the Commander to configure something that changed nothing — so the page now says what is
+     true: tools and skills come built in. A loadout carried in from a station draft or an edited class still rides
+     along untouched (buildKit/buildSkills/buildEffort/buildModel) — it only ever ADDS focus, never restricts. */
   const BUILD_ACCENTS = ['#ffaa33', '#7bc88a', '#6fa8bf', '#b790c0', '#cf8a7d', '#88b6c4', '#ffd34a', '#6fbcc0', '#9fc0c4'];
+  const BUILD_ACCENT_NAMES = ['Amber', 'Green', 'Blue', 'Purple', 'Coral', 'Ice', 'Gold', 'Teal', 'Silver'];
   const CLASS_ICONS = [['✦', 'Star'], ['◆', 'Diamond'], ['◉', 'Focus'], ['⌕', 'Research'], ['✎', 'Writing'], ['☑', 'Planning'], ['⚙', 'Engineering'], ['⚒', 'Building'], ['⚑', 'Strategy'], ['♟', 'Advisor'], ['♜', 'Security'], ['♬', 'Music'], ['✉', 'Messages'], ['⌂', 'Home'], ['☼', 'Ideas'], ['♥', 'Care']];
   function buildFormHTML() {
     const editing = editingId ? Specialties.get(editingId) : null;
     const d = editing || buildDraft || { emoji: '✦', name: '', tagline: '', purpose: '', manual: '' };
     const previewEmoji = (d.emoji || '✦').trim() || '✦';
     const sw = BUILD_ACCENTS.map((c, i) => '<button type="button" class="mkt-sw' + (c === buildAccent ? ' sel' : '') +
-      '" data-acc="' + c + '" style="background:' + c + '" aria-label="' + ['Amber', 'Green', 'Blue', 'Purple', 'Coral', 'Ice', 'Gold', 'Teal', 'Silver'][i] + '"></button>').join('');
-    const seg = (m, l) => '<button type="button" class="mkt-seg' + (buildModel === m ? ' sel' : '') + '" data-model="' + m + '">' + l + '</button>';
-    const basics = '<label class="mkt-lbl">Name<input class="mkt-in" id="mkt-b-name" maxlength="28" value="' + esc(d.name || '') + '" placeholder="e.g. Travel Planner"></label>' +
-      '<label class="mkt-lbl">Short description <span class="mkt-opt">optional</span><input class="mkt-in" id="mkt-b-tag" maxlength="48" value="' + esc(d.tagline || '') + '" placeholder="Plans practical trips around your budget"></label>' +
-      '<label class="mkt-lbl">What should this class do?<textarea class="mkt-in" id="mkt-b-purpose" rows="3" placeholder="Describe its job and what a useful result looks like.">' + esc(d.purpose || '') + '</textarea></label>' +
-      '<label class="mkt-lbl">Always follow these instructions <span class="mkt-opt">optional</span><textarea class="mkt-in" id="mkt-b-manual" rows="3" placeholder="e.g. Compare costs, cite sources, and ask before booking.">' + esc(d.manual || '') + '</textarea></label>';
-    const tools = '<p class="mkt-detail-note">Choose at least one tool this class will use. Skills are optional.</p>' +
-      '<div class="mkt-kitpicks" id="mkt-b-kit">' + buildKitChipsHTML() + '</div>' +
-      '<label class="mkt-lbl">Find a skill<input class="mkt-in" id="mkt-b-skill-search" placeholder="Search skills"></label>' +
-      '<div class="mkt-chips" id="mkt-b-skills"><span class="mkt-hint">Loading skills…</span></div>';
-    const settings = '<p class="mkt-detail-note">These defaults apply when you recruit from this class.</p>' +
-      '<div class="mkt-lbl">Model preference</div><div class="mkt-segs" id="mkt-b-model">' + seg('reasoning', 'Deep reasoning') + seg('balanced', 'Balanced') + seg('fast', 'Fast') + '</div>' +
-      '<div class="mkt-lbl">Reasoning effort</div><div class="mkt-segs" id="mkt-b-effort">' + effSeg(null, 'Default') + effSeg('high', 'High') + effSeg('medium', 'Medium') + effSeg('low', 'Low') + '</div>' +
-      '<div class="mkt-lbl">Suit color</div><p class="mkt-detail-note">The agent’s floor accent. Its class icon follows your station theme.</p><div class="mkt-swatches" id="mkt-b-acc">' + sw + '</div>';
+      '" data-acc="' + c + '" style="background:' + c + '" aria-label="' + BUILD_ACCENT_NAMES[i] + '" title="' + BUILD_ACCENT_NAMES[i] + '"></button>').join('');
+    // icons are glyph-only keys (the label is the hover tip + aria name) so the whole set fits one compact row.
+    const icons = '<div class="mkt-class-icons" role="group" aria-label="Class icon">' + CLASS_ICONS.map(([glyph, label]) =>
+      '<button type="button" data-class-icon="' + esc(glyph) + '" aria-pressed="' + (glyph === previewEmoji) + '" aria-label="' + label + '" title="' + label + '">' + glyph + '</button>').join('') +
+      '<input class="mkt-in mkt-class-own" id="mkt-b-emoji" maxlength="16" value="' + esc(previewEmoji) + '" aria-label="Or type your own icon" title="Or type your own"></div>';
+    // identity header: the live seal beside the name — what you are making, in one glance.
+    const ident = '<div class="mkt-class-ident"><div class="mkt-coin" id="mkt-build-coin"><span class="mkt-coin-emoji" id="mkt-build-emoji">' + esc(previewEmoji) + '</span></div>' +
+      '<label class="mkt-lbl mkt-grow">Name<input class="mkt-in" id="mkt-b-name" maxlength="28" value="' + esc(d.name || '') + '" placeholder="e.g. Travel Planner"></label></div>';
+    const fields =
+      '<label class="mkt-lbl">What should it do?<textarea class="mkt-in" id="mkt-b-purpose" rows="3" placeholder="Describe its job and what a good result looks like.">' + esc(d.purpose || '') + '</textarea></label>' +
+      '<label class="mkt-lbl"><span>How should it work? <span class="mkt-opt">optional</span></span><textarea class="mkt-in" id="mkt-b-manual" rows="2" placeholder="e.g. Compare costs, cite sources, ask before booking.">' + esc(d.manual || '') + '</textarea></label>' +
+      '<label class="mkt-lbl"><span>One-line description <span class="mkt-opt">optional · shown on its card</span></span><input class="mkt-in" id="mkt-b-tag" maxlength="48" value="' + esc(d.tagline || '') + '" placeholder="Plans practical trips around your budget"></label>' +
+      '<div class="mkt-lbl">Icon</div>' + icons +
+      '<div class="mkt-lbl">Suit color</div><div class="mkt-swatches" id="mkt-b-acc">' + sw + '</div>';
+    // the ONE line that replaces three tabs of pickers — and it is the truth (see the block comment above).
+    const builtIn = '<div class="mkt-class-builtin"><span class="mkt-class-builtin-mark" aria-hidden="true">✓</span>' +
+      '<span><b>Tools and skills are built in.</b> It works with the same tools and skills as the rest of your crew — nothing to set up. ' +
+      'Pick its model when you recruit it.</span></div>';
     return '<div class="mkt-save mkt-build-form mkt-class-editor"><div class="mkt-save-h">' + (editing ? 'Edit custom class' : 'Build a custom class') + '</div>' +
-      '<p class="mkt-detail-note">' + (editing ? 'Update this template for future recruits. Existing crew members keep their settings.' : 'Give it a job and choose its tools. Save it to your specialists, then recruit when ready.') + '</p>' +
-      '<div class="mkt-class-columns"><aside class="mkt-class-icon-panel"><div class="mkt-build-preview"><div class="mkt-coin" id="mkt-build-coin"><span class="mkt-coin-emoji" id="mkt-build-emoji">' + esc(previewEmoji) + '</span></div><span>Class icon</span></div>' +
-      '<div class="mkt-class-icons" role="group" aria-label="Class icon">' + CLASS_ICONS.map(([glyph, label]) => '<button type="button" data-class-icon="' + esc(glyph) + '" aria-pressed="' + (glyph === previewEmoji) + '"><span aria-hidden="true">' + glyph + '</span><span>' + label + '</span></button>').join('') + '</div>' +
-      '<label class="mkt-lbl">Or use your own symbol<input class="mkt-in" id="mkt-b-emoji" maxlength="16" value="' + esc(previewEmoji) + '"></label></aside>' +
-      '<div class="mkt-class-fields"><div class="mkt-recipe-detail-tabs" role="tablist" aria-label="Class settings">' +
-      ['Basics', 'Tools & skills', 'Defaults'].map((label, i) => '<button type="button" role="tab" id="class-tab-' + i + '" aria-controls="class-panel-' + i + '" aria-selected="' + (i === 0) + '" tabindex="' + (i ? '-1' : '0') + '" data-recipe-panel="' + i + '">' + label + '</button>').join('') + '</div>' +
-      [basics, tools, settings].map((html, i) => '<div class="mkt-recipe-detail-panel" role="tabpanel" id="class-panel-' + i + '" aria-labelledby="class-tab-' + i + '"' + (i ? ' hidden' : '') + '>' + html + '</div>').join('') + '</div></div>' +
+      '<p class="mkt-detail-note">' + (editing ? 'Changes apply to future recruits. Existing crew members keep their settings.' : 'Give it a name and a job. Everything else is ready to go.') + '</p>' +
+      ident + fields + builtIn +
       '<div class="mkt-save-acts"><button class="bb sm mkt-cancel">‹ BACK</button><button class="bb sm mkt-do-build">' + (editing ? 'SAVE CHANGES' : 'CREATE CLASS') + '</button></div></div>';
   }
-  // the pickable kit objectTypes — the auto-requisitionable capabilities (computer/connector are per-agent
-  // manual-bind, per-agent bound props, never shared station gear a class draws on). Labels from the live source.
-  const KIT_PICKABLE = ['dish', 'cabinet', 'notebook', 'workbench', 'studio'];
-  // each kit pick shows its capability blurb (from capGrant) next to the toggle, so a beginner sees what the
-  // gear actually grants ("the WEB — live search & fetch") instead of a bare prop label with a hidden title.
-  function buildKitChipsHTML() {
-    return KIT_PICKABLE.map(t => {
-      const on = buildKit.indexOf(t) >= 0;
-      return '<div class="mkt-kitpick">' +
-        '<button type="button" class="mkt-chip pick' + (on ? ' sel' : '') + '" data-kit="' + esc(t) + '" ' +
-          'title="' + esc(capGrant(t)) + '" aria-pressed="' + (on ? 'true' : 'false') + '">' + esc(kitPropLabel(t)) + '</button>' +
-        '<span class="mkt-kitpick-grant">' + esc(capGrant(t)) + '</span></div>';
-    }).join('');
-  }
-  const effSeg = (e, l) => '<button type="button" class="mkt-seg' + ((buildEffort === e || (e === null && !buildEffort)) ? ' sel' : '') + '" data-effort="' + (e == null ? '' : e) + '">' + l + '</button>';
   function wireBuildForm(stage) {
-    wireDetailTabs(stage);
     const iconChoices = stage.querySelectorAll('[data-class-icon]');
+    const emojiIn = stage.querySelector('#mkt-b-emoji'), coinEmoji = stage.querySelector('#mkt-build-emoji');
+    // live seal preview: the ICON only. The suit swatch never repaints the coin — the seal is station phosphor
+    // in the roster, so previewing it in the picked colour would preview a lie.
     const paintIcon = value => {
-      stage.querySelector('#mkt-build-emoji').textContent = value || '✦';
+      if (coinEmoji) coinEmoji.textContent = value || '✦';
       iconChoices.forEach(b => b.setAttribute('aria-pressed', String(b.dataset.classIcon === value)));
     };
-    iconChoices.forEach(b => b.addEventListener('click', () => {
-      stage.querySelector('#mkt-b-emoji').value = b.dataset.classIcon; paintIcon(b.dataset.classIcon);
-    }));
-    stage.querySelector('#mkt-b-emoji').addEventListener('input', e => paintIcon(e.target.value.trim()));
-    const skillSearch = stage.querySelector('#mkt-b-skill-search');
-    skillSearch.addEventListener('input', () => {
-      const q = skillSearch.value.trim().toLowerCase();
-      stage.querySelectorAll('#mkt-b-skills [data-skill]').forEach(b => { b.hidden = !b.textContent.toLowerCase().includes(q); });
-    });
+    iconChoices.forEach(b => b.addEventListener('click', () => { emojiIn.value = b.dataset.classIcon; paintIcon(b.dataset.classIcon); sfx('click'); }));
+    if (emojiIn) emojiIn.addEventListener('input', () => paintIcon(emojiIn.value.trim()));
     const back = stage.querySelector('.mkt-cancel');
     if (back) back.addEventListener('click', () => { sfx('click'); editingId = null; buildDraft = null; acceptingProspectId = null; view = 'grid'; renderStage(); });
-    // live seal preview: the ICON only. The suit swatch no longer repaints the coin — the seal is
-    // station phosphor in the roster, so previewing it in the picked colour would preview a lie.
-    const emojiIn = stage.querySelector('#mkt-b-emoji'), coinEmoji = stage.querySelector('#mkt-build-emoji');
-    if (emojiIn) emojiIn.addEventListener('input', () => { if (coinEmoji) coinEmoji.textContent = (emojiIn.value || '✦').trim() || '✦'; });
     stage.querySelectorAll('#mkt-b-acc .mkt-sw').forEach(b => b.addEventListener('click', () => {
       buildAccent = b.dataset.acc;
       stage.querySelectorAll('#mkt-b-acc .mkt-sw').forEach(x => x.classList.remove('sel')); b.classList.add('sel');
       sfx('click');
     }));
-    stage.querySelectorAll('#mkt-b-model .mkt-seg').forEach(b => b.addEventListener('click', () => {
-      buildModel = b.dataset.model;
-      stage.querySelectorAll('#mkt-b-model .mkt-seg').forEach(x => x.classList.remove('sel')); b.classList.add('sel'); sfx('click');
-    }));
-    // EFFORT selector — '' data-effort => default (null).
-    stage.querySelectorAll('#mkt-b-effort .mkt-seg').forEach(b => b.addEventListener('click', () => {
-      buildEffort = b.dataset.effort || null;
-      stage.querySelectorAll('#mkt-b-effort .mkt-seg').forEach(x => x.classList.remove('sel')); b.classList.add('sel'); sfx('click');
-    }));
-    // KIT chips — toggle a capability objectType in/out of the picked kit.
-    const wireKitChips = () => stage.querySelectorAll('#mkt-b-kit .mkt-chip.pick').forEach(b => b.addEventListener('click', () => {
-      const t = b.dataset.kit, i = buildKit.indexOf(t);
-      if (i >= 0) buildKit.splice(i, 1); else buildKit.push(t);
-      const on = buildKit.indexOf(t) >= 0;
-      b.classList.toggle('sel', on); b.setAttribute('aria-pressed', on ? 'true' : 'false'); sfx('click');
-    }));
-    wireKitChips();
-    // SKILL chips — fetched from the live catalog, then toggle a slug in/out of the package. Best-effort: an
-    // unreachable catalog leaves a hint (the class still saves with whatever kit/effort was picked).
-    const skHost = stage.querySelector('#mkt-b-skills');
-    if (skHost) loadSkillCatalog().then(map => {
-      const slugs = Object.keys(map).sort((a, b) => map[a].name.localeCompare(map[b].name));
-      if (!slugs.length) { skHost.innerHTML = '<span class="mkt-hint">no skill library found (is the sidecar running?)</span>'; return; }
-      skHost.innerHTML = slugs.map(slug => {
-        const on = buildSkills.indexOf(slug) >= 0;
-        return '<button type="button" class="mkt-chip pick' + (on ? ' sel' : '') + '" data-skill="' + esc(slug) + '" ' +
-          'title="' + esc(map[slug].description) + '" aria-pressed="' + (on ? 'true' : 'false') + '">' + esc(map[slug].name) + '</button>';
-      }).join('');
-      skHost.querySelectorAll('.mkt-chip.pick').forEach(b => b.addEventListener('click', () => {
-        const slug = b.dataset.skill, i = buildSkills.indexOf(slug);
-        if (i >= 0) buildSkills.splice(i, 1); else buildSkills.push(slug);
-        const on = buildSkills.indexOf(slug) >= 0;
-        b.classList.toggle('sel', on); b.setAttribute('aria-pressed', on ? 'true' : 'false'); sfx('click');
-      }));
-    });
     const create = stage.querySelector('.mkt-do-build');
     if (create) create.addEventListener('click', () => {
       // editingId set => upserting an existing custom class through the SAME store path (saveCustom keeps the id).
       const editing = editingId ? Specialties.get(editingId) : null;
-      const name = (stage.querySelector('#mkt-b-name').value || '').trim();
-      if (!name) { sfx('bad'); note('give your class a name', 'bad'); stage.querySelector('#mkt-b-name').focus(); return; }
-      // mirror the prospect drafter's constraint (prospect.js:112): a specialist with no gear is not a real role.
-      // an empty kit used to save silently; make it explain itself and point back at the gear picker.
-      if (!buildKit.length) {
-        sfx('bad'); note('Choose at least one tool for this class.', 'bad');
-        stage.querySelector('#class-tab-1').click();
-        const kitHost = stage.querySelector('#mkt-b-kit'); if (kitHost && kitHost.scrollIntoView) kitHost.scrollIntoView({ block: 'center' });
-        return;
-      }
+      const nameIn = stage.querySelector('#mkt-b-name'), purposeIn = stage.querySelector('#mkt-b-purpose');
+      const name = (nameIn.value || '').trim();
+      if (!name) { sfx('bad'); note('give your class a name', 'bad'); nameIn.classList.add('mkt-bad'); nameIn.focus(); return; }
+      const purpose = (purposeIn.value || '').trim();
       // when editing, start from the saved record so non-authored carried fields (persona, tags, starters, blurb)
       // survive the round-trip; the form fields below overwrite what the builder exposes.
       const spec = Object.assign({}, editing || {}, {
         name,
-        emoji: (stage.querySelector('#mkt-b-emoji').value || '✦').trim() || '✦',
+        emoji: (emojiIn.value || '✦').trim() || '✦',
         accent: buildAccent, model: buildModel,
         tagline: (stage.querySelector('#mkt-b-tag').value || '').trim(),
-        purpose: (stage.querySelector('#mkt-b-purpose').value || '').trim(),
+        purpose,
         manual: (stage.querySelector('#mkt-b-manual').value || '').trim(),
-        // LOADOUT (Class Loadouts S3): the picked kit/skills/effort round-trip into the saved custom spec
-        // (Specialties.normCustom normalizes + freezes them) so a user class is a full loadout, applied at summon.
+        // the carried loadout (a station draft's or the edited class's) round-trips untouched — empty for a fresh
+        // class, which simply works with the crew's tools + enabled skills (Specialties.normCustom normalizes them).
         kit: buildKit.slice(), skills: buildSkills.slice(), reasoningEffort: buildEffort
       });
-      // keep the id (and any non-editable carried fields, e.g. persona/tags/starters) when editing, so the edit
-      // is an upsert of the SAME record rather than a new class. Editing does not touch already-summoned agents —
-      // they own their loadout on their roster record (applyLoadout snapshots it at summon).
+      // keep the id when editing, so the edit is an upsert of the SAME record rather than a new class. Editing does
+      // not touch already-summoned agents — they own their loadout on their roster record (snapshotted at summon).
       if (editing) spec.id = editing.id;
       try {
         const saved = Specialties.saveCustom(spec);
@@ -3730,11 +3810,13 @@ const Marketplace = (() => {
         renderStage();
       } catch (e) { sfx('bad'); note((e && e.message) || 'could not save', 'bad'); }
     });
-    const nameIn = stage.querySelector('#mkt-b-name'); if (nameIn) nameIn.focus();
+    const nameIn = stage.querySelector('#mkt-b-name');
+    if (nameIn) { nameIn.addEventListener('input', () => nameIn.classList.remove('mkt-bad')); nameIn.focus(); }
   }
 
   // Slice 4: let ProspectStore refresh the open bay when a fresh prospect mints (no-op when the bay is closed or
   // not on the grid view — never yanks the user out of the editor).
   function refreshIfOpen() { if (root && view === 'grid') { try { renderStage(); } catch (_) {} } }
-  return { open, close, refreshIfOpen };
+  // currentTab: which library the open bay shows ('recipes' | 'agents') — StationUI files the RECIPES library under MY WORK
+  return { open, close, refreshIfOpen, currentTab: () => (root ? tab : null), currentIntent: () => (root && ctx ? ctx.intent : null), INTENTS: BAY_INTENTS, intentOf, titleFor };
 })();

@@ -20,6 +20,7 @@ const { runAgentLoop } = require('../sidecar/loop.js');
 const { makeRegistry } = require('../sidecar/tools/registry.js');
 const { makeWebTools } = require('../sidecar/tools/builtin/web.js');
 const { makeConnectorTools } = require('../sidecar/tools/builtin/connectors.js');
+const { makeKeyTools } = require('../sidecar/tools/builtin/keys.js');
 const { makeBrowserTools } = require('../sidecar/tools/builtin/browser.js');
 const { makeDesktopTools } = require('../sidecar/tools/builtin/desktop.js');
 const { makeFsTools } = require('../sidecar/tools/builtin/fs.js');
@@ -31,6 +32,8 @@ const { makeRecallTool } = require('../sidecar/tools/builtin/recall.js');
 const { makeToolSearchTool } = require('../sidecar/tools/builtin/toolsearch.js');
 const { makeCodeTools } = require('../sidecar/tools/builtin/code.js');
 const { makeStationInspectTool } = require('../sidecar/tools/builtin/station-inspect.js');
+const { makeManualReadTool } = require('../sidecar/tools/builtin/manual-read.js');
+const { makeStationShowTool } = require('../sidecar/tools/builtin/station-show.js');
 const { makeTranscriptStore } = require('../sidecar/transcriptstore.js');
 const { makeSkillTools } = require('../sidecar/tools/builtin/skills.js');
 const { makeSkillStore } = require('../sidecar/skillstore.js');
@@ -105,6 +108,11 @@ const fixture = {
   makeToolSearchTool({ registry }).register(registry);   // tool.search — rides the computer object, so it is in every office
   makeCodeTools({}).register(registry);
   makeStationInspectTool({ inspect: () => ({ schemaVersion: 1 }) }).register(registry);
+  makeManualReadTool().register(registry);   // manual.read rides COMPUTER beside station.inspect
+  makeStationShowTool({}).register(registry);   // station.show too (deferred; opens a window on the watched Commander's screen) — mirrors index.js
+  // plugin.* authoring is NOT registered for runs (no grant): the crew builds APPS — mirrors index.js
+  // app.* rides COMPUTER too (deferred; an app page is a network-less sandbox) — registered like index.js does
+  require('../sidecar/tools/builtin/apps.js').makeAppTools({ apps: {} }).register(registry);
   makeRecallTool({ transcriptStore: makeTranscriptStore({ io: { readAll() { return []; }, append() {} }, clock: { now: () => 0 } }) }).register(registry);
   makeSkillTools({ store: makeSkillStore({ io: { readAll() { return []; }, append() {} }, clock: { now: () => 0 } }) }).register(registry);
   // QUEST V2 §B: quest.update rides the COMPUTER (the 'quest' freebie), present in this office. In-memory questStore
@@ -124,6 +132,7 @@ const fixture = {
   // connectors.list rides the same placed DISH as web_request (capId 'web'). Registered with NO deps: the
   // honest empty station, which is also the case that must not pretend "you have nothing to add".
   makeConnectorTools({}).register(registry);
+  makeKeyTools({}).register(registry);
   // routine.notepad rides the computer on every runnable station but remains inert without a host-minted
   // scheduled cronJobId. Register the honest unwired shape so the capability/registration drift guard stays exact.
   makeRoutineTools({}).register(registry);
@@ -141,7 +150,7 @@ const fixture = {
   const capCtx = makeCapCtx(resolved, { emit, consent, timeoutMs: 5000 });
 
   // ---- DRIFT GUARDS (these alone would have caught both default-path showstoppers) ----
-  const EXPECTED = ['browser.attach', 'browser.back', 'browser.click', 'browser.console', 'browser.detach', 'browser.dialog', 'browser.drag', 'browser.emulate', 'browser.eval', 'browser.find', 'browser.forward', 'browser.get_text', 'browser.hover', 'browser.inspect', 'browser.intercept', 'browser.login', 'browser.navigate', 'browser.network', 'browser.pdf', 'browser.press', 'browser.screenshot', 'browser.scroll', 'browser.select', 'browser.snapshot', 'browser.tab_close', 'browser.tab_select', 'browser.tabs', 'browser.type', 'browser.upload', 'browser.viewport', 'browser.vision', 'browser.wait', 'channel.send', 'channel.targets', 'code.run', 'connectors.list', 'deliverable_note', 'fs.append', 'fs.edit', 'fs.list', 'fs.patch', 'fs.read', 'fs.search', 'fs.write', 'notebook.feedback', 'notebook.read', 'notebook.write', 'quest.update', 'recall_conversation', 'routine.notepad', 'skill.list', 'skill.manage', 'skill.view', 'skill.write', 'station.inspect', 'todo', 'tool.search', 'web_fetch', 'web_request', 'web_search', 'widget.get', 'widget.set'];
+  const EXPECTED = ['app.check', 'app.create', 'app.publish', 'app.read', 'app.schedule', 'app.write', 'browser.attach', 'browser.back', 'browser.click', 'browser.console', 'browser.detach', 'browser.dialog', 'browser.drag', 'browser.emulate', 'browser.eval', 'browser.find', 'browser.forward', 'browser.get_text', 'browser.hover', 'browser.inspect', 'browser.intercept', 'browser.login', 'browser.navigate', 'browser.need_human', 'browser.network', 'browser.pdf', 'browser.press', 'browser.reset', 'browser.screenshot', 'browser.scroll', 'browser.select', 'browser.snapshot', 'browser.tab_close', 'browser.tab_select', 'browser.tabs', 'browser.type', 'browser.upload', 'browser.viewport', 'browser.vision', 'browser.wait', 'channel.send', 'channel.targets', 'code.run', 'connectors.list', 'deliverable_note', 'keys.save', 'fs.append', 'fs.edit', 'fs.list', 'fs.patch', 'fs.read', 'fs.search', 'fs.write', 'manual.read', 'notebook.feedback', 'notebook.read', 'notebook.write', 'quest.update', 'recall_conversation', 'routine.notepad', 'skill.list', 'skill.manage', 'skill.view', 'skill.write', 'station.inspect', 'station.show', 'todo', 'tool.search', 'web_fetch', 'web_request', 'web_search', 'widget.get', 'widget.set'];
   A.eq(resolved.tools.slice().sort(), EXPECTED.slice().sort(), 'office objects resolve to the full toolset (object=capability is real)');
   for (const name of EXPECTED) A.ok(registry.get(name), 'tool registered: ' + name);
 

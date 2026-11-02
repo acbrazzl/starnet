@@ -145,6 +145,68 @@ function ctxFor(runId) {
       const r = await t.listTool.run({ goal: 'email my notes to myself', scope: 'available' }, bad);
       A.ok(/could not be raised for: gmail: bus dead/.test(r.content), 'a lost emit is named in the result (catch fires, says so)');
     }
+    // a card whose sign-in is DISABLED in this build is not a door: no chip event, and the model is told not to
+    // send the Commander to sign in (first-hour walk 2026-09-28: "sign in with Google, no setup" beside a disabled button)
+    {
+      const reason = 'Google sign-in is not available in this build.';
+      const t = makeConnectorTools({ connectors: { list: () => [] }, connectorCatalog: catalog, keysCatalog: null,
+        signInUnavailable: e => (e && e.googleApi ? reason : '') });
+      const sg = t.suggestFor('send my newsletter to subscribers');
+      A.eq(sg.find(x => x.id === 'gmail').unavailable, reason, 'the suggestion carries the card\'s own unavailable reason');
+      const ctx = ctxFor('run-9');
+      const r = await t.listTool.run({ goal: 'send my newsletter to subscribers', scope: 'available' }, ctx);
+      A.ok(!ctx.emitted.some(e => e.name === 'connector_required' && e.payload.connectorId === 'gmail'), 'no CONNECT chip for a disabled sign-in');
+      A.ok(/CANNOT BE CONNECTED IN THIS BUILD/.test(r.content) && /- gmail — Google sign-in is not available in this build\./.test(r.content), 'the model is told gmail cannot be connected, with the reason');
+      A.ok(/never tell them to sign in/.test(r.content), 'the model is told not to send the Commander to sign in');
+      // blocked cards must not take the 3 slots from connectable ones (review nit 2026-09-28)
+      const allBlocked = makeConnectorTools({ connectors: { list: () => [] }, connectorCatalog: catalog,
+        signInUnavailable: e => (e && e.id !== 'composio' ? 'off in this build' : '') });
+      const slots = allBlocked.suggestFor('send my newsletter to subscribers');
+      A.ok(slots.some(x => x.id === 'composio' && !x.unavailable), 'a connectable fit still gets a slot when higher-scored cards are blocked: ' + JSON.stringify(slots.map(x => x.id)));
+      A.ok(slots.filter(x => !x.unavailable).length <= 3 && slots.filter(x => x.unavailable).length <= 3, 'at most 3 connectable + 3 blocked');
+      const listed = await t.listTool.run({ query: 'gmail', scope: 'available' }, ctxFor('run-10'));
+      A.ok(/Gmail \[[^\]]*\] — connector, sign-in — SIGN-IN NOT AVAILABLE in this build/.test(listed.content), 'the AVAILABLE list marks the disabled card too');
+      A.ok(ctx.emitted.some(e => e.name === 'connector_required' && e.payload.connectorId !== 'gmail') || !/SUGGESTED for/.test(r.content) || /SUGGESTED \(0\)/.test(r.content), 'connectable suggestions still raise their chip');
+      const thrower = makeConnectorTools({ connectors: { list: () => [] }, connectorCatalog: catalog, signInUnavailable: () => { throw new Error('boom'); } });
+      A.eq(thrower.suggestFor('send my newsletter to subscribers')[0].unavailable, '', 'a throwing availability probe fails open to the old behavior');
+    }
+    // every ABILITIES path the agent quotes names a tab or section the window actually draws (the walk found "KEYS tab",
+    // "ABILITIES › CONNECTORS" and "ABILITIES › KEYS" — doors renamed away long ago, still quoted to users)
+    {
+      const win = fs.readFileSync(path.join(__dirname, '../frontend/app/windows/connectors.js'), 'utf8');
+      const labels = new Set((win.match(/label: '([^']+)'/g) || []).map(m => m.slice(8, -1)));
+      (win.match(/data-ab-to="[a-z]+">([^<]+)</g) || []).forEach(m => labels.add(m.replace(/^.*">/, '').replace(/<$/, '')));
+      // ONE FLAT LIST (UX night 2026-10-26): a block heading inside a section is a real place too (CONNECTED › API KEYS,
+      // TOOLS › COMPUTER CONTROL), and the skills lane's sections and blocks (SKILL MARKET › ADD FROM A LINK, SKILLS ›
+      // LEARNED SKILLS) are drawn from stationui.js
+      (win.match(/<span class="sec-l">([^<]+)<\/span>/g) || []).forEach(m => labels.add(m.replace(/^<span class="sec-l">/, '').replace(/<\/span>$/, '')));
+      const sui = fs.readFileSync(path.join(__dirname, '../frontend/app/stationui.js'), 'utf8');
+      const lane = sui.slice(sui.indexOf('function abilitySkillsLane('), sui.indexOf('window.AbilityLanes.push(abilitySkillsLane)'));
+      A.ok(lane.length > 0, 'the skills lane source is found');
+      (lane.match(/label: '([^']+)'/g) || []).forEach(m => labels.add(m.slice(8, -1)));
+      (lane.match(/block\('[a-z-]+', '([^']+)'\)/g) || []).forEach(m => labels.add(m.replace(/^block\('[a-z-]+', '/, '').replace(/'\)$/, '')));
+      A.ok(['API KEYS', 'COMPUTER CONTROL', 'SKILL MARKET', 'ADD FROM A LINK', 'LEARNED SKILLS'].every(l => labels.has(l)), 'the merged blocks are in the place list');
+      // EVERY sidecar file (a door quoted in a string that moves out of index.js or manual.js into a new module is
+      // still checked), plus the one frontend file that quotes doors
+      const sources = require('./helpers/source').sidecarSourceFiles()
+        .concat([{ rel: 'frontend/app/marketplace.js', text: fs.readFileSync(path.join(__dirname, '..', 'frontend/app/marketplace.js'), 'utf8') }]);
+      const bad = [];
+      for (const { rel: f, text } of sources) {
+        // segments are the window's UPPERCASE labels; prose after a label ("… is where …") must not join the path
+        for (const m of text.match(/ABILITIES(?: › [A-Z][A-Z0-9 /&]*[A-Z0-9])+/g) || []) {
+          m.split(' › ').slice(1).forEach(seg => { if (!labels.has(seg.trim())) bad.push(f + ': ' + m + ' (' + seg + ')'); });
+        }
+        // internal comments may keep the old nickname: block comments are blanked to their newlines (line numbers hold),
+        // and a line that starts as a comment is skipped (a block comment's prose lines need not start with *)
+        const uncommented = text.replace(/(^|[ \t])\/\*[\s\S]*?\*\//gm, (m, lead) => lead + m.slice(lead.length).replace(/[^\n]/g, ' '));
+        uncommented.split('\n').forEach((line, i) => {
+          const code = line.trim();
+          if (/^(\/\/|\/\*|\*)/.test(code)) return;
+          if (/['"`][^'"`]*KEYS tab/.test(line)) bad.push(f + ':' + (i + 1) + ' quotes the retired "KEYS tab"');
+        });
+      }
+      A.eq(bad, [], 'every quoted ABILITIES door exists in the ABILITIES window');
+    }
     // the lead is TOLD to call it before declining (system-prompt guidance)
     const manual = fs.readFileSync(path.join(__dirname, '../sidecar/manual.js'), 'utf8');
     A.ok(/BEFORE DECLINING a task for lack of email, website, calendar, docs/.test(manual) && /connectors\.list/.test(manual), 'manual tells the lead to call connectors.list {goal} before declining');
@@ -201,8 +263,65 @@ function ctxFor(runId) {
     A.ok(/if \(!taskQuestion && \(!endReason \|\| endReason === 'done'\)\) offerConnectorDoor\(thisRunId, ws\);/.test(src),
       'stored on the originating stream at clean run end, including background streams');
     const callAt = src.indexOf('offerConnectorDoor(thisRunId, ws)');
-    const stopAt = src.indexOf("if (endReason === 'budget') offerBudgetDoor(); else offerTryAgain();");
+    const stopAt = src.indexOf("else if (endReason === 'budget' && !subscription) offerBudgetDoor(budgetCapIsBalance); else offerTryAgain();");
     A.ok(stopAt > 0 && callAt > stopAt, 'the connect offer sits AFTER the stop-reason branch in the same run-end block');
+    // A run that ends on a TASK_QUESTION owns the slot, but connectors.list already told the model the chip exists
+    // (first-hour walk 2026-09-28: the agent said "tap the ⇄ CONNECT chip" three times and none was drawn).
+    A.ok(/if \(taskQuestion \|\| endReason === 'clarifying'\) holdConnectorDoor\(thisRunId, ws\);/.test(src), 'a question-ending run (parsed, or restored from the store) still records the connector handoff');
+    // …held as awaitingAnswer: CONTINUE TASK sends a continuation prompt that send() would record as the question's ANSWER
+    const cont = A.fnBody(src, 'async function continueConnectorTask(');
+    const guardAt = cont.indexOf('if (h.awaitingAnswer)'), sendAt = cont.indexOf('await send(');
+    A.ok(guardAt > 0 && sendAt > guardAt && /App\.openWorkstream\(streamId\);[\s\S]{0,200}return false;/.test(cont.slice(guardAt, sendAt)), 'continueConnectorTask returns to the open question instead of answering it');
+    const winSrc = fs.readFileSync(path.join(__dirname, '../frontend/app/windows/connectors.js'), 'utf8');
+    A.ok(/const supported = !h\.awaitingAnswer && /.test(winSrc) && /btn\.textContent = h\.awaitingAnswer \? 'RETURN TO TASK'/.test(winSrc), 'ABILITIES offers RETURN TO TASK, never CONTINUE TASK, while the question is open');
+    {
+      const W = require('../frontend/app/workstreams.js');
+      W.reset();
+      const g = W.all()[0];
+      W.setConnectorHandoff(g.id, { connectorId: 'composio', runId: 'r9', agentId: g.agentId || 'agent', awaitingAnswer: true });
+      const plain = W.setConnectorHandoff(g.id, { connectorId: 'composio', runId: 'r9', agentId: g.agentId || 'agent' });
+      A.ok(plain && !('awaitingAnswer' in plain), 'an ordinary handoff keeps its exact old shape');
+      const held = W.setConnectorHandoff(g.id, { connectorId: 'composio', runId: 'r9', agentId: g.agentId || 'agent', awaitingAnswer: true });
+      A.eq(held && held.awaitingAnswer, true, 'the awaiting-answer mark survives normalization (and so persistence)');
+      W.reset();
+    }
+    const tqFn = A.fnBody(src, 'function offerTaskQuestion(');
+    A.eq((tqFn.match(/taskQuestionDoor\((?:r|q)\.body, tq\.runId\)/g) || []).length, 2, 'both task-question cards (chips and conversation) carry the door');
+    // a FORK's chips take the same slot and replaced the connect chip live (2026-09-28: composio door lost) — it carries the door too
+    A.ok(/taskQuestionDoor\(q\.body, runId\)/.test(A.fnBody(src, 'function offerFork(')), 'the FORK card carries the door');
+    A.ok(/offerFork\(fk, thisRunId\)/.test(src) && /presentTaskQuestion\(ws, Object\.assign\(\{ runId: thisRunId \}, taskQuestion\)\)/.test(src), 'fresh question cards are scoped to their own run');
+    // behavior: hold records the handoff once; the door renders inside the given card and opens the connect screen
+    const vm = require('node:vm');
+    const hold = A.fnBody(src, 'function holdConnectorDoor(');
+    const door = A.fnBody(src, 'function taskQuestionDoor(');
+    const handoffs = {}, opened = [];
+    const made = [];
+    const ctx = {
+      CONNECTOR_NEEDED: new Map([['run-1', { runId: 'run-1', connectorId: 'gmail', kind: 'mcp' }]]),
+      activeWs: { id: 'ws-1', agentId: 'agent' }, persisted: 0,
+      App: { persist() { ctx.persisted++; } },
+      Workstreams: { setConnectorHandoff(id, h) { handoffs[id] = h; }, connectorHandoff(id) { return handoffs[id] || null; } },
+      Friendly: { connectorDoor(h) { return { label: '⇄ CONNECT ' + h.connectorId.toUpperCase(), run() { opened.push(h.connectorId); return true; } }; } },
+      document: { createElement() { const el = { children: [] }; made.push(el); return el; } }
+    };
+    vm.createContext(ctx);
+    vm.runInContext(hold + '\n' + door + '\nthis.held = holdConnectorDoor("run-1", activeWs); this.again = holdConnectorDoor("run-1", activeWs);', ctx);
+    A.eq(ctx.held, true, 'hold records the pending connector'); A.eq(ctx.again, false, 'the pending event is consumed once');
+    A.eq(handoffs['ws-1'] && handoffs['ws-1'].connectorId, 'gmail', 'the handoff lands on the originating stream'); A.eq(ctx.persisted, 1, 'the handoff is persisted');
+    A.eq(handoffs['ws-1'].awaitingAnswer, true, 'a held handoff is marked as waiting on the question\'s answer');
+    const card = { kids: [], appendChild(el) { this.kids.push(el); } };
+    ctx.card = card;
+    vm.runInContext('this.btn = taskQuestionDoor(card);', ctx);
+    A.ok(ctx.btn && card.kids[0] === ctx.btn, 'the door is appended inside the question card, not as a second row');
+    A.eq(ctx.btn.textContent, '⇄ CONNECT GMAIL', 'the door names the connector');
+    ctx.btn.onclick();
+    A.eq(opened.join(), 'gmail', 'tapping the door opens the connect screen for that connector');
+    vm.runInContext('this.other = taskQuestionDoor(card, "run-2"); this.same = taskQuestionDoor(card, "run-1");', ctx);
+    A.eq(ctx.other, null, 'an older run\'s handoff never rides on a later run\'s question card');
+    A.ok(ctx.same && ctx.same.textContent === '⇄ CONNECT GMAIL', 'the run that raised the connector gets its door');
+    delete handoffs['ws-1'];
+    vm.runInContext('this.none = taskQuestionDoor(card);', ctx);
+    A.eq(ctx.none, null, 'no handoff, no door');
   }
   A.report('connector-required.test');
 })().catch(e => { console.error(e); process.exit(1); });

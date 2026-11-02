@@ -30,7 +30,18 @@
    work a run PRODUCES can be filed under the thing the Commander was working ON. Same additive-provenance shape as
    `recipeId`: old rows lack it and default ''. The caller records it ONLY when the root is still a standing path
    grant — an unblessed/revoked root files nothing, because the station must never assert a project relationship the
-   grant layer can't prove. */
+   grant layer can't prove.
+
+   INTERRUPTED RUNS (ADDITIVE, 2026-09-22): a run whose process died mid-flight never reached run end, so it left no
+   row at all. The host's boot scan of the run journal now records ONE row for it with reason 'interrupted' (the
+   ORIGINAL run's execution terminal — true forever) plus a `recoveryStatus` (recoverable | needs_review | resolved |
+   recovering | continued | forensic), `continuedRunId`/`continuedReason` once a continuation settled, `spendUnknown`
+   (the ledger books spend at run end, so an interrupted run's spend is NOT known — never read its usd:0 as "free"),
+   and a plain `error` line. A continuation run's own row carries `recoveryOf` = the interrupted runId.
+   Representation: the log stays append-only. When the recovery status changes the host appends a newer row for the
+   SAME runId, and every read (list/all/count/latest) collapses a chain whose first row is 'interrupted' into ONE row:
+   the newest row's content at the first row's position and ts. So history never shows a stale "recoverable" beside
+   the continuation's outcome; the interrupted run and its continuation stay two linked rows (two real runs). */
 'use strict';
 (function (root, factory) {
   const api = factory();
@@ -43,7 +54,10 @@
 
   // Sets, not object literals: `({a:1})['constructor']` is truthy, so an object-literal allowlist
   // silently admits every Object.prototype key — and these keys come off persisted/model-supplied data.
-  const REASONS = new Set(['done', 'max_iters', 'budget', 'cancelled', 'error', 'empty', 'refusal', 'clarifying']);
+  const REASONS = new Set(['done', 'max_iters', 'budget', 'cancelled', 'error', 'empty', 'refusal', 'clarifying', 'interrupted']);
+  const RECOVERY_STATUSES = new Set(['recoverable', 'needs_review', 'resolved', 'recovering', 'continued', 'forensic']);
+  const SETTLED_AS = new Set(['entered', 'limit']);   // how an interrupted run's spend was settled (ledger attestedAs)
+  const ERROR_MAX = 240;
   const DEFAULT_LIMIT = 200;        // a sane cap so list() never returns an unbounded history
   const TITLE_MAX = 120;
   const UNKNOWN_MODEL = '(unknown)';
@@ -55,12 +69,26 @@
   const DELIVERABLE_KINDS = new Set(['doc', 'data', 'page', 'patch', 'image', 'files']);   // mirrors tools/builtin/deliverable.js
   const DELIVERY_PROMPT_MAX = 4000;
   const DELIVERY_TEXT_MAX = 24000;
+  // Dispatch completion is assessed AFTER the execution loop (including one optional result repair).
+  // Its envelope is separate from the immutable execution outcome and spend.
+  const DELIVERY_PATCH_KIND = 'dispatch-delivery';
+  function dispatchDelivery(v) {
+    if (!v || !['pending', 'internal', 'final'].includes(v.state)) return null;
+    if (v.state !== 'final') return { state: v.state };
+    const out = { state: 'final', text: str(v.text).slice(0, DELIVERY_TEXT_MAX),
+      reason: str(v.reason).trim().slice(0, 80) || 'error', repairRunId: str(v.repairRunId).slice(0, 100) };
+    if (Number.isSafeInteger(v.textLength) && v.textLength >= out.text.length && /^[a-f0-9]{64}$/.test(str(v.textSha256))) {
+      out.textLength = v.textLength; out.textSha256 = v.textSha256;
+    }
+    return out;
+  }
   const TOOL_TRACE_MAX = 200;
   const TOOL_SUMMARY_MAX = 240;
   const FAILURE_FIELD_MAX = 80;
   const UNCERTAIN_MUTATIONS_MAX = 200;
   const COMPLETION_ROWS_MAX = 100;
   const RECOVERY_ATTEMPTS_MAX = 100;
+  const ID_RE = /^[A-Za-z0-9_-]{1,80}$/;   // a floor prop id (lineId = its INBOX's id, dockId = the bay's id)
   function num(v) { return (typeof v === 'number' && isFinite(v)) ? v : 0; }
   function nonnegative(v) { return Math.max(0, num(v)); }
   function str(v) { return v == null ? '' : String(v); }
@@ -98,6 +126,40 @@
       kind: DELIVERABLE_KINDS.has(kind) ? kind : 'files',
       main: str(v.main).trim().slice(0, ARTIFACT_STR_MAX)
     };
+  }
+
+  // what a cancel interrupted (record's `cancelledWhile`, loop.js #99): the model-call wait phase (the agent.waiting
+  // enum), how long it had lasted, the adapter's facts. Bounded at the persistence boundary; anything else is dropped.
+  const WAIT_PHASES = new Set(['connect', 'first_byte', 'streaming', 'retry_backoff']);
+  function cancelledWhileOf(v) {
+    if (!v || typeof v !== 'object' || !WAIT_PHASES.has(v.phase)) return null;
+    const out = { phase: v.phase };
+    const ms = Number(v.waitedMs);
+    if (Number.isFinite(ms) && ms >= 0) out.waitedMs = Math.round(ms);
+    const note = str(v.note).replace(/\s+/g, ' ').trim().slice(0, 240);
+    if (note) out.note = note;
+    return out;
+  }
+
+  // the page-closed note (record's `pageClosed`), bounded at the persistence boundary like every other host field
+  function pageClosedOf(v) {
+    if (!v || typeof v !== 'object') return null;
+    const waitingOn = (Array.isArray(v.waitingOn) ? v.waitingOn : []).slice(0, 16)
+      .map(s => str(s).replace(/\s+/g, ' ').trim().slice(0, 200)).filter(Boolean).slice(0, 4);
+    return { at: nonnegative(v.at), waitingOn };
+  }
+
+  // the run's SEND NOW ledger (record's `steerNotes`, from steer-buffer ledgerOf): which page-made note ids it read.
+  // Ids only (the page keeps the words); bounded like every other host field.
+  function steerNotesOf(v) {
+    if (!Array.isArray(v)) return [];
+    const out = [];
+    for (const n of v.slice(0, 256)) {
+      if (out.length >= 32) break;
+      if (!n || typeof n !== 'object' || !/^[A-Za-z0-9_-]{1,64}$/.test(str(n.id))) continue;
+      out.push({ id: str(n.id), applied: n.applied === true });
+    }
+    return out;
   }
 
   function toolTraceList(v) {
@@ -213,13 +275,51 @@
     catch (e) { rows = []; }
     if (rows.length > ramMax) rows = rows.slice(rows.length - ramMax);   // bound even a large bounded-boot load
 
+    // Interrupted-run chains: runId -> { first, latest } for every runId whose FIRST retained row is 'interrupted';
+    // `updates` holds the later rows of those chains, which are never served on their own (see header).
+    let chains = new Map();
+    let updates = new Set();
+    let deliveries = new Map();
+    const unpersisted = new Set();
+    function track(r) {
+      const id = r && r.runId;
+      if (!id) return;
+      if (r.kind === DELIVERY_PATCH_KIND) {
+        updates.add(r);
+        const envelope = dispatchDelivery(r.dispatchDelivery);
+        if (envelope && envelope.state === 'final' && !deliveries.has(id)) deliveries.set(id, envelope);
+        return;
+      }
+      const c = chains.get(id);
+      if (c) { c.latest = r; updates.add(r); return; }
+      if (r.reason === 'interrupted') chains.set(id, { first: r, latest: r });
+    }
+    function reindex() {
+      chains = new Map(); updates = new Set(); deliveries = new Map(); for (const r of rows) track(r);
+      if (unpersisted.size) { const retained = new Set(rows.map(r => r.runId)); for (const id of unpersisted) if (!retained.has(id)) unpersisted.delete(id); }
+    }
+    reindex();
+    function view(r) {
+      const c = r.runId ? chains.get(r.runId) : null;
+      const out = !c || c.first !== r || c.latest === r ? Object.assign({}, r) : Object.assign({}, c.latest, { ts: r.ts });
+      const final = deliveries.get(r.runId);
+      if (out.dispatchDelivery && out.dispatchDelivery.state === 'pending' && final) out.dispatchDelivery = Object.assign({}, final);
+      else if (out.dispatchDelivery) out.dispatchDelivery = Object.assign({}, out.dispatchDelivery);
+      return out;
+    }
+
     function record(e) {
       e = e || {};
       const entry = {
         runId: str(e.runId), parentRunId: str(e.parentRunId).slice(0, 100), agentId: str(e.agentId),
         provider: str(e.provider).trim().slice(0, 60),
-        reason: REASONS.has(e.reason) ? e.reason : 'done',     // clamp to the known enum (matches agent.run.end)
+        // clamp to the known enum (matches agent.run.end). An unknown or missing reason is not proof the run finished, so it
+        // records as 'error', never 'done' (bug 812c3bfb: a thrown run read as a finished one in the history)
+        reason: REASONS.has(e.reason) ? e.reason : 'error',
         turns: num(e.turns), tokens: num(e.tokens), usd: num(e.usd),
+        // (additive, token-burn audit 2026-10-17) how much of `tokens`' input the provider served from its prompt cache —
+        // `tokens` counts a cache read at full weight. Present only when > 0, so every other row stays byte-identical.
+        ...(num(e.cachedTokens) > 0 ? { cachedTokens: num(e.cachedTokens) } : {}),
         title: str(e.title).slice(0, TITLE_MAX),
         streamId: str(e.streamId),     // H3.2: the run's workstream — joins this outcome row to its transcript (GET /api/transcript?stream=)
         // Durable session-delivery envelope. The page bridge is best-effort (and multiple open pages may disagree
@@ -227,18 +327,57 @@
         sessionTitle: str(e.sessionTitle).trim().slice(0, SESSION_TITLE_MAX),
         deliveryPrompt: str(e.deliveryPrompt).slice(0, DELIVERY_PROMPT_MAX),
         deliveryText: str(e.deliveryText).slice(0, DELIVERY_TEXT_MAX),
+        ...(dispatchDelivery(e.dispatchDelivery) ? { dispatchDelivery: dispatchDelivery(e.dispatchDelivery) } : {}),
         recipeId: str(e.recipeId).slice(0, 60),   // provenance spine (additive): WHICH recipe launched this run ('' for non-recipe runs; old rows lack it and default '')
         projectRoot: str(e.projectRoot).slice(0, PROJECT_ROOT_MAX),   // deliverable organization (additive): the BLESSED project folder this run was scoped to ('' when unscoped/unblessed)
         deliverable: deliverableNote(e.deliverable),                  // deliverable organization (additive): the agent's own PROSE name for the work (null when it never named it)
         reasoningEffort: str(e.reasoningEffort).trim().slice(0, 20),
         model: modelName(e.model),   // H3.3/G6: actual model used, or explicit (unknown) as a last resort
         unmetered: !!e.unmetered,    // G6.2: subscription usage is counted, not summed as $0 spend
+        ...(e.unpriced === true ? { unpriced: true } : {}),   // (additive) tokens with NO published price: its usd is unknown, not $0
+        ...(e.usageMissing === true ? { usageMissing: true } : {}),   // (additive) a Stop cut a call off mid-stream before its usage arrived: usd is a floor
         artifacts: artifactList(e.artifacts),   // work-visibility: what the run PRODUCED (additive; [] default)
         toolsOk: num(e.toolsOk),                // crate-honesty (additive): successful tool results — proven work, not just talk. Old rows default 0.
         identityFallback: !!e.identityFallback, // P1.2 (additive): TRUE when this run's agentId was MISSING from the roster and it ran on the station-persona/default-model fallback — an honest marker that it was NOT the named specialist. Old rows lack it and default false.
         internal: !!e.internal,                 // progression catch-up excludes harness self-talk from agent work
         surface: e.surface === 'interactive' || e.surface === 'autonomous' ? e.surface : '',
         clarifying: !!e.clarifying,             // additive outcome truth; `reason` remains the execution terminal
+        // STEP-THROUGH TEST (additive, 2026-09-22): TRUE only when the handoff this run was handed had been EDITED
+        // by the owner before it continued — history must never claim an agent wrote the owner's words. Present
+        // only when true, so every other row stays byte-identical.
+        ...(e.handoffEdited ? { handoffEdited: true } : {}),
+        // STEP TEST ROW (additive, sweep 2026-09-25): TRUE when the run was a step-through test / try-this-step hop,
+        // set by the host that ran it (never re-derived from a stream prefix). The line stats count these apart —
+        // a test is not a job the line shipped or failed. Present only when true.
+        ...(e.stepTest ? { stepTest: true } : {}),
+        // OWNER DIRECTIVE (additive, 2026-10-12): TRUE only when the host proved this run's directive is the
+        // Commander's own (their typed COMMS turn, or the bound owner's direct chat). A channel group guest's run looks
+        // exactly like the owner's by surface and streamId, so ambient activity and repeat-work proof need this stamp;
+        // old rows lack it and prove nothing. Present only when true, so every other row stays byte-identical.
+        ...(e.ownerDirective === true ? { ownerDirective: true } : {}),
+        // LINE WATCH (additive, 2026-09-23): WHICH work line and WHICH bay (dock prop id) this run worked AT, set
+        // by the host that dispatched it (hub / chain hop / routine / step test) — never re-derived from a stream
+        // prefix. The per-line stats plate and the bay status lamps read these. Present only when known, so every
+        // other row stays byte-identical.
+        ...(ID_RE.test(str(e.lineId)) ? { lineId: str(e.lineId) } : {}),
+        ...(ID_RE.test(str(e.dockId)) ? { dockId: str(e.dockId) } : {}),
+        // DELEGATION (additive, #57): the LEAD agentId whose team.dispatch/spawn/resume started this worker run. Set only by
+        // orchestration — parentRunId alone also links overseer reviews and connector continuations, which are not
+        // delegated work. Present only when set, so every other row stays byte-identical.
+        ...(ID_RE.test(str(e.delegatedBy)) ? { delegatedBy: str(e.delegatedBy) } : {}),
+        // PAGE CLOSED (additive, rc-walk #60, 2026-10-13): the page watching this desk run closed or reloaded while the run
+        // was live, so the station cancelled it (the disconnect law). `waitingOn` names, in plain words, the approvals
+        // still open at that moment — the disconnect denied them, so none of them was granted. Set only by the host that
+        // saw its stream close (index.js handleRun); present only on such a run, so every other row stays byte-identical.
+        ...(pageClosedOf(e.pageClosed) ? { pageClosed: pageClosedOf(e.pageClosed) } : {}),
+        // CANCELLED WHILE (additive, #99, 2026-10-18): a cancelled run that was still WAITING on its model (no reply yet, a
+        // silent open stream, a retry backoff) names that wait — a bare `cancelled` read the same for a hung local model
+        // and a busy healthy run. Present only on such a cancelled run, so every other row stays byte-identical.
+        ...(e.reason === 'cancelled' && cancelledWhileOf(e.cancelledWhile) ? { cancelledWhile: cancelledWhileOf(e.cancelledWhile) } : {}),
+        // SEND NOW LEDGER (additive, 0.13.5 live walk 2026-10-14): which of the page's tracked steering notes this run
+        // read (applied) or ended without reading — so GET /api/run/steer still answers a page that lost its memory after
+        // a station restart. Present only on a run that took a tracked note, so every other row stays byte-identical.
+        ...(steerNotesOf(e.steerNotes).length ? { steerNotes: steerNotesOf(e.steerNotes) } : {}),
         toolTrace: toolTraceList(e.toolTrace),
         failureStage: str(e.failureStage).trim().slice(0, FAILURE_FIELD_MAX),
         failureCode: str(e.failureCode).trim().slice(0, FAILURE_FIELD_MAX),
@@ -248,12 +387,41 @@
         startedAt: nonnegative(e.startedAt), endedAt: nonnegative(e.endedAt), durationMs: nonnegative(e.durationMs),
         ts: num(e.ts) || clock.now()
       };
+      // Interrupted-run/recovery provenance (additive; set only when present so ordinary rows keep their shape).
+      if (RECOVERY_STATUSES.has(e.recoveryStatus)) entry.recoveryStatus = e.recoveryStatus;
+      const continuedRunId = str(e.continuedRunId).slice(0, 100);
+      if (continuedRunId) entry.continuedRunId = continuedRunId;
+      if (REASONS.has(e.continuedReason)) entry.continuedReason = e.continuedReason;
+      const recoveryOf = str(e.recoveryOf).slice(0, 100);
+      if (recoveryOf) entry.recoveryOf = recoveryOf;
+      // SETTLED SPEND (additive, 2026-10-08): the Commander settled this interrupted run's unknown spend in SETTINGS ›
+      // SPENDING LIMITS, so `usd` is the booked figure and `spendSettled` says how ('entered' | 'limit' — mirrors the
+      // ledger's attestedAs). A settlement is a fact about money; a later recovery-status update for the same run is
+      // not, so it inherits the settlement instead of re-opening the spend as unknown.
+      const prior = (e.reason === 'interrupted' && entry.runId) ? chains.get(entry.runId) : null;
+      const settledAs = SETTLED_AS.has(e.spendSettled) ? e.spendSettled
+        : (prior && prior.latest && SETTLED_AS.has(prior.latest.spendSettled) ? prior.latest.spendSettled : '');
+      if (settledAs) {
+        entry.spendSettled = settledAs;
+        if (!SETTLED_AS.has(e.spendSettled)) entry.usd = num(prior.latest.usd);
+      } else if (e.spendUnknown === true) entry.spendUnknown = true;
+      // ROUTINE HISTORY (additive, 2026-10-01): the scheduled routine this run fired for, so a routine's past runs are
+      // one filter away (GET /api/cron/history). Present only on scheduled runs; every other row stays byte-identical.
+      const cronJobId = str(e.cronJobId).slice(0, 100);
+      if (cronJobId) entry.cronJobId = cronJobId;
+      // untrusted-content taint the run ended with (additive; absent on a clean run) — sec-taint 09-25
+      const taintedBy = str(e.taintedBy).replace(/\s+/g, ' ').trim().slice(0, 200);
+      if (taintedBy) entry.taintedBy = taintedBy;
+      const error = str(e.error).replace(/\s+/g, ' ').trim().slice(0, ERROR_MAX);
+      if (error) entry.error = error;
       rows.push(entry);
       // bound the RAM mirror: splice the oldest off past the ceiling. Disk keeps the full append-only log; only
       // this in-process array is capped so a long-lived process doesn't leak. The cap is well above every served
       // query horizon (≤1000), so no list()/insights query is ever short-changed within the window it reads.
-      if (rows.length > ramMax) rows.splice(0, rows.length - ramMax);
-      try { io.append(entry); } catch (e) { failNote('runstore.append', e); }
+      if (rows.length > ramMax) { rows.splice(0, rows.length - ramMax); reindex(); }
+      else track(entry);
+      try { io.append(entry, entry.dispatchDelivery ? { strict: true } : undefined); }
+      catch (e) { if (entry.dispatchDelivery) unpersisted.add(entry.runId); failNote('runstore.append', e); }
       return entry;
     }
 
@@ -264,26 +432,76 @@
       const beforeRunId = o.beforeRunId == null ? '' : str(o.beforeRunId);
       const since = num(o.since);
       const through = num(o.through);
+      // one workstream's rows (a trigger fire / a sample reads back ITS runs — never the station's global newest N)
+      const wantStream = o.streamId == null ? null : str(o.streamId);
       const out = [];
       let afterCursor = !beforeRunId;
       for (let i = rows.length - 1; i >= 0 && out.length < limit; i--) {   // newest-first
-        const row = rows[i];
+        const raw = rows[i];
+        if (updates.has(raw)) continue;   // served through its chain's first row, never on its own
         if (!afterCursor) {
-          if (row.runId === beforeRunId) afterCursor = true;
+          if (raw.runId === beforeRunId) afterCursor = true;
           continue;
         }
+        const row = view(raw);
         if (want != null && row.agentId !== want) continue;
+        if (wantStream != null && str(row.streamId) !== wantStream) continue;
         if (since > 0 && num(row.ts) <= since) continue;
         if (through > 0 && num(row.ts) > through) continue;
-        out.push(Object.assign({}, row));
+        out.push(row);
       }
       return out;
     }
 
+    // The one served row for a runId (collapsed chain view), or null.
+    function latest(runId) {
+      const id = str(runId);
+      if (!id) return null;
+      const c = chains.get(id);
+      if (c) return view(c.first);
+      for (let i = rows.length - 1; i >= 0; i--) if (rows[i].runId === id && !updates.has(rows[i])) return view(rows[i]);
+      return null;
+    }
+
+    // Append a final dispatch envelope without adding a second execution/spend row. Only the host-created
+    // pending original is eligible; an internal repair or missing run can never become a new execution here.
+    // Persist first: a failed append leaves the provisional state honest and can be retried safely.
+    function deliverySource(runId) {
+      const row = latest(runId);
+      if (!row || !row.dispatchDelivery || row.dispatchDelivery.state === 'internal') return null;
+      if (unpersisted.has(row.runId)) throw new Error('The original dispatch run was not durably recorded.');
+      return row;
+    }
+    function finalizeDelivery(runId, value) {
+      const row = deliverySource(runId), envelope = dispatchDelivery(Object.assign({}, value, { state: 'final' }));
+      if (!row) return null;
+      if (row.dispatchDelivery.state === 'final') return row;
+      const patch = { kind: DELIVERY_PATCH_KIND, runId: row.runId, dispatchDelivery: envelope, ts: clock.now() };
+      io.append(patch, { strict: true });
+      rows.push(patch);
+      if (rows.length > ramMax) { rows.splice(0, rows.length - ramMax); reindex(); }
+      else track(patch);
+      return latest(runId);
+    }
+
+    /* settleSpend(runId, usd, how) — the Commander settled an interrupted run's unknown spend (POST /api/budget/settle,
+       after the ledger booked it). Appends ONE superseding row for the run's interrupted chain carrying the booked
+       figure, so INSIGHTS and the run row stop calling it spend-unknown; every other field is the run's served row.
+       Only a served interrupted row whose spend is still unknown qualifies (null otherwise): a settled run is never
+       settled twice and an ordinary run's history is never rewritten. */
+    function settleSpend(runId, usd, how) {
+      const row = latest(runId);
+      if (!row || row.reason !== 'interrupted' || row.spendUnknown !== true || !SETTLED_AS.has(how)) return null;
+      if (typeof usd !== 'number' || !isFinite(usd) || usd < 0) return null;
+      const next = Object.assign({}, row, { usd, spendSettled: how });
+      delete next.spendUnknown; delete next.ts;   // ts: this update's own time (reads serve the chain's first ts)
+      return record(next);
+    }
+
     return {
-      record, list,
-      all() { return rows.map(r => Object.assign({}, r)); },
-      count() { return rows.length; }
+      record, list, latest, settleSpend, finalizeDelivery, deliverySource,
+      all() { return rows.filter(r => !updates.has(r)).map(view); },
+      count() { return rows.length - updates.size; }
     };
   }
 

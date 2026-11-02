@@ -7,7 +7,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { spawn } = require('node:child_process');
 const A = require('./_assert.js');
-const { makeLspManager } = require('../sidecar/lsp-manager.js');
+const { makeLspManager, DEFAULT_SERVERS } = require('../sidecar/lsp-manager.js');
 const { makeFsTools } = require('../sidecar/tools/builtin/fs.js');
 
 (async () => {
@@ -52,6 +52,7 @@ const { makeFsTools } = require('../sidecar/tools/builtin/fs.js');
 
     const source = path.join(workspace, 'main.fake');
     fs.writeFileSync(source, 'OLD\nclean\n', 'utf8');
+    await tools.readTool.run({ path: 'main.fake' }, ctx);   // fs.edit requires the file to have been observed this session
     const first = await tools.editTool.run({ path: 'main.fake', find: 'clean', replace: 'BROKEN' }, ctx);
     A.ok(first.diagnostics && first.diagnostics.status === 'available', 'a detected server confirms the edit delta');
     A.eq(first.diagnostics.addedCount, 1, 'only one newly introduced diagnostic is counted');
@@ -114,6 +115,7 @@ const { makeFsTools } = require('../sidecar/tools/builtin/fs.js');
     const recordedBeforeCancel = ledgerRows.length;
     const cancelFile = path.join(workspace, 'cancel.fake');
     fs.writeFileSync(cancelFile, 'clean before cancel\n', 'utf8');
+    await tools.readTool.run({ path: 'cancel.fake' }, ctx);
     const ac = new AbortController(); ac.abort();
     let cancelled = false;
     try {
@@ -124,6 +126,70 @@ const { makeFsTools } = require('../sidecar/tools/builtin/fs.js');
     A.eq(fs.readFileSync(cancelFile, 'utf8'), 'clean before cancel\n', 'a cancelled baseline never permits a late mutation');
 
     A.eq(manager.status().length, 0, 'an already-cancelled edit leaves no cached replacement client');
+    // 2026-10-10: a server that EXECUTES the project (rust-analyzer: cargo config, toolchain files, build.rs, proc
+    // macros) starts only for a watched run — an unattended file write must not become code execution.
+    {
+      const execRows = [];
+      const execManager = makeLspManager({
+        spawn: (...a) => { execRows.push(a[0]); return spawn(...a); }, fs, fsp, pathMod: path, env,
+        servers: [{ id: 'execfake', command: process.execPath, args: [fixture], extensions: ['.xfake'], languageIds: { '.xfake': 'fake' }, executesProject: true, settings: { probe: true } }],
+        limits: { requestTimeoutMs: 2000, diagnosticTimeoutMs: 1000, idleMs: 500 }
+      });
+      try {
+        const file = { abs: path.join(workspace, 'm.xfake'), base: workspace, rel: 'm.xfake', text: '' };
+        const unattended = await execManager.beginEdit({ files: [file] });
+        A.eq(execRows.length, 0, 'an unattended edit never starts a project-executing language server');
+        A.ok(unattended.unavailable.length === 1 && /starts only for a watched run/.test(unattended.unavailable[0].reason), 'and says why, honestly');
+        const watched = await execManager.beginEdit({ files: [file], allowProjectExecution: true });
+        A.eq(execRows.length, 1, 'a watched run may start it');
+        A.eq(watched.unavailable.length, 0, 'and gets diagnostics');
+      } finally { await execManager.closeAll(); }
+      const ra = DEFAULT_SERVERS.find(s => s.id === 'rust-analyzer');
+      A.ok(ra && ra.executesProject === true, 'rust-analyzer is marked as executing the project');
+      A.eq(JSON.stringify(ra.settings), JSON.stringify({ cargo: { buildScripts: { enable: false } }, procMacro: { enable: false }, checkOnSave: false, check: { workspace: false } }),
+        'and never runs build scripts, proc macros or cargo check on its own');
+      const fsSrc = fs.readFileSync(path.join(__dirname, '..', 'sidecar', 'tools', 'builtin', 'fs.js'), 'utf8');
+      A.ok(/allowProjectExecution: !!\(ctx && ctx\.surface === 'interactive'\)/.test(fsSrc), 'fs edits allow project execution only on the interactive surface');
+    }
+    // Review finding security-storage-01: typescript-language-server forks the workspace's own
+    // node_modules/typescript/lib/tsserver.js, so an unattended run that planted that file and then wrote a .ts
+    // file got code execution. The DEFAULT typescript descriptor (only its command swapped for the fake) must hold
+    // the same watched-run gate as rust-analyzer, end to end through fs.write.
+    {
+      const tsDefault = DEFAULT_SERVERS.find(s => s.id === 'typescript');
+      const tsRows = [];
+      const tsManager = makeLspManager({
+        spawn: (...a) => { tsRows.push(a[0]); return spawn(...a); }, fs, fsp, pathMod: path, env,
+        servers: [Object.assign({}, tsDefault, { command: process.execPath, args: [fixture] })],
+        limits: { requestTimeoutMs: 2000, diagnosticTimeoutMs: 1000, idleMs: 500 }
+      });
+      const tsTools = makeFsTools({ fsp, pathMod: path, root, editDiagnostics: tsManager });
+      try {
+        const unattended = await tsTools.writeTool.run({ path: 'planted.ts', content: 'export const a = 1;\n' }, Object.assign({}, ctx, { surface: 'autonomous' }));
+        A.eq(tsRows.length, 0, 'an unattended .ts write never starts typescript-language-server (it runs the workspace tsserver.js)');
+        A.eq(unattended.diagnostics && unattended.diagnostics.status, 'unavailable', 'the unattended .ts write reports diagnostics as unavailable');
+        A.ok(/typescript: .*starts only for a watched run/.test(unattended.diagnostics.reason || ''), 'and names the watched-run reason');
+        const watched = await tsTools.writeTool.run({ path: 'watched.ts', content: 'export const b = BROKEN;\n' }, Object.assign({}, ctx, { surface: 'interactive' }));
+        A.eq(tsRows.length, 1, 'the same .ts write on the interactive surface still starts it');
+        A.eq(watched.diagnostics && watched.diagnostics.status, 'available', 'and gets diagnostics');
+      } finally { await tsManager.closeAll(); }
+      // Follow-up: on a machine WITHOUT typescript-language-server (most users) the unattended reason must stay the
+      // detection truth, never a watched-run promise for a server the harness never found.
+      const noTsRows = [];
+      const noTsManager = makeLspManager({
+        spawn: (...a) => { noTsRows.push(a[0]); return spawn(...a); }, fs, fsp, pathMod: path,
+        env: Object.assign({}, env, { PATH: '', Path: '' }),
+        limits: { requestTimeoutMs: 2000, diagnosticTimeoutMs: 1000, idleMs: 500 }
+      });
+      const noTsTools = makeFsTools({ fsp, pathMod: path, root, editDiagnostics: noTsManager });
+      try {
+        const absentTs = await noTsTools.writeTool.run({ path: 'absent.ts', content: 'export const c = 1;\n' }, Object.assign({}, ctx, { surface: 'autonomous' }));
+        A.eq(noTsRows.length, 0, 'an unattended .ts write with no typescript-language-server spawns nothing');
+        A.eq(absentTs.diagnostics && absentTs.diagnostics.status, 'unavailable', 'and reports diagnostics as unavailable');
+        A.ok(/typescript-language-server is not installed on PATH/.test(absentTs.diagnostics.reason || ''), 'with the detection truth: not installed on PATH');
+        A.ok(!/watched run/.test(absentTs.diagnostics.reason || ''), 'never a watched-run promise for a server that was never found');
+      } finally { await noTsManager.closeAll(); }
+    }
     A.eq(ledgerRows.length, 1, 'the long-lived language-server child is recorded for crash recovery');
     A.ok(ledgerRows[0].kind === 'lsp:fake' && ledgerReleases.includes(ledgerRows[0].pid), 'normal idle exit releases the durable process-ledger row');
   } finally {

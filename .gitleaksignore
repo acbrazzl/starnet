@@ -76,3 +76,74 @@ eef21c982c9cacd73e6db3e24baf5e2d798cbeee:dev/industrial-textures/coordinated-bat
 eef21c982c9cacd73e6db3e24baf5e2d798cbeee:dev/industrial-textures/coordinated-batch03-recipes.json:generic-api-key:356
 3d445dbcc5b3b927c1fe148d9ceca2dc11e0a075:dev/industrial-textures/prop-structure-manifest.json:generic-api-key:142
 3d445dbcc5b3b927c1fe148d9ceca2dc11e0a075:dev/industrial-textures/prop-structure-manifest.json:generic-api-key:158
+
+# SHA-256 digests in release evidence (installer hash, log-file hash) — hex, not credentials. Reviewed 2026-09-26.
+2e7d5e71d079c3ea7bab03df2853548806a08e02:docs/releases/0.12.4/NATIVE_RESULTS.md:generic-api-key:12
+f74ba86aafee94930c1509692edda568ce96a7cd:qa/evidence/systemic-bugs-0919/validation.json:generic-api-key:70
+
+# Deliberately secret-SHAPED test fixtures (redaction, keychain migration, process-fault and shell-ledger tests):
+# synthetic token-shaped strings built from sequential digits and letters. Reviewed 2026-09-27.
+49be8d8de7c6bd7e103d562086b533ef45ecff4e:test/channels.keychain-all.e2e.test.js:slack-app-token:30
+ff00d7ccdb6cad7c0dbf0aefee41d7401f9ee84d:test/process-fault.test.js:generic-api-key:38
+ff00d7ccdb6cad7c0dbf0aefee41d7401f9ee84d:test/process-fault.test.js:generic-api-key:44
+eae4248a82dbe17c4a1eebada1c3759cb0402f61:test/redact.known-values.test.js:slack-app-token:24
+99a6dccb9a947be703515dd39c1502900932e28a:test/shell.fg-ledger.test.js:curl-auth-header:102
+# The comment above first quoted one of those fixtures, which the history scan then read as a key in this file.
+1b01aae6c5aa7224b92a1ce029c73ff9aa99a4ea:.gitleaksignore:generic-api-key:85
+# v0.13.0 push (2026-10-03): the WebSocket RFC 6455 sample handshake key, the Web Push RFC 8291 example auth secret,
+# and a fake key-shaped string in a redaction test. Reviewed: protocol test vectors and fixtures, not credentials.
+00e66ce4e3c0bb6addaa0460cd14bc51ef0f5575:test/remote.relay.test.js:generic-api-key:281
+5594548fec053d3d32e4abfd9f476eb189c6537b:test/remote.relay.test.js:generic-api-key:106
+1d8f701515cf8e18929a583a3540e6819d27b22e:test/remote.relay.test.js:generic-api-key:81
+954caf8e0b43a7e55af868e9117601476fe9b5af:test/verdictreview.test.js:generic-api-key:124
+3b3c50b332fcf72cf63840e9c9dfc8081adc8f7e:test/remote-push.test.js:generic-api-key:107
+
+# 0.13.2 (2026-10-09): reviewed fixtures, not keys — patterned fake OpenRouter keys in key-handling tests, and a settings path
+# ("budget/caps/perDay") in a station-control tool comment that the generic-api-key rule reads as a key.
+93a73b295d3ba048a45953dd3ebdca80624744ad:sidecar/tools/builtin/station-control.js:generic-api-key:377
+99be50565ce5c4e24dc3e4922025f7f61cd17b3c:test/provider-key-check.test.js:generic-api-key:53
+dc2a6676b72bc30d665076b3f965c1a81870182b:test/engine-credential.test.js:generic-api-key:26
+dc2a6676b72bc30d665076b3f965c1a81870182b:test/engine-credential.test.js:generic-api-key:29
+dc2a6676b72bc30d665076b3f965c1a81870182b:test/engine-key-sync.test.js:generic-api-key:110
+dc2a6676b72bc30d665076b3f965c1a81870182b:test/engine-key-sync.test.js:generic-api-key:119
+dc2a6676b72bc30d665076b3f965c1a81870182b:test/routine-keys.e2e.test.js:generic-api-key:25
+
+# 0.13.5 trunk push (reviewed 2026-10-16): ten generic-api-key hits, all synthetic OpenRouter-shaped test fixtures
+# (22-25 chars; a real sk-or-v1 key is 73) used with mock providers / model test/model, or a redaction-test string.
+46a5990d247573280e020b9fd061f43d06154b24:test/verdictreview.test.js:generic-api-key:124
+747d73bffa55cf0709d37c7c31c0618e6f8ada76:test/learning.evidence.test.js:generic-api-key:57
+9168c4481c37aca51545043bd27b3778d396391d:qa/evidence/frontend-deep-sweep-2026-10-11/phone-voice-probe.mjs:generic-api-key:44
+a3f610ba4ec47e9ca49810f0e76594fecf4c4a61:test/verdictreview.test.js:generic-api-key:124
+b01ab61bf4b33da307c81088754d9e2c23cf4c08:qa/evidence/memory-continuation-1011/stop-ui.mjs:generic-api-key:15
+b03c75e8c5b03bcde0cac6981c01eab3d783035c:qa/evidence/frontend-deep-sweep-2026-10-11/probe.mjs:generic-api-key:21
+b887cb75b8b5f4fd1a713ebd97c40cbff69f3772:test/tasteref.http.test.js:generic-api-key:57
+b887cb75b8b5f4fd1a713ebd97c40cbff69f3772:test/tasteref.http.test.js:generic-api-key:65
+d26549162aa41c080ef3c0f40f075f03174f2bbe:test/earlier-conversation.http.test.js:generic-api-key:37
+d26549162aa41c080ef3c0f40f075f03174f2bbe:test/earlier-conversation.http.test.js:generic-api-key:45
+
+# 0.14.0 candidate (reviewed 2026-10-22): eight hits, all synthetic fixtures in tests — a jwt.io-style sample JWT
+# (sub 1234567890) and stub "MIIx" private-key blocks in the redaction tests, and patterned fake keys
+# (sk-live-ISOLATION-SECRET-…, sk-or-v1-unpriced-e2e, sk_live_NEW1234 / sk_live_SECRETVALUE) driven against mock providers.
+1235814f19519fe153bb08f6930c3346b12acf67:test/redact.linear.test.js:jwt:48
+f2bc03e7693fca7ac361fef94cc8094f9d12d6b1:test/redact.linear.test.js:private-key:31
+f2bc03e7693fca7ac361fef94cc8094f9d12d6b1:test/redact.linear.test.js:private-key:67
+0dcfc92aa5f434255c28c7b3824e5a650a1ddfbe:test/provider.catalog-cache.test.js:generic-api-key:209
+3c53fa524daeb9ec3b45f8c727599510049cad68:test/unpriced-run-label.e2e.test.js:generic-api-key:51
+d43ab06e62b5b3a51c4a37820477fd7b06a2dc9a:test/onepassword.test.js:stripe-access-token:56
+d43ab06e62b5b3a51c4a37820477fd7b06a2dc9a:test/onepassword.test.js:generic-api-key:50
+d43ab06e62b5b3a51c4a37820477fd7b06a2dc9a:test/onepassword.test.js:generic-api-key:51
+# 0.14.0 night fixes (reviewed 2026-10-23): five hits, all the literal placeholder key 'sk-or-v1-fixture' passed to a mock
+# OpenRouter provider aimed at .test hosts (provider-403-upstream-refusal and vision-input tests).
+5c832f5f82c61b29af8712557b1c5f0338565e37:test/provider-403-upstream-refusal.test.js:generic-api-key:111
+31aedfb9d65e80b5c68218afa4cb7843dbe5ad02:test/provider-403-upstream-refusal.test.js:generic-api-key:44
+9b2b1c9352f0dfb05bce280dc241ebfe2174b637:test/vision-input.test.js:generic-api-key:297
+cff098ae174fb5a68c63e88c2483dbcef4272386:test/vision-input.test.js:generic-api-key:117
+cff098ae174fb5a68c63e88c2483dbcef4272386:test/vision-input.test.js:generic-api-key:153
+# 0.14.1 synthetic test fixtures (keys.save pasted-key tests, group-session key tests, the engine-stderr redaction test's sample RSA block): verified fake, 2026-10-26; the Stripe-shaped one is now built at runtime
+15e30d25ca7d31a8e910fa87ebce0950c285f007:src-tauri/src/sidecar_output.rs:private-key:678
+18c53693c31ed6d0d2948af55c986f90959d2de6:test/group-sessions.http.test.js:generic-api-key:8
+18c53693c31ed6d0d2948af55c986f90959d2de6:test/group-sessions.http.test.js:generic-api-key:9
+18c53693c31ed6d0d2948af55c986f90959d2de6:test/keys-save.http.test.js:generic-api-key:62
+2cd66e34f753df152f5d2fe733b9caaa59903c98:test/keys-save.http.test.js:generic-api-key:51
+2cd66e34f753df152f5d2fe733b9caaa59903c98:test/keys-save.http.test.js:generic-api-key:59
+2cd66e34f753df152f5d2fe733b9caaa59903c98:test/keys-save.test.js:generic-api-key:142

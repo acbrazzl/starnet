@@ -24,6 +24,7 @@ sidecar/workspaces.*/
 # dev seed launcher: local secrets + the throwaway seeded workspace it materializes
 dev/.env.dev
 dev/.scratch-workspace/
+dev/.google-review-workspace/
 # mock-cron dev sidecar runtime state (roster/goals/cron json + .bak churn; never committed)
 dev/.scratch-mock-cron/
 # mock-comms dev sidecar runtime state (same shape; never committed)
@@ -33,9 +34,17 @@ dev/.scratch-adversarial/
 dev/.scratch-deliverables/
 # free-chain dev sidecar runtime state (seed-free-chain.js materializes it; never committed)
 dev/.scratch-free-chain/
+# builder-lend seed scratch from runs before it moved under .dogfood/, plus the mock-login and mock-reliability
+# seeds' scratch stations (seed-mock-login.js / seed-mock-reliability.js; never committed)
+dev/.scratch-builder-lend/
+dev/.scratch-mock-login/
+dev/.scratch-mock-reliability/
 dev/.shots-deliverables/
 dev/.shots-wallcorner/
 dev/.shots-walljoin/
+# COMMS conversation seed + shooter (seed-comms-convo.js / comms-convo-shots.mjs; never committed)
+dev/.scratch-comms-convo*/
+dev/.shots-comms-convo/
 
 # rust / tauri desktop shell build output
 src-tauri/target/
@@ -210,3 +219,9 @@ sidecar/mcp/google-client.json
 /.local/google-review/
 
 src-tauri/frontend-embed/
+# user-study-loop live proof scratch (seeded workspace + chrome profile). Never committed.
+dev/.scratch-workspace-usl-proof/
+# workspace-recovery writes its owner-record generations beside the scratch workspace (sidecar/workspace-recovery.js). Never committed.
+dev/.scratch-workspace.recovery-owner.json.generations/
+# local gate/sweep logs and scratch output moved out of the repo root. Never committed.
+/logs/

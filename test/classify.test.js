@@ -23,7 +23,11 @@ const TASKS = [
   'download the spec and extract the API limits',
   'compare the top 3 GPUs and make a table',
   'build me a landing page',
-  'investigate why sales dropped in Q2'
+  'investigate why sales dropped in Q2',
+  // an ack-led RETRY / REDIRECT / new topic carries work: the ack word does not make it small talk (the agent was
+  // handed zero tools and told the Commander a placed DISH gave it no web tool)
+  'ok, try it now', 'cool, try now', 'no, use the dish', 'ok try again', 'ok, versuch es nochmal',
+  'sure, latest news?', 'yes, bitcoin price today', 'perfect, now the weather', 'cool, do that'
 ];
 
 // pure small-talk / questions about the agent / bare acknowledgements -> MUST be chat (no tools, quick reply)
@@ -37,7 +41,16 @@ const CHATS = [
   'how are you today', 'how are you doing today?', 'what are you up to', 'are you busy', 'are you free',
   'yes', 'yeah', 'yep', 'nope', 'nah', 'sure', 'fine', 'correct',
   'sounds good', 'sound good', 'got it', 'will do', 'makes sense', 'perfect', 'exactly', 'agreed',
-  'good idea', 'nice one'
+  'good idea', 'nice one',
+  // the pleasantry tail stays chat: every trailing word is itself a pleasantry
+  'ok thanks', 'thanks a lot', 'no thanks', 'no worries', 'sure thing', 'no problem', 'thanks for that',
+  'thank you so much', 'yes please', 'hey there friend', 'good morning everyone',
+  // two acks in a row are still an ack — the head words are tail words too (a task here dropped an INTAKE box on
+  // the work-only belt for a closing "ok got it")
+  'ok got it', 'ok sounds good', 'sure, sounds good', 'yep got it', 'ok will do', 'yes exactly', 'yes correct',
+  'cool makes sense', 'ok makes sense thanks', 'ok np', 'ok thx', 'k thx', 'no worries at all', 'thanks, will do',
+  'nice, well done', 'awesome job', 'great work', 'nice work', 'thanks, that worked', 'thanks, appreciate it',
+  'bye for now', 'ok understood'
 ];
 
 for (const t of TASKS) A.ok(isTaskDirective(t) === true, 'TASK: ' + JSON.stringify(t));
@@ -103,5 +116,26 @@ A.eq(stanceFor(false, { voiceOn: true }), 'talk', 'voice ON must NOT promote a c
 // every real mission classifies as a task (baseline stance 'task'); small talk maps to 'talk' — end-to-end
 for (const t of TASKS) A.eq(stanceFor(isTaskDirective(t)), 'task', 'mission -> task stance: ' + JSON.stringify(t));
 for (const c of CHATS) A.eq(stanceFor(isTaskDirective(c)), 'talk', 'small talk -> one-on-one: ' + JSON.stringify(c));
+
+// "YES" TO AN OFFER IS A GO: a bare yes is still chat on its own, but accepts an agent's offer to act.
+{
+  const { isAffirmation, offeredWork } = require('../frontend/app/classify.js');
+  for (const y of ['yes', 'Yes please', 'sure, go for it', 'ok do it', 'go ahead', 'do it', 'yep', 'sounds good', 'please do', 'yes!', 'absolutely'])
+    A.ok(isAffirmation(y), 'a bare yes is an affirmation: ' + JSON.stringify(y));
+  for (const y of ['yes', 'Yes please', 'sure', 'ok', 'yep', 'sounds good'])
+    A.ok(!isTaskDirective(y), 'on its own it is still chat (the gap the offer check closes): ' + JSON.stringify(y));
+  for (const n of ['thanks', 'no', 'nope', 'got it', 'hello', 'not now', 'yes but make it shorter and add the quarterly chart', ''])
+    A.ok(!isAffirmation(n), 'not a bare yes: ' + JSON.stringify(n));
+  for (const o of ['Here is the plan. Want me to draft it?', 'Shall I go ahead and send it?', 'Would you like me to create the file?', 'Should I proceed?', 'I can draft the email now — should I?'])
+    A.ok(offeredWork(o), 'an offer to act: ' + JSON.stringify(o));
+  A.eq(isTaskDirective('yes', { priorAgentTurn: 'Want me to draft it?' }), true, 'isTaskDirective: "yes" answering an offer is a task');
+  A.eq(isTaskDirective('yes', { priorAgentTurn: 'Anything else?' }), false, 'isTaskDirective: "yes" to a plain question stays chat');
+  A.eq(isTaskDirective('thanks', { priorAgentTurn: 'Want me to draft it?' }), false, 'isTaskDirective: "thanks" is not a yes');
+  A.eq(isTaskDirective('ok thanks', { priorAgentTurn: 'Would you like me to change anything?' }), false, 'isTaskDirective: "ok thanks" is an acknowledgement, not a go');
+  A.eq(offeredWork('Happy to help with anything else?'), false, '"happy to help?" is not an offer to act');
+  A.eq(isTaskDirective('yes'), false, 'isTaskDirective: no context = unchanged');
+  for (const o of ['Done! Anything else?', 'I found 3 options:\n1. A\n2. B\nWhich do you prefer?', 'Here it is.', 'Should I have used tabs? Anyway, the file is saved.', '', null])
+    A.ok(!offeredWork(o), 'not an offer to act: ' + JSON.stringify(o));
+}
 
 A.report('classify.test');

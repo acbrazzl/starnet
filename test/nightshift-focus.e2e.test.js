@@ -15,12 +15,14 @@
 'use strict';
 
 const A = require('./_assert.js');
+const { userWords } = require('./helpers/host-notes.js');   // the user's own words: the run-context note leads the newest user message on this wire
 const http = require('http');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const { spawn, execFileSync } = require('child_process');
 const { bootToken } = require('./_httpToken.js');
+const { allocatePort, BIND_REFUSED } = require('./helpers/ports.js');
 
 const HOST = '127.0.0.1';
 const INDEX = path.resolve(__dirname, '..', 'sidecar', 'index.js');
@@ -72,7 +74,7 @@ function startMock() {
       if (req.url.indexOf('/chat/completions') >= 0) {
         let body = ''; req.on('data', d => { body += d; }); req.on('end', () => {
           let msgs = []; try { msgs = (JSON.parse(body).messages) || []; } catch (_) {}
-          const prompt = String(((msgs.find(m => m && m.role === 'user')) || {}).content || '');
+          const prompt = userWords(msgs.find(m => m && m.role === 'user'));
           const toolResults = msgs.filter(m => m && m.role === 'tool').length;
           res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
           const tool = (id, name, args) => {
@@ -91,7 +93,11 @@ function startMock() {
             else text('Wrote the patch.');
           } else if (/JOB:/.test(prompt) && /GROUNDS:/.test(prompt)) {
             // the PROPOSE: a build job grounded in the REAL repo state (the planted TODO, surfaced by the harness scan).
-            text(['JOB: fix empty invoice list', 'KIND: advance-goal', 'GROUNDS: the TODO in app.js — handle empty invoice list', 'CONFIDENCE: high', 'SPEC: a git-apply-able patch that guards total() against an empty list'].join('\n'));
+            // PRIOR WORK (2026-10-05): once the fix was kept, the prompt lists it as ALREADY BUILT and a plain rebuild is
+            // vetoed by the host — so the mock follows the no-rebuild rule and asks to CONTINUE it (an explicit
+            // continuation of kept work is honored, and still exercises the honest-failure keep below).
+            const already = /ALREADY BUILT ON EARLIER NIGHTS[\s\S]*"fix empty invoice list"/.test(prompt);
+            text([already ? 'JOB: Continue: fix empty invoice list' : 'JOB: fix empty invoice list', 'KIND: advance-goal', 'GROUNDS: the TODO in app.js — handle empty invoice list', 'CONFIDENCE: high', 'SPEC: a git-apply-able patch that guards total() against an empty list'].join('\n'));
           } else { text('ok'); }
           res.write('data: [DONE]\n\n'); res.end();
         });
@@ -110,7 +116,7 @@ function boot(port, env, attemptsLeft) {
     const onData = d => {
       out += d.toString();
       if (!settled && out.indexOf('http://' + HOST + ':' + port) >= 0) { settled = true; resolve({ child, port }); }
-      else if (!settled && /already in use/i.test(out)) { settled = true; try { child.kill(); } catch (_) {} if (attemptsLeft > 0) resolve(boot(port + 1, env, attemptsLeft - 1)); else reject(new Error('no free port')); }
+      else if (!settled && BIND_REFUSED.test(out)) { settled = true; try { child.kill(); } catch (_) {} if (attemptsLeft > 0) resolve(allocatePort().then(next => boot(next, env, attemptsLeft - 1))); else reject(new Error('no free port')); }
     };
     child.stdout.on('data', onData); child.stderr.on('data', onData);
     child.on('error', e => { if (!settled) { settled = true; reject(e); } });
@@ -157,7 +163,7 @@ async function stop(child) {
   ] }));
   fs.writeFileSync(path.join(ws, '_commander.goals.json'), JSON.stringify({ goal: { text: 'launch billing beta', done: 1, total: 3, next: 'finish export' } }));
   const env = { SKYNET_WORKSPACES: ws, SKYNET_DEV: '1', SKYNET_OPENROUTER_BASE: mock.base, SKYNET_OPENROUTER_KEY: 'sk-or-v1-ns5b-fake', SKYNET_DEFAULT_MODEL: 'test/model' };
-  const started = await boot(8970 + (process.pid % 25), env, 20);
+  const started = await boot(await allocatePort(), env, 20);
   let child = started.child;
   const port = started.port;
   const B = 'http://' + HOST + ':' + port;
@@ -225,7 +231,7 @@ async function stop(child) {
     const branches = git(repo, ['branch', '--list', 'ns/*']);
     A.ok(branches.indexOf(keep.branch.replace('ns/', '')) >= 0 || branches.length > 0, 'git shows the new ns/ branch exists');
     A.eq(git(repo, ['rev-parse', '--abbrev-ref', 'HEAD']), keep.branch, 'HEAD is now on the ns/ branch (never committed onto ' + beforeBranch + ')');
-    A.ok(/night-shift:/.test(git(repo, ['log', '-1', '--pretty=%s'])), 'the branch tip is the night-shift commit');
+    A.ok(/^autonomy:/.test(git(repo, ['log', '-1', '--pretty=%s'])), 'the branch tip is the autonomy patch commit (one word: autonomy)');
     A.ok(fs.readFileSync(path.join(repo, 'app.js'), 'utf8').indexOf('if (!items || !items.length) return 0;') >= 0, 'the planted bug is actually fixed in the working tree');
     // the original branch was NOT mutated: it still has the seed commit only.
     A.eq(git(repo, ['log', beforeBranch, '--pretty=%s']).split('\n').length, 1, 'the original branch (' + beforeBranch + ') was never touched — still one commit');
@@ -234,6 +240,9 @@ async function stop(child) {
     // (the working tree is now dirty-free on ns/ but the seed file already changed; a second identical patch won't
     //  apply cleanly. Build a fresh beat, then keep — the apply must fail HONESTLY, not lie.)
     const act2 = await fireBeat(B, headers);
+    A.ok(act2.reason === 'built' && act2.runId, 'the second beat built (an explicit continuation of the kept fix, not a vetoed rebuild): ' + act2.reason);
+    A.eq(act2.continuesRunId, runId, 'the continuation names the kept build it continues');
+    A.ok(fs.existsSync(path.join(ws, 'agent', 'workshop', String(act2.runId), 'change.patch')), 'the continuation started from the earlier build\'s files');
     if (act2.reason === 'built' && act2.runId) {
       const keep2 = await (await fetch(B + '/api/workshop/decide', { method: 'POST', headers, body: JSON.stringify({ agentId: 'agent', runId: act2.runId, decision: 'keep' }) })).json();
       A.ok(keep2.applied !== true, 'a non-applying / dirty-tree keep reports applied:false (honest failure, never a false apply)');

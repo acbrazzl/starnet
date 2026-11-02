@@ -256,9 +256,15 @@ let ms = Xp.fresh();
 for (let i = 0; i < 10; i++) ms = Xp.applyEvent(ms, { name: 'memory.write', payload: { agentId: 'a', runId: 'r', id: 'm' + i, kind: 'fact' } }).stats;
 A.eq(ms.xp, 0, 'memory writes do not mint xp');
 A.ok(ms.milestones.indexOf('archivist') !== -1, 'archivist at 10 memory writes (a real write IS proof — committed immediately)');
-const nightShift = Xp.applyEvent(Xp.fresh(), delivered());
+// NIGHT SHIFT = work delivered OUT through a channel. A COMMS work item is not that (first-hour walk 2026-09-28: it
+// fired in the same beat as FIRST LIGHT for listings pasted into chat).
+const chatOnly = Xp.applyEvent(Xp.fresh(), delivered());
+A.eq(chatOnly.awards.milestones.indexOf('night_shift'), -1, 'a COMMS delivery alone does NOT earn night_shift');
+const failedSend = Xp.applyEvent(Xp.fresh(), { name: 'channel.delivery', payload: { channel: 'telegram', chatId: '1', runId: 'r', ok: false, chunks: 0, reason: 'redelivery-delayed' } });
+A.eq(failedSend.awards.milestones.indexOf('night_shift'), -1, 'a failed or delayed channel send earns nothing');
+const nightShift = Xp.applyEvent(Xp.fresh(), { name: 'channel.delivery', payload: { channel: 'telegram', chatId: '1', runId: 'r', ok: true, chunks: 1 } });
 A.eq(nightShift.stats.xp, 0, 'delivery milestone does not mint xp');
-A.ok(nightShift.awards.milestones.indexOf('night_shift') !== -1, 'night_shift on first external delivery (a real delivery IS proof — immediate)');
+A.ok(nightShift.awards.milestones.indexOf('night_shift') !== -1, 'night_shift on the first confirmed channel delivery (a real delivery IS proof — immediate)');
 const near = { xp: 2249, level: 9, lifetimeXp: 2249, confidence: 50, samples: 0, counters: {}, milestones: [], run: { id: null, toolXp: 0 } };
 const vr = Xp.applyEvent(near, keep());
 A.eq(vr.stats.level, 10, 'positive feedback crossing 2250 xp -> level 10');
@@ -582,4 +588,14 @@ A.eq(twiceRating.stats.xp, onceRating.stats.xp, 'a replayed work rating cannot m
 A.eq(twiceRating.stats.samples, onceRating.stats.samples, 'a replayed work rating cannot skew confidence twice');
 A.eq(twiceRating.awards.duplicate, true, 'the duplicate rating receipt is explicit to callers');
 
+// user-visible text says AUTONOMY, never "night shift" (the server-side driver keeps the internal name; walk 10-14 #20):
+// the trophy keeps its id (saved trophy cases still hold 'night_shift') and is named for what it marks — work that
+// reached the Commander through a channel, far from the station.
+{
+  const away = Xp.MILESTONES.find(m => m.id === 'night_shift');
+  A.ok(!!away, 'the channel-delivery trophy keeps its saved id');
+  A.ok(away && !/night\s*shift/i.test(away.label), 'its visible label never says NIGHT SHIFT, got ' + (away && away.label));
+  A.eq(away && away.label, 'LONG RANGE', 'it reads LONG RANGE: the first work that reached you through a channel');
+  A.ok(Xp.MILESTONES.every(m => !/night\s*shift/i.test(m.label + ' ' + m.hint)), 'no trophy label or hint says night shift');
+}
 A.report('xp.test');

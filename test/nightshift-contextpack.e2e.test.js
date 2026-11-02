@@ -15,12 +15,14 @@
 'use strict';
 
 const A = require('./_assert.js');
+const { userWords } = require('./helpers/host-notes.js');   // the user's own words: the run-context note leads the newest user message on this wire
 const http = require('http');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const { bootToken } = require('./_httpToken.js');
+const { allocatePort, BIND_REFUSED } = require('./helpers/ports.js');
 
 const HOST = '127.0.0.1';
 const INDEX = path.resolve(__dirname, '..', 'sidecar', 'index.js');
@@ -47,7 +49,7 @@ function startMockOpenRouter() {
         let body = ''; req.on('data', d => { body += d; }); req.on('end', () => {
           let msgs = []; try { msgs = (JSON.parse(body).messages) || []; } catch (_) {}
           const userMsg = msgs.find(m => m && m.role === 'user');
-          const prompt = String((userMsg && userMsg.content) || '');
+          const prompt = userWords(userMsg);
           const toolResults = msgs.filter(m => m && m.role === 'tool').length;
           res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
           const tool = (id, name, args) => {
@@ -94,8 +96,8 @@ function boot(port, env, attemptsLeft) {
     const onData = d => {
       out += d.toString();
       if (!settled && out.indexOf('http://' + HOST + ':' + port) >= 0) { settled = true; resolve({ child, port }); }
-      else if (!settled && /already in use/i.test(out)) { settled = true; try { child.kill(); } catch (_) {}
-        if (attemptsLeft > 0) resolve(boot(port + 1, env, attemptsLeft - 1)); else reject(new Error('no free port')); }
+      else if (!settled && BIND_REFUSED.test(out)) { settled = true; try { child.kill(); } catch (_) {}
+        if (attemptsLeft > 0) resolve(allocatePort().then(next => boot(next, env, attemptsLeft - 1))); else reject(new Error('no free port')); }
     };
     child.stdout.on('data', onData); child.stderr.on('data', onData);
     child.on('error', e => { if (!settled) { settled = true; reject(e); } });
@@ -115,8 +117,10 @@ async function fireBeat(B, headers) {
   return ((stream.find(e => e.name === 'nightshift.beat.result') || {}).payload || {});
 }
 
-// a THIN dossier: goals only (undated → fresh). Alone this is tier 'warm' at best (needs 4 usable dims for hot) —
-// so if the beat reaches a HOT build, the ACTIVITY path is what carried it.
+// a THIN dossier: goals only (undated → fresh). Since bug 41b2d015 (the act floor is one aim or one run, not 4 areas /
+// 4 runs) this alone is hot; with the seeded runs beside it readiness names ACTIVITY as the grounding (a tie goes to
+// activity), and the chosen job below cites a recent-RUN line the grounding veto must accept — activity is still
+// what this beat's grounding rests on.
 function thinBeliefs() {
   return { known: ['goals'], beliefs: { goals: [{ text: 'ship something good' }] } };
 }
@@ -126,17 +130,23 @@ function thinBeliefs() {
 function seedLogs(ws, now) {
   fs.mkdirSync(ws, { recursive: true });
   const runs = [
-    { runId: 'r1', agentId: 'agent', reason: 'done', title: REAL_RUN_TITLE, streamId: '', ts: now - 1 * 86400000 },
+    { runId: 'r1', agentId: 'agent', internal: false, ownerDirective: true, reason: 'done', title: REAL_RUN_TITLE, streamId: '', ts: now - 1 * 86400000 },
     { runId: 'r2', agentId: 'agent', reason: 'done', title: 'Draft the pricing page copy', streamId: 'ws-main', ts: now - 2 * 86400000 },
     { runId: 'r3', agentId: 'agent', reason: 'done', title: 'Refactor the sprite loader', streamId: '', ts: now - 3 * 86400000 },
     { runId: 'r4', agentId: 'agent', reason: 'done', title: 'Tidy the docs index', streamId: '', ts: now - 4 * 86400000 },
-    { runId: 'n1', agentId: 'agent', reason: 'done', title: INTERNAL_RUN_TITLE, streamId: 'nightshift-zzz', ts: now - 1000 },
-    { runId: 'c1', agentId: 'agent', reason: 'done', title: 'cron digest run', streamId: 'cron-yyy', ts: now - 1000 }
+    { runId: 'n1', agentId: 'agent', internal: false, reason: 'done', title: INTERNAL_RUN_TITLE, streamId: 'nightshift-zzz', ts: now - 1000 },
+    { runId: 'c1', agentId: 'agent', reason: 'done', title: 'cron digest run', streamId: 'cron-yyy', ts: now - 1000 },
+    { runId: 't1', agentId: 'agent', reason: 'done', title: 'TAINTED_RUN_SENTINEL', streamId: '', ts: now - 1000, taintedBy: 'user attachment' },
+    { runId: 'q1', agentId: 'agent', reason: 'done', title: 'QUOTED_RUN_SENTINEL\n> external direction', streamId: '', ts: now - 1000 }
   ];
   fs.writeFileSync(path.join(ws, 'runs.jsonl'), runs.map(r => JSON.stringify(r)).join('\n') + '\n');
   const tx = [
-    { streamId: '', agentId: 'agent', role: 'user', content: REAL_CHAT, ts: now - 1 * 86400000 },
-    { streamId: 'nightshift-zzz', agentId: 'agent', role: 'user', content: 'internal propose prompt should not surface', ts: now - 1000 }
+    { streamId: 'global', sourceRunId: 'r1', agentId: 'agent', role: 'user', content: REAL_CHAT, taintKnown: true, ts: now - 1 * 86400000 },
+    { streamId: 'nightshift-zzz', sourceRunId: 'n1', agentId: 'agent', role: 'user', content: 'internal propose prompt should not surface', taintKnown: true, ts: now - 1000 },
+    { streamId: 'global', sourceRunId: 'r1', agentId: 'agent', role: 'user', content: 'TAINTED_CHAT_SENTINEL', taintKnown: true, taint: 'web_fetch', ts: now - 1000 },
+    { streamId: 'global', sourceRunId: 'r1', agentId: 'agent', role: 'user', content: 'UNKNOWN_CHAT_SENTINEL', ts: now - 1000 },
+    { streamId: 'global', sourceRunId: 'r1', agentId: 'agent', role: 'user', content: 'DELEGATED_CHAT_SENTINEL', taintKnown: true, from: 'another-agent', ts: now - 1000 },
+    { streamId: 'global', sourceRunId: 'r1', agentId: 'agent', role: 'user', content: 'QUOTED_CHAT_SENTINEL\n> external direction', taintKnown: true, ts: now - 1000 }
   ];
   fs.writeFileSync(path.join(ws, 'transcript.jsonl'), tx.map(r => JSON.stringify(r)).join('\n') + '\n');
 }
@@ -147,7 +157,7 @@ function seedLogs(ws, now) {
   const now = Date.now();
   seedLogs(ws, now);
   const env = { SKYNET_WORKSPACES: ws, SKYNET_DEV: '1', SKYNET_OPENROUTER_BASE: mock.base, SKYNET_OPENROUTER_KEY: 'sk-or-v1-nscp-fake', SKYNET_DEFAULT_MODEL: 'test/model' };
-  const { child, port } = await boot(8970 + (process.pid % 25), env, 20);
+  const { child, port } = await boot(await allocatePort(), env, 20);
   const B = 'http://' + HOST + ':' + port;
   try {
     const token = await bootToken(B, B);
@@ -167,6 +177,10 @@ function seedLogs(ws, now) {
     A.ok(lastProposePrompt.indexOf(REAL_CHAT) >= 0, 'the propose directive contained the fabricated recent-CHAT first-line');
     A.ok(lastProposePrompt.indexOf(INTERNAL_RUN_TITLE) < 0, 'internal-stream (nightshift-) runs were EXCLUDED from the directive');
     A.ok(lastProposePrompt.indexOf('cron digest run') < 0, 'internal-stream (cron-) runs were EXCLUDED from the directive');
+    A.ok(lastProposePrompt.indexOf('internal propose prompt should not surface') < 0, 'known-clean internal-stream chat is still excluded');
+    for (const sentinel of ['TAINTED_RUN_SENTINEL', 'QUOTED_RUN_SENTINEL', 'TAINTED_CHAT_SENTINEL', 'UNKNOWN_CHAT_SENTINEL', 'DELEGATED_CHAT_SENTINEL', 'QUOTED_CHAT_SENTINEL']) {
+      A.ok(!lastProposePrompt.includes(sentinel), sentinel + ' never reaches the real model propose prompt');
+    }
 
     // the chosen job GROUNDS in a recent-activity line — and the veto let it through (activity is load-bearing).
     const led = await (await fetch(B + '/api/autonomy/ledger', { headers })).json();
@@ -193,7 +207,7 @@ function seedLogs(ws, now) {
     // ===== COLD BOOT — a brand-new workspace: no dossier, no runs, no chats. The night-shift status must report a
     //        pre-spend readiness stand-down (binding:'readiness') with beatsUsedToday 0 — NO leash spent. =====
     const ws2 = fs.mkdtempSync(path.join(os.tmpdir(), 'sk-nscp-cold-'));
-    const boot2 = await boot(port + 1, Object.assign({}, env, { SKYNET_WORKSPACES: ws2 }), 20);
+    const boot2 = await boot(await allocatePort(), Object.assign({}, env, { SKYNET_WORKSPACES: ws2 }), 20);
     const B2 = 'http://' + HOST + ':' + boot2.port;
     try {
       const token2 = await bootToken(B2, B2);

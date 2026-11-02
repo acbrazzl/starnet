@@ -33,11 +33,39 @@
      once at boot rather than threaded through selectProvider's ~10 call sites, all of which pass the same
      globalThis.fetch. Absent = every adapter behaves byte-identically to before. */
   let rateLimits = null;
+  /* SUBSCRIPTION USAGE (sub-usage.js): what a subscription says of its own windows, per sign-in. Attached once at boot
+     like the quota tracker; opts.usageAccount names the sign-in an adapter runs on ('' = the provider's own). ChatGPT
+     says it in its response headers (the fetch is read, never changed); Claude Code in a line of its run's stream. */
+  let subUsage = null;
+  function attachSubUsage(tracker) { subUsage = (tracker && typeof tracker.wrapFetch === 'function') ? tracker : null; return subUsage; }
   function attachRateLimits(tracker) {
     rateLimits = (tracker && typeof tracker.wrapFetch === 'function') ? tracker : null;
     return rateLimits;
   }
 
+  /* SHARED MODEL CATALOG (providers/catalog-cache.js). A run builds a fresh adapter, and each adapter kept its /models
+     list on that instance: the run's context was sized from a COLD catalog (131072 assumed for a 1M Gemini, for a
+     65536 Ollama) and every fresh adapter re-fetched the list on its first stream. Attached once at boot, like the
+     rate-limit tracker. A keyed adapter gets a scope per (provider, base URL, credential fingerprint), so one key's
+     list never answers for another; an OAuth adapter (codex, grok, kimi) gets no list scope, because its token
+     rotates and accounts must never share a list, and reads only the key-independent window facts. Absent = every
+     adapter behaves exactly as before. */
+  let catalogCache = null;
+  function attachCatalogCache(cache) {
+    catalogCache = (cache && typeof cache.bind === 'function' && typeof cache.scopeOf === 'function') ? cache : null;
+    if (typeof openrouter.attachCatalogCache === 'function') openrouter.attachCatalogCache(catalogCache);
+    return catalogCache;
+  }
+  function catalogFor(id, baseUrl, credential, keyed) {
+    if (!catalogCache) return {};
+    return { catalogCache, catalogScope: keyed ? catalogCache.scopeOf(id, baseUrl, credential) : null };
+  }
+
+  // Ollama's default port, or a host named for it (a reverse proxy like ollama.lan). Anything else stays generic.
+  function looksLikeOllama(baseUrl) {
+    try { const u = new URL(String(baseUrl || '')); return u.port === '11434' || /ollama/i.test(u.hostname); }
+    catch (_) { return false; }
+  }
   function resolveMaxOutputTokens(profile, field = 'maxOutputTokens') {
     if (!profile) return 0;
     const envName = String(profile[field + 'Env'] || '');
@@ -47,19 +75,30 @@
     return Number.isFinite(declared) && declared > 0 ? declared : 0;
   }
 
+  /* REQUEST SCRUB (prompt-scrub.js guardRequest, context-key-redact 2026-10-28). The last line before a prompt leaves
+     the process: every adapter this factory builds — runs, fallbacks, extra accounts, aux one-shots, compaction,
+     vision, probes — streams through the attached guard, which removes the secret values the station holds from the
+     request's text. One seam for the same reason as the rate-limit tracker: a seventh adapter never remembers.
+     Attached once at boot; absent = every adapter behaves byte-identically to before. */
+  let requestScrub = null;
+  function attachRequestScrub(fn) { requestScrub = typeof fn === 'function' ? fn : null; return requestScrub; }
+  function guarded(provider) { return requestScrub ? requestScrub(provider) : provider; }
+
   function selectProvider(opts) {
     opts = opts || {};
     // Configured OAuth fallbacks need metadata at admission, but authentication only if used.
     // Cache a successful activation for this run. Failed activation stays retryable, and a
     // cancelled caller never starts refresh/inference. No credential is shared across wrappers.
+    // The deferred wrapper is the one thing guarded: its metadata and live adapters are built unguarded, so a request
+    // is scrubbed exactly once, against one held-list snapshot.
     if (typeof opts.tokenProvider === 'function') {
       const base = Object.assign({}, opts); delete base.tokenProvider;
-      const metadata = selectProvider(base);
+      const metadata = buildAdapter(base);
       let active = null, live = null;
       const activate = () => {
         if (!active) {
           active = Promise.resolve().then(() => opts.tokenProvider()).then(token => {
-            live = selectProvider(Object.assign({}, base, { token, headers: typeof opts.headersProvider === 'function' ? opts.headersProvider() : base.headers }));
+            live = buildAdapter(Object.assign({}, base, { token, headers: typeof opts.headersProvider === 'function' ? opts.headersProvider() : base.headers }));
             return live;
           });
           active.catch(() => { active = null; });
@@ -93,21 +132,27 @@
         if (req && req.signal && req.signal.aborted) return;
         yield* provider.stream(req);
       };
-      return deferred;
+      return guarded(deferred);
     }
+    return guarded(buildAdapter(opts));
+  }
+
+  // the concrete adapter for one provider profile (unguarded: selectProvider is the only caller)
+  function buildAdapter(opts) {
     const id = registry.normalizeProviderId(opts.provider, registry.DEFAULT_PROVIDER_ID);
     const profile = registry.getProviderProfile(id);
     if (!profile) throw new Error('unknown provider: ' + (opts.provider || ''));
     if (rateLimits && typeof opts.fetch === 'function') opts = Object.assign({}, opts, { fetch: rateLimits.wrapFetch(id, opts.fetch) });
+    if (subUsage && profile.adapter === 'codex' && typeof opts.fetch === 'function') opts = Object.assign({}, opts, { fetch: subUsage.wrapFetch(id, opts.usageAccount || '', opts.fetch) });
 
     if (profile.adapter === 'codex') {
-      return codex.makeCodexProvider({
+      return codex.makeCodexProvider(Object.assign({
         fetch: opts.fetch,
         token: opts.token,
         renewToken: opts.renewToken,   // optional 401-recovery seam — the host's force-refresh (see codex.js header)
         baseUrl: opts.baseUrl || profile.baseUrl,
         reasoningEffort: opts.reasoningEffort
-      });
+      }, catalogFor(id, opts.baseUrl || profile.baseUrl, null, false)));
     }
     if (profile.adapter === 'openrouter') {
       return openrouter.makeOpenRouterProvider({
@@ -133,16 +178,24 @@
           ? 'STARNET is not linked on this station — link it in SETTINGS to run on credits (relink if you recently unlinked or reinstalled)'
           : 'provider ' + id + ' has no endpoint configured (base URL missing)');
       }
+      /* An Ollama server added as a CUSTOM OpenAI-compatible endpoint (http://…:11434/v1) got none of the Ollama
+         profile's wire fixes: /v1 runs it at the server's default window (4k) and silently cuts a ~21k-token task
+         prompt to its tail, so a local Qwen lead never even saw team.dispatch (2026-10-11 user report). Such an
+         endpoint borrows the Ollama profile's WIRE (native /api/chat + sized window, output ceiling, model-load
+         timeout); the native path still drops back to /v1 by itself when the server has no /api/chat. */
+      const wire = (id === 'custom' && looksLikeOllama(opts.baseUrl || profile.baseUrl) && registry.getProviderProfile('ollama')) || profile;
       const mergedHeaders = (profile.extraHeaders || opts.headers)
         ? Object.assign({}, profile.extraHeaders || {}, opts.headers || {})
         : undefined;
-      return openaiCompatible.makeOpenAICompatibleProvider({
+      return openaiCompatible.makeOpenAICompatibleProvider(Object.assign({
         fetch: opts.fetch,
         clock: opts.clock,
         // device-OAuth errors must carry the provider's NAME (e.g. "Grok (xAI) http 401 - …") so a mid-run
         // token death classifies to the ⏼ RECONNECT door, mirroring the pre-run oauthLabel() wrap. Keyed
         // openai-compatible providers keep the generic label (their recovery door is the key field either way).
         label: isDeviceOAuth ? (profile.name || profile.id) : undefined,
+        // the routed-catalog hint is for a VENDOR's own API; a user-run endpoint's ids are legitimately vendor/model (#126)
+        routedIdHint: id !== 'custom' && id !== 'ollama',
         key: isDeviceOAuth ? (opts.token || opts.key) : opts.key,
         baseUrl: opts.baseUrl || profile.baseUrl,
         chatPath: profile.chatPath,
@@ -151,43 +204,63 @@
         // profile wire hints: does this endpoint document `reasoning_effort`, and is tool support
         // asserted/denied at the provider level (fallback when the catalog carries no capability data)?
         sendReasoningEffort: profile.wireReasoningEffort === true,
+        // per-model levels the profile documents where the catalog publishes none (openai), the OFF value an
+        // endpoint documents outside its declared lists (deepseek 'none'), and DeepSeek's reasoning_content replay
+        reasoningModels: profile.reasoningModels,
+        reasoningOffEffort: profile.reasoningOffEffort,
+        replayReasoningContent: profile.replayReasoningContent === true,
         supportsTools: typeof profile.supportsTools === 'boolean' ? profile.supportsTools : null,
         // wireStreamOptions:false = endpoint rejects/lacks stream_options (usage streams by default there)
         includeUsage: profile.wireStreamOptions === false ? false : opts.includeUsage,
         staticModels: profile.staticModels,
         // prices.js family for endpoints whose /models carries no pricing (null = stays honestly unpriced)
         priceFamily: (typeof profile.priceFamily === 'string') ? profile.priceFamily : null,
+        // an endpoint that relays to OpenRouter (the managed proxy) takes OpenRouter's cache breakpoints verbatim
+        cacheControl: profile.explicitCache === 'openrouter' ? openrouter.applyCacheControl : null,
         // Local runtimes may need to load a model before returning headers. Hosted providers retain the
-        // shared 30s connect ceiling; only profiles that prove a different need override it.
-        connectTimeoutMs: profile.connectTimeoutMs,
+        // shared 30s connect ceiling; only profiles that prove a different need override it (an env override wins).
+        connectTimeoutMs: resolveMaxOutputTokens(wire, 'connectTimeoutMs') || undefined,
         // Output ceiling: only profiles that declare one (Ollama) send max_tokens; an env override wins.
-        maxTokens: resolveMaxOutputTokens(profile),
-        maxChatTokens: resolveMaxOutputTokens(profile, 'maxChatOutputTokens'),
+        maxTokens: resolveMaxOutputTokens(wire),
+        maxChatTokens: resolveMaxOutputTokens(wire, 'maxChatOutputTokens'),
+        // Ollama: chat on the native /api/chat with a request-sized window (registry `nativeOllama`); an env pin or
+        // ceiling wins over the profile's, the same way the output ceilings above resolve.
+        nativeOllama: wire.nativeOllama === true,
+        // ...and whether that native wire was only BORROWED on the URL's look (a CUSTOM card): a server that then proves
+        // it is not Ollama is StarNet's wrong guess, so the turn moves to /v1 instead of blaming the user's card.
+        nativeOllamaBorrowed: wire !== profile && wire.nativeOllama === true,
+        numCtx: resolveMaxOutputTokens(wire, 'numCtx'),
+        maxCtx: resolveMaxOutputTokens(wire, 'maxCtx'),
+        waitNoteMs: resolveMaxOutputTokens(wire, 'waitNoteMs'),   // native Ollama: when an unanswered request names its placement (#99)
         defaultContext: opts.defaultContext,
-        headers: mergedHeaders
-      });
+        headers: mergedHeaders,
+        // run attribution header (starnet only — the profile names it; see openai-compatible requestHeaders)
+        runIdHeader: typeof profile.runIdHeader === 'string' ? profile.runIdHeader : undefined
+      }, catalogFor(id, opts.baseUrl || profile.baseUrl, opts.key, !isDeviceOAuth)));
     }
     if (profile.adapter === 'anthropic') {
-      return anthropic.makeAnthropicProvider({
+      return anthropic.makeAnthropicProvider(Object.assign({
         fetch: opts.fetch,
         clock: opts.clock,
         key: opts.key,
         baseUrl: opts.baseUrl || profile.baseUrl,
         reasoningEffort: opts.reasoningEffort
-      });
+      }, catalogFor(id, opts.baseUrl || profile.baseUrl, opts.key, true)));
     }
     if (profile.adapter === 'gemini') {
-      return gemini.makeGeminiProvider({
+      return gemini.makeGeminiProvider(Object.assign({
         fetch: opts.fetch,
         clock: opts.clock,
         key: opts.key,
         baseUrl: opts.baseUrl || profile.baseUrl,
         reasoningEffort: opts.reasoningEffort
-      });
+      }, catalogFor(id, opts.baseUrl || profile.baseUrl, opts.key, true)));
     }
     if (profile.adapter === 'claude-cli') {
-      if (!claudeCli) throw new Error('the Claude login brain runs only in the local sidecar');
-      return claudeCli.makeClaudeCliProvider({ reasoningEffort: opts.reasoningEffort });
+      // A local child process, not HTTP: no fetch/key/baseUrl — the CLI's own sign-in is the credential.
+      // configDir = an extra connected account (subscription stacking); absent = the CLI's default sign-in.
+      return claudeCli.makeClaudeCliProvider({ clock: opts.clock, configDir: opts.configDir || undefined,
+        onRateLimit: subUsage ? info => subUsage.observeClaude(opts.usageAccount || '', info) : undefined });
     }
     throw new Error('provider adapter is not wired: ' + profile.adapter);
   }
@@ -203,6 +276,9 @@
     defaultReasoningEffortForProvider: registry.defaultReasoningEffortForProvider,
     providerRequiresKey: registry.providerRequiresKey,
     providerRequiresBaseUrl: registry.providerRequiresBaseUrl,
-    attachRateLimits: attachRateLimits
+    attachRateLimits: attachRateLimits,
+    attachSubUsage: attachSubUsage,
+    attachCatalogCache: attachCatalogCache,
+    attachRequestScrub: attachRequestScrub
   };
 });

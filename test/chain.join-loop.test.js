@@ -97,33 +97,47 @@ function rig(floor, script, opts) {
     A.ok(/BRANCH 1 of 2 — B/.test(R.log[1].text) && /BRANCH 2 of 2 — A/.test(R.log[1].text), 'delivery order is the join order');
   }
 
-  /* ---- TIMEOUT: a joiner expecting THREE lanes on a two-lane split waits, then releases PARTIAL ---- */
+  /* ---- A LANE NOBODY RUNS IS NOT WAITED FOR (2026-10-10): a joiner with THREE in-lanes on a two-branch fan-out releases as
+     soon as both LAUNCHED branches deliver — it used to sit out its whole timeout for a lane no branch could ever fill ---- */
   {
     const floor = joinFloor({ timeoutMin: 3 });
     floor.belts.push(belt(9, 3, 'S'));   // a third in-lane from the north that nothing feeds
-    const R = rig(floor, { B: { text: 'beta' }, D: { text: 'synth from partial' } });
-    A.eq(R.plan.junctions['9,4'].expect, 3, 'the joiner now expects three lanes');
-    const p = R.c.advance({ agentId: 'A', text: 'alpha', originalText: 'go', lineId: R.lineId, runId: 'run3' });
-    await new Promise(r => setImmediate(r)); await new Promise(r => setImmediate(r));
-    A.eq(R.timers.length, 1, 'with no branch left to run the barrier arms ONE timeout');
-    A.eq(R.timers[0].ms, 3 * 60 * 1000, 'the timeout is the joiner\'s configured timeoutMin');
-    A.eq(R.log.map(l => l.agentId).join(','), 'B', 'nothing past the joiner ran while it waits');
+    const R = rig(floor, { B: { text: 'beta' }, D: { text: 'synth' } });
+    A.eq(R.plan.junctions['9,4'].expect, 3, 'the joiner has three lanes');
+    const res = await R.c.advance({ agentId: 'A', text: 'alpha', originalText: 'go', lineId: R.lineId, runId: 'run3' });
+    A.eq(R.timers.length, 0, 'no timeout armed: both launched branches delivered');
+    A.eq(res.stopped, null, 'the line runs on');
+    A.eq(res.text, 'synth', 'D ran on both branches');
+    A.ok(/JOINED OUTPUT — 2 of 2 branches delivered/.test(R.log[1].text), 'the merged crate counts the branches that ran');
+    A.eq(R.c._barrier.size(), 0, 'the barrier is cleared');
+  }
+
+  /* ---- TIMEOUT: a barrier still short when nothing in this run can fill it waits out timeoutMin, then releases PARTIAL ---- */
+  {
+    const R = rig(joinFloor({ timeoutMin: 3 }), {});
+    const r1 = R.c._barrier.deliver('9,4|run3b', 3, 'A', 'alpha', 3);
+    A.ok(!r1.released, 'one of three parts: held');
+    const p = R.c._barrier.wait('9,4|run3b', 3);
+    A.eq(R.timers.length, 1, 'the barrier arms ONE timeout');
+    A.eq(R.timers[0].ms, 3 * 60 * 1000, "the timeout is the joiner configured timeoutMin");
     R.timers[0].fn();   // the clock runs out
-    const res = await p;
-    A.eq(res.stopped, null, 'a timed-out join still runs the line on (' + res.stopped + ')');
-    A.eq(res.text, 'synth from partial', 'D ran on the partial set');
-    A.ok(/JOINED OUTPUT — 2 of 3 branches delivered/.test(R.log[1].text), 'the merged crate says 2 of 3');
-    A.ok(/PARTIAL: 1 branch never delivered before the joiner timed out \(lane 3\)/.test(R.log[1].text), 'and is MARKED partial, naming the missing lane');
+    const w = await p;
+    A.ok(w && w.timedOut && w.parts.length === 1, 'it releases what came in');
+    A.eq(w.missing, ['lane 2', 'lane 3'], 'naming the lanes that never delivered');
+    A.ok(/PARTIAL: 2 branches never delivered before the joiner timed out [(]lane 2, lane 3[)]/.test(P.joinPayload(w.parts, w.missing)), 'and the merged crate is MARKED partial');
     A.eq(R.c._barrier.size(), 0, 'the barrier is cleared after the timeout');
   }
 
-  /* ---- a FAILED branch does not deadlock the barrier: the chain stops with the honest note ---- */
+  /* ---- A FAILED BRANCH NO LONGER ENDS THE JOB (2026-10-10): the joiner sends on what arrived, the failed branch named ---- */
   {
-    const R = rig(joinFloor(), { B: { error: 'provider exploded' }, D: { text: 'never' } });
+    const R = rig(joinFloor(), { B: { error: 'provider exploded' }, D: { text: 'synth from A alone' } });
     const res = await R.c.advance({ agentId: 'A', text: 'alpha', originalText: 'go', lineId: R.lineId, runId: 'run4' });
-    A.ok(/B failed: provider exploded/.test(res.stopped), 'a failed branch stops the line with its reason');
-    A.eq(res.text, 'alpha', 'the last good output is delivered');
-    A.ok(R.log.every(l => l.agentId !== 'D'), 'D never ran');
+    A.eq(res.stopped, null, 'the line runs on past a failed branch (' + res.stopped + ')');
+    A.eq(res.text, 'synth from A alone', 'D ran on what arrived');
+    const dTurn = R.log.find(l => l.agentId === 'D');
+    A.ok(dTurn && /JOINED OUTPUT — 1 of 2 branches delivered/.test(dTurn.text), 'the merged crate says 1 of 2');
+    A.ok(dTurn && /PARTIAL: 1 branch failed and sent nothing [(]B failed[)]/.test(dTurn.text), 'and names the failed branch');
+    A.eq(R.c._barrier.size(), 0, 'nothing is stranded at the barrier');
   }
 
   /* ---- a direct order (no lineId) advances nothing — the line gate is unchanged by joiners ---- */
@@ -138,10 +152,10 @@ function rig(floor, script, opts) {
   {
     let disk = null;
     const store = { load: () => disk, save: v => { disk = JSON.parse(JSON.stringify(v)); } };
-    const floor = joinFloor(); floor.belts.push(belt(9, 3, 'S'));
-    const R = rig(floor, { B: { text: 'beta' }, D: { text: 'synth' } }, { barrierStore: store });
-    const p = R.c.advance({ agentId: 'A', text: 'alpha', originalText: 'go', lineId: R.lineId, runId: 'run5' });
-    await new Promise(r => setImmediate(r)); await new Promise(r => setImmediate(r));
+    const R = rig(joinFloor(), {}, { barrierStore: store });
+    // a barrier parked mid-run: two of three branches in (a third lane's branch still to come when the process died)
+    R.c._barrier.deliver('9,4|run5', 3, 'A', 'alpha', 10); R.c._barrier.deliver('9,4|run5', 3, 'B', 'beta', 10);
+    const p = R.c._barrier.wait('9,4|run5', 10);
     const keys = Object.keys(disk || {});
     A.eq(keys.length, 1, 'a parked barrier is written to the store');
     A.eq(keys[0], '9,4|run5', 'keyed by joiner tile + run');
@@ -171,6 +185,13 @@ function rig(floor, script, opts) {
     A.eq(res.text, 'published', 'the publisher has the last word');
     A.ok(/\[LOOP — pass 1 of 3/.test(R.log[0].text), 'the re-entry handoff names the pass');
     A.ok(/\[LOOP — pass 3 of 3/.test(R.log[4].text), 'and counts up to max');
+    // token-burn audit 2026-10-17: hops no longer replay the line's transcript, so the loop-back turn itself carries the work
+    A.eq(R.log[2].agentId, 'drafter');
+    // (the fixture's drafter names its output after the pass it was handed: its first draft is 'draft v2')
+    A.ok(R.log[2].text.indexOf('THE WORK UNDER REVIEW') >= 0 && R.log[2].text.indexOf('draft v2') >= 0 && R.log[2].text.indexOf('needs work 1') >= 0,
+      'a loop-back shows the writer the draft the reviewer judged AND the review: ' + R.log[2].text.slice(-300));
+    A.ok(R.log[2].text.indexOf('draft v2') < R.log[2].text.indexOf('needs work 1'), 'the work under review comes before the review');
+    A.ok(R.log[4].text.indexOf('draft v3') >= 0 && R.log[4].text.indexOf('draft v2') < 0, 'each pass shows the LATEST draft under review, never a stale one');
     A.eq(R.log[6].agentId, 'publisher');
     A.ok(!/\[LOOP/.test(R.log[6].text), 'the done-lane handoff carries no loop marker');
     A.eq(res.hops.length, 7, 'seven hops bought — more than the 6-stage cap, because loop passes are bounded by max, not by the stage cap');
@@ -203,6 +224,43 @@ function rig(floor, script, opts) {
     A.eq(res.stopped, null, 'join-then-outbox runs to its end (' + res.stopped + ')');
     A.eq(res.hops.map(h => h.agentId).join(','), 'B', 'sibling B ran; nothing past the joiner');
     A.ok(/2 of 2 branches delivered/.test(res.text) && /alpha findings/.test(res.text) && /beta findings/.test(res.text), 'the merged crate is the delivered answer');
+  }
+
+  /* ---- A PARTIAL JOIN IS A DELIVERED REPLY, NOT A SHIPMENT (wave 2 review, conveyor-backend-07; docs/DECISIONS.md): a COPY job whose
+     branch failed still answers (law 1 — the joiner sends on what arrived, marked PARTIAL), but the job is `partial`, the floor gets no
+     line-output product at the OUTBOX, and SEND TO hears of it only as partial (the host refuses it and says why on the next line —
+     never handed on, never counted as SHIPPED). Same verdict one after another and in parallel; the clean job is unchanged. ---- */
+  {
+    const floor = joinFloor();
+    floor.props[5] = { id: 'p6', t: 'outbox', x: 12, y: 4, w: 2, h: 2 };
+    const plan = P.compileRoutingPlan(floor), router = makeRouter();
+    A.ok(router.setPlan(plan).ok, 'partial: the join-to-OUTBOX floor deploys');
+    const entry = router.resolveDock({ tag: 'general' }), lineId = router.lineOriginFor(entry.agentId, entry.dockId);
+    for (const peek of [false, true]) for (const fail of [true, false]) {
+      const events = [], shipped = [];
+      const c = makeChainRunner(Object.assign({ nextAgent: (a, x) => router.chainNext(a, x), stepDock: (d, x) => router.chainStepDock(d, x),
+        entryDockOf: a => router.entryDockOf(a), fanSiblingsDock: d => router.fanSiblingsDock(d), lineOfAgent: (a, d) => router.lineOfAgent(a, d),
+        lastStage: (a, d) => router.chainShipsToOutbox(a, d), onShipped: r => { shipped.push(r); }, emit: (n, p) => events.push({ n, p }), now: clock,
+        setTimer: () => 0 }, peek ? { peekDock: (d, x) => router.chainPeekDock(d, x) } : {}));
+      const other = entry.agentId === 'A' ? 'B' : 'A';
+      const res = await c.advance({ agentId: entry.agentId, dockId: entry.dockId, text: entry.agentId + ' findings', originalText: 'research X', lineId, runId: 'pj' + peek + fail,
+        runAgent: async h => (fail && h.agentId === other ? { error: 'provider exploded' } : { text: h.agentId + ' findings', usd: 0.01 }) });
+      await new Promise(r => setImmediate(r));
+      const label = (peek ? 'parallel' : 'one after another') + (fail ? ', a failed branch' : ', clean');
+      const outputs = events.filter(e => e.n === 'workitem.delivered' && e.p.box === 'line-output');
+      A.eq(res.stopped, null, label + ': the line still answers (' + res.stopped + ')');
+      A.eq(res.outboxId, 'p6', label + ': at its OUTBOX');
+      if (fail) {
+        A.ok(typeof res.partial === 'string' && new RegExp(other + ' failed').test(res.partial), label + ': the job is partial, naming the failed branch (' + res.partial + ')');
+        A.ok(/PARTIAL/.test(res.text), label + ': the reply is still delivered, marked PARTIAL');
+        A.eq(outputs.length, 0, label + ': no product is released at the OUTBOX');
+        A.ok(shipped.length === 1 && shipped[0].partial === res.partial, label + ': SEND TO hears of it only as partial (the host refuses it, never hands it on)');
+      } else {
+        A.ok(!res.partial, label + ': a full join is not partial');
+        A.eq(outputs.length, 1, label + ': its product is released once');
+        A.ok(shipped.length === 1 && !shipped[0].partial, label + ': and it ships clean');
+      }
+    }
   }
 
   /* ---- the chain USD cap still bounds a loop ---- */
@@ -266,6 +324,9 @@ function rig(floor, script, opts) {
     A.eq(fixerTurn.agentId, 'fixer');
     A.ok(/\[LOOP — escalated: 2 passes round the gate at 12,4 without VERDICT: approved — handed to the escalation lane\]/.test(fixerTurn.text),
       'the fixer\'s handoff says exactly why it has the crate');
+    // token-burn audit 2026-10-17: hops no longer replay the line, so the fixer is handed the work itself, not only the notes on it
+    A.ok(fixerTurn.text.indexOf('THE WORK UNDER REVIEW') >= 0 && fixerTurn.text.indexOf('another draft') >= 0 && fixerTurn.text.indexOf('still bad 2') >= 0,
+      'the fixer gets the last draft AND the review: ' + fixerTurn.text.slice(-260));
   }
   /* the SAME floor with the verdict PASSING never touches the fixer */
   {
@@ -303,6 +364,149 @@ function rig(floor, script, opts) {
     } else {
       A.ok(true, 'visited-esc fallback floor did not compile as intended — covered by the runner guard');
     }
+  }
+
+  /* ---- SEND TO carries the routine's own directive (token-burn audit 2026-10-17): a contextFrom routine hands its line the
+          ASSEMBLED prompt (untrusted context + directive) as originalText so stages can read it, and the plain directive as
+          `ask`; the shipped record (what SEND TO hands the next line, cut at 4k downstream) must be the ask. ---- */
+  {
+    const shippedRecs = [];
+    const R = rig(loopFloor({ maxIter: 1 }), { publisher: { text: 'published', usd: 0.01 } }, { lastStage: () => true, onShipped: r => shippedRecs.push(r) });
+    const assembled = '<untrusted_routine_context>' + 'digest line. '.repeat(400) + '</untrusted_routine_context>\n\n## ROUTINE DIRECTIVE\nwrite a post';
+    await R.c.advance({ agentId: 'publisher', text: 'published', originalText: assembled, ask: 'write a post', lineId: R.lineId, runId: 'ask1' });
+    await new Promise(r => setImmediate(r));
+    A.ok(shippedRecs.length === 1, 'the job ships (' + shippedRecs.length + ')');
+    A.eq(shippedRecs[0] && shippedRecs[0].originalText, 'write a post', 'the SEND TO record carries the routine directive, never its context block');
+    const plain = [];
+    const R2 = rig(loopFloor({ maxIter: 1 }), { publisher: { text: 'published', usd: 0.01 } }, { lastStage: () => true, onShipped: r => plain.push(r) });
+    await R2.c.advance({ agentId: 'publisher', text: 'published', originalText: 'write a post', lineId: R2.lineId, runId: 'ask2' });
+    await new Promise(r => setImmediate(r));
+    A.eq(plain[0] && plain[0].originalText, 'write a post', 'with no separate ask the record keeps originalText (every other caller unchanged)');
+  }
+
+  /* ---- loopDecision's WORK UNDER REVIEW block, at the seam the runner and the step test share (token-burn audit 2026-10-17) ---- */
+  {
+    const { loopDecision } = require('../sidecar/routing/chain.js');
+    const gate = (o) => Object.assign({ loop: '12,4', backTo: 'drafter', max: 2, when: 'approved', next: 'publisher' }, o || {});
+    const ctxRevise = { verdict: 'revise' };
+    const back = loopDecision(gate(), ctxRevise, 0, {}, 'notes\nVERDICT: revise', 'DRAFT-1');
+    A.ok(back.again && /^\[LOOP — pass 1 of 2[^\n]*\]\nTHE WORK UNDER REVIEW[^\n]*\nDRAFT-1\n\nREVIEW:\nnotes/.test(back.text), 'a loop-back: marker, then the work under review, then the review');
+    const self = loopDecision(gate(), ctxRevise, 0, {}, 'notes\nVERDICT: revise', '');
+    A.ok(self.again && self.text.indexOf('THE WORK UNDER REVIEW') < 0, 'no reviewed text (a self-loop) -> no block, never a nested loop turn');
+    const exNext = loopDecision(gate(), ctxRevise, 2, {}, 'still bad\nVERDICT: revise', 'DRAFT-3');
+    A.ok(exNext.exhausted && exNext.text.indexOf('DRAFT-3') >= 0, 'an exhausted crate going to a downstream dock carries the unapproved work');
+    // a done lane that meets a JOINER: next is null and the dock past the joiner is afterJoin.next (frontend/app/pipeline.js)
+    const exJoinDock = loopDecision(gate({ next: null, afterJoin: { join: '14,8', expect: 2, next: 'synth' } }), ctxRevise, 2, {}, 'still bad\nVERDICT: revise', 'DRAFT-3');
+    A.ok(exJoinDock.exhausted && exJoinDock.text.indexOf('DRAFT-3') >= 0, 'an exhausted branch whose joiner feeds a dock carries the unapproved work for that dock');
+    const exJoinOut = loopDecision(gate({ next: null, afterJoin: { join: '14,8', expect: 2, next: null } }), ctxRevise, 2, {}, 'still bad\nVERDICT: revise', 'DRAFT-3');
+    A.ok(exJoinOut.exhausted && exJoinOut.text.indexOf('DRAFT-3') < 0, '...a joiner that ships straight out keeps the delivered product unchanged');
+    const exOut = loopDecision(gate({ next: null }), ctxRevise, 2, {}, 'still bad\nVERDICT: revise', 'DRAFT-3');
+    A.ok(exOut.exhausted && exOut.text.indexOf('DRAFT-3') < 0 && exOut.text.indexOf('still bad') >= 0, 'an exhausted crate that ships straight out keeps the reviewer\'s word only');
+    const big = 'x'.repeat(30000);
+    const clipped = loopDecision(gate(), ctxRevise, 0, {}, 'notes', big);
+    A.ok(clipped.text.length < 17000 && /characters of the work omitted/.test(clipped.text), 'a huge draft is clipped (head + tail), never the whole thing');
+
+    /* THE APPROVED WORK (2026-10-18): an approval that does not restate the work hands on the work it approved */
+    const ctxOk = { verdict: 'approved' };
+    const W = 'The draft: rooftop installs grew 34% in 2025, battery attach passed half, permits are the top soft cost.';
+    const okDock = loopDecision(gate(), ctxOk, 0, {}, 'Looks good.\nVERDICT: approved', W);
+    A.eq(okDock.text, '[LOOP — approved round the gate at 12,4 — the reviewer passed the work on without restating it]\nTHE WORK UNDER REVIEW (what the reviewer was handed):\n' + W + '\n\nREVIEW:\nLooks good.',
+      'a terse approval going to a dock: the work it approved, then the approval as its review (no VERDICT line)');
+    A.ok(!okDock.again && !okDock.exhausted && okDock.target === 'publisher', '...and it still leaves on the done lane, approved');
+    A.eq(loopDecision(gate({ next: null }), ctxOk, 0, {}, 'Looks good.\nVERDICT: approved', W).text, W, 'a terse approval that ships straight out delivers the work alone');
+    A.ok(/^\[LOOP — approved[^\n]*\]\nTHE WORK UNDER REVIEW[^\n]*\n/.test(loopDecision(gate({ next: null, afterJoin: { join: '14,8', expect: 2, next: 'synth' } }), ctxOk, 0, {}, 'Looks good.\nVERDICT: approved', W).text),
+      'past a JOINER that feeds a dock: framed for that dock');
+    A.eq(loopDecision(gate({ next: null, afterJoin: { join: '14,8', expect: 2, next: null } }), ctxOk, 0, {}, 'Looks good.\nVERDICT: approved', W).text, W,
+      'past a JOINER that ships straight out: the work alone (the joined product carries no frame)');
+    A.eq(loopDecision(gate(), ctxOk, 0, {}, 'VERDICT: approved', W).text, W, 'a reply that is only the verdict line hands on the work (no empty review)');
+    const restated = W.replace('34%', '34 percent') + '\n\nSpelled out one unit.';
+    A.eq(loopDecision(gate(), ctxOk, 0, {}, restated + '\nVERDICT: approved', W).text, restated, 'a reply that RESTATED the work is the work (R1) — no second copy');
+    A.eq(loopDecision(gate(), ctxOk, 0, {}, 'Looks good.\nVERDICT: approved', '').text, 'Looks good.', 'no reviewed text (a self-loop) -> the reply as before');
+    A.eq(loopDecision(gate({ next: null }), ctxOk, 0, {}, 'fine\nVERDICT: approved', okDock.text).text, W,
+      'two gates in a row, both terse: the second reviews the work inside the first one\'s frame — frames never nest or ship');
+    A.ok(loopDecision(gate(), ctxRevise, 0, {}, 'tighten it\nVERDICT: revise', okDock.text).text.indexOf('THE WORK UNDER REVIEW (what the reviewer was handed):\n' + W + '\n\nREVIEW:\ntighten it') > 0,
+      '...and a loop-back at the second gate shows the work, not the first gate\'s frame');
+    /* (review of 77b627c18, 2026-10-21) only THAT frame is unwrapped. An exhausted, escalated or looping gate's frame holds the earlier
+       reviewer's last word (perhaps its own redacted version): a later gate reviews the frame whole, and a bare approval of it swaps
+       nothing in — the draft that reviewer redacted never moves on in its place */
+    const DRAFT_PII = 'Call Jane Doe at 555-123-4567.';
+    const LAST_WORD = 'Call [redacted] at [redacted].\nVERDICT: revise';
+    const exhaustedFrame = loopDecision(gate(), ctxRevise, 2, {}, LAST_WORD, DRAFT_PII).text;
+    const escalatedFrame = loopDecision(gate({ esc: 'fixer' }), ctxRevise, 2, {}, LAST_WORD, DRAFT_PII).text;
+    const loopBackFrame = loopDecision(gate(), ctxRevise, 0, {}, LAST_WORD, DRAFT_PII).text;
+    A.ok(/^\[LOOP — exhausted/.test(exhaustedFrame) && /^\[LOOP — escalated/.test(escalatedFrame) && /^\[LOOP — pass 1 of 2/.test(loopBackFrame), 'the three other frames, each carrying the draft and the reviewer\'s last word');
+    for (const [name, frame] of [['an exhausted', exhaustedFrame], ['an escalated', escalatedFrame], ['a loop-back', loopBackFrame]]) {
+      for (const [where, g] of [['to a dock', gate()], ['out of the line', gate({ next: null })]]) {
+        const d = loopDecision(g, ctxOk, 0, {}, 'Looks good.\nVERDICT: approved', frame);
+        A.eq(d.text, 'Looks good.', name + ' gate\'s frame, a bare approval ' + where + ': the reply moves on as it is (as on trunk), never the draft inside');
+      }
+      const again = loopDecision(gate(), ctxRevise, 0, {}, 'Needs a source.\nVERDICT: revise', frame);
+      A.ok(again.text.indexOf('THE WORK UNDER REVIEW (what the reviewer was handed):\n' + frame + '\n\nREVIEW:\nNeeds a source.') > 0,
+        name + ' gate\'s frame, a loop-back at the next gate: the whole frame is what the reviewer was handed, its last word included');
+    }
+    const longWork = Array.from({ length: 6000 }, (_, i) => 'w' + i).join(' ');
+    const okLong = loopDecision(gate({ next: null }), ctxOk, 0, {}, 'Ship it.\nVERDICT: approved', longWork);
+    A.eq(okLong.text, longWork, 'the approved work is the product: never clipped');
+    A.eq(loopDecision(gate({ when: 'code' }), { tag: 'general' }, 0, {}, 'tag reply', W).text, 'tag reply', 'a classifier-tag gate is untouched (no verdict, no approval)');
+
+    /* FRAMES ANYWHERE (review of 524522d2c, 2026-10-22): a gate's done lane that meets a JOINER parks its frame as one BRANCH of the
+       merged crate (Pipeline.joinPayload), so the frame does not start the crate. Only the crate's first line was read: a bare
+       approval past the joiner swapped in the whole merged crate, an exhausted frame's draft (the personal data its reviewer had
+       redacted) and a passed-on frame's wrapper with it. Now an exhausted, escalated or looping frame anywhere keeps the reply, and
+       a passed-on frame that is a whole branch is unwrapped in place to the work it carries. */
+    const { hopTurn } = require('../sidecar/routing/chain.js');
+    const OTHER = 'Branch two: permits average 40 days.';
+    const piiFree = (t) => String(t).indexOf('Jane Doe') < 0 && String(t).indexOf('555-123-4567') < 0;
+    for (const [name, frame] of [['an exhausted', exhaustedFrame], ['an escalated', escalatedFrame], ['a loop-back', loopBackFrame]]) {
+      for (const [order, crate] of [['first', P.joinPayload([{ agentId: 'reviewer', text: frame }, { agentId: 'researcher', text: OTHER }], [])],
+        ['second', P.joinPayload([{ agentId: 'researcher', text: OTHER }, { agentId: 'reviewer', text: frame }], [])]]) {
+        A.ok(!/^\[LOOP — /.test(crate) && crate.indexOf('Jane Doe') > 0, name + ' frame as the ' + order + ' branch of a joined crate: the frame sits inside it, the draft with it');
+        for (const [where, g] of [['to a dock', gate()], ['out of the line', gate({ next: null })]]) {
+          const d = loopDecision(g, ctxOk, 0, {}, 'Looks good.\nVERDICT: approved', crate);
+          A.eq(d.text, 'Looks good.', name + ' frame as the ' + order + ' branch, a bare approval ' + where + ': the reply moves on as on trunk, never the joined crate');
+          A.ok(piiFree(d.text), name + ' frame as the ' + order + ' branch, ' + where + ': the draft its reviewer redacted never moves on');
+        }
+        const again = loopDecision(gate(), ctxRevise, 0, {}, 'Needs a source.\nVERDICT: revise', crate);
+        A.ok(again.text.indexOf('THE WORK UNDER REVIEW (what the reviewer was handed):\n' + crate + '\n\nREVIEW:\nNeeds a source.') > 0,
+          name + ' frame as the ' + order + ' branch, a loop-back: the whole joined crate is what the reviewer was handed');
+      }
+    }
+    // a passed-on frame that is a whole branch: unwrapped IN PLACE, the joiner's header, the other branch and its seams kept
+    const passedBranch = P.joinPayload([{ agentId: 'reviewer', text: okDock.text }, { agentId: 'researcher', text: OTHER }], []);
+    const cleanJoined = P.joinPayload([{ agentId: 'reviewer', text: W }, { agentId: 'researcher', text: OTHER }], []);
+    A.ok(passedBranch.indexOf('passed the work on without restating it') > 0, 'a joined crate whose first branch is a passed-on frame');
+    A.eq(loopDecision(gate({ next: null }), ctxOk, 0, {}, 'Ship it.\nVERDICT: approved', passedBranch).text, cleanJoined,
+      'a passed-on branch, a bare approval out of the line: the joined work ships, the frame unwrapped to its work (no wrapper, no REVIEW part)');
+    const passedDock = loopDecision(gate(), ctxOk, 0, {}, 'Ship it.\nVERDICT: approved', passedBranch).text;
+    A.eq(passedDock, '[LOOP — approved round the gate at 12,4 — the reviewer passed the work on without restating it]\nTHE WORK UNDER REVIEW (what the reviewer was handed):\n' + cleanJoined + '\n\nREVIEW:\nShip it.',
+      'a passed-on branch, a bare approval to a dock: one frame round the joined work — frames never nest');
+    const passedSecond = P.joinPayload([{ agentId: 'researcher', text: OTHER }, { agentId: 'reviewer', text: okDock.text }], ['late'], ['fixer failed']);
+    A.eq(loopDecision(gate({ next: null }), ctxOk, 0, {}, 'LGTM\nVERDICT: approved', passedSecond).text,
+      P.joinPayload([{ agentId: 'researcher', text: OTHER }, { agentId: 'reviewer', text: W }], ['late'], ['fixer failed']),
+      'a passed-on LAST branch of a partial join: unwrapped to the end of its branch, the PARTIAL marks kept as they are');
+    const bothPassed = P.joinPayload([{ agentId: 'reviewer', text: okDock.text }, { agentId: 'reviewer2', text: okDock.text }], []);
+    A.eq(loopDecision(gate({ next: null }), ctxOk, 0, {}, 'Approved.\nVERDICT: approved', bothPassed).text,
+      P.joinPayload([{ agentId: 'reviewer', text: W }, { agentId: 'reviewer2', text: W }], []), 'two passed-on branches: both unwrapped');
+    const mixed = P.joinPayload([{ agentId: 'reviewer', text: okDock.text }, { agentId: 'reviewer2', text: exhaustedFrame }], []);
+    A.eq(loopDecision(gate({ next: null }), ctxOk, 0, {}, 'Looks good.\nVERDICT: approved', mixed).text, 'Looks good.',
+      'a passed-on branch beside an exhausted one: the reply moves on as on trunk, never the exhausted draft');
+    const midText = P.joinPayload([{ agentId: 'reviewer', text: 'Intro the reviewer wrote.\n' + okDock.text }, { agentId: 'researcher', text: OTHER }], []);
+    A.eq(loopDecision(gate({ next: null }), ctxOk, 0, {}, 'Looks good.\nVERDICT: approved', midText).text, 'Looks good.',
+      'a frame that does not start its branch cannot be read back exactly: the reply moves on as on trunk');
+    A.eq(loopDecision(gate({ next: null }), ctxOk, 0, {}, 'Looks good.\nVERDICT: approved', 'Notes:\n' + exhaustedFrame).text, 'Looks good.',
+      'a frame mid-crate with no joiner at all: the reply moves on as on trunk');
+    // a passed-on frame round a joined crate (gate 1 approved a merged job), itself one branch of a later join: unwrapped to the inner joined work
+    const nestedWork = P.joinPayload([{ agentId: 'a', text: 'alpha work' }, { agentId: 'b', text: 'beta work' }], []);
+    const nestedFrame = loopDecision(gate(), ctxOk, 0, {}, 'Looks good.\nVERDICT: approved', nestedWork).text;
+    A.ok(nestedFrame.indexOf('THE WORK UNDER REVIEW (what the reviewer was handed):\n' + nestedWork + '\n\nREVIEW:\nLooks good.') > 0, 'gate 1 passes a joined crate on in its frame');
+    A.eq(loopDecision(gate({ next: null }), ctxOk, 0, {}, 'Ship it.\nVERDICT: approved', P.joinPayload([{ agentId: 'reviewer', text: nestedFrame }, { agentId: 'researcher', text: OTHER }], [])).text,
+      P.joinPayload([{ agentId: 'reviewer', text: nestedWork }, { agentId: 'researcher', text: OTHER }], []), 'a passed-on frame round a joined crate, as a branch: unwrapped to that joined work');
+    // the brief makes the bare-approval promise exactly where it holds
+    const turnFor = (upstream) => hopTurn({ loopGateAfter: () => ({ when: 'approved', max: 2, backTo: 'writer', backDock: null }), originalText: 'go', from: 'researcher', upstream, hop: 3, target: 'editor', lineId: 'p1' });
+    const PROMISE = /a reply of only the VERDICT line, or a bare approval such as "Looks good\.", passes it on exactly as you were handed it/;
+    A.ok(PROMISE.test(turnFor(passedBranch)) && PROMISE.test(turnFor(cleanJoined)), 'the reviewer of a joined crate of plain or passed-on branches is told a bare approval passes it on');
+    for (const [name, crate] of [['an exhausted', P.joinPayload([{ agentId: 'researcher', text: OTHER }, { agentId: 'reviewer', text: exhaustedFrame }], [])], ['a mixed', mixed]])
+      A.ok(!PROMISE.test(turnFor(crate)) && /your reply is what moves on past the gate/.test(turnFor(crate)), 'the reviewer of a joined crate with ' + name + ' branch is never promised a bare approval passes it on');
   }
 
   A.report('chain.join-loop');

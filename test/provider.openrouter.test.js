@@ -5,6 +5,7 @@
 'use strict';
 const A = require('./_assert.js');
 const { makeOpenRouterProvider } = require('../sidecar/providers/openrouter.js');
+const provider = require('../sidecar/providers/provider.js');
 
 const line = obj => 'data: ' + JSON.stringify(obj);
 const sseFetch = (sseText, status) => async () => new Response(sseText, { status: status || 200, headers: { 'Content-Type': 'text/event-stream' } });
@@ -157,20 +158,23 @@ async function collect(provider, req) { const out = []; for await (const e of pr
       { role: 'user', content: 'hi' },
       { role: 'tool', tool_call_id: 'orphan_1', content: 'result body' }
     ] });
-    A.eq(posted[0][1], {
-      role: 'user',
-      content: '[recovered tool result orphan_1 — its originating call is not in this transcript]\nresult body'
-    }, 'orphan result is preserved as labeled user text instead of a 400-invalid tool message');
+    // the labelled text joins the user turn before it (provider.js projectRoles 'chat': roles alternate on a chat wire)
+    A.eq(posted[0].map(m => m.role), ['user'], 'no tool message without its call reaches the wire');
+    A.eq(posted[0][0].content, 'hi\n\n[recovered tool result orphan_1 — its originating call is not in this transcript]\nresult body',
+      'orphan result is preserved as labeled user text instead of a 400-invalid tool message');
 
     await collect(p, { model: 'm', messages: [
       { role: 'assistant', content: '', tool_calls: [{ id: 'call_lost', type: 'function', function: { name: 'fs_read', arguments: '{}' } }] },
       { role: 'user', content: 'continue' }
     ] });
-    A.eq(posted[1][1], {
+    // a request that opens on an assistant turn gets a short fenced user boundary first (projectRoles 'chat')
+    const at = posted[1].findIndex(m => m.role === 'assistant');
+    A.eq(posted[1][0].role, 'user', 'the request opens on a user turn');
+    A.eq(posted[1][at + 1], {
       role: 'tool', tool_call_id: 'call_lost',
       content: '[interrupted — this call produced no recorded result. Reissue it if it is still needed.]'
     }, 'unanswered call receives a synthetic result before the next conversational message');
-    A.eq(posted[1][2], { role: 'user', content: 'continue' }, 'the following user message keeps its place after the repaired pair');
+    A.eq(posted[1][at + 2], { role: 'user', content: 'continue' }, 'the following user message keeps its place after the repaired pair');
   }
 
   // H3. Healthy parallel pairs are byte-identical; duplicate results are downgraded without losing content.
@@ -205,7 +209,7 @@ async function collect(provider, req) { const out = []; for await (const e of pr
   // I. supportsTools reflects the warmed catalog; unknown -> null (never a false refusal)
   {
     const modelsFetch = async () => new Response(JSON.stringify({ data: [
-      { id: 'tooly', supported_parameters: ['tools'] },
+      { id: 'tooly', supported_parameters: ['tools'], top_provider: { max_completion_tokens: 64000 } },
       { id: 'brainy', supported_parameters: ['tools', 'reasoning_effort'], reasoningEfforts: ['low', 'high'] },
       { id: 'plain', supported_parameters: [] }
     ] }), { status: 200 });
@@ -214,6 +218,8 @@ async function collect(provider, req) { const out = []; for await (const e of pr
     A.eq(p.supportsTools('tooly'), true, 'tool-capable model -> true');
     A.eq(p.supportsTools('plain'), false, 'non-tool model -> false');
     A.eq(p.supportsTools('unknown-xyz'), null, 'unknown model -> null (do not false-refuse)');
+    A.eq(p.outputLimit('tooly'), 64000, 'output limit from top_provider.max_completion_tokens (bug d3a76db3: what a call can bill)');
+    A.eq(p.outputLimit('plain'), 0, 'a model with no published output ceiling -> 0 (unknown)');
     A.eq(p.reasoningEfforts('brainy'), ['low', 'high'], 'declared reasoning efforts are exposed');
     A.eq(p.reasoningEfforts('plain'), ['none'], 'non-reasoning model exposes only reasoning off');
   }
@@ -332,12 +338,33 @@ async function collect(provider, req) { const out = []; for await (const e of pr
     A.eq(cached[1], msgs[1], 'messages beyond the three tail anchors are passed through by reference');
     A.eq(msgs[3].content, 'tool result', 'pure: no input message is mutated');
     // A blank message is never stamped (Anthropic 400s an empty text block); the anchor slides past it.
+    // (lean-prompt 2026-10-12: the fixture used to put two user messages back to back and expect the FIRST stamped —
+    //  they are one upstream turn, and only a turn's last message is stamped now; see ONE ANCHOR PER USER TURN.)
     const blank = applyCacheControl([
-      { role: 'system', content: 'S' }, { role: 'user', content: 'u1' },
+      { role: 'system', content: 'S' }, { role: 'user', content: 'u0' }, { role: 'assistant', content: 'a0' },
       { role: 'user', content: 'u2' }, { role: 'assistant', content: '' }, { role: 'user', content: 'u3' }
     ], 'anthropic/claude-3.5');
-    A.eq(blank[3].content, '', 'a blank message is skipped, not stamped');
-    A.ok(Array.isArray(blank[1].content) && blank[1].content[0].cache_control, 'the third anchor slides past the blank onto the next stampable message');
+    A.eq(blank[4].content, '', 'a blank message is skipped, not stamped');
+    A.ok(Array.isArray(blank[2].content) && blank[2].content[0].cache_control, 'the third anchor slides past the blank onto the next stampable message');
+    // ONE ANCHOR PER USER TURN: host notes made user-side (run context, recall) never take a tail anchor from the
+    // previous assistant reply — the last bytes the NEXT message's request shares, so the one whose write it reads.
+    const prefix = 'STABLE '.repeat(40);
+    const turn = applyCacheControl(provider.preserveClaudeContinuations([
+      { role: 'system', content: prefix + 'tail' }, { role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' },
+      { role: 'system', content: provider.runContextNote('[RUNTIME] Run id: r2') }, { role: 'system', content: '<recalled-memory>\nm\n</recalled-memory>' },
+      { role: 'user', content: 'q2' }
+    ], 'anthropic/claude-sonnet-4.6'), 'anthropic/claude-sonnet-4.6', prefix);
+    const turnAnchors = turn.map((m, i) => Array.isArray(m.content) && m.content.some(p => p && p.cache_control) ? i : -1).filter(i => i >= 0);
+    A.eq(turnAnchors, [0, 2, 5], 'split system + the user turn + the previous reply; the run-context and recall notes are not stamped');
+    A.eq(turn.map(m => m.role), ['system', 'user', 'assistant', 'user', 'user', 'user'], 'the notes ride the user side for Claude');
+    A.eq((JSON.stringify(turn).match(/cache_control/g) || []).length, 4, 'four markers: two system, two tail');
+    process.env.STARNET_STABLE_PREFIX = '0';
+    const legacy = applyCacheControl(provider.preserveClaudeContinuations([
+      { role: 'system', content: prefix + 'tail' }, { role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' },
+      { role: 'system', content: provider.runContextNote('x') }, { role: 'user', content: 'q2' }
+    ], 'anthropic/claude-sonnet-4.6'), 'anthropic/claude-sonnet-4.6', prefix);
+    delete process.env.STARNET_STABLE_PREFIX;
+    A.eq(legacy.map((m, i) => Array.isArray(m.content) && m.content.some(p => p && p.cache_control) ? i : -1).filter(i => i >= 0), [0, 3, 4], 'kill switch STARNET_STABLE_PREFIX=0: the old per-message stamping');
   }
 
   // L2. caching is actually WIRED into the request body for Anthropic models (and absent for others)
@@ -374,7 +401,11 @@ async function collect(provider, req) { const out = []; for await (const e of pr
       };
       await collect(makeOpenRouterProvider({ fetch, key: 'k' }), { model, messages });
       const claude = model.startsWith('anthropic/');
-      A.eq(body.messages.map(m => m.role), ['system', 'system', 'user', 'assistant', claude ? 'user' : 'system'], model + ': leading policy preserved and continuation remains a conversation turn');
+      // Claude keeps its structural placement; every other model the strict 'chat' shape: ONE leading system message (the
+      // two leading policies joined, in order) and the continuation as the user turn after the answer — never a system
+      // message after index 0 (#102), and never ending on the assistant answer (no prefill)
+      A.eq(body.messages.map(m => m.role), claude ? ['system', 'system', 'user', 'assistant', 'user'] : ['system', 'user', 'assistant', 'user'], model + ': leading policy preserved and continuation remains a conversation turn');
+      if (!claude) A.eq(body.messages[0].content, 'Primary policy\n\nTool policy', model + ': the leading policies are one system message, in order');
       const tail = body.messages.at(-1).content;
       A.eq(typeof tail === 'string' ? tail : tail[0].text, messages.at(-1).content, model + ': continuation bytes preserved');
     }

@@ -11,10 +11,18 @@
   const esc = H.esc, sfx = H.sfx, notify = H.notify, fmtRel = H.fmtRel;
   const consoleSection = H.consoleSection;
   let routineAgentId = 'agent'; // selected roster agent for new scheduled routines (window-local state)
+  let routineLineKey = null;    // RUN BY a workflow (org P16): the picked line's key, or null when an agent runs it
+  /* RUN BY's workflows (org P16, 2026-10-14): every line on the floor, read the way WORKFLOWS reads it (its compiled plan —
+     WorkflowsWindow.startLines). A line with no agent on its first step has no dockId and is offered disabled. [] when the
+     floor is not loaded: the form then offers agents only, as before. */
+  function startLines() {
+    try { return (typeof WorkflowsWindow !== 'undefined' && WorkflowsWindow.startLines) ? (WorkflowsWindow.startLines() || []) : []; }
+    catch (e) { return []; }
+  }
 
   // the browser's IANA zone, or undefined when the runtime won't resolve one (then the host default
-  // applies server-side, exactly as before). Sent with every create / preview / reschedule so all three
-  // agree about which 9:00 they mean.
+  // applies server-side, exactly as before). Sent with create and its preview; rescheduling uses the
+  // routine's saved zone so opening it on another device cannot move its wall-clock time.
   function deviceTz() {
     try { return (Intl.DateTimeFormat().resolvedOptions().timeZone) || undefined; } catch (_) { return undefined; }
   }
@@ -47,6 +55,8 @@
      last-result only from real server data, and says plainly when the scheduler tick is off. */
   function routinesLane(body) {
     const roster = H.present.length ? H.present : [{ id: 'agent', name: 'Agent', color: 'var(--ph)' }];
+    const lines = startLines();
+    if (routineLineKey && !lines.some(l => l.key === routineLineKey && l.dockId)) routineLineKey = null;
     const hasSelected = roster.some(a => a && a.id === routineAgentId);
     if (!hasSelected) routineAgentId = (H.present[H.sel] && H.present[H.sel].id) || (roster[0] && roster[0].id) || 'agent';
     function agentFor(id) { return roster.find(a => a && a.id === id) || null; }
@@ -78,8 +88,14 @@
       '<div id="rt-out" class="msg rt-out" hidden></div>';
     const secCreate =
       '<div class="mc-form rt-simple-create">' +
-        '<div class="rt-identity"><label class="sn-menu-field">Name<input id="rt-name" class="key-input" placeholder="e.g. Morning research brief" maxlength="80" autocomplete="off"></label>' +
-        '<label class="sn-menu-field">Agent<select id="rt-agent-select" class="key-input">' + roster.map(a => '<option value="' + esc(a.id) + '"' + (a.id === routineAgentId ? ' selected' : '') + '>' + esc(a.name || a.id) + '</option>').join('') + '</select></label></div>' +
+        '<div class="rt-identity"><label class="sn-menu-field">Name<input id="rt-name" class="key-input" placeholder="e.g. Morning brief" maxlength="80" autocomplete="off"></label>' +
+        // RUN BY (org P16): agents first, then workflows — a workflow runs the WHOLE line from its first step (runsLine)
+        '<label class="sn-menu-field">Run by<select id="rt-agent-select" class="key-input">' +
+          (lines.length ? '<optgroup label="AGENTS">' : '') +
+          roster.map(a => '<option value="' + esc(a.id) + '"' + (!routineLineKey && a.id === routineAgentId ? ' selected' : '') + '>' + esc(a.name || a.id) + '</option>').join('') +
+          (lines.length ? '</optgroup><optgroup label="WORKFLOWS">' + lines.map(l => '<option value="line:' + esc(l.key) + '"' + (l.dockId ? '' : ' disabled') + (routineLineKey === l.key ? ' selected' : '') + '>' +
+            esc(String(l.name || 'workflow').toUpperCase()) + (l.dockId ? '' : ' (no agent on its first step)') + '</option>').join('') + '</optgroup>' : '') +
+        '</select></label></div>' +
         '<div hidden><div class="rt-agent-pick">' + roster.map(agentButton).join('') + '</div></div><input id="rt-agent" type="hidden" value="' + esc(routineAgentId) + '">' +
         '<label class="sn-menu-field">What should it do?<textarea id="rt-prompt" class="key-input" rows="2" placeholder="e.g. Find three research updates and summarize them with source links." style="resize:vertical"></textarea></label>' +
         // WHEN — the schedule PICKER (frontend/app/schedpicker.js). It owns the `#rt-sched` text input and
@@ -101,7 +117,7 @@
           '<div data-auto-panel="1" hidden><p class="sn-menu-note">Optional script and tool restrictions for this job.</p>' +
             '<label class="sn-menu-field">Pre-check script<input id="rt-script" class="key-input" placeholder="Path relative to the project"></label>' +
             '<label class="rt-term"><input type="checkbox" id="rt-no-agent"> Run the script only, without a model</label>' +
-            '<label class="sn-menu-field">Allowed toolsets<input id="rt-toolsets" class="key-input" placeholder="Comma-separated; blank uses station defaults"></label></div>' +
+            '<label class="sn-menu-field">Allowed toolsets<input id="rt-toolsets" class="key-input" placeholder="Toolset ids, e.g. web, cabinet; blank uses station defaults"></label></div>' +
           '<div data-auto-panel="2" hidden><p class="sn-menu-note">Choose where the result goes.</p>' +
             '<label class="sn-menu-field">Result destination<select id="rt-deliver" class="key-input"><option value="local">Keep in StarNet</option><option value="origin">Return to this conversation</option></select></label>' +
             '<label class="rt-term"><input type="checkbox" id="rt-continue"> Allow follow-up in that conversation</label></div>' +
@@ -122,9 +138,16 @@
           '<span>Let this routine use your <b>connected tools</b> ' +
           '<span class="dim">— the MCP connectors you set up in ⇄ ABILITIES, called unattended on your behalf. Connectors you switched off stay off.</span></span>' +
         '</label>' +
+        // UNATTENDED IMAGES GRANT — its own tick: making a picture opens no shell and no outside account, but each
+        // one can cost money, so it is never bundled with the two above. Also default OFF.
+        '<label class="rt-term" for="rt-img" style="display:flex;gap:.5em;align-items:flex-start;cursor:pointer">' +
+          '<input type="checkbox" id="rt-img" style="margin-top:.25em">' +
+          '<span>Let this routine make <b>images</b> ' +
+          '<span class="dim">— generates pictures unattended, with nobody approving each one. Each picture can cost money and counts toward your spend caps.</span></span>' +
+        '</label>' +
         '</div>' +
         '</details>' +
-        '<div id="rt-create-state" class="set-about" role="status">Checking scheduling status…</div><button class="bb sm" id="rt-add">SAVE SCHEDULE</button>' +
+        '<div id="rt-create-state" class="set-about" role="status">Checking scheduling status…</div><button class="bb sm" id="rt-add">▸ SAVE SCHEDULE</button>' +
       '</div>' +
       '<div id="rt-msg" class="msg"></div>';
     const frag = h => (el => { el.innerHTML = h; });
@@ -132,18 +155,23 @@
     // rail with the loops lane — 'active' alone would collide. wire() runs after mountConsole has appended
     // every pane to `body`, so all the querySelector wiring below resolves exactly as it always did.
     const sections = [
-      { id: 'routines', label: 'ACTIVE ROUTINES', glyph: '◷', desc: 'Standing jobs that fire on a schedule — their next run, last result, and whether the scheduler is armed.', build: frag(secActive) },
+      { id: 'routines', label: 'ACTIVE ROUTINES', glyph: '◷', desc: 'Jobs that run on a schedule — when each runs next, how it last went, and whether scheduling is on.', build: frag(secActive) },
       { id: 'routines-create', label: 'CREATE ROUTINE', glyph: '✦', desc: 'Put your agent to work on a schedule — a morning brief, a nightly summary, a recurring check.', build: frag(secCreate) }
     ];
     function wire() {
     const listEl = body.querySelector('#rt-list'), gateEl = body.querySelector('#rt-gate');
     const msgEl = body.querySelector('#rt-msg'), outEl = body.querySelector('#rt-out');
-    const post = (path, payload) => fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    const post = (path, payload, signal) => fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal });
     // P0 #11 — run-output placement. lastRunId = the routine whose RUN NOW result #rt-out currently shows.
     // schedulerArmed mirrors GET /api/cron `.enabled` (set in refresh) so the create-confirm can tell the honest
     // armed/disarmed story via AutoJobs.armStateLine. #rt-out lives in the ACTIVE pane (sibling of #rt-list); when a
     // run fires we splice it in right AFTER its row, and after every list re-render positionOut() re-slots it there.
-    let lastRunId = null, schedulerArmed = false;
+    let lastRunId = null, schedulerArmed = false, listedJobs = [], editSaving = false;
+    // EDIT TASK size: POST /api/cron/update reads at most 64 KB of JSON (readBody 1 << 16). The textarea caps the
+    // characters a little under it; the save re-checks the REAL serialized request bytes (UTF-8 + JSON escapes) so an
+    // oversized edit is refused here with a reason instead of dying as a bare 'bad body' from the server.
+    const EDIT_BODY_MAX = 1 << 16, EDIT_PROMPT_MAX = 60000;
+    const utf8Bytes = s => { try { return new TextEncoder().encode(String(s)).length; } catch (e) { return String(s).length * 3; } };
     function showRunOut(rowEl, id) {
       lastRunId = id;
       const nmEl = rowEl && rowEl.querySelector('.mc-top b');
@@ -167,7 +195,7 @@
     function runsLine(j) {
       const who = esc(agentLabel(j.agentId || 'agent'));
       if (j.runsLine !== true) return 'runs as ' + who;
-      const info = (typeof Build !== 'undefined' && Build.lineOfAgentInfo) ? Build.lineOfAgentInfo(j.agentId) : null;
+      const info = (typeof Build !== 'undefined' && Build.lineOfAgentInfo) ? Build.lineOfAgentInfo(j.agentId, j.dockId) : null;   // (multi-bay) the bay it FIRES AT
       if (!info) return 'runs as ' + who;
       return 'runs the <b>' + esc((info.name || 'unnamed').toUpperCase()) + '</b> line from ' + who + ' (' + info.docks + ' dock' + (info.docks === 1 ? '' : 's') + ')';
     }
@@ -209,15 +237,30 @@
     // error string already carries the channel in [brackets]); a success or a never-delivered job shows nothing
     // (honest no-signal — we never invent a "delivered" state the job never attempted).
     function deliveryLine(j) {
-      if (!j.lastDeliveryAt || j.lastDeliveryOk !== false) return '';
-      return '<div class="mc-detail" style="color:var(--bad)">✕ delivery failed — ' + esc(j.lastDeliveryError || 'notification could not be sent') +
+      const pending = (Array.isArray(j.deliveryBacklog) ? j.deliveryBacklog : []).concat(j.finalization ? [j.finalization] : []).filter(f => f && f.state === 'pending');
+      let line = '';
+      if (pending.length) {
+        // a routine the Commander PAUSED holds its results until resumed (cron-store deliveriesHeld): no retry is due
+        const held = j.enabled === false && j.state === 'paused';
+        const retry = pending.map(f => Date.parse(f.nextAttemptAt)).filter(Number.isFinite).sort((a, b) => a - b)[0];
+        // the driver defers on UNDELIVERED results (cron-store undeliveredCount): one collapsed receipt stands for
+        // itself plus every earlier result it superseded
+        const undelivered = pending.reduce((n, f) => n + 1 + Math.max(0, Number(f.superseded) || 0), 0);
+        line = '<div class="mc-detail">' + pending.length + ' result' + (pending.length === 1 ? '' : 's') + ' awaiting delivery' +
+          (held ? ' · held until the routine is resumed'
+            : (retry ? ' · next retry ' + esc(wallClock(new Date(retry).toISOString())) : '') +
+              (maxPendingDeliveries > 0 && undelivered >= maxPendingDeliveries ? ' · new runs deferred until the destination recovers' : '')) + '</div>';
+      }
+      if (j.lastDeliveryAt && j.lastDeliveryOk === false) line += '<div class="mc-detail" style="color:var(--bad)">✕ delivery failed — ' + esc(j.lastDeliveryError || 'notification could not be sent') +
         ' <span class="dim">' + esc(fmtRel(j.lastDeliveryAt)) + '</span></div>';
+      return line;
     }
     // CONSECUTIVE-FAILURE AUTO-PAUSE (routine hardening, 2026-08-21): the store counts terminal failures in a row
     // and disables the job at the ceiling with disabledReason:'consecutive-failures'. Both fields come straight
     // off GET /api/cron (real store state) — a paused-by-failures row says so, and a still-enabled row with a
     // streak shows how close it is to the ceiling. Nothing is rendered for a clean job (honest no-signal).
     let maxConsecutive = 0;   // GET /api/cron .maxConsecutiveFailures (0 = the ceiling is off)
+    let maxPendingDeliveries = 0;   // GET /api/cron .maxPendingDeliveries (0 = an older sidecar that does not say)
     function failureStreakLine(j) {
       const n = Number(j.consecutiveFailures) || 0;
       if (j.enabled === false && j.disabledReason === 'consecutive-failures') {
@@ -266,7 +309,11 @@
         : '';
       const termBadge =
         grantBadge(grantsOf.indexOf('workbench') >= 0, '⌘ terminal', 'this routine may run shell commands unattended') +
-        grantBadge(grantsOf.indexOf('connectors') >= 0, '⧉ connected tools', 'this routine may call your MCP connectors unattended');
+        grantBadge(grantsOf.indexOf('connectors') >= 0, '⧉ connected tools', 'this routine may call your MCP connectors unattended') +
+        grantBadge(grantsOf.indexOf('studio') >= 0, '▣ images', 'this routine may make images unattended');
+      // a routine made from a chat (the agent's routine.create) carries no grant, and the create form is the only other
+      // place one is set — so images can be allowed on the row itself. A script-only routine never calls a model.
+      const canAllowImages = grantsOf.indexOf('studio') < 0 && !j.noAgent;
       const skillCount = Array.isArray(j.skills) ? j.skills.length : 0;
       const runtimeBadge =
         grantBadge(!!j.noAgent, '⚙ script only', 'this routine completes without calling a model') +
@@ -281,9 +328,11 @@
       // at 9:00 AM", and the audit string that actually fires the job is one hover away, never hidden.
       const sched = j.scheduleDisplay || '';
       const schedHuman = human(sched);
-      return '<div class="mc-row" data-id="' + esc(j.id) + '" data-on="' + (on ? '1' : '0') + '" data-sched="' + esc(sched) + '">' +
+      const schedTz = j.schedule && j.schedule.kind === 'cron' ? String(j.schedule.tz || '') : '';
+      const tzLabel = schedTz ? ' [' + schedTz + ']' : '';
+      return '<div class="mc-row" data-id="' + esc(j.id) + '" data-agent="' + esc(j.agentId || 'agent') + '" data-name="' + esc(j.name || '') + '" data-on="' + (on ? '1' : '0') + '" data-sched="' + esc(sched) + '" data-tz="' + esc(schedTz) + '">' +
         '<div class="mc-top"><b>' + esc(j.name || '(unnamed)') + '</b> <span class="dim"' +
-          (schedHuman !== sched ? ' title="' + esc(sched) + '"' : '') + '>' + esc(schedHuman) + '</span> ' + stateBadge + termBadge + runtimeBadge + fromRecipe + '</div>' +
+          (schedHuman !== sched ? ' title="' + esc(sched) + '"' : '') + '>' + esc(schedHuman + tzLabel) + '</span> ' + stateBadge + termBadge + runtimeBadge + fromRecipe + '</div>' +
         '<div class="mc-url dim">' + runsLine(j) + ' · next ' + next + ' · last ' + lastResult(j) + spendLine(j) + '</div>' +
         (j.lastError ? '<div class="mc-detail">' + esc(j.lastError === 'schedule-unfireable' ? 'schedule can never fire — reschedule this routine' : j.lastError) + '</div>' : '') +
         failureStreakLine(j) +
@@ -292,12 +341,15 @@
           '<button class="bb xs" data-act="run"' + (running ? ' disabled title="already running — one run per routine"' : '') + '>▶ RUN NOW</button>' +
           // RESCHEDULE — the same picker, opened on this routine's current schedule. Before this you could
           // only DELETE and re-create a routine to move it an hour, which also threw away its run history.
+          '<button class="bb xs" data-act="edit">✎ EDIT TASK</button>' +
           '<button class="bb xs" data-act="resched">◷ RESCHEDULE</button>' +
+          '<button class="bb xs" data-act="history"' + (j.lastRunAt ? '' : ' disabled title="no runs yet"') + '>☰ HISTORY</button>' +
           // no toggle on a settled one-shot: ENABLE can't re-arm it (see completedOnce above)
           (completedOnce ? '' : '<button class="bb xs" data-act="toggle">' + (on ? '⏸ DISABLE' : '▶ ENABLE') + '</button>') +
           // REVOKE — a standing unattended permission must be withdrawable without deleting the routine.
           // Only rendered when there is something to revoke, so an ordinary routine's action row is unchanged.
-          (grantsOf.length ? '<button class="bb xs" data-act="revoke" title="stop this routine using the terminal / your connected tools">⌫ REVOKE ACCESS</button>' : '') +
+          (canAllowImages ? '<button class="bb xs" data-act="allow-images" title="let this routine make images with nobody approving each one — each picture can cost money and counts toward your spend caps">▣ ALLOW IMAGES</button>' : '') +
+          (grantsOf.length ? '<button class="bb xs" data-act="revoke" title="stop this routine using the terminal / your connected tools / making images">⌫ REVOKE ACCESS</button>' : '') +
           '<button class="bb xs danger" data-act="remove">✕ DELETE</button>' +
         '</div></div>';
     }
@@ -308,12 +360,20 @@
         const j = typeof QuerySpine !== 'undefined' && QuerySpine.refresh
           ? (await QuerySpine.refresh('cron')).data : await Harness.api.get('/api/cron');
         const jobs = (j && j.jobs) || [];
+        listedJobs = jobs;
         // the live cronArmed — feeds the create-confirm's honest arm-state line. A HALTED scheduler is not armed no
         // matter what the intent flag says, or the create-confirm promises a fire that an E-STOP is holding down.
         schedulerArmed = !!(j && j.enabled && !j.halted);
         const createState = body.querySelector('#rt-create-state');
-        if (createState) createState.textContent = schedulerArmed ? 'Scheduling is enabled. Saving adds this task to the schedule shown below.' : 'Scheduling is off. You can save a routine, but it will not run automatically until you enable scheduling in Active Routines.';
+        // ONE ARM RULE (org P16): the line says what saving will really do — it turns a never-set switch on, never an explicit OFF
+        // (GET /api/cron armSet), never an E-STOP. It names the switch by its key and the page it is on, as AUTOMATE labels it
+        // (automation.js labels.routines = 'Scheduled jobs' — never an old page name no tab carries; org wire AUTO-P16-2)
+        if (createState) createState.textContent = schedulerArmed ? 'Scheduling is on. Saving adds this task to the schedule shown below.'
+          : (j && j.halted) ? 'Scheduling is stopped (E-STOP). Saving keeps it stopped: it runs only after you press ▶ TURN SCHEDULING ON in Scheduled jobs.'
+          : (j && j.armSet) ? 'Scheduling is off — you turned it off. Saving keeps it off: press ▶ TURN SCHEDULING ON in Scheduled jobs when you want it to run.'
+          : 'Scheduling is off. Saving turns it on for the whole station, so every saved schedule runs at its time.';   // the INBOX form's own words (workflowpanel.js) — one SAVE SCHEDULE, one sentence
         maxConsecutive = (j && Number(j.maxConsecutiveFailures)) || 0;
+        maxPendingDeliveries = (j && Number(j.maxPendingDeliveries)) || 0;
         // DEGRADED STORE (routine hardening, 2026-08-21): GET /api/cron carries `degraded` when cron.jobs.json AND
         // its .bak were both unreadable at boot. The sidecar quarantined the file, froze the scheduler, and refuses
         // to persist an empty list until the Commander accepts the loss. Say so loudly; the one action is explicit.
@@ -333,7 +393,7 @@
         // show the armed state + a DISABLE control. `enabled` comes straight from GET /api/cron (the live
         // cronArmed), so the badge reflects a runtime arm/disarm immediately.
         // G4.6 — when OFF, this is not a whisper: promote it to a .brief-block banner (same vocabulary the quest
-        // APPROVE ask uses) with the ENABLE SCHEDULING action inline, so "saved but won't fire" reads loudly and
+        // APPROVE ask uses) with the ▶ TURN SCHEDULING ON action inline, so "saved but won't fire" reads loudly and
         // the fix is one click away. When ON, the calm one-liner + DISABLE control is enough. `#rt-arm`/data-arm
         // stay identical so the arm/disarm wiring below binds unchanged.
         // E-STOP WINS OVER `enabled` (bug-sweep P0). GET /api/cron carries `halted` — the durable stand-down written
@@ -344,17 +404,18 @@
         gateEl.innerHTML = degradedBlock + (j && j.halted
           ? '<div class="brief-block" style="border-left-color:var(--bad);margin-bottom:8px">' +
               '<div class="brief-k" style="color:var(--bad)">✕ SCHEDULING IS STOPPED (E-STOP)</div>' +
-              '<div class="brief-v">Your routines are saved but <b>will not fire</b> — an emergency stop is engaged and it survives a restart.' +
-              '<div style="margin-top:8px"><button class="bb xs" id="rt-arm" data-arm="1">▶ RESUME SCHEDULING</button></div>' +
+              '<div class="brief-v">Your routines are saved but <b>will not run</b> — an emergency stop is on, and it stays on after a restart.' +
+              '<div style="margin-top:8px"><button class="bb xs" id="rt-arm" data-arm="1">▶ TURN SCHEDULING ON</button></div>' +
             '</div></div>'
           : j && j.enabled
-          ? '<span style="color:var(--gold)">● scheduler armed</span> <span class="dim">— routines fire automatically.</span>' + tickHealthLine(j) + ' ' +
-            '<button class="bb xs" id="rt-arm" data-arm="0">⏸ DISABLE SCHEDULING</button>'
+          ? '<span style="color:var(--gold)">● scheduling is on</span> <span class="dim">— routines run on their own schedule.</span>' + tickHealthLine(j) + ' ' +
+            '<button class="bb xs" id="rt-arm" data-arm="0">⏸ TURN SCHEDULING OFF</button>'
           : '<div class="brief-block" style="border-left-color:var(--bad);margin-bottom:8px">' +
               '<div class="brief-k" style="color:var(--bad)">○ SCHEDULING IS OFF</div>' +
-              '<div class="brief-v">Your routines are saved but <b>will not fire</b> — the scheduler is disarmed. ' +
-              'Enable scheduling to arm the live timer now (no restart needed).' +
-              '<div style="margin-top:8px"><button class="bb xs" id="rt-arm" data-arm="1">▶ ENABLE SCHEDULING</button></div>' +
+              // plain words (UX night 10-25): this is the first thing a newcomer reads here, since scheduling starts off
+              '<div class="brief-v">Your routines are saved but <b>will not run</b> until scheduling is on. ' +
+              'Turning it on takes effect right away (no restart needed).' +
+              '<div style="margin-top:8px"><button class="bb xs" id="rt-arm" data-arm="1">▶ TURN SCHEDULING ON</button></div>' +
             '</div></div>');
         const degradedBtn = gateEl.querySelector('#rt-degraded-clear');
         if (degradedBtn) degradedBtn.addEventListener('click', async () => {
@@ -369,10 +430,10 @@
         const armBtn = gateEl.querySelector('#rt-arm');
         if (armBtn) armBtn.addEventListener('click', async () => {
           const want = armBtn.dataset.arm === '1';
-          armBtn.disabled = true; armBtn.textContent = want ? '… enabling' : '… disabling';
+          armBtn.disabled = true; armBtn.textContent = want ? '… turning on' : '… turning off';
           try {
             const r = await (await post('/api/cron/arm', { enabled: want })).json();
-            if (r && r.ok) { notify(want ? 'scheduling enabled — routines will now fire' : 'scheduling disabled', want ? 'good' : 'warn'); sfx('click'); }
+            if (r && r.ok) { notify(want ? 'scheduling is on — routines will run on schedule' : 'scheduling is off', want ? 'good' : 'warn'); sfx('click'); }
             else { notify((r && r.error) || 'could not change scheduling', 'warn'); sfx('bad'); }
           } catch (_) { notify('could not reach the sidecar', 'warn'); sfx('bad'); }
           refresh();   // re-render the badge from the authoritative GET /api/cron enabled
@@ -396,6 +457,7 @@
         positionOut();   // re-slot a live RUN NOW result under its row after the list re-renders (P0 #11)
       } catch (_) {
         schedulerArmed = false;
+        listedJobs = [];
         const createState = body.querySelector('#rt-create-state');
         if (createState) createState.textContent = 'Scheduling status could not be checked. Reconnect to the station before relying on an automatic run.';
         listEl.innerHTML = '<div class="mc-detail">sidecar offline — start it to manage routines.</div>';
@@ -419,20 +481,27 @@
     /* live schedule preview (debounced) — the honest "next fires", straight from the server math. Bound
        as a function so the RESCHEDULE editor previews through the IDENTICAL path: two implementations of
        "when does this run" would eventually disagree, and this panel's entire job is to be right about it. */
-    function wirePreview(inp, pvEl) {
-      let pvTimer = null, previewRevision = 0;
+    function wirePreview(inp, pvEl, scheduleTz) {
+      let pvTimer = null, previewRevision = 0, previewAbort = null;
       inp.addEventListener('input', () => {
       clearTimeout(pvTimer);
+      if (previewAbort) { previewAbort.abort(); previewAbort = null; }
       const revision = ++previewRevision;
       const v = inp.value.trim();
       if (!v) { pvEl.textContent = ''; return; }
       pvEl.textContent = 'Checking next run…';
       pvTimer = setTimeout(async () => {
+        const controller = new AbortController(); previewAbort = controller;
+        const timeout = setTimeout(() => controller.abort(), 15000);
+        const current = () => revision === previewRevision && inp.value.trim() === v && pvEl.isConnected !== false;
         try {
           // tz honesty in the PREVIEW too: the create POST sends the device zone, so a preview computed
           // without it would quote a different 9:00 than the routine will actually keep.
-          const r = await (await post('/api/cron/preview', { schedule: v, tz: deviceTz() })).json();
-          if (r && r.ok) {
+          const response = await post('/api/cron/preview', { schedule: v, tz: scheduleTz === undefined ? deviceTz() : scheduleTz }, controller.signal);
+          const r = await response.json();
+          if (!current()) return;
+          if (response.ok && r && r.ok === true) {
+            if (!Array.isArray(r.next) || r.next.some(t => !Number.isFinite(Date.parse(String(t))))) throw new Error('Invalid preview response');
             // show the LOCAL wall-clock time the routine fires (with its tz), not just a relative delta, so a
             // cron schedule reads honestly across DST (e.g. "next: 9:00 AM EDT (in 3h)"). Falls back to the
             // relative-only line when the server didn't supply a localNext (interval/once).
@@ -447,10 +516,11 @@
               const local = esc(wallClock(t) || ln[i] || '');
               return local ? (local + ' <span class="dim">(' + esc(fmtRel(t)) + ')</span>') : esc(fmtRel(t));
             }).join(', ');
-            pvEl.innerHTML = '<span class="rt-next-label">Next run</span> ' + nxt;
+            pvEl.innerHTML = nxt ? '<span class="rt-next-label">Next run</span> ' + nxt : 'No upcoming run for this schedule.';
           }
           else pvEl.innerHTML = '<span style="color:var(--bad)">' + esc((r && r.error) || 'unrecognized schedule') + '</span>';
-        } catch (_) {}
+        } catch (_) { if (current()) pvEl.textContent = 'Could not check the next run. Edit the schedule to retry.'; }
+        finally { clearTimeout(timeout); if (previewAbort === controller) previewAbort = null; }
       }, 300);
       });
     }
@@ -463,12 +533,17 @@
     const picker = (typeof SchedPicker !== 'undefined')
       ? SchedPicker.mount(body.querySelector('#rt-when'), { onChange: () => sfx('click') })
       : null;
+    body._rtPicker = picker;   // AUTOMATION.openDraft pre-selects a takeover's suggested cadence through set()
 
     body.querySelector('#rt-agent-select').addEventListener('change', e => {
-      const btn = Array.from(body.querySelectorAll('.rt-agent-btn')).find(b => b.dataset.agent === e.target.value); if (btn) btn.click();
+      const v = String(e.target.value || '');
+      if (v.indexOf('line:') === 0) { routineLineKey = v.slice(5); sfx('click'); return; }   // RUN BY a workflow (org P16)
+      routineLineKey = null;
+      const btn = Array.from(body.querySelectorAll('.rt-agent-btn')).find(b => b.dataset.agent === v); if (btn) btn.click();
     });
     body.querySelectorAll('.rt-agent-btn').forEach(btn => btn.addEventListener('click', () => {
       routineAgentId = btn.dataset.agent || 'agent';
+      routineLineKey = null;
       body.querySelector('#rt-agent-select').value = routineAgentId;
       const input = body.querySelector('#rt-agent');
       if (input) input.value = routineAgentId;
@@ -481,12 +556,84 @@
     }));
 
     /* RESCHEDULE — the same WHEN picker, inline under the row, opened on the routine's CURRENT schedule.
-       It patches only `schedule` (plus the device tz, which the update route folds onto schedule.tz), so
+       It patches only `schedule`; the update route retains the saved zone, so
        the routine keeps its id, its history and its grants — moving a routine an hour used to mean
        deleting it and re-creating it from scratch. */
     function closeResched() {
       listEl.querySelectorAll('.rt-resched').forEach(el => el.remove());
       listEl.querySelectorAll('button[data-act="resched"]').forEach(b => b.classList.remove('on'));
+    }
+
+    function closeEdit() {
+      listEl.querySelectorAll('.rt-edit').forEach(el => el.remove());
+      listEl.querySelectorAll('button[data-act="edit"]').forEach(b => b.classList.remove('on'));
+    }
+    function openEdit(rowEl, id, btn) {
+      const job = listedJobs.find(j => j.id === id);
+      if (!job) { notify('could not load this routine — refresh and try again', 'warn'); return; }
+      const host = document.createElement('div');
+      host.className = 'rt-edit mc-form';
+      // RUN AS — reassign a routine to another crew member without asking the lead in COMMS (user feedback
+      // 10-03: recipe schedules landed on the Overseer and could only be moved by chat). A routine whose agent
+      // left the station keeps its own id as an option, so opening the form never silently retargets it.
+      const curAgent = job.agentId || 'agent';
+      const runAsOpts = roster.map(a => ({ id: a.id, name: a.name || a.id }));
+      if (!runAsOpts.some(a => a.id === curAgent)) runAsOpts.unshift({ id: curAgent, name: curAgent + ' (not on station)' });
+      const runAsField = job.noAgent ? '' :
+        '<label class="sn-menu-field">Run as<select class="key-input" data-edit-agent>' +
+          runAsOpts.map(a => '<option value="' + esc(a.id) + '"' + (a.id === curAgent ? ' selected' : '') + '>' + esc(a.name) + '</option>').join('') +
+        '</select></label>';
+      host.innerHTML =
+        '<label class="sn-menu-field">Name<input class="key-input" data-edit-name maxlength="80" autocomplete="off"></label>' + runAsField +
+        '<label class="sn-menu-field">What should it do?<textarea class="key-input" data-edit-prompt rows="5" maxlength="' + EDIT_PROMPT_MAX + '" style="resize:vertical"></textarea></label>' +
+        '<div class="mc-detail" data-edit-error role="alert" hidden></div>' +
+        '<div class="mc-acts"><button class="bb xs" data-edit="save">✓ SAVE CHANGES</button>' +
+        '<button class="bb xs" data-edit="cancel">CANCEL</button></div>';
+      rowEl.insertAdjacentElement('afterend', host);
+      btn.classList.add('on');
+      const nameEl = host.querySelector('[data-edit-name]');
+      const promptEl = host.querySelector('[data-edit-prompt]');
+      const errorEl = host.querySelector('[data-edit-error]');
+      const cancelBtn = host.querySelector('[data-edit="cancel"]');
+      nameEl.value = job.name || '';
+      promptEl.value = job.prompt || '';
+      nameEl.focus();
+      host.addEventListener('click', async ev2 => {
+        const action = ev2.target.closest('button[data-edit]'); if (!action) return;
+        if (editSaving) return;
+        if (action.dataset.edit === 'cancel') { sfx('click'); closeEdit(); return; }
+        const name = nameEl.value.trim(), prompt = promptEl.value.trim();
+        const error = !name ? 'give this routine a name' : (!prompt && !job.script ? 'enter instructions for this routine' : '')
+          || (utf8Bytes(JSON.stringify({ id, patch: { name, prompt } })) > EDIT_BODY_MAX ? 'these instructions are too long (the station accepts up to 64 KB) — shorten them' : '');
+        if (error) { errorEl.textContent = error; errorEl.hidden = false; sfx('bad'); return; }
+        // Only send changed fields. An agent may have edited the other field since this form opened;
+        // posting both old values would silently undo that newer edit.
+        const patch = {};
+        if (name !== (job.name || '')) patch.name = name;
+        if (prompt !== (job.prompt || '')) patch.prompt = prompt;
+        const agentEl = host.querySelector('[data-edit-agent]');
+        if (agentEl && agentEl.value && agentEl.value !== curAgent) patch.agentId = agentEl.value;
+        if (!Object.keys(patch).length) { closeEdit(); return; }
+        editSaving = true;
+        action.disabled = true; action.textContent = '… saving';
+        cancelBtn.disabled = true;
+        errorEl.hidden = true;
+        try {
+          const response = await post('/api/cron/update', { id, patch });
+          const result = await response.json();
+          if (!response.ok || !result || !result.ok || !result.job || Object.keys(patch).some(k => result.job[k] !== patch[k])) {
+            throw new Error((result && result.error) || 'could not verify the saved changes');
+          }
+          notify('routine updated', 'good'); sfx('click'); closeEdit(); refresh();
+        } catch (e) {
+          errorEl.textContent = (e && e.message) || 'could not reach the station — changes were not saved';
+          errorEl.hidden = false; sfx('bad');
+        } finally {
+          editSaving = false;
+          action.disabled = false; action.textContent = '✓ SAVE CHANGES';
+          cancelBtn.disabled = false;
+        }
+      });
     }
     function openResched(rowEl, id, btn) {
       const host = document.createElement('div');
@@ -499,8 +646,11 @@
         '<button class="bb xs" data-resched="cancel">CANCEL</button></div>';
       rowEl.insertAdjacentElement('afterend', host);
       btn.classList.add('on');
+      const savedTz = rowEl.dataset.tz || '';
+      const zoneLabel = host.querySelector('.sp-tz');
+      if (zoneLabel) zoneLabel.textContent = 'repeating: ' + (savedTz || 'station time') + ' · once: your time';
       const inp = host.querySelector('[data-sp-input]'), pv = host.querySelector('.rt-resched-pv');
-      if (inp && pv) wirePreview(inp, pv);
+      if (inp && pv) wirePreview(inp, pv, savedTz);
       const p = (typeof SchedPicker !== 'undefined') ? SchedPicker.mount(host, {}) : null;
       if (p) p.set(rowEl.dataset.sched || '');
       else if (inp) { inp.value = String(rowEl.dataset.sched || '').replace(/^cron /, ''); inp.dispatchEvent(new Event('input', { bubbles: true })); }
@@ -513,7 +663,7 @@
         // A RESCHEDULE CLAIM MUST BE PROVEN: fetch resolves on 4xx, so a rejected schedule would otherwise
         // toast "rescheduled" over a routine still firing on its old time.
         try {
-          const r = await (await post('/api/cron/update', { id, patch: { schedule: value, tz: deviceTz() } })).json();
+          const r = await (await post('/api/cron/update', { id, patch: { schedule: value } })).json();
           if (r && r.ok) { notify('rescheduled — ' + human((r.job && r.job.scheduleDisplay) || value), 'good'); sfx('click'); closeResched(); }
           else { notify((r && r.error) || 'could not reschedule — it still runs on its old schedule', 'warn'); sfx('bad'); b.disabled = false; b.textContent = '✓ SAVE SCHEDULE'; return; }
         } catch (_) {
@@ -524,15 +674,65 @@
       });
     }
 
+    /* RUN HISTORY (2026-10-01): one routine's past runs, newest first, from GET /api/cron/history — each line is
+       that run's own durable record (status, when, how long, spend, tool calls, error). A list redraw closes it. */
+    function historyLine(r) {
+      const ok = r.reason === 'done';
+      const usd = Number(r.usd) || 0;
+      // an interrupted run's spend was never reconciled (runstore spendUnknown) — never print that as $0
+      const cost = r.spendUnknown ? 'spend unknown' : r.unmetered ? 'subscription' : usd >= 0.01 ? '$' + usd.toFixed(2) : usd > 0 ? '$' + usd.toFixed(4) : '$0';
+      const secs = Math.round((Number(r.durationMs) || 0) / 1000);
+      const took = secs >= 60 ? Math.floor(secs / 60) + 'm ' + (secs % 60) + 's' : secs + 's';
+      const tools = Number(r.toolsOk) || 0, files = Number(r.artifacts) || 0;
+      return '<div class="mc-detail">' + (ok ? '<span class="pos">✓ ok</span>' : '<span style="color:var(--bad)">✕ ' + esc(r.reason || 'error') + '</span>') +
+        ' <span class="dim">' + esc(r.at ? new Date(r.at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '') +
+        ' · ' + took + ' · ' + cost + ' · ' + tools + ' tool call' + (tools === 1 ? '' : 's') +
+        (files ? ' · ' + files + ' file' + (files === 1 ? '' : 's') : '') + '</span>' +
+        (r.error && !ok ? '<div class="dim">' + esc(String(r.error).slice(0, 240)) + '</div>' : '') +
+        // (2026-10-09) every past run opens the run itself — its session holds what it said and did
+        (r.runId ? ' <button class="bb xs" data-act="open-run" data-run="' + esc(r.runId) + '" data-stream="' + esc(r.streamId || ('cron-' + r.runId)) + '">OPEN</button>' : '') + '</div>';
+    }
+    async function toggleHistory(rowEl, id, btn) {
+      const open = rowEl.querySelector('.rt-hist');
+      if (open) { open.remove(); btn.classList.remove('on'); return; }
+      btn.classList.add('on');
+      const box = document.createElement('div'); box.className = 'rt-hist'; box.innerHTML = '<div class="mc-detail dim">loading…</div>';
+      rowEl.appendChild(box);
+      try {
+        const h = await Harness.api.get('/api/cron/history?id=' + encodeURIComponent(id) + '&limit=10');
+        if (!box.isConnected) return;
+        const runs = (h && h.ok && Array.isArray(h.runs)) ? h.runs : null;
+        box.innerHTML = runs == null ? '<div class="mc-detail" style="color:var(--bad)">could not read this routine’s history</div>'
+          : runs.length ? runs.map(historyLine).join('')
+          : '<div class="mc-detail dim">no recorded runs yet</div>';
+      } catch (_) { if (box.isConnected) box.innerHTML = '<div class="mc-detail" style="color:var(--bad)">could not reach the station</div>'; }
+    }
+
     // row actions: run-now (stream + show the reply), toggle enable/disable, delete (two-step arm/confirm).
     listEl.addEventListener('click', async ev => {
       const btn = ev.target.closest('button[data-act]'); if (!btn) return;
+      if (editSaving) return;
       const rowEl = ev.target.closest('.mc-row'); const id = rowEl && rowEl.dataset.id; if (!id) return;
       const act = btn.dataset.act;
+      if (act === 'history') { sfx('click'); toggleHistory(rowEl, id, btn); return; }
+      if (act === 'open-run') {
+        sfx('click');
+        let opened = false;
+        try { if (typeof ReturnStore !== 'undefined' && ReturnStore.openWork) opened = await ReturnStore.openWork({ runId: btn.dataset.run, streamId: btn.dataset.stream, agentId: rowEl.dataset.agent || 'agent', title: rowEl.dataset.name || '' }); } catch (_) { opened = false; }
+        if (!opened && typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify('That run’s conversation could not be loaded.', 'warn');
+        return;
+      }
+      if (act === 'edit') {
+        sfx('click');
+        const wasOpen = btn.classList.contains('on');
+        closeEdit(); closeResched();
+        if (!wasOpen) openEdit(rowEl, id, btn);
+        return;
+      }
       if (act === 'resched') {
         sfx('click');
         const wasOpen = btn.classList.contains('on');
-        closeResched();                       // one editor at a time; the button toggles its own
+        closeEdit(); closeResched();          // one editor at a time; the button toggles its own
         if (!wasOpen) openResched(rowEl, id, btn);
         return;
       }
@@ -553,6 +753,22 @@
         // force while the station said "access revoked" — the one lie a permission surface can never tell.
         try { const r = await post('/api/cron/update', { id, patch: { unattendedGrants: [] } }); notify(r.ok ? 'access revoked' : 'could NOT revoke access — the routine still has it', r.ok ? 'good' : 'warn'); }
         catch (_) { notify('could not reach the station — access was NOT revoked', 'warn'); }
+        refresh(); return;
+      }
+      if (act === 'allow-images') {
+        // GRANTING is the direction that needs a deliberate second click (the create form's is a tick + save):
+        // a standing permission must never come from one stray click on a crowded row.
+        if (!btn.dataset.armed) { btn.dataset.armed = '1'; btn.textContent = '▣ CONFIRM IMAGES'; sfx('click'); setTimeout(() => { if (btn.isConnected) { delete btn.dataset.armed; btn.textContent = '▣ ALLOW IMAGES'; } }, 5000); return; }
+        sfx('click');
+        // addGrants: the station adds 'studio' to the grants the routine holds NOW (read under its lock), never to this
+        // row's possibly stale copy. The claim is proven off the saved job the station hands back.
+        try {
+          const r = await post('/api/cron/update', { id, patch: {}, addGrants: ['studio'] });
+          const out = r.ok ? await r.json().catch(() => null) : null;
+          const job = out && out.job;
+          const saved = !!(job && Array.isArray(job.unattendedGrants) && job.unattendedGrants.indexOf('studio') >= 0);
+          notify(saved ? 'this routine may now make images' : 'could NOT allow images — the routine still cannot make them', saved ? 'good' : 'warn');
+        } catch (_) { notify('could not reach the station — images were NOT allowed', 'warn'); }
         refresh(); return;
       }
       if (act === 'toggle') {
@@ -618,11 +834,20 @@
       const name = (body.querySelector('#rt-name').value || '').trim();
       const prompt = (body.querySelector('#rt-prompt').value || '').trim();
       const schedule = (body.querySelector('#rt-sched').value || '').trim();
-      const agentId = (body.querySelector('#rt-agent').value || '').trim();
+      let agentId = (body.querySelector('#rt-agent').value || '').trim();
+      /* RUN BY a workflow (org P16): the line's first-step agent at that step's BAY, runsLine:true — the very body the INBOX
+         form posts (createCronJobFromSpec's line path). Re-read at save so a floor edit since the paint is honoured. */
+      let line = null;
+      if (routineLineKey) {
+        line = startLines().find(l => l.key === routineLineKey && l.dockId && l.agentId) || null;
+        if (!line) { sfx('bad'); msgEl.className = 'msg'; msgEl.textContent = 'that workflow has no agent on its first step any more — pick it again or choose an agent'; return; }
+        agentId = line.agentId;
+      }
       // Inherit the selected agent's provider; the station's chat selection is not an override.
-      if ((!prompt && !(body.querySelector('#rt-script').value || '').trim()) || !schedule) { sfx('bad'); msgEl.textContent = 'a prompt or script and a schedule are required'; return; }
+      if ((!prompt && !(body.querySelector('#rt-script').value || '').trim()) || !schedule) { sfx('bad'); msgEl.className = 'msg'; msgEl.textContent = 'a prompt or script and a schedule are required'; return; }
       addBtn.disabled = true;
-      msgEl.textContent = 'saving…';
+      // a save's own lines read in the success ink (.msg.ok); refusals below paint their own --bad span
+      msgEl.className = 'msg ok'; msgEl.textContent = 'saving…';
       try {
         // tz honesty (G4.1): send the browser's IANA timezone so a wall-clock schedule ("every morning 9:00")
         // fires in the user's LOCAL time, not the server host's. Backend validates + persists it (invalid tz 400s).
@@ -632,6 +857,7 @@
         const grants = [];
         if ((body.querySelector('#rt-term') || {}).checked) grants.push('workbench');
         if ((body.querySelector('#rt-conn') || {}).checked) grants.push('connectors');
+        if ((body.querySelector('#rt-img') || {}).checked) grants.push('studio');
         const split = id => (body.querySelector(id).value || '').split(',').map(x => x.trim()).filter(Boolean);
         const script = (body.querySelector('#rt-script').value || '').trim();
         const toolsetText = (body.querySelector('#rt-toolsets').value || '').trim();
@@ -641,7 +867,8 @@
         const attachToSession = !!body.querySelector('#rt-continue').checked;
         if ((deliveryMode === 'origin' || attachToSession) && !activeSession) throw new Error('Open the conversation this routine should return to, then save again.');
         const r = await (await post('/api/cron', {
-          name, prompt, schedule, agentId: agentId || undefined, tz,
+          name, prompt, schedule, agentId: agentId || undefined, tz, arm: true,   // ONE ARM RULE (org P16): turns a never-set switch on; an explicit OFF and an E-STOP hold
+          dockId: line ? line.dockId : undefined, runsLine: line ? true : undefined,
           meta: body.querySelector('#rt-prompt').dataset.widgetId
             ? { widgetId: body.querySelector('#rt-prompt').dataset.widgetId }
             : body.querySelector('#rt-prompt').dataset.workflowTakeoverId
@@ -666,13 +893,30 @@
           // HONEST create-confirm: don't claim "scheduled" if the scheduler that fires it is off. armStateLine
           // returns null when armed (→ the normal "scheduled for <agent>" line) and an honest {text} when disarmed
           // ("saved, but the scheduler is off — this won't run until you enable scheduling"). Built for exactly this.
+          if (r && r.scheduler) schedulerArmed = !!r.scheduler.armed;   // the create reply carries the live arm state
           const arm = (typeof AutoJobs !== 'undefined' && AutoJobs.armStateLine) ? AutoJobs.armStateLine(schedulerArmed) : null;
-          if (arm) notify('routine "' + (name || 'unnamed') + '" ' + arm.text, 'warn');
-          else notify('routine "' + (name || 'unnamed') + '" scheduled for ' + agentLabel(agentId || 'agent'), 'good');
+          const who = line ? 'the ' + String(line.name || 'workflow').toUpperCase() + ' workflow' : agentLabel(agentId || 'agent');
+          if (r && r.scheduler && r.scheduler.halted) notify('routine "' + (name || 'unnamed') + '" saved — the scheduler is on E-STOP, so nothing fires until you press ▶ TURN SCHEDULING ON in AUTOMATE › SCHEDULES › Scheduled jobs', 'warn');
+          // ONE ARM RULE (org P16): said as it happened — this save turned scheduling on, or it kept the Commander's OFF and offers the switch
+          else if (r && r.scheduler && r.scheduler.armedNow) { msgEl.textContent = '✓ saved · scheduling is now on'; notify('routine "' + (name || 'unnamed') + '" scheduled for ' + who + ' — scheduling is now on', 'good'); }
+          else if (r && r.scheduler && r.scheduler.offByChoice) {
+            msgEl.innerHTML = '✓ saved · scheduling is off (you turned it off), so it will not run yet. <button class="bb xs" id="rt-msg-arm" type="button">▶ TURN SCHEDULING ON</button>';
+            const mArm = msgEl.querySelector('#rt-msg-arm');
+            if (mArm) mArm.addEventListener('click', async () => {
+              mArm.disabled = true; mArm.textContent = '… turning on';
+              try {
+                const ar = await (await post('/api/cron/arm', { enabled: true })).json();
+                if (ar && ar.ok) { msgEl.textContent = '✓ scheduling is on'; sfx('click'); } else { mArm.disabled = false; mArm.textContent = '▶ TURN SCHEDULING ON'; notify((ar && ar.error) || 'could not turn scheduling on', 'warn'); sfx('bad'); }
+              } catch (e) { mArm.disabled = false; mArm.textContent = '▶ TURN SCHEDULING ON'; notify('could not reach the sidecar', 'warn'); sfx('bad'); }
+              refresh();
+            });
+          }
+          else if (arm) notify('routine "' + (name || 'unnamed') + '" ' + arm.text, 'warn');
+          else notify('routine "' + (name || 'unnamed') + '" scheduled for ' + who, 'good');
           sfx('click');
           ['#rt-name', '#rt-prompt'].forEach(s => { body.querySelector(s).value = ''; });
           delete body.querySelector('#rt-prompt').dataset.workflowTakeoverId;
-          ['#rt-term', '#rt-conn'].forEach(s => { const el = body.querySelector(s); if (el) el.checked = false; });   // a grant is never sticky across creates
+          ['#rt-term', '#rt-conn', '#rt-img'].forEach(s => { const el = body.querySelector(s); if (el) el.checked = false; });   // a grant is never sticky across creates
           // the WHEN selection SURVIVES a create (people add three morning routines in a row) — but a
           // sticky cadence with a cleared field would be a lie, so we re-emit it and let the preview
           // redraw from the server rather than blanking one half of the pair.

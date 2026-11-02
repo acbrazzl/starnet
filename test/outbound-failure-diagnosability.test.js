@@ -28,7 +28,9 @@ function undiciError(causeMessage, extra) {
   const dns = undiciError('getaddrinfo ENOTFOUND api.openai.com', { code: 'ENOTFOUND', hostname: 'api.openai.com' });
   A.eq(transportDetail(dns), 'ENOTFOUND api.openai.com', 'DNS failure yields code + host');
   const v = classifyApiError(dns, {});
-  A.eq(v.message, 'fetch failed (ENOTFOUND api.openai.com)', 'the emitted message names the code and the host');
+  // the transport detail still LEADS; since quick win 15 (2026-10-27) the unreachable sentence follows it
+  A.ok(v.message.indexOf('fetch failed (ENOTFOUND api.openai.com) — ') === 0, 'the emitted message names the code and the host');
+  A.ok(/the name api.openai.com did not resolve/.test(v.message), 'and says what that means');
   A.ok(/ENOTFOUND/.test(v.message), 'the report can now distinguish DNS failure from a refused connection');
 
   const refused = undiciError('connect ECONNREFUSED 1.2.3.4:443', { code: 'ECONNREFUSED' });
@@ -38,6 +40,55 @@ function undiciError(causeMessage, extra) {
   A.ok(/UND_ERR_CONNECT_TIMEOUT/.test(classifyApiError(timeout, {}).message), 'an undici connect timeout is named');
 }
 
+// ---- 1b. TLS-alert and socket causes carry NO host: the adapter-stamped requestHost names it (2026-10-07) ----
+// A macOS customer's report read "fetch failed (ERR_SSL_TLSV1_ALERT_DECODE_ERROR)" — no way to tell which service.
+{
+  const OPENSSL = 'C0:error:0A000432:SSL routines:ssl3_read_bytes:tlsv1 alert decode error:../deps/openssl/openssl/ssl/record/rec_layer_s3.c:1605:SSL alert number 50';
+  const bare = undiciError(OPENSSL, { code: 'ERR_SSL_TLSV1_ALERT_DECODE_ERROR' });
+  A.eq(classifyApiError(bare, {}).message, 'fetch failed (ERR_SSL_TLSV1_ALERT_DECODE_ERROR)',
+    'unstamped: the openssl path in the cause message is NOT mistaken for a host');
+  const tls = undiciError(OPENSSL, { code: 'ERR_SSL_TLSV1_ALERT_DECODE_ERROR' });
+  tls.requestHost = 'api.example.com';
+  const tv = classifyApiError(tls, {});
+  A.eq(tv.message, 'fetch failed (ERR_SSL_TLSV1_ALERT_DECODE_ERROR api.example.com)', 'stamped: the TLS failure names its host');
+  A.eq(tv.reason, classifyApiError(bare, {}).reason, 'the host never moves the verdict');
+
+  const sock = new TypeError('terminated');
+  sock.cause = Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' });
+  sock.requestHost = 'api.example.com';
+  const sv = classifyApiError(sock, {});
+  A.eq(sv.message, 'terminated (UND_ERR_SOCKET api.example.com)', 'a mid-stream socket drop names its host');
+  A.eq(sv.reason, 'timeout', 'and keeps its transport verdict');
+
+  const own = undiciError('getaddrinfo ENOTFOUND api.openai.com', { code: 'ENOTFOUND', hostname: 'api.openai.com' });
+  own.requestHost = 'stamped.example.com';
+  const ownMsg = classifyApiError(own, {}).message;
+  A.ok(ownMsg.indexOf('fetch failed (ENOTFOUND api.openai.com) — ') === 0 && ownMsg.indexOf('stamped.example.com') < 0, 'a host the cause carries still wins');
+}
+
+// ---- 1c. the adapter seam: stampRequestHost keeps the HOSTNAME only (keys ride query strings / userinfo) ----
+let readerStamp = Promise.resolve();   // the async leg below; report() waits for it
+{
+  const { runtime, timeouts } = require('../sidecar/providers/provider.js');
+  const e = runtime.stampRequestHost(new TypeError('fetch failed'), 'https://user:pass@gen.example.com:8443/v1beta/models/x:stream?alt=sse&key=SECRET');
+  A.eq(e.requestHost, 'gen.example.com', 'only the hostname is stamped — no port, path, query or userinfo');
+  const ab = Object.assign(new Error('aborted'), { name: 'AbortError' });
+  A.eq(runtime.stampRequestHost(ab, 'https://x.example.com/').requestHost, undefined, 'a cancel is never stamped');
+  A.eq(runtime.stampRequestHost(new Error('x'), 'not a url').requestHost, undefined, 'an unparseable URL stamps nothing');
+  A.eq(runtime.stampRequestHost('str', 'https://x.example.com/'), 'str', 'a non-object passes through');
+
+  // a socket dropped MID-STREAM throws from the guarded reader, not the adapter's fetch catch — it is stamped there
+  readerStamp = (async () => {
+    const drop = new TypeError('terminated');
+    drop.cause = Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' });
+    const r = timeouts.idleGuardedReader({ read: async () => { throw drop; }, cancel: async () => {} }, { idleMs: 5000, url: 'https://api.example.com/v1' });
+    let got = null;
+    try { await r.read(); } catch (err) { got = err; }
+    A.eq(got && got.requestHost, 'api.example.com', 'the mid-stream reader stamps the host it was opened on');
+    A.eq(classifyApiError(got, {}).message, 'terminated (UND_ERR_SOCKET api.example.com)', 'so the run error names it');
+  })().catch(err => A.ok(false, 'reader stamp threw: ' + (err && err.stack || err)));
+}
+
 // ---- 2. annotation must NEVER change the verdict, and never bury a real provider explanation ----
 {
   /* `reason` is picked from the RAW message BEFORE annotation runs, so the appended text can never be
@@ -45,12 +96,13 @@ function undiciError(causeMessage, extra) {
      message were fed back through classification, 'unauthorized' would flip the verdict to `auth` — which would be
      a nasty bug, since `auth` is non-retryable and would send the user to the PROVIDERS key field over what is
      actually a DNS failure. It must stay the transport verdict.
-     (NOTE for the next reader: a cause CODE legitimately DOES change the reason — errorClass.js:168 maps
-     ENOTFOUND/ECONNREFUSED/UND_ERR_* to `timeout`. That is pre-existing and correct; don't "fix" it.) */
+     (NOTE for the next reader: a cause CODE legitimately DOES change the reason — errorClass.js maps
+     ECONNREFUSED/ENOTFOUND/EAI_AGAIN to `unreachable` (quick win 15, 2026-10-27) and the other UND_ERR_* / socket codes
+     to `timeout`. That is the code, not the text.) */
   const trap = undiciError('getaddrinfo ENOTFOUND unauthorized.example.com', { code: 'ENOTFOUND', hostname: 'unauthorized.example.com' });
   const tv = classifyApiError(trap, {});
   A.ok(/unauthorized\.example\.com/.test(tv.message), 'the trap host really did land in the message');
-  A.eq(tv.reason, 'timeout', 'the appended host text is NOT re-classified (it would read as `auth` if it were)');
+  A.eq(tv.reason, 'unreachable', 'the appended host text is NOT re-classified (it would read as `auth` if it were)');
   A.eq(tv.retryable, true, 'so the verdict stays retryable rather than becoming a dead-end auth door');
 
   // A provider that sent real words keeps them verbatim — plumbing must never displace an upstream explanation.
@@ -111,4 +163,131 @@ function undiciError(causeMessage, extra) {
     'routed is always false until real proxy routing exists');
 }
 
-A.report('outbound-failure-diagnosability.test');
+// ---- 5. real registered web_fetch body failures retain code + dialled host ----
+// A decoder/socket failure after HTTP headers is NOT a proven TLS failure or customer recovery.
+const webBodyStamp = (async () => {
+  const http = require('node:http');
+  const undici = require('undici');
+  const { makeRegistry } = require('../sidecar/tools/registry.js');
+  const { makeWebTools } = require('../sidecar/tools/builtin/web.js');
+  const publicAddress = '93.184.216.34';
+  const lookup = async () => [{ address: publicAddress, family: 4 }];
+  const call = url => ({ id: 'body-read', name: 'web_fetch', args: { url } });
+  const safeMessage = out => !/SECRET|private-body|token=|https?:\/\/|decoder-private|:8443/.test(JSON.stringify(out));
+
+  for (const [kind, redirect] of [['gzip', false], ['socket', false], ['gzip', true]]) {
+    let requests = 0, headersSeen = 0, bodyReads = 0, closed = 0, browserCalls = 0, releaseBody;
+    const agents = [], pinnedHosts = [];
+    const server = http.createServer((req, res) => {
+      requests++;
+      if (req.url.startsWith('/redirect')) {
+        res.writeHead(302, { location: 'http://final.body.example:' + server.address().port + '/private-body?token=SECRET' });
+        res.end(); return;
+      }
+      res.writeHead(200, kind === 'gzip'
+        ? { 'content-type': 'text/plain', 'content-encoding': 'gzip' }
+        : { 'content-type': 'text/plain', 'content-length': '256' });
+      if (kind === 'gzip') { res.end('not a gzip stream'); return; }
+      // Destroy the socket only AFTER real Undici returned the headers.
+      res.flushHeaders();
+      releaseBody = () => res.destroy();
+      res.write('partial');
+    });
+    await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+    try {
+      const web = makeWebTools({ lookup,
+        agentFactory: opts => {
+          // Same public-DNS -> loopback socket seam as web.pinned-dispatcher.test.js.
+          const agent = new undici.Agent({ ...opts, connect: { ...opts.connect, lookup(host, options, cb) {
+            pinnedHosts.push(host);
+            opts.connect.lookup(host, options, (err, address, family) => {
+              if (err) return cb(err);
+              if (Array.isArray(address)) cb(null, address.map(a => ({ ...a, address: '127.0.0.1' })));
+              else cb(null, '127.0.0.1', family);
+            });
+          } } });
+          const close = agent.close.bind(agent);
+          agent.close = () => { closed++; return new Promise((resolve, reject) => close(err => err ? reject(err) : resolve())); };
+          agents.push(agent); return agent;
+        },
+        fetchImpl: async (url, init) => {
+          const response = await undici.fetch(url, init);
+          if (response.status === 200) {
+            headersSeen++;
+            countBodyReads(response, () => { bodyReads++; });
+            if (releaseBody) releaseBody();
+          }
+          return response;
+        },
+        reader: { available: () => ({ ok: true }), fetchText: async () => { browserCalls++; return { ok: false }; } }
+      });
+      const url = 'http://initial.body.example:' + server.address().port + (redirect ? '/redirect' : '/private-body?token=SECRET');
+      const out = await web.register(makeRegistry()).dispatch(call(url));
+      const code = kind === 'gzip' ? 'Z_DATA_ERROR' : 'UND_ERR_SOCKET';
+      const host = redirect ? 'final.body.example' : 'initial.body.example';
+      A.eq(out.content, 'tool web_fetch failed: terminated (' + code + ' ' + host + ')', kind + ': registered result retains body cause and final hop');
+      A.eq(out.isError, true, kind + ': a body failure stays a tool error');
+      A.eq([headersSeen, bodyReads], [1, 1], kind + ': failure occurred reading the body after successful headers');
+      A.eq(requests, redirect ? 2 : 1, kind + ': no request retry or extra fallback');
+      A.eq(closed, requests, kind + ': every pinned dispatcher closes');
+      A.eq(browserCalls, 0, kind + ': body failure does not invoke the browser');
+      A.ok(pinnedHosts.includes(host), kind + ': real socket used the public-host pin seam');
+      A.ok(safeMessage(out) && !out.content.includes(':' + server.address().port), kind + ': diagnostic contains no URL path, query, port or body');
+    } finally {
+      await Promise.all(agents.map(a => a.destroy().catch(() => {})));
+      server.closeAllConnections();
+      await new Promise(resolve => server.close(resolve));
+    }
+  }
+
+  /* A body READ is either Response.text() (the historic path) or a reader on response.body (the streaming
+     raw-body ceiling, 2026-10-20). Count whichever the tool uses, once per read, so this pins "the body was
+     read after the headers", not which API read it. */
+  function countBodyReads(response, inc) {
+    const text = response.text.bind(response);
+    response.text = () => { inc(); return text(); };
+    const body = response.body;
+    if (body && typeof body.getReader === 'function') {
+      const getReader = body.getReader.bind(body);
+      body.getReader = (...a) => { inc(); return getReader(...a); };
+    }
+  }
+  const bodyError = (message, code, name) => Object.assign(new TypeError(message), {
+    ...(name ? { name } : {}),
+    ...(code === null ? {} : { cause: Object.assign(new Error('decoder-private SECRET https://secret.invalid/path'), {
+      code, hostname: 'https://secret.invalid/private-body?token=SECRET', address: 'SECRET:8443'
+    }) })
+  });
+  const cases = [
+    [bodyError('terminated', 'Z_DATA_ERROR'), 'terminated (Z_DATA_ERROR api.body.example)'],
+    [bodyError('terminated', 'UND_ERR_SOCKET'), 'terminated (UND_ERR_SOCKET api.body.example)'],
+    [bodyError('terminated', null), 'terminated'],
+    [bodyError('terminated', 'Z_DATA_ERROR SECRET/path'), 'terminated'],
+    [bodyError('terminated', 'Z_' + 'A'.repeat(80)), 'terminated'],
+    [bodyError('body read failed', 'Z_DATA_ERROR'), 'body read failed'],
+    [bodyError('terminated', 'Z_DATA_ERROR', 'AbortError'), 'terminated'],
+    [bodyError('terminated (Z_DATA_ERROR api.body.example)', 'Z_DATA_ERROR'), 'terminated (Z_DATA_ERROR api.body.example)']
+  ];
+  for (const [error, message] of cases) {
+    let requests = 0, reads = 0, closed = 0, browserCalls = 0;
+    const web = makeWebTools({ lookup, agentFactory: () => ({ close: async () => { closed++; } }),
+      fetchImpl: async () => {
+        requests++;
+        const response = new undici.Response(new ReadableStream({ start(c) { c.error(error); } }), { status: 200 });
+        countBodyReads(response, () => { reads++; }); return response;
+      }, reader: { available: () => ({ ok: true }), fetchText: async () => { browserCalls++; return { ok: false }; } }
+    });
+    const out = await web.register(makeRegistry()).dispatch(call('https://api.body.example:8443/private-body?token=SECRET'));
+    A.eq(out.content, 'tool web_fetch failed: ' + message, 'body metadata guard: ' + message);
+    A.eq([out.isError, requests, reads, closed, browserCalls], [true, 1, 1, 1, 0], 'diagnostic enrichment leaves dispatch and fallback unchanged');
+    A.ok(safeMessage(out), 'raw cause fields never enter the registered result');
+  }
+  let cancelledFetches = 0;
+  const stop = new AbortController(); stop.abort();
+  const cancelled = await makeWebTools({ lookup: null, fetchImpl: async () => { cancelledFetches++; throw Error('must not run'); } })
+    .register(makeRegistry()).dispatch(call('https://api.body.example/'), { signal: stop.signal });
+  A.eq(cancelledFetches, 0, 'cancelled registered call makes no network request');
+  A.ok(cancelled.isError && /cancelled/.test(cancelled.summary), 'cancelled run keeps its cancellation result');
+})().catch(err => A.ok(false, 'registered web body diagnostic threw: ' + (err && err.stack || err)));
+
+Promise.all([readerStamp, webBodyStamp]).then(() => A.report('outbound-failure-diagnosability.test'));

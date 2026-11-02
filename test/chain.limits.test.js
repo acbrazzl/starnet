@@ -3,7 +3,9 @@
    refuses with a reason off a DURABLE ledger, and a seed with no limits runs on exactly the old defaults.
    Pure: fake floor, fake harness, injected clock, in-memory "disk" for the day ledger. */
 'use strict';
+const { readSidecarSource } = require('./helpers/source');
 const A = require('./_assert.js');
+const fs = require('fs');
 const { makeChainRunner, effectiveLimits, MAX_HOPS, MAX_CHAIN_USD } = require('../sidecar/routing/chain.js');
 const { makeLineSpend, DAY_MS } = require('../sidecar/routing/line-spend.js');
 const { makeRouter } = require('../sidecar/routing/router.js');
@@ -34,10 +36,40 @@ let T = 0; const clock = () => (T += 10);
     const c = makeChainRunner({ nextAgent: line(chain5), runAgent: harness({}), now: clock });
     const r1 = await c.advance({ agentId: 'a', text: 'go', limits: { maxHops: 2 } });
     A.eq(r1.hops.length, 2, 'maxHops:2 runs exactly two downstream stages');
-    A.eq(r1.stopped, 'the line is longer than 2 stages', "and says so in the ceiling's own number");
+    A.eq(r1.stopped, 'the line is longer than 2 stages — raise max stages in the INBOX’s LINE BUDGET', "and says so in the ceiling's own number — and where it is raised");
     const r2 = await c.advance({ agentId: 'a', text: 'go', limits: { maxUsdPerMessage: 0.25 } });
     A.eq(r2.stopped, 'the line reached its $0.25 limit', 'maxUsdPerMessage replaces the $2.00 constant in the reason');
     A.ok(r2.hops.length < 5, 'and actually stopped the line short');
+  }
+
+  /* ---- QA 2026-10-02: each hop is told what is LEFT of the line's $ ceiling (a lower-only cap for that run) ----
+     The pre-hop check alone let one own-key stage spend far past the line's limit. */
+  {
+    const seen = [];
+    const c = makeChainRunner({ nextAgent: line({ a: 'b', b: 'c', c: 'd' }), now: clock,
+      runAgent: async (call) => { seen.push([call.agentId, call.ceilingUsd]); return { text: call.agentId + ' out', usd: 0.5 }; } });
+    await c.advance({ agentId: 'a', text: 'go', entryUsd: 0.25, limits: { maxUsdPerMessage: 1.5 } });
+    A.eq(seen.map(x => x[0]), ['b', 'c', 'd'], 'three hops start under the line limit');
+    A.ok(Math.abs(seen[0][1] - 1.25) < 1e-9, 'the first hop may spend only what the entry left (got ' + seen[0][1] + ')');
+    A.ok(Math.abs(seen[1][1] - 0.75) < 1e-9, 'the next hop only what is left after that (got ' + seen[1][1] + ')');
+    A.ok(Math.abs(seen[2][1] - 0.25) < 1e-9, 'and the last one only the final quarter (got ' + seen[2][1] + ')');
+    // the hub's own hop runner (sidecar/channels/hub.js) also passes h.ceilingUsd. The host's hop runners are each sliced and
+    // must pass it: the scheduled routine's (the cronDriver wiring), Run Now's (handleCronRun) and, since quick win 28, the
+    // step tester's (stepTestRunDock) — a whole-text COUNT read the step tester's new pass as a broken cron runner.
+    const idx = readSidecarSource({ except: ['sidecar/channels/hub.js'] });
+    const { sidecarTopLevelFunction } = require('./helpers/source');
+    const cdAt = idx.indexOf('const cronDriver = makeCronDriver({');
+    const runners = {
+      scheduled: cdAt < 0 ? '' : idx.slice(cdAt, idx.indexOf('\n});', cdAt) + 4),
+      runNow: sidecarTopLevelFunction('handleCronRun'),
+      stepTest: sidecarTopLevelFunction('stepTestRunDock')
+    };
+    A.ok(idx.includes("!(runCapUsd <= o.ceilingUsd)) runCapUsd = Math.max(0.01, o.ceilingUsd);"), 'runOnce lowers its cap to the ceiling (never raises it)');
+    for (const k of Object.keys(runners)) {
+      A.ok(runners[k].length > 200 && runners[k].indexOf('ceilingUsd: h.ceilingUsd') >= 0, 'the ' + k + ' hop runner passes the line\'s remaining ceiling');
+    }
+    const hub = fs.readFileSync(require('path').join(__dirname, '..', 'sidecar', 'channels', 'hub.js'), 'utf8');
+    A.ok(hub.includes('ceilingUsd: h.ceilingUsd'), 'and so does the hub hop runner');
   }
 
   /* ---- the injected per-line reader (the compiled plan's LINE BUDGET) is read by lineId ---- */

@@ -48,11 +48,22 @@
       // not a toggleable family: switching it off would strand every deferred tool behind a tool that no
       // longer exists. It is never itself deferred — the finder cannot be the thing that must be found.
       { capId: 'toolsearch', tool: 'tool.search', scope: 'read', requiresConsent: false, network: false },
-      { capId: 'code', tool: 'code.run', scope: 'read', requiresConsent: false, network: false },
+      // execute + consent: see the SECURITY STOPGAP note in tools/builtin/code.js (vm child is not an isolation boundary)
+      { capId: 'code', tool: 'code.run', scope: 'execute', requiresConsent: true, network: false },
       // HARNESS SELF-KNOWLEDGE: reading the station's own secret-free status is part of being able to
       // operate at all, not a power the Commander should have to unlock with a DISH, CABINET or WORKBENCH.
       // A distinct capId is required because `compute` is the non-callable model gate in resolve.js.
       { capId: 'stationinfo', tool: 'station.inspect', scope: 'read', requiresConsent: false, network: false },
+      // The operator manual's REFERENCE sections (navigation / props / troubleshooting), served on demand so the
+      // interactive prompt carries only their table of contents (sidecar/manual.js). Same self-knowledge class as
+      // station.inspect and the same always-present object, so the prompt's "call manual.read" can never name a
+      // tool the run lacks. A constant text lookup: no IO, no network, no consent.
+      { capId: 'stationinfo', tool: 'manual.read', scope: 'read', requiresConsent: false, network: false },
+      // SHOWING the station (2026-10-04): station.show opens a StarNet window/tab on the Commander's screen (frontend/app/places.js).
+      // Read scope + no consent: it changes only what they LOOK at (no harness state), so neither an approval card nor the Task
+      // Brief gate stands between "show me" and the window; the page obeys only the run they are watching. Deferred: found by
+      // tool_search "show open window" (the manual's navigation section names it), so it costs no prompt bytes.
+      { capId: 'stationinfo', tool: 'station.show', scope: 'read', requiresConsent: false, network: false, deferred: true },
       // Host-scoped scheduled scratchpad: the computer is present on every runnable station, while the tool
       // itself refuses any run without a host-minted cronJobId. This does not grant general notebook access.
       { capId: 'routinescratch', tool: 'routine.notepad', scope: 'write', requiresConsent: false, network: false },
@@ -66,7 +77,18 @@
       // TOOLSETS_META row (never a toggleable family), no capsummary CAPS row (never advertised or nagged).
       // The plan itself still persists through the notebook STORE — this grant is about tool AVAILABILITY,
       // not where the bytes live. (see tools/builtin/todo.js)
-      { capId: 'taskplan', tool: 'todo', scope: 'write', requiresConsent: false, network: false }
+      { capId: 'taskplan', tool: 'todo', scope: 'write', requiresConsent: false, network: false },
+      // PLUGIN AUTHORING (sidecar/tools/builtin/plugin-author.js) is deliberately NOT granted (Andrew 2026-09-30): what
+      // the Commander asks the crew for is an APP (below) — describe it, get it — never a plugin to review and approve.
+      // Plugins stay a power-user path the Commander takes himself in ABILITIES → CREATE / ADVANCED.
+      // APPS: the crew builds and fills the Commander's apps (sidecar/apps.js). Inert by construction — an app page is a
+      // network-less sandbox and its data is whatever a crew run publishes — so nothing here asks first. Deferred.
+      { capId: 'apps', tool: 'app.create', scope: 'write', requiresConsent: false, network: false, deferred: true },
+      { capId: 'apps', tool: 'app.read', scope: 'read', requiresConsent: false, network: false, deferred: true },
+      { capId: 'apps', tool: 'app.write', scope: 'write', requiresConsent: false, network: false, deferred: true },
+      { capId: 'apps', tool: 'app.check', scope: 'read', requiresConsent: false, network: false, deferred: true },
+      { capId: 'apps', tool: 'app.publish', scope: 'write', requiresConsent: false, network: false, deferred: true },
+      { capId: 'apps', tool: 'app.schedule', scope: 'write', requiresConsent: false, network: false, deferred: true }
     ],
     notebook: [
       { capId: 'memory', tool: 'notebook.write', scope: 'write', requiresConsent: false, network: false },   // private sandboxed memory — no consent gate (see notebook.js)
@@ -107,6 +129,11 @@
       // secret (names and env-var names only). NOT deferred: it is the cure for not knowing what exists, so it
       // cannot itself be a tool the agent must already suspect exists to find. (see tools/builtin/connectors.js)
       { capId: 'web', tool: 'connectors.list', scope: 'read', requiresConsent: false, network: false },
+      // A key the Commander pastes into chat becomes a KEYS entry, spent by name through web_request (2026-10-25). The
+      // value comes only from the Commander's own turns, never the call's args (tools/builtin/keys.js). Deferred and
+      // left out of the deferred index: the run ADVERTISES it only when the Commander's recent messages hold a
+      // key-shaped string, so every other run pays nothing for it.
+      { capId: 'web', tool: 'keys.save', scope: 'write', requiresConsent: false, network: false, deferred: true },
       // DEFERRED (`deferred: true`) — still GRANTED, just not advertised in every request. The browser family
       // alone is 29 tools / ~10.2KB of the 37.7KB of schemas re-sent on EVERY turn (measured at the wire), and
       // an agent needs about six of them to drive a page. A deferred tool stays fully dispatchable; the model
@@ -128,6 +155,9 @@
          which is also the moment a human is around to answer its consent card. */
       { capId: 'web', tool: 'browser.attach', scope: 'execute', requiresConsent: true, network: true, deferred: true },
       { capId: 'web', tool: 'browser.detach', scope: 'execute', requiresConsent: false, network: true, deferred: true },
+      /* #61: the supported recovery for a wedged station browser (ends only StarNet's own orphaned browser on the
+         station profile). Deferred: a repair move, found through tool.search when a browser error names it. */
+      { capId: 'web', tool: 'browser.reset', scope: 'execute', requiresConsent: false, network: true, deferred: true },
       /* Deferred, same reasoning as attach: specialist moves, not the ordinary browse loop. pdf is a
          READ (render what is already on screen into the jail); intercept/emulate reshape only the
          STATION browser and both refuse in attached mode (ownership — the Commander's own Chrome is
@@ -146,6 +176,10 @@
       // requiresConsent:false is NOT a free pass — browser.login runs its OWN two-phase live consent
       // (open-window ask + done-wait) inside the tool; the generic broker card would double-prompt.
       { capId: 'web', tool: 'browser.login', scope: 'execute', requiresConsent: false, network: true, deferred: true },
+      /* STEP-IN (2026-09-29): NOT deferred. A stuck agent that cannot see the door does not go looking for it — it
+         reports "I can't log in" (or worse, tries to get round the wall). The navigate/get_text results name it, and
+         a named tool must be callable. scope 'read': the agent pauses and hands over; it changes nothing itself. */
+      { capId: 'web', tool: 'browser.need_human', scope: 'read', requiresConsent: false, network: true },
       { capId: 'web', tool: 'browser.click', scope: 'execute', requiresConsent: true, network: true },
       { capId: 'web', tool: 'browser.type', scope: 'execute', requiresConsent: true, network: true },
       { capId: 'web', tool: 'browser.press', scope: 'execute', requiresConsent: true, network: true },
@@ -191,6 +225,10 @@
     // instance's binding ({ connectorId }) selects WHICH server. This empty marker just declares 'connector' a
     // known, placeable capability object so the builder/world can treat it like any other room object.
     connector: [],
+    // PLUGINS: a 'plugin' object (a PLUGIN TERMINAL bound to { pluginId }) is dynamic in exactly the same way — its
+    // grants are the tools that plugin registered (api.tool) in its own process, projected per run by index.js
+    // with the connector trust contract (sidecar/plugin-tools.js). This marker makes it a known room object.
+    plugin: [],
     // WORKBENCH: real code execution (shell.exec). Opt-in per agent by PLACING this object — no object, no shell,
     // exactly like cabinet=files. scope 'execute' so the consent broker's exec-lockout binds it: an autonomous
     // run can NEVER execute off a cached grant (only an interactive human, or frozen FULL_ACCESS, may approve).
@@ -213,6 +251,7 @@
       // command, so it carries shell.exec's gate, not shell.bg.status's.
       { capId: 'workbench', tool: 'shell.bg.write', scope: 'execute', requiresConsent: true, network: true },
       { capId: 'workbench', tool: 'shell.bg.kill', scope: 'write', requiresConsent: false, network: false },     // H2.2: stop a background process you started
+      { capId: 'workbench', tool: 'shell.bg.wait', scope: 'read', requiresConsent: false, network: false },     // h2: block (bounded) until your background process exits
       // A real PTY/ConPTY rail for interactive programs. Start + input carry the same execution/consent posture
       // as shell.exec; observation, resize, Ctrl-C and stop remain agent-owned control operations.
       { capId: 'workbench', tool: 'terminal.start', scope: 'execute', requiresConsent: true, network: true },
@@ -262,6 +301,9 @@
       // "what did the researcher do?" answered from assumption and denied real finished work (2026-07-30).
       { capId: 'orchestrator', tool: 'session.peek', scope: 'read', requiresConsent: false, network: false },
       { capId: 'orchestrator', tool: 'session.focus', scope: 'write', requiresConsent: false, network: false },
+      // station.status: the page's station-wide snapshot (busy / awaiting approval per session), read-only (#55). Deferred:
+      // the tool budget is spent, so it costs every run one name in the deferred index, not a schema (tool_search "status").
+      { capId: 'orchestrator', tool: 'station.status', scope: 'read', requiresConsent: false, network: false, deferred: true },
       // TASK BOARD: cards are the page's canonical kind:'task' Workstreams and are persisted through the same
       // agent save the board renders. Creation is reversible and spends nothing; management is consent-gated
       // because its action set includes shipping, archiving, reassignment, and deletion.
@@ -270,6 +312,26 @@
       { capId: 'orchestrator', tool: 'task.manage', scope: 'write', requiresConsent: true, network: false },
       { capId: 'orchestrator', tool: 'team.config', scope: 'read', requiresConsent: false, network: false },
       { capId: 'orchestrator', tool: 'team.configure', scope: 'write', requiresConsent: true, network: false },
+      // station.layout: the floor as the Workflow panel reads it (lines, steps, briefs, starts, blockers). Read-only.
+      { capId: 'orchestrator', tool: 'station.layout', scope: 'read', requiresConsent: false, network: false },
+      // the station builder (2026-09-29): plan a ready-made line on a copy (changes nothing), then build exactly that
+      // plan behind the approval card (one undo, add-only)
+      /* THE STATION BUILDER: deferred — found by tool_search "station builder" (the lead's note names it), each result
+         revealing the next tool. A floor change is a specialist job the Commander asks for, not a headline every run needs. */
+      { capId: 'orchestrator', tool: 'station.map', scope: 'read', requiresConsent: false, network: false, deferred: true },
+      { capId: 'orchestrator', tool: 'station.plan', scope: 'read', requiresConsent: false, network: false, deferred: true },
+      { capId: 'orchestrator', tool: 'station.build', scope: 'write', requiresConsent: true, network: false, deferred: true },
+      // MAKE A PROP (2026-10-01): a new piece drawn by StarNet's prop maker, paid with StarNet credits (consent, the card names the price)
+      { capId: 'orchestrator', tool: 'station.make_prop', scope: 'write', requiresConsent: true, network: true, deferred: true },
+      { capId: 'orchestrator', tool: 'station.test_line', scope: 'write', requiresConsent: true, network: true, deferred: true },
+      { capId: 'orchestrator', tool: 'station.start_line', scope: 'write', requiresConsent: true, network: false, deferred: true },
+      /* STATION CONTROL (2026-10-02): the Commander's settings, read and changed from chat — the crew's model/approval/reach/
+         personality/name/skin, sessions, the look, spending, autonomy, memory, connectors, skills, apps, projects. Deferred
+         (found by tool_search "settings"): a settings change is something the Commander asks for, not a headline every run
+         needs. station.power holds only the escalations, in its own consent class, refused on unattended runs. */
+      { capId: 'orchestrator', tool: 'station.settings', scope: 'read', requiresConsent: false, network: false, deferred: true },
+      { capId: 'orchestrator', tool: 'station.control', scope: 'write', requiresConsent: true, network: false, deferred: true },
+      { capId: 'orchestrator', tool: 'station.power', scope: 'write', requiresConsent: true, network: false, deferred: true },
       // LOOPS: standing objective iteration through loops.json. Both mutations require consent because they
       // create or alter future autonomous work. Model tools never accept the host-run check command.
       { capId: 'orchestrator', tool: 'loop.list', scope: 'read', requiresConsent: false, network: false },
@@ -285,6 +347,16 @@
       { capId: 'orchestrator', tool: 'claude.send', scope: 'write', requiresConsent: false, network: true },
       { capId: 'orchestrator', tool: 'claude.adopt', scope: 'write', requiresConsent: true, network: false }
     ],
+    /* BUILDER (2026-10-11, the delegated Build Manager): a SLICE of the lead's station builder — see the floor, plan on a
+       copy, build behind the Commander's approval card — LENT by the lead to ONE dispatched worker for ONE job
+       (team.dispatch builder:true). Never placed and never in the full-power sweep: only the lead's dispatch confers it.
+       Same capId as the orchestrator it is cut from, so the TASK DELEGATION switch turns it off with the rest. Making
+       props (credits), testing and starting lines, and settings stay the lead's. */
+    builder: [
+      { capId: 'orchestrator', tool: 'station.map', scope: 'read', requiresConsent: false, network: false, deferred: true },
+      { capId: 'orchestrator', tool: 'station.plan', scope: 'read', requiresConsent: false, network: false, deferred: true },
+      { capId: 'orchestrator', tool: 'station.build', scope: 'write', requiresConsent: true, network: false, deferred: true }
+    ],
     // STUDIO (media skills): text->image generation + image vision analysis, both on the SAME BYOK OpenRouter
     // key the agent already uses (no new provider). image_generate WRITES a file into the agent's workspace, so
     // it is consent-gated like fs.write; image_analyze only READS an image and returns text (consent-free).
@@ -295,7 +367,14 @@
       // image_generate is: it writes into the workspace. It rides the station's existing TTS ladder (the keyed
       // neural chain, then the free keyless Edge floor), so it needs no studio-specific credential — but it
       // does reach the network on the keyed legs. (see tools/builtin/voice.js)
-      { capId: 'studio', tool: 'voice_generate', scope: 'write', requiresConsent: true, network: true }
+      { capId: 'studio', tool: 'voice_generate', scope: 'write', requiresConsent: true, network: true },
+      // DAVINCI RESOLVE (the edit bay, tools/builtin/resolve.js — a native port of the Hermes plugin). The timeline
+      // FILE writes an FCPXML into the workspace (consent, like every studio write) and works with free Resolve.
+      // resolve_status only reads. resolve_control drives a running Resolve Studio through its scripting API —
+      // imports, timelines, markers, renders — so it is execute + consent. All local: no network.
+      { capId: 'studio', tool: 'resolve_timeline_file', scope: 'write', requiresConsent: true, network: false },
+      { capId: 'studio', tool: 'resolve_status', scope: 'read', requiresConsent: false, network: false },
+      { capId: 'studio', tool: 'resolve_control', scope: 'execute', requiresConsent: true, network: false }
     ],
     // JUKEBOX (Spotify): querying playback/library is consent-free (read); CONTROLLING playback is an outward
     // action on the user's account/device, so it is execute + consent-gated. The OAuth session (PKCE, no secret)

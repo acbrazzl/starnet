@@ -7,6 +7,7 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { allocatePort, BIND_REFUSED } = require('./helpers/ports.js');
 
 const HOST = '127.0.0.1';
 const INDEX = path.resolve(__dirname, '..', 'sidecar', 'index.js');
@@ -33,10 +34,10 @@ function boot(port, workspaces, attemptsLeft) {
         settled = true;
         resolve({ child, port });
       }
-      if (!settled && /already in use/i.test(out)) {
+      if (!settled && BIND_REFUSED.test(out)) {
         settled = true;
         try { child.kill(); } catch (_) {}
-        if (attemptsLeft > 0) resolve(boot(port + 1, workspaces, attemptsLeft - 1));
+        if (attemptsLeft > 0) resolve(allocatePort().then(next => boot(next, workspaces, attemptsLeft - 1)));
         else reject(new Error('no free port'));
       }
     };
@@ -60,7 +61,7 @@ function extractBootToken(html) {
 
 (async () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'starnet-bootsec-'));
-  const booted = await boot(8880 + (process.pid % 40), ws, 20);
+  const booted = await boot(await allocatePort(), ws, 20);
   const { child, port } = booted;
   const B = 'http://' + HOST + ':' + port;
 
@@ -123,7 +124,7 @@ function extractBootToken(html) {
     });
     A.eq(tauriBudget.status, 200, 'Tauri trusted flow can read token-gated GETs');
 
-    const sse = await fetch(B + '/api/channels/events?token=' + encodeURIComponent(browserToken), {
+    const sse = await fetch(B + '/api/channels/events?' + require('./_httpToken.js').sseQuery(browserToken), {
       headers: { Origin: B }
     });
     A.eq(sse.status, 200, 'browser EventSource flow can authenticate with token query');

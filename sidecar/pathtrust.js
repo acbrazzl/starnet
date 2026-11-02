@@ -27,7 +27,10 @@
                   `path:*` grants, so a revoke takes effect on the very next call with no restart).
      bless      : async (rootReal, { isGitRepo, now }) => bool  — persist the standing grant + upsert the
                   known-projects store (persist-before-commit in index.js); false ⇒ deny (never committed).
-     touch      : (rootReal, absPath) => void  — bump lastTouchedAt on I/O under a known root (best-effort).
+     touch      : (rootReal, absPath, meta) => void  — bump lastTouchedAt on I/O under a known root (best-effort).
+                  meta.user === true iff a USER-caused run did the I/O (guard o.userTouch, default: surface ===
+                  'interactive'). The host bumps recency ONLY for user touches: the agent's own away work must
+                  never keep its folder "most recently worked in" (the self-reinforcing night-focus loop, 2026-10-05).
      isGitRepoOf: async (rootReal) => bool  — light metadata for the store (has a .git entry).
      workspaceRoot: absolute parent of the private per-agent workspaces; standing grants and Full Access do
                   not override ownership beneath this root.
@@ -59,6 +62,8 @@
     const workspaceRoot = deps.workspaceRoot ? P.resolve(String(deps.workspaceRoot)) : '';
     const now = typeof deps.now === 'function' ? deps.now : (() => null);
     const MAX_WALK = Number(deps.maxWalk) > 0 ? Number(deps.maxWalk) : 40;
+    const isReservedWorkspaceId = typeof deps.isReservedWorkspaceId === 'function' ? deps.isReservedWorkspaceId
+      : (typeof require === 'function' ? require('./workspace-reserved.js').isReservedWorkspaceId : (() => false));
 
     const winish = P.sep === '\\';
     function pathInside(abs, base) {
@@ -66,18 +71,24 @@
       if (winish) { a = a.toLowerCase(); b = b.toLowerCase(); }
       return a === b || a.indexOf(b + P.sep) === 0;
     }
-    async function realpathOrSelf(p) { try { return await fsp.realpath(p); } catch (_) { return p; } }
+    async function realpathOrSelf(p) {
+      try { return await fsp.realpath(p); }
+      catch (e) { throw new Error('cannot resolve filesystem path (possibly a dangling symlink): ' + p + ': ' + ((e && e.message) || e)); }
+    }
     // realpath the DEEPEST existing ancestor of a (possibly not-yet-created) absolute path, so a symlink
     // anywhere along the real chain is resolved before the containment test (symlink-escape re-proof).
     async function realpathDeepest(abs) {
       let cur = P.resolve(abs);
       for (;;) {
-        try { await fsp.lstat(cur); return await realpathOrSelf(cur); }
-        catch (_) {
+        try { await fsp.lstat(cur); }
+        catch (e) {
+          if (!e || e.code !== 'ENOENT') throw e;
           const parent = P.dirname(cur);
-          if (!parent || parent === cur) return cur;
+          if (!parent || parent === cur) throw new Error('cannot resolve filesystem path: ' + abs);
           cur = parent;
+          continue;
         }
+        return realpathOrSelf(cur);
       }
     }
 
@@ -86,14 +97,44 @@
     // returns it; pathInside is case-insensitive on win32, so any residual case difference still matches.
     function normalizeRoot(abs) { return P.resolve(String(abs == null ? '' : abs)); }
 
+    /* THE CREDENTIAL FLOOR (2026-10-10 security pass). The THIS COMPUTER profile gives every run — scheduled and
+       chat-driven ones included — read access to any non-hardline path with no card, and fs.read never asks. So a
+       prompt-injected routine could read the user's SSH keys, cloud CLI logins, other AI CLIs' tokens, release
+       signing keys or browser profiles and fetch them out. These well-known credential stores are part of the
+       floor: no project grant or Full Access reaches them; only host-wide Full Power (unrestrictedHost, which
+       bypasses this whole function) does — the operator's explicit "this agent is me" switch. Matched on path
+       SEGMENTS (forward-slashed, case-folded), so a name merely containing ".ssh" is not caught. */
+    const CREDENTIAL_STORES = [
+      [/(^|\/)\.(ssh|gnupg|aws|azure|kube|tauri|starnet-signing|starnet-keys|fly|codex)(\/|$)/, 'SSH, GPG, cloud CLI and signing keys'],
+      [/(^|\/)(\.netrc|_netrc|\.git-credentials|\.pypirc|\.pgpass|\.npmrc)$|(^|\/)\.cargo\/credentials(\.toml)?$/, 'saved login credentials'],
+      // gcloud and the GitHub CLI keep their logins under %APPDATA% on Windows, ~/.config elsewhere
+      [/(^|\/)\.docker\/config\.json$|(^|\/)\.config\/(gcloud|gh)(\/|$)|(^|\/)appdata\/roaming\/(gcloud|github cli)(\/|$)|(^|\/)\.claude\/\.credentials\.json$/, 'cloud and developer CLI logins'],
+      [/(^|\/)microsoft\/(credentials|protect|vault)(\/|$)|(^|\/)library\/keychains(\/|$)|(^|\/)\.local\/share\/keyrings(\/|$)/, 'the operating system credential store'],
+      // browser profiles are matched under their real parent folders (AppData, ~/.config and its snap/flatpak
+      // twins, ~/Library) — a project folder merely NAMED chromium or vivaldi is an ordinary project. The [^\/]*
+      // suffix keeps the Beta/Dev/SxS/Stable siblings ("Chrome SxS", "Edge Beta", "google-chrome-beta").
+      // A Microsoft Store (MSIX) browser keeps its AppData under Packages/<pkg>/LocalCache/{Local,Roaming}.
+      // Opera's ~/.config folders are named exactly, so ~/.config/operator or .config/operations stay readable.
+      [/(^|\/)(appdata|localcache)\/(local|roaming)\/(google\/chrome|chromium|microsoft\/edge|bravesoftware\/brave-browser|vivaldi|opera software|mozilla\/firefox)[^\/]*(\/|$)|(^|\/)\.mozilla\/firefox(\/|$)|(^|\/)(\.config|\.var\/app\/[^\/]+\/config|snap\/chromium\/common)\/(google-chrome[^\/]*|chromium|vivaldi[^\/]*|brave-?software|opera(-beta|-developer|-gx)?|microsoft-edge[^\/]*)(\/|$)|(^|\/)library\/(cookies|application support\/(google\/chrome[^\/]*|chromium|vivaldi|firefox|microsoft edge[^\/]*|bravesoftware|com\.operasoftware\.opera[^\/]*))(\/|$)/, 'browser profiles (cookies and saved passwords)']
+    ];
+    function credentialFloor(p) {
+      const s = String(p || '').replace(/\\/g, '/').toLowerCase();
+      for (const [rx, what] of CREDENTIAL_STORES) if (rx.test(s)) return what;
+      return null;
+    }
+
     // the unconditional floor — throws a reason if the path is illegal or protected regardless of any grant.
     function hardlineReason(rawAbs, resolvedAbs) {
       if (rawAbs.indexOf('\0') >= 0) return 'illegal path (NUL): ' + rawAbs;
       // UNC / network path — off-host, never blessable. Check the RAW string (P.resolve can mangle it).
       if (/^[\\/]{2}/.test(rawAbs)) return 'network paths (UNC) are not permitted: ' + rawAbs;
       const probe = resolvedAbs || rawAbs;
-      if (/(^|[\\/])\.env(\.|$)/i.test(probe)) return 'reading ' + probe + ' is blocked by the protected-file floor (.env)';
-      if (/(^|[\\/])\.git([\\/]|$)/i.test(probe)) return 'reading ' + probe + ' is blocked by the protected-file floor (.git)';
+      // `:` too: NTFS stream syntax (`.env::$DATA`, `.git::$INDEX_ALLOCATION\hooks`) opens the protected file itself, and the
+      // realpath re-proof below only canonicalizes a target that already exists
+      if (/(^|[\\/])\.env(\.|:|$)/i.test(probe)) return 'reading ' + probe + ' is blocked by the protected-file floor (.env)';
+      if (/(^|[\\/])\.git([\\/:]|$)/i.test(probe)) return 'reading ' + probe + ' is blocked by the protected-file floor (.git)';
+      const cred = credentialFloor(probe);
+      if (cred) return 'reading ' + probe + ' is blocked by the credential floor (' + cred + ') — only Full Power reaches it';
       return null;
     }
 
@@ -120,6 +161,9 @@
       const prompt = typeof o.prompt === 'function' ? o.prompt : null;
       const fullAccess = o.fullAccess === true;
       const unrestrictedHost = o.unrestrictedHost === true;
+      // WHO caused this I/O, for recency metadata only (never an authority input): an explicit host-minted flag wins,
+      // otherwise a watched interactive run is the user's and everything else is the agent's.
+      const userTouch = (o.userTouch === true || o.userTouch === false) ? o.userTouch : surface === 'interactive';
 
       const raw = String(absPath == null ? '' : absPath);
       const norm = P.resolve(raw);
@@ -154,9 +198,22 @@
         const workspaceReal = await realpathOrSelf(workspaceRoot);
         if (pathInside(real, workspaceReal)) {
           const agentId = String(o.agentId == null ? '' : o.agentId);
-          if (/^[A-Za-z0-9_-]{1,40}$/.test(agentId)) {
+          // A station-owned directory (codex/, channels/, connectors/, plugins/ …) is never an agent's own
+          // workspace, even for an agent whose id collides with it — those fall through to the deny below.
+          if (/^[A-Za-z0-9_-]{1,40}$/.test(agentId) && !isReservedWorkspaceId(agentId)) {
             const ownReal = await realpathOrSelf(P.join(workspaceRoot, agentId));
             if (pathInside(real, ownReal)) return { base: ownReal, abs: norm };
+          }
+          /* THE HAND-OFF EXCEPTION (2026-10-13): a READ of one EXACT file the host handed this run (a dispatched
+             worker reading what the worker before it saved; a lead reading its workers' saved files). Exact real path
+             only — never a folder, never a write, never a path the model named on its own. */
+          if (scope === 'read' && Array.isArray(o.readGrants) && o.readGrants.length) {
+            for (const g of o.readGrants) {
+              if (!g || !P.isAbsolute(String(g))) continue;
+              let gReal = '';
+              try { gReal = await realpathOrSelf(String(g)); } catch (e) { continue; }   // a granted file since deleted grants nothing
+              if (gReal && pathInside(real, gReal) && pathInside(gReal, real)) return { base: P.dirname(real), abs: norm, handoff: true };
+            }
           }
           throw new Error('path is inside another agent workspace and cannot be shared by a project grant: ' + norm);
         }
@@ -165,8 +222,12 @@
       // 1. already under a blessed root? reads flow; the write-scope boundary is the broker's job upstream.
       for (const R of rootsFn()) {
         if (!R) continue;
-        if (pathInside(real, R)) { touch(R, norm); return { base: R, abs: norm }; }
+        if (pathInside(real, R)) { touch(R, norm, { user: userTouch }); return { base: R, abs: norm }; }
       }
+      // 1b. …or under a root the Commander approved "for this session" earlier in THIS run (o.sessionRoots: a Set the
+      // caller owns per run, so it dies with the run and is never a standing grant)
+      const sessionRoots = (o.sessionRoots && typeof o.sessionRoots.add === 'function') ? o.sessionRoots : null;
+      if (sessionRoots) for (const R of sessionRoots) if (R && pathInside(real, R)) return { base: R, abs: norm };
 
       // 2. not blessed. In ASK mode only a watched, prompt-wired run may approve a new root. Full Access is
       // already the operator's authority for every non-hardline path, so it must never manufacture a prompt.
@@ -210,11 +271,15 @@
         const isGit = await isGitRepoOf(proposedReal);
         const ok = await bless(proposedReal, { isGitRepo: isGit, now: now() });
         if (!ok) throw new Error('could not persist project trust — denied: ' + proposed);
-        touch(proposedReal, norm);
+        touch(proposedReal, norm, { user: userTouch });
         return { base: proposedReal, abs: norm };
       }
       // "once": allow THIS access only, without persisting a root — the next access asks again, as promised.
       if (decision === 'once') return { base: proposedReal, abs: norm };
+      /* "session" (ACP's "Allow for the rest of this session", a paired phone's "for this session") is a legal consent
+         word: it used to fall through to the deny below while the answering surface was told it was applied. It approves
+         this access and the rest of THIS run under the same root — never a standing grant. No session store wired = once. */
+      if (decision === 'session') { if (sessionRoots) sessionRoots.add(proposedReal); return { base: proposedReal, abs: norm }; }
       throw new Error('access to ' + norm + ' was denied');
     }
 

@@ -11,7 +11,7 @@ the layout IS the org: rooms = capability scopes, placed props = real tool grant
 (**object = capability**), conveyor items = real work. The core product law is **truthful
 telemetry**: the UI never asserts anything the harness can't prove.
 
-- Thesis: beginner-friendly and power-user-complete — sandbox freedom, real work, Factorio-style pride loop. User-work quotas are off by default; limits are opt-in.
+- Thesis: beginner-friendly and power-user-complete — sandbox freedom, real work, Factorio-style pride loop. User-work quotas are off by default; limits are opt-in — with ONE shipped exception: a $25/day SOFT spend rail on metered runs (one-click RESUME, editable, 0 = off; `sidecar/budgetcaps.js`, DECISIONS 2026-09-17).
 - Lineage: UltronOS (banned from Claude API 2026-04-04) → "v7" fake sim → this real harness
   (reuses v7's canvas + U.bus). Rebranded Skynet→StarNet 2026-06-22; internal `skynet.*`
   keys are intentionally kept.
@@ -99,6 +99,8 @@ instead of being learned as answers, terse channel answers resume by durable bri
 can contribute weak relationship evidence. The text `TASK_QUESTION` marker remains a compatibility/UI transport,
 not the authority boundary.
 
+Build-mode gestures and onward routing are locked in [DECISIONS.md](DECISIONS.md), “Build mode / conveyors”: SELECT MOVES, THE HAND, SEND TO and the LOOP-only cycle rule.
+
 ## How to work here (non-negotiable)
 
 1. **Read the local operating protocol** (`CLAUDE.md` at the repo root of the internal
@@ -111,8 +113,9 @@ not the authority boundary.
    (frontend/backend), `starnet-verify` before claiming done, `starnet-merge-ritual` to
    integrate. They encode the locked judgment; they win over anything conflicting in older
    docs.
-3. **Gate:** `npm run test:fast` (509 manifest-owned steps as of 2026-08-03) green before merge. Sidecar/route
-   changes also owe the 56-suite `npm run test:http`. Live-app verification via
+3. **Gate:** `npm run test:fast` green before merge. The current step lists live in
+   `test/fast.list` and `test/http.list`; do not copy changing counts into this orientation.
+   Sidecar/route changes also owe the complete `npm run test:http`. Live-app verification via
    `node dev/seed.js --keep` (pre-onboarded workspace, no ceremony) + preview/CDP DOM
    round-trips (canvas screenshots time out — see MISTAKES.md).
 4. Read [DECISIONS.md](DECISIONS.md) (locked, don't re-litigate) and
@@ -127,8 +130,8 @@ not the authority boundary.
 | Is trunk green / app healthy | `npm run qa:guardian` · dashboard `qa/STATUS.md` |
 | Known/suppressed defects | `qa/KNOWN_ISSUES.md` (fingerprint ledger) |
 | Open findings | `node scripts/qa/ledger.mjs --status` |
-| Who is working where | `git worktree list` (18+ unmerged `agent/*` branches exist; many are parked) |
-| Current priorities | [NEXT.md](NEXT.md) — reconciled 2026-07-06; re-verify by grep before building |
+| Who is working where | `git worktree list` plus the current owner assignments in NEXT.md; a parked tree is not an active claim |
+| Current priorities | The current campaign at the top of [NEXT.md](NEXT.md); re-verify old entries against source and customer evidence |
 | What the user saw break | `docs/GROUND_UP_AUDIT_2026-07-06.md` + the two UPDATE_*_AUDIT docs |
 
 **Doc-trust rule:** any doc older than ~a day is a hypothesis. This project merges many
@@ -158,7 +161,11 @@ everything in `docs/archive/`.
 
 When in doubt: the newer date wins, the audit beats the plan, and trunk beats both.
 
-## The biggest bottlenecks right now (brutal, 2026-07-06)
+## Bottlenecks as of 2026-07-06 (historical — current priorities live in docs/NEXT.md)
+
+Since this list was written: releases are public on `androoAGI/starnet-releases` (every cut since v0.10.x),
+the release train signs Windows installers and notarizes both macOS builds, and outside users file issues
+and PRs on the public repo. Kept for the reasoning, not as current status.
 
 1. **Everything user-facing is bottlenecked on Andrew's ~1 hour of launch chores** — publish
    the releases repo (updater 404s for the public until then), rotate the dev OpenRouter

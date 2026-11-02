@@ -11,23 +11,33 @@ const source = fs.readFileSync(path.join(__dirname, '../frontend/app/updates.js'
 function makeCase(opts) {
   const o = opts || {};
   const calls = [];
-  const store = new Map([['starnet.save', '{"version":5,"updatedAt":99}']]);
+  const store = new Map([['starnet.save', '{"version":5,"updatedAt":99}']].concat(o.store || []));
+  let lastBundle = null;
   let installCalls = 0;
   let cancelCalls = 0;
   let preparedFrozen = false;
+  let prepareCalls = 0;
+  const prepareForce = [];
+  const opened = [];
   class Channel { constructor(fn) { this.fn = fn; } }
-  const invoke = async cmd => {
+  const invoke = async (cmd, args) => {
     calls.push(cmd);
+    if (cmd === 'open_external_url') { opened.push(args && args.url); return {}; }
     if (cmd === 'starnet_update_status') return { desktop: true, currentVersion: '1.0.0', pending: null };
     if (cmd === 'starnet_update_check') return { available: true, checkedAt: 10, update: { version: '2.0.0', body: '' } };
-    if (cmd === 'starnet_update_install') { installCalls++; if (o.installFails) throw new Error('native failed'); return {}; }
+    if (cmd === 'starnet_update_install') { installCalls++; if (o.installError) throw o.installError; if (o.installFails) throw new Error('native failed'); return {}; }
     return {};
   };
   const fetch = async (url, init) => {
     calls.push(String(url));
     if (url === '/api/update/prepare') {
       const sent = JSON.parse(init.body);
-      A.eq(sent.browserStore['starnet.save'], store.get('starnet.save'), 'prepare carries browser-owned save bytes');
+      prepareCalls++;
+      prepareForce.push(sent.force === true);
+      lastBundle = sent.browserStore;
+      const own = o.journalKey || 'starnet.save';
+      A.eq(sent.browserStore[own], store.get(own), 'prepare carries browser-owned save bytes (this window’s journal)');
+      if (o.prepareBody && !(o.prepareBodyOnce && prepareCalls > 1)) return { ok: false, status: 409, json: async () => o.prepareBody };
       if (o.prepareFails) return { ok: false, status: 409, json: async () => ({ ok: false, code: 'UPDATE_SNAPSHOT_FAILED' }) };
       preparedFrozen = true;
       return { ok: true, status: 200, json: async () => ({ ok: true, receipt: { id: 'receipt-1' } }) };
@@ -49,7 +59,7 @@ function makeCase(opts) {
       get length() { return store.size; }, key(i) { return Array.from(store.keys())[i] || null; },
       getItem(k) { return store.has(k) ? store.get(k) : null; }, setItem(k, v) { store.set(k, String(v)); }
     },
-    CloudSave: { flushForUpdate: async () => { calls.push('save'); return { ok: o.saveOk !== false }; } },
+    CloudSave: { flushForUpdate: async () => { calls.push('save'); return { ok: o.saveOk !== false }; }, journalKey: () => o.journalKey || 'starnet.save' },
     App: { pushRoster: async () => { calls.push('roster'); return o.rosterOk !== false; } },
     Channels: { busyCount: () => 0 },
     fetch, console,
@@ -59,16 +69,32 @@ function makeCase(opts) {
   vm.createContext(context);
   vm.runInContext(source, context, { filename: 'updates.js' });
   return {
-    updates: context.__Updates, calls,
+    updates: context.__Updates, calls, opened,
     installCalls: () => installCalls,
     cancelCalls: () => cancelCalls,
-    isPreparedFrozen: () => preparedFrozen
+    isPreparedFrozen: () => preparedFrozen,
+    prepareForce,
+    bundle: () => lastBundle
   };
 }
 
 async function ready(c) { await c.updates.init(); await c.updates.check(true, 'test'); }
 
 (async () => {
+  // review 10-27: every window of a browser keeps its own whole-station journal (cloudsave.js); only THIS window's rides the
+  // update bundle, or two journals of a big station overflow the 16 MiB the prepare route reads
+  {
+    const c = makeCase({ store: [['starnet.save.w.other-tab', '{"version":6,"big":true}'], ['starnet.ui.rail', 'w400']] });
+    await ready(c); await c.updates.install();
+    const b = c.bundle() || {};
+    A.ok(b['starnet.save'] && !('starnet.save.w.other-tab' in b) && b['starnet.ui.rail'] === 'w400', 'update bundle: this window’s journal and the other station keys, never another window’s journal (' + Object.keys(b) + ')');
+  }
+  {
+    const c = makeCase({ journalKey: 'starnet.save.w.mine', store: [['starnet.save.w.mine', '{"version":6,"mine":true}']] });
+    await ready(c); await c.updates.install();
+    const b = c.bundle() || {};
+    A.ok(b['starnet.save.w.mine'] && !('starnet.save' in b), 'update bundle: a second tab bundles its own journal, not the first window’s (' + Object.keys(b) + ')');
+  }
   {
     const c = makeCase({ saveOk: false });
     await ready(c); await c.updates.install();
@@ -104,6 +130,72 @@ async function ready(c) { await c.updates.init(); await c.updates.check(true, 't
     await ready(c); const state = await c.updates.install();
     A.ok(/writes may still be paused/i.test(state.error), 'persistent thaw failure is disclosed instead of reporting only the installer error');
     A.eq(c.isPreparedFrozen(), true, 'persistent thaw failure remains truthfully represented by the frozen fixture');
+  }
+  {
+    // #91: a capture failure is a dead end only if the panel offers nothing — the Update Center error must carry the
+    // manual installer door (RELEASES_PAGE), because retrying the in-app update re-runs the same capture.
+    const c = makeCase({ prepareBody: { ok: false, frozen: false, code: 'ENOENT', error: "ENOENT: no such file or directory, lstat 'C:\\WORKSPACES\\.checkpoints\\auditor\\git\\tw40mZg'" } });
+    await ready(c); const state = await c.updates.install();
+    A.eq(c.installCalls(), 0, 'a failed recovery point still blocks the native installer');
+    A.ok(/^Pre-update recovery point failed - ENOENT/.test(state.error), 'the capture failure is named on the panel');
+    const handlers = {};
+    const body = { innerHTML: '', querySelector(sel) {
+      const id = sel.replace(/^#/, '');
+      if (body.innerHTML.indexOf('id="' + id + '"') < 0) return null;
+      return { addEventListener(type, fn) { handlers[id + ':' + type] = fn; } };
+    } };
+    c.updates.render(body);
+    A.ok(body.innerHTML.indexOf('Pre-update recovery point failed') >= 0, 'the error renders in the Update Center');
+    A.ok(/class="up-error"[\s\S]*id="up-manual-err"/.test(body.innerHTML), 'the error card carries the manual installer button');
+    A.ok(typeof handlers['up-manual-err:click'] === 'function', 'the installer button is wired');
+    if (handlers['up-manual-err:click']) handlers['up-manual-err:click']({ preventDefault() {} });
+    const page = (fs.readFileSync(path.join(__dirname, '../frontend/app/updates.js'), 'utf8').match(/RELEASES_PAGE = '([^']+)'/) || [])[1];
+    A.ok(!!page, 'updates.js declares RELEASES_PAGE');
+    A.eq(c.opened, [page], 'the button opens the public releases page (the full installer), nothing invented');
+  }
+  {
+    // The SIDECAR is the authority on live runs. A scheduled routine, a hop or a background worker the floor never lit
+    // (busyCount 0) still refuses a plain install: that must land on the GB-4 guard (WAIT / INSTALL ANYWAY), never on a
+    // dead-end "recovery point failed" card that offers only the manual installer.
+    const c = makeCase({ prepareBodyOnce: true, prepareBody: { ok: false, frozen: false, code: 'UPDATE_RUNS_ACTIVE', error: 'agent runs are still active' } });
+    await ready(c); const state = await c.updates.install();
+    A.eq(c.installCalls(), 0, 'a sidecar-refused install never reaches the native installer');
+    A.eq(state.error, '', 'live runs are not reported as a failed recovery point');
+    A.ok((state.confirmRuns | 0) >= 1, 'the guard card is raised from the sidecar refusal even when this window counts no busy agent');
+    const handlers = {};
+    const body = { innerHTML: '', querySelector(sel) {
+      const id = sel.replace(/^#/, '');
+      if (body.innerHTML.indexOf('id="' + id + '"') < 0) return null;
+      return { addEventListener(type, fn) { handlers[id + ':' + type] = fn; } };
+    } };
+    c.updates.render(body);
+    A.ok(/id="up-install-force"/.test(body.innerHTML) && /id="up-guard-wait"/.test(body.innerHTML), 'the guard offers WAIT FOR AGENTS and INSTALL ANYWAY');
+    await handlers['up-install-force:click']();
+    A.eq(c.prepareForce, [false, true], 'INSTALL ANYWAY re-asks the sidecar with force');
+    A.eq(c.installCalls(), 1, 'and the forced, drained install proceeds');
+  }
+  {
+    // A refused download is the updater working. Tauri rejects the invoke with the plugin's bare Display text
+    // (minisign-verify 0.2.5 / reqwest): the Commander must read that NOTHING was installed, not a crypto library error.
+    const sig = makeCase({ installError: 'The signature verification failed' });
+    await ready(sig); const refused = await sig.updates.install();
+    A.ok(/^Update refused: the download did not match the signed StarNet release\./.test(refused.error), 'a bad signature reads as a refusal: ' + refused.error);
+    A.ok(/Nothing was installed; your current StarNet is unchanged\./.test(refused.error), 'and says the current install is untouched');
+    A.ok(/\(The signature verification failed\)$/.test(refused.error), 'the raw updater text stays as the detail');
+    const key = makeCase({ installError: 'The signature was created with a different key than the one provided' });
+    await ready(key); A.ok(/^Update refused:/.test((await key.updates.install()).error), 'a wrong-key release is a refusal too');
+    const net = makeCase({ installError: 'error decoding response body' });
+    await ready(net); const cut = await net.updates.install();
+    A.ok(/^The update download did not finish\. Nothing was installed/.test(cut.error), 'a dropped download says nothing was installed: ' + cut.error);
+    A.eq(net.isPreparedFrozen(), false, 'and the station is writable again');
+  }
+  {
+    // the forward-version gate has no Update Center: it opens the same manual installer through this export
+    const c = makeCase({});
+    await ready(c);
+    A.eq(typeof c.updates.openReleasesPage, 'function', 'Updates exports openReleasesPage');
+    c.updates.openReleasesPage();
+    A.eq(c.opened.length, 1, 'which opens the releases page');
   }
   A.report('updates-install.test');
 })().catch(e => { console.error(e); process.exit(1); });

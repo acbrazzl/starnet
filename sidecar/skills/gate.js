@@ -90,7 +90,7 @@
     function keyFor(agentId, id) { return str(agentId || 'agent') + '\x00' + str(id); }
     function approvalFor(skill) {
       if (!approvals || typeof approvals.get !== 'function' || !skill) return null;
-      try { return approvals.get(str(skill.agentId || 'agent'), str(skill.id)) || null; } catch (_) { return null; }
+      try { return approvals.get(str(skill.agentId || 'agent'), str(skill.id), stampOf(skill)) || null; } catch (_) { return null; }
     }
     /* A stamped digest is what list() can carry (metadata only — no body). When the store had no
        digest stamper, fall back to the lifecycle stamp so an approval still expires on the next
@@ -99,15 +99,39 @@
       const d = str(skill && skill.contentDigest);
       return d || ('u' + str((skill && skill.updatedAt) || 0));
     }
+    /* AN UNSTAMPED RECORD (no contentDigest: saved before digest stamping — a legacy row with no verdict, or an
+       'ask' written between verdict stamping and digest stamping) has only the lifecycle stamp, which no
+       Approve can match: the route binds the approval to digestOf(the bytes the Commander read). With the body,
+       verify() re-scans those live bytes and re-decides against their digest (below), so an approval releases
+       exactly the bytes that were scanned and read — never unscanned bytes on a lifecycle stamp (review
+       2026-10-12: an earlier fix approved the live digest here with no scan, which laundered a rewrite past the
+       guard). Metadata only (the prompt index, skill.list): the lifecycle stamp the record carried when it was
+       approved (`rec.stamp`), so the next real mutation re-asks. A stamped record is unchanged. */
     function isApproved(skill) {
       const rec = approvalFor(skill);
-      return !!(rec && str(rec.digest) === stampOf(skill));
+      if (!rec) return false;
+      const want = str(rec.digest);
+      if (want === stampOf(skill)) return true;
+      if (str(skill.contentDigest) || typeof skill.body === 'string') return false;
+      return !!str(rec.stamp) && str(rec.stamp) === stampOf(skill);
     }
 
     /* decide — the metadata-only decision, safe to call from the index composer where bodies are
        not loaded. `action` is the guard verdict already stamped on the record by persist(). */
+    /* The action the trust rule gives this record TODAY, from metadata alone: the stored scan verdict judged at
+       the stricter of its origin tier and its writer tier (guard.actionFor). A stamp written under the old
+       relabel can be MORE permissive than that; it never wins. '' when there is no guard or no stored verdict. */
+    function ruleAction(skill) {
+      const verdict = str(skill && skill.scan && skill.scan.verdict);
+      if (!verdict || !guard || typeof guard.actionFor !== 'function') return '';
+      try { return str(guard.actionFor(skill, verdict)); } catch (_) { return ''; }
+    }
     function decide(skill) {
-      const action = str(skill && skill.guardAction).trim().toLowerCase();
+      if (skill && skill.pendingCandidate) return { action: 'ask', visible: false, approvable: false,
+        categories: categoriesOf(skill), reason: 'proposed revision awaits behavior evaluation and Commander approval; the active version is unchanged' };
+      const stamped = str(skill && skill.guardAction).trim().toLowerCase();
+      const rule = ruleAction(skill);
+      const action = rule ? worseAction(stamped, rule) : stamped;
       if (action === 'block') {
         return { action: 'block', visible: false, approvable: false, categories: categoriesOf(skill),
           reason: 'blocked by the skill guard' };
@@ -128,7 +152,8 @@
     function liveScan(skill) {
       try {
         if (!guard || typeof guard.scanSkillRecord !== 'function' || typeof guard.shouldAllow !== 'function') return null;
-        const scan = guard.scanSkillRecord(skill, { source: trustSource(skill.createdBy) });
+        const scan = guard.scanSkillRecord(skill, { source: typeof guard.originTier === 'function' ? guard.originTier(skill) : trustSource(skill.createdBy) });
+        if (typeof guard.actionFor === 'function') return { action: guard.actionFor(skill, scan.verdict), scan };
         const policy = guard.shouldAllow(scan, { allowAsk: true });
         return { action: (policy && policy.action) || 'allow', scan };
       } catch (_) { return null; }
@@ -145,12 +170,22 @@
       if (!stamped && !str(skill.guardAction)) {
         const live = liveScan(skill);
         if (!live || live.action === 'allow') return base;
-        const legacy = decide(Object.assign({}, skill, { guardAction: live.action, scan: live.scan }));
+        // Decide against the digest of the bytes just scanned: the allow route stores digestOf(the body the Commander
+        // read), so with no stamp isApproved() would compare it to 'u'+updatedAt and ALLOW would never take effect.
+        // An approval releases exactly these bytes.
+        const legacy = decide(Object.assign({}, skill, { guardAction: live.action, scan: live.scan, contentDigest: digestOf(skill) }));
         legacy.unscanned = true;
         if (!legacy.visible) legacy.reason = 'this skill was saved before the guard existed and re-scanning it flagged content — review it in ABILITIES > SKILLS';
         return legacy;
       }
-      if (!stamped) return base;
+      /* An unstamped record WITH a verdict: its verdict describes bytes no digest pins, so re-scan what is here now,
+         take the worse action, and judge any approval against THESE bytes' digest (fail closed: unscannable => ask). */
+      if (!stamped) {
+        const live = liveScan(skill);
+        return decide(Object.assign({}, skill, {
+          guardAction: worseAction(base.action, live ? live.action : 'ask'), scan: (live && live.scan) || skill.scan, contentDigest: digestOf(skill)
+        }));
+      }
       if (digestOf(skill) === stamped) return base;
       const live = liveScan(skill);
       const action = worseAction(base.action, live ? live.action : 'ask');   // unscannable tamper => at least ask
@@ -192,12 +227,21 @@
         });
       });
     }
+    // Reviewers may inspect their clean draft to continue editing it. This does not
+    // grant foreground delivery or waive a content finding / blocked origin.
+    function verifyDraft(skill) {
+      if (!skill || !skill.pendingCandidate) return verify(skill);
+      const live = liveScan(skill);
+      if (!live || live.action !== 'allow') return { action: (live && live.action) || 'ask', visible: false,
+        approvable: false, categories: categoriesOf(skill), reason: 'pending draft must pass the content guard before a reviewer can load it' };
+      return { action: 'allow', visible: true, approvable: false, categories: [], reason: 'review draft only; not an active skill' };
+    }
     function pending(skills) {
       return annotate(skills).filter(s => s.withheld && s.guardApprovable)
         .map(s => ({ id: s.id, agentId: s.agentId, name: s.name, action: s.guardDecision, categories: s.guardCategories, digest: stampOf(s) }));
     }
 
-    return { decide, verify, annotate, pending, keyFor, stampOf, isApproved, digestOf };
+    return { decide, verify, verifyDraft, annotate, pending, keyFor, stampOf, isApproved, digestOf };
   }
 
   return { makeSkillGate, digestOf, worseAction };

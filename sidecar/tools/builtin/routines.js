@@ -127,13 +127,19 @@
     return { agentId: rosterEntries[0].id, reason: 'used first available agent' };
   }
 
-  function packJob(job) {
+  // describe (injected by the host) turns a job into plain words: { when, next } on the host's wall clock. The model
+  // reports a routine's cadence back to the Commander, and reading `cron 0 10 * * 1` it once told them "bi-weekly".
+  function packJob(job, describe) {
     if (!job) return null;
+    let words = null;
+    try { words = typeof describe === 'function' ? describe(job) : null; } catch (_) { words = null; }
     return {
       id: job.id,
       name: job.name,
       agentId: job.agentId,
       scheduleDisplay: job.scheduleDisplay,
+      when: (words && words.when) || undefined,
+      nextRunLocal: (words && words.next) || undefined,
       enabled: !!job.enabled,
       state: job.state,
       nextRunAt: job.nextRunAt,
@@ -141,6 +147,7 @@
       lastStatus: job.lastStatus,
       lastError: job.lastError || (job.blockedConfig && job.blockedConfig.reason) || null,
       lastReason: job.lastReason || null,
+      lastLine: job.lastLine || null,   // the work line stopped short / came out partial / unapproved on its last fire (quick win 25)
       deliver: job.deliver || 'local',
       completedRuns: job.repeat && job.repeat.completed || 0,
       provider: job.provider || null,
@@ -207,11 +214,17 @@
        leaves true — so every readout here said "armed" about a scheduler the Commander had durably stood down, and
        run_now told the model the routine "fires on its next tick (within ~1 minute)" when no tick was coming. */
     const schedulerHalted = typeof deps.schedulerHalted === 'function' ? deps.schedulerHalted : function () { return false; };
+    /* (org wire AUTO-P16-1) the Commander TURNED SCHEDULING OFF: a create keeps it off (the one arm rule), so the note names their
+       choice and their switch — never "DISARMED" as if a create could fix it */
+    const schedulerOffByChoice = typeof deps.schedulerOffByChoice === 'function' ? deps.schedulerOffByChoice : function () { return false; };
     const armedNote = function () {
       if (schedulerHalted()) return "the scheduler is STOPPED by the Commander's E-STOP — nothing fires until they resume it";
-      return schedulerState() ? null : 'the scheduler is DISARMED — nothing fires until it is armed';
+      if (schedulerState()) return null;
+      if (schedulerOffByChoice()) return 'scheduling is OFF because the Commander turned it off — saving a routine keeps it off, so nothing fires until they turn scheduling on (AUTOMATE › SCHEDULES › ▶ TURN SCHEDULING ON)';
+      return 'the scheduler is DISARMED — nothing fires until it is armed';
     };
     const roster = typeof deps.roster === 'function' ? deps.roster : function () { return new Map(); };
+    const pack = function (job) { return packJob(job, deps.describeSchedule); };
     // W6: the plain anti-retry line + the per-agent "you already maintain: …" summary. Injected so this tool
     // stays node-testable; defaults keep it a no-op when the host doesn't wire the mint ledger.
     const ANTI_RETRY = 'this routine already exists — do not recreate it';
@@ -237,46 +250,46 @@
 
     const listTool = {
       name: 'routine.list', capability: 'orchestrator', scope: 'read', requiresConsent: false,
-      description: 'List StarNet ROUTINES scheduled jobs. Use this to check existing routines before creating another one.',
+      description: 'List StarNet ROUTINES scheduled jobs; check them before creating another.',
       schema: { type: 'object', properties: { agentId: { type: 'string' } } },
       run: async (args) => {
         const agentId = clean(args && args.agentId, 80);
         if (agentId && !validId(agentId)) throw new Error('agentId must be one of your station agents');
-        let jobs = (listJobs() || []).map(packJob).filter(Boolean);
+        let jobs = (listJobs() || []).map(pack).filter(Boolean);
         if (agentId) jobs = jobs.filter(j => j.agentId === agentId);
         return { content: JSON.stringify({ schedulerArmed: !!schedulerState(), schedulerHalted: !!schedulerHalted(), schedulerNote: armedNote() || undefined, jobs: jobs }), summary: jobs.length + ' routine(s)' };
       }
     };
 
     const createTool = {
-      name: 'routine.create', capability: 'orchestrator', scope: 'write', requiresConsent: true, timeoutMs: 15000,
+      name: 'routine.create', capability: 'orchestrator', scope: 'write', requiresConsent: true, timeoutMs: 15000, taintLocked: true,
       /* Trimmed 2026-07-26 (tool-schema cost pass). Re-sent every turn, so it keeps only what changes a
          decision and lives nowhere better: what this is, the trigger words that route work HERE instead of
          to a shell, and the check-first rule. Dropped: the agentId auto-routing and `arm` default, both of
          which the schema below already states at the point of use, and the explanation that the server
          rejects a duplicate name — it says so itself, at call time, more precisely than a remembered note. */
-      description: 'Create a StarNet ROUTINES scheduled job in the built-in harness scheduler. Use this whenever the Commander asks for a cron, routine, recurring task, reminder, standing job, or scheduled research — never shell.exec, crontab, Windows Task Scheduler, or any OS scheduler. Check routine.list first and do not re-create a routine that already exists.',
+      description: 'Create a StarNet ROUTINE: work an agent runs on a schedule (digests, research, monitoring, reports, drafts, reminders). Use it whenever the Commander wants anything recurring, scheduled or automated; never shell.exec, crontab or an OS scheduler. Results come back to this chat by default; do not ask where to send them. Write a self-contained prompt: task, sources, format, what to flag. Asked to automate something broadly? Create 2-5 routines your own tools can run now (web research, writing, checks; no connection needed), then list them. Call routine.list first; never duplicate.',
       schema: {
         type: 'object',
         required: ['prompt', 'schedule'],
         properties: {
           name: { type: 'string' },
-          prompt: { type: 'string', description: 'The instruction the target agent will run every time the routine fires.' },
-          schedule: { type: 'string', description: 'Examples: every 30m, every 6h, 0 9 * * *, in 2h, or an ISO timestamp.' },
-          agentId: { type: 'string', description: 'Optional exact station agent id. Omit to auto-route by specialty.' },
-          agentHint: { type: 'string', description: 'Optional specialty hint such as research, engineer, scribe, operator, designer.' },
-          timezone: { type: 'string', description: 'Optional IANA timezone for cron expressions, e.g. America/New_York.' },
+          prompt: { type: 'string', description: 'What the agent runs each time it fires.' },
+          schedule: { type: 'string', description: 'Plain English (every day at 7am, weekdays at 9am, 1st of every month, tomorrow at 9am), every 30m, in 2h, or cron.' },
+          agentId: { type: 'string', description: 'Exact station agent id; omit to auto-route by specialty.' },
+          agentHint: { type: 'string', description: 'Specialty hint, e.g. research, engineer, scribe.' },
+          timezone: { type: 'string', description: 'IANA timezone for cron, e.g. America/New_York.' },
           provider: { type: 'string', enum: providerEnum },
           model: { type: 'string' },
           enabled: { type: 'boolean' },
-          arm: { type: 'boolean', description: 'Default true. When true, also enables the scheduler so routines will fire.' },
+          arm: { type: 'boolean', description: 'Default true: turns scheduling on if never set; keeps an OFF or E-STOP.' },
           repeatTimes: { type: ['integer', 'null'], description: 'Omit/null for recurring forever; one-shot schedules still run once.' }
-          ,deliver: { type: 'string', enum: ['local', 'origin'], description: 'Where to send each result. origin returns it to this chat/session.' }
-          ,attachToSession: { type: 'boolean', description: 'Keep delivered results in the origin conversation so replies can continue from them.' }
-          ,skills: { type: 'array', items: { type: 'string' }, maxItems: 8, description: 'Saved runtime skills to preload on every run.' }
+          ,deliver: { type: 'string', enum: ['local', 'origin'], description: 'origin returns each result to this chat/session.' }
+          ,attachToSession: { type: 'boolean', description: 'Keep delivered results in the origin conversation for follow-up replies.' }
+          ,skills: { type: 'array', items: { type: 'string' }, maxItems: 8, description: 'Saved skills to preload each run.' }
           ,contextFrom: { type: 'array', items: { type: 'string' }, maxItems: 8, description: 'Routine ids whose latest successful outputs feed this routine.' }
-          ,monitorMode: { type: 'boolean', description: 'When true with contextFrom, run only after the durable upstream source hash changes.' }
-          ,enabledToolsets: { type: 'array', items: { type: 'string' }, maxItems: 16, description: 'Optional restriction-only list of capability families for this routine.' }
+          ,monitorMode: { type: 'boolean', description: 'With contextFrom: run only when the upstream source changes.' }
+          ,enabledToolsets: { type: 'array', items: { type: 'string' }, maxItems: 16, description: 'Only these toolset ids (e.g. web, cabinet); omit = station defaults.' }
         }
       },
       run: async (args, ctx) => {
@@ -309,7 +322,7 @@
           skills: Array.isArray(args && args.skills) ? args.skills.slice(0, 8) : [],
           contextFrom: Array.isArray(args && args.contextFrom) ? args.contextFrom.slice(0, 8) : null,
           monitorMode: !!(args && args.monitorMode),
-          enabledToolsets: Array.isArray(args && args.enabledToolsets) ? args.enabledToolsets.slice(0, 16) : null,
+          enabledToolsets: Array.isArray(args && args.enabledToolsets) && args.enabledToolsets.length ? args.enabledToolsets.slice(0, 16) : null,   // [] = no restriction, never "no tools"
           repeat: { times: repeatTimes == null ? null : Math.max(1, parseInt(repeatTimes, 10) || 1) }
         };
         const job = await createRoutine(spec);
@@ -325,7 +338,7 @@
           };
         }
         if (job && job._duplicate) {
-          const existing = packJob(job);
+          const existing = pack(job);
           return {
             content: JSON.stringify({ ok: true, duplicate: true, message: ANTI_RETRY, routedTo: route.agentId, job: existing }),
             summary: 'already exists — did not create a duplicate for ' + route.agentId
@@ -333,27 +346,33 @@
         }
 
         let armError = null;
+        const wasArmed = !!schedulerState();
         if (!args || args.arm !== false) {
           try { if (typeof armScheduler === 'function') armScheduler(true); }
           catch (e) { armError = (e && e.message) || String(e); }
         }
+        const offByChoice = !schedulerState() && !!schedulerOffByChoice();
 
         const body = {
           ok: true,
           schedulerArmed: !!schedulerState(),
           schedulerHalted: !!schedulerHalted(),
-          // so the model cannot report "this will run daily" over a stopped scheduler
-          schedulerNote: armedNote() || undefined,
+          // so the model cannot report "this will run daily" over a stopped scheduler. (AUTO-P16-1: the arm schema has ~0 payload
+          // headroom, so the arm rule's detail lives HERE, in the result the model reads after the call — a save never lifts an E-STOP.)
+          schedulerNote: schedulerHalted() ? armedNote() + ' (saving this routine did not lift it — only the Commander resumes)' : (armedNote() || undefined),
+          // the one arm rule, said as it happened: THIS create turned scheduling on, or kept the Commander's OFF
+          schedulerArmedNow: !wasArmed && !!schedulerState() && !schedulerHalted(),
+          schedulerOffByChoice: offByChoice,
           armError: armError,
           routedTo: route.agentId,
           routingReason: route.reason,
-          job: packJob(job),
+          job: pack(job),
           // W6: the plain "you already maintain: …" reminder so the model tracks what exists across turns.
           maintains: mintSummary(route.agentId) || undefined
         };
         return {
           content: JSON.stringify(body),
-          summary: 'scheduled routine for ' + route.agentId + (armError ? ' (arm failed)' : '')
+          summary: 'scheduled routine for ' + route.agentId + (armError ? ' (arm failed)' : offByChoice ? ' — scheduling is off (the Commander turned it off), so it will not run yet' : '')
         };
       }
     };
@@ -376,14 +395,18 @@
        reference harness's trigger_job does. It reports the armed time, never "it ran". */
     const manageTool = {
       name: 'routine.manage', capability: 'orchestrator', scope: 'write', requiresConsent: true, timeoutMs: 15000,
-      description: 'Edit, pause, resume, delete, or queue an immediate fire of an existing StarNet ROUTINES job. Call routine.list first to see what exists; reference a routine by its exact id, or by name when that name is unambiguous.',
+      // taint lock per ACTION (taint.js): a run that read outside content may still pause a routine (stopping work
+      // schedules nothing); update/resume/run_now re-arm what a later run obeys and remove throws it away. Same
+      // action reading as run() below, so the lock and the tool can never disagree about which action this is.
+      taintLocked: (a) => lower(clean(a && a.action, 20)) !== 'pause',
+      description: 'Edit, pause, resume, delete, or queue an immediate fire of an existing StarNet ROUTINES job. Call routine.list first to see what exists.',
       schema: {
         type: 'object',
         required: ['action'],
         properties: {
           action: { type: 'string', enum: ['update', 'pause', 'resume', 'remove', 'run_now'] },
           id: { type: 'string', description: 'The routine id, or its name when unambiguous.' },
-          name: { type: 'string', description: 'For action=update, the NEW name. To reference a routine by name, pass it as `id`.' },
+          name: { type: 'string', description: 'update: the NEW name; reference the routine by `id`.' },
           prompt: { type: 'string', description: 'update: replace the instruction the routine runs.' },
           schedule: { type: 'string', description: 'update: a new schedule, e.g. every 30m, 0 9 * * *, in 2h.' },
           timezone: { type: 'string', description: 'update: IANA timezone for a cron schedule.' },
@@ -415,7 +438,7 @@
           if (typeof setRoutineEnabled !== 'function') throw new Error('routine pause/resume unavailable');
           const updated = await setRoutineEnabled(job.id, action === 'resume');
           return {
-            content: JSON.stringify({ ok: true, action: action, schedulerArmed: !!schedulerState(), schedulerHalted: !!schedulerHalted(), schedulerNote: armedNote() || undefined, job: packJob(updated || job) }),
+            content: JSON.stringify({ ok: true, action: action, schedulerArmed: !!schedulerState(), schedulerHalted: !!schedulerHalted(), schedulerNote: armedNote() || undefined, job: pack(updated || job) }),
             summary: (action === 'resume' ? 'resumed' : 'paused') + ' routine "' + job.name + '"'
           };
         }
@@ -436,7 +459,7 @@
                 : armed
                   ? 'queued — the scheduler fires this routine on its next tick (within ~1 minute); it has not run yet'
                   : 'queued, but the scheduler is DISARMED so nothing will fire until it is armed',
-              job: packJob(updated || job)
+              job: pack(updated || job)
             }),
             summary: 'queued routine "' + job.name + '" to fire on the next tick' + (armed ? '' : ' (scheduler disarmed)')
           };
@@ -477,15 +500,23 @@
         const touched = Object.keys(patch).filter(k => AGENT_PATCHABLE.indexOf(k) >= 0);
         if (!touched.length) throw new Error('nothing to update — pass at least one of ' + AGENT_PATCHABLE.join(', '));
         const updated = await updateRoutine(job.id, patch);
+        // TRUTHFUL TELEMETRY: a rewritten prompt drops the routine's unattended grants (host rule, see updateRoutine
+        // in index.js) — say so, or the model promises the Commander a routine that will now be locked out.
+        const cleared = updated && Array.isArray(updated._grantsCleared) ? updated._grantsCleared : [];
+        const out = { ok: true, action: action, changed: touched, job: pack(updated || job) };
+        if (cleared.length) out.standingGrantsCleared = { grants: cleared, note: 'the new instruction was not approved by the Commander, so its unattended ' + cleared.join('/') + ' grant was removed; the Commander can re-grant it in ROUTINES' };
         return {
-          content: JSON.stringify({ ok: true, action: action, changed: touched, job: packJob(updated || job) }),
-          summary: 'updated routine "' + job.name + '" (' + touched.join(', ') + ')'
+          content: JSON.stringify(out),
+          summary: 'updated routine "' + job.name + '" (' + touched.join(', ') + ')' + (cleared.length ? ' — unattended grants cleared' : '')
         };
       }
     };
 
+    // impact 'none' STATED (#155): undeclared, the fail-closed classifier filed it as external-unknown and stripped it from
+    // every unattended ASK routine — the only runs it works in. Declared on THIS def, not the 'routinescratch' cap: a
+    // connector/plugin re-registering the name replaces the whole registry entry and keeps its own (external-unknown) class.
     const notepadTool = {
-      name: 'routine.notepad', capability: 'routinescratch', scope: 'write', requiresConsent: false,
+      name: 'routine.notepad', capability: 'routinescratch', scope: 'write', requiresConsent: false, impact: 'none',
       description: 'Read or replace the bounded private scratchpad for THIS scheduled routine. The host selects the job from the current scheduled run; no job id is accepted, so one routine cannot read or write another routine\'s notes. Notes survive restart. Use action=write with empty text to clear it.',
       schema: {
         type: 'object', required: ['action'],

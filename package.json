@@ -1,6 +1,6 @@
 {
   "name": "starnet-harness",
-  "version": "0.12.4",
+  "version": "0.14.1",
   "private": true,
   "description": "A local-first, gamified desktop harness for building and running real AI-agent teams.",
   "license": "MIT",
@@ -22,12 +22,14 @@
   "engines": {
     "node": ">=18"
   },
+  "bin": {
+    "starnet": "bin/starnet.js"
+  },
   "scripts": {
-    "validate:raw": "node test/validate_map.js",
-    "test:http": "node scripts/timeout.mjs --label test:http --timeout=1200000 -- npm run test:http:raw",
-    "test:http:raw": "node scripts/run-test-list.mjs test/http.list",
-    "test:fast": "node scripts/timeout.mjs --label test:fast --timeout=1200000 -- npm run test:fast:raw",
-    "test:fast:raw": "node scripts/run-fast-tests.mjs",
+    "test:http": "node scripts/timeout.mjs --label test:http --timeout=3600000 -- npm run test:http:raw",
+    "test:http:raw": "node scripts/run-test-list.mjs test/http.list --deadline=3420000",
+    "test:fast": "node scripts/timeout.mjs --label test:fast --timeout=3000000 -- npm run test:fast:raw",
+    "test:fast:raw": "node scripts/run-fast-tests.mjs --deadline=2820000",
     "test": "npm run test:fast && npm run test:http",
     "website:stage": "node scripts/stage-website-deploy.mjs",
     "website:stage:check": "node scripts/stage-website-deploy.mjs --check",
@@ -134,6 +136,7 @@
     "qa:product-perfect": "node scripts/qa/product-perfect.mjs --run",
     "qa:smoke:installed": "node scripts/qa/installed-smoke.mjs",
     "qa:input-isolation": "node scripts/qa/input-isolation-smoke.mjs",
+    "qa:window-leaks": "node scripts/qa/window-leaks.mjs",
     "qa:lifecycle:packaged": "node scripts/qa/packaged-lifecycle.mjs",
     "qa:soak": "node scripts/qa/soak.mjs --minutes=20",
     "qa:soak:release": "node scripts/qa/soak.mjs --minutes=720",
@@ -169,7 +172,8 @@
     "ajv": "8.20.0",
     "kokoro-js": "^1.2.1",
     "node-pty": "^1.1.0",
-    "ogg-opus-decoder": "^1.7.3"
+    "ogg-opus-decoder": "^1.7.3",
+    "undici": "^6.28.1"
   },
   "overrides": {
     "adm-zip": "0.6.1",

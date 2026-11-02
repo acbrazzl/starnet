@@ -64,7 +64,11 @@ function impactOfTool(tool) {
 // 'connectors' = the Commander's CONNECTED MCP servers (capability 'mcp:<connectorId>'). Deliberately NOT a
 // blanket external-unknown unlock: that impact class is also the FAIL-CLOSED default for any tool the host
 // cannot classify, so the grant is additionally narrowed to real connector tools by isConnectorTool below.
-const GRANTABLE_UNATTENDED = new Set(['workbench', 'connectors']);
+// 'studio' = image_generate (capability 'studio', scope write). Its impact class is NONE, so this gate already
+// offers it; the grant only answers the consent broker's "silence is not consent" for that one capability
+// (permissions.js studioAutonomy). It opens no host process and no outside account, and the image's spend still
+// books against the run's caps like any media call.
+const GRANTABLE_UNATTENDED = new Set(['workbench', 'connectors', 'studio']);
 
 // A tool projected from a configured MCP connector. sidecar/mcp/translate.js stamps every such def with
 // capability 'mcp:<sanitized connectorId>'; nothing else in the registry uses that prefix.
@@ -198,9 +202,17 @@ function makeRunAuthority(opts) {
       // this call ONCE only. "Always", Full Access, and cached grants are not recorded here.
       return Promise.resolve(confirm(call, tool)).then(decision => {
         const allow = /^(?:once|session|always|full)$/i.test(String(decision || ''));
-        return allow
-          ? { ok: true, impact, surface, isTask, isolated, oneShot: true }
-          : { ok: false, impact, reason: 'exact external-effect confirmation was denied' };
+        if (allow) return { ok: true, impact, surface, isTask, isolated, oneShot: true };
+        // an unanswered prompt (consentwait timeoutDecision) is not a refusal: never let the model say they declined.
+        // The reason carries the consent path's own guidance (registry.js consent timeout), because it is what the model reads.
+        if (String(decision) === 'timeout') {
+          return {
+            ok: false, impact, timedOut: true,
+            reason: 'the exact confirmation for ' + String((call && call.name) || 'this call') + ' timed out: the Commander did not answer in time, '
+              + 'so it was NOT run. This was not a refusal; tell them it timed out and that they can ask again. Do NOT retry it yourself.'
+          };
+        }
+        return { ok: false, impact, reason: 'exact external-effect confirmation was denied' };
       }, () => ({ ok: false, impact, reason: 'exact external-effect confirmation failed' }));
     }
     // Cached grants and task text never turn an ASK-mode unattended run into authority over a host
@@ -267,17 +279,28 @@ function enforceSyntheticOnly(resolved, remoteDesktopAuthorized) {
   });
 }
 
+/* The computer-object freebies (capability/registry.js) with no TOOLSETS_META row. No switch can turn them off,
+   so a restriction-only list must not either: a routine restricted to ['web'] still keeps its own notepad
+   (routine.notepad), task plan (todo), deliverable naming and the station self-knowledge tools (station.inspect,
+   manual.read) its prompt tells it to call. Named, never derived ("every family without a row"): that would fail
+   OPEN for 'code' (execute + consent, the SECURITY STOPGAP in tools/builtin/code.js) and 'apps' (deferred write
+   tools), which a restricted routine deliberately does NOT keep — and for any family added later. */
+const TOOLSET_FREEBIES = new Set(['quest', 'toolsearch', 'taskplan', 'deliverable', 'stationinfo', 'routinescratch']);
+
 /* Per-run toolsets are attenuation only: null preserves the station grant, while an explicit array
-   intersects it. Compute and the two computer freebies are not toggleable tool families. */
+   intersects it. Compute and the TOOLSET_FREEBIES above are not toggleable tool families. */
 function enforceEnabledToolsets(resolved, registry, enabledToolsets) {
   if (enabledToolsets == null) return resolved;
   const enabled = new Set(Array.isArray(enabledToolsets) ? enabledToolsets.map(String) : []);
-  const free = new Set(['quest', 'toolsearch']);
+  const free = TOOLSET_FREEBIES;
   const allowed = new Set();
   for (const name of ((resolved && resolved.tools) || [])) {
     const tool = registry && typeof registry.get === 'function' ? registry.get(name) : null;
     const cap = String((tool && tool.capability) || '');
-    const family = cap.indexOf('mcp:') === 0 ? 'connectors' : cap;
+    // Plugin tools (capability 'plugin:<id>', sidecar/plugin-tools.js) are installed third-party tools with the
+    // connector trust contract, so the CONNECTORS toolset switch governs them too — otherwise their unknown family
+    // name could never be enabled and a placed plugin terminal would silently grant nothing.
+    const family = (cap.indexOf('mcp:') === 0 || cap.indexOf('plugin:') === 0) ? 'connectors' : cap;
     if (free.has(family) || enabled.has(family)) allowed.add(name);
   }
   const approvalRules = {}, networkCaps = {};
@@ -353,7 +376,10 @@ function makeLoopbackListenerProbe(opts) {
       args = ['-c', script, 'starnet-listener-probe', String(port), String(rootPid)];
     } else return false;
     return new Promise(resolve => {
-      try { run(exe, args, { windowsHide: true, timeout: 5000 }, err => resolve(!err)); }
+      // 12s, not 5s (measured 2026-09-29 on the Windows dev box: this PowerShell CIM + NetTCP walk took 2.4–4.6s
+      // idle, and past 5s under a busy sidecar — so browser.test_navigate refused the agent's OWN dev server as
+      // "not proven" on every try). Still well inside browser.test_navigate's 20s tool budget.
+      try { run(exe, args, { windowsHide: true, timeout: 12000 }, err => resolve(!err)); }
       catch (_) { resolve(false); }
     });
   };
@@ -364,4 +390,4 @@ async function backgroundOwnsLocalUrl(status, rawUrl, listenerProbe) {
   try { return await listenerProbe(status, rawUrl) === true; } catch (_) { return false; }
 }
 
-module.exports = { enforceSyntheticOnly, enforceRunAuthority, enforceEnabledToolsets, runInputContext, impactOfTool, makeRunAuthority, IMPACTS, backgroundOwnsLoopbackUrl, backgroundOwnsLocalUrl, makeLoopbackListenerProbe, REAL_DESKTOP_TOOLS, GRANTABLE_UNATTENDED, normalizeUnattendedGrants, isConnectorTool };
+module.exports = { enforceSyntheticOnly, enforceRunAuthority, enforceEnabledToolsets, TOOLSET_FREEBIES, runInputContext, impactOfTool, makeRunAuthority, IMPACTS, backgroundOwnsLoopbackUrl, backgroundOwnsLocalUrl, makeLoopbackListenerProbe, REAL_DESKTOP_TOOLS, GRANTABLE_UNATTENDED, normalizeUnattendedGrants, isConnectorTool };

@@ -100,12 +100,16 @@ A.eq(above.below, false, 'a tip with room above renders above its anchor');
 A.eq(above.left + tip.width / 2, 450, 'and is centred on the anchor');
 const flipped = T.place({ left: 400, top: 10, width: 100, height: 20 }, tip, vp);
 A.eq(flipped.below, true, 'a tip with no room above flips below');
+A.eq(T.place({ left: 400, top: 300, width: 100, height: 20 }, tip, vp, true).below, true, 'a data-tip-below anchor (a grid tile) gets its tip below, off the tile above');
+A.eq(T.place({ left: 400, top: 770, width: 100, height: 20 }, tip, vp, true).below, false, 'and still goes above when there is no room below');
 const clampedL = T.place({ left: 0, top: 300, width: 20, height: 20 }, tip, vp);
 A.ok(clampedL.left >= 0, 'a tip at the left edge stays on screen');
 const clampedR = T.place({ left: 980, top: 300, width: 20, height: 20 }, tip, vp);
 A.ok(clampedR.left + tip.width <= vp.width, 'a tip at the right edge stays on screen');
 A.ok(clampedR.arrowX <= tip.width - 10 && clampedR.arrowX >= 10,
   'the arrow stays inside the card after clamping (it must keep pointing at the anchor, not off the corner)');
+const tall = T.place({ left: 400, top: 5, width: 8, height: 790 }, tip, vp);   // the CREW rail's resize edge spans the rail
+A.ok(tall.top >= 0 && tall.top + tip.height <= vp.height, 'a tip on an anchor with no room above or below stays on screen (it ran off the bottom at TEXT SIZE 130+)');
 A.ok(T.adopt(null) === '', 'adopt() tolerates a null element');
 
 /* ---- 5. the DELAY/CANCEL path: no ghost card beside a control the pointer already left ------------
@@ -179,6 +183,28 @@ A.ok(T.adopt(null) === '', 'adopt() tolerates a null element');
     A.ok(card.classList.contains('dock-tip'), 'a bottom-bar hover card keeps the approved dock finish');
     fire('focusin', { target: tipped });
     A.ok(!card.classList.contains('dock-tip'), 'reusing the card outside the dock clears the dock finish');
+
+    /* ---- 6. focus from a CLICK is not a glance (touchscreen-laptop dock bug) ------------------------
+       A mouse click focuses the button, and focusin showed the card at once — over the dock menu the click
+       had just opened. Only keyboard focus (:focus-visible) shows it now; an engine without matches() keeps
+       the old behaviour. And no card ever opens over an open dock menu (aria-expanded), even on hover. */
+    fire('pointerdown', {});
+    const mouseFocus = mkEl({ title: 'Your agents' }, ''); mouseFocus.matches = () => false;
+    fire('focusin', { target: mouseFocus });
+    A.ok(!mouseFocus.getAttribute('aria-describedby'), 'focus from a mouse click (not :focus-visible) never pops the card');
+    const keyFocus = mkEl({ title: 'Your agents' }, ''); keyFocus.matches = q => q === ':focus-visible';
+    fire('focusin', { target: keyFocus });
+    A.eq(keyFocus.getAttribute('aria-describedby'), 'station-tip', 'keyboard focus (:focus-visible) still shows the card at once');
+    fire('pointerdown', {});
+    const oddEngine = mkEl({ title: 'Your agents' }, ''); oddEngine.matches = () => { throw new Error('unsupported selector'); };
+    fire('focusin', { target: oddEngine });
+    A.eq(oddEngine.getAttribute('aria-describedby'), 'station-tip', 'a matches() that throws falls back to showing on focus');
+    fire('pointerdown', {});
+    const openDock = mkEl({ title: 'Shape the station', 'aria-expanded': 'true' }, 'BUILD');
+    fire('pointerover', { target: openDock });
+    await sleep(420);
+    A.ok(!openDock.getAttribute('aria-describedby'), 'no card opens over an open dock menu (aria-expanded="true"), even on hover');
+    A.ok(!openDock.hasAttribute('title'), 'its title is still adopted, so the OS bubble stays silenced');
 
     A.report('station-tooltip.test');
   })().catch(e => { console.log('FAIL: tooltip rig threw — ' + (e && e.stack || e)); process.exit(1); });

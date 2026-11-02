@@ -20,6 +20,8 @@
   <nav class="topnav" aria-label="Site">
     <a href="../index.html#station">Product</a>
     <a href="index.html" class="on">Docs</a>
+    <a href="../market.html">Skills</a>
+    <a href="../maps.html">Maps</a>
     <a href="../pricing.html" data-pricing-link>Pricing</a>
     <a href="https://github.com/androoAGI/starnet" target="_blank" rel="noopener">GitHub<svg class="nav-external" aria-hidden="true" focusable="false" viewBox="0 0 16 16" width="12" height="12"><path d="M3 13 13 3M4 3h9v9" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></a>
   </nav>
@@ -63,7 +65,7 @@
     <summary class="side-title">Repeat &amp; automate</summary>
     <a href="guides/routines.html">Create repeatable work</a>
     <a href="skills.html">Skills &amp; routines reference</a>
-    <a href="guides/night-shift.html">Set up Night Shift</a>
+    <a href="guides/night-shift.html">Set up autonomy</a>
     <a href="autonomy.html">Autonomy controls</a>
     </details>
     <details class="side-group">
@@ -89,7 +91,7 @@
 
 <div class="help-grid">
   <a class="help-card" href="getting-started.html"><span class="hc-glyph">&#9654;</span><span class="hc-title">I JUST INSTALLED IT</span><p>Download, first-run OS warnings, connecting a provider, your first agent.</p></a>
-  <a class="help-card" href="guides/index.html"><span class="hc-glyph">&#9636;</span><span class="hc-title">SHOW ME HOW IT WORKS</span><p>The Field Manual: short picture guides &mdash; belts, crew, goals, Night Shift, phone.</p></a>
+  <a class="help-card" href="guides/index.html"><span class="hc-glyph">&#9636;</span><span class="hc-title">SHOW ME HOW IT WORKS</span><p>The Field Manual: short picture guides &mdash; belts, crew, goals, autonomy, phone.</p></a>
   <a class="help-card" href="troubleshooting.html"><span class="hc-glyph">&#9888;</span><span class="hc-title">SOMETHING IS BROKEN</span><p>Install warnings, updates, uninstalling, proxies, Live Voice start-up.</p></a>
   <a class="help-card" href="guides/conveyors.html#somethings-not-running"><span class="hc-glyph">&#10005;</span><span class="hc-title">MY BELT IS DARK</span><p>Every message the floor can show, and the one fix for each.</p></a>
   <a class="help-card" href="shortcuts.html"><span class="hc-glyph">&#9000;</span><span class="hc-title">KEYBOARD SHORTCUTS</span><p>Every key the app actually binds, from window navigation to the build tools.</p></a>
@@ -97,7 +99,7 @@
 </div>
 
 <h2 id="help-inside-the-app">Help inside the app</h2>
-<p>Open <b>&#9635; SYSTEM &rsaquo; &sect; FIELD MANUAL</b>. The <b>FIRST STEPS</b> tab has a <b>REPLAY QUICK TOUR</b> button that re-runs the real onboarding tour &mdash; the same one that placed your first gear and ran your first command. Every button in the station also has a tooltip that says what it does and, where one exists, its shortcut.</p>
+<p>Open <b>&#9635; SYSTEM &rsaquo; &sect; FIELD MANUAL</b>. The <b>FIRST MISSION</b> tab has a <b>REPLAY QUICK TOUR</b> button that re-runs the real onboarding tour &mdash; the same one that placed your first gear and ran your first command. Every button in the station also has a tooltip that says what it does and, where one exists, its shortcut.</p>
 
 <h2 id="common-questions">Common questions</h2>
 <div class="faq">
@@ -108,32 +110,32 @@
   <details><summary>Can I run it without installing?</summary><p>Yes &mdash; clone the repo and <code>npm install &amp;&amp; npm start</code> with Node 18+. The station opens at <code>localhost:8787</code>. Keys live in a local file instead of the OS keychain in that mode.</p></details>
 
   <h3 id="keys-models-and-cost">Keys, models and cost</h3>
-  <details><summary>Which providers work?</summary><p>Eighteen, including OpenRouter (the default), OpenAI, Anthropic, Gemini, xAI, Groq, Mistral, DeepSeek, Together, Fireworks, Perplexity, Cerebras, any OpenAI-compatible endpoint, and Ollama (free, fully local). Three need no key at all &mdash; ChatGPT, Grok, and Kimi sign in with a device code. Full list in <a href="providers.html">Providers &amp; Keys</a>.</p></details>
+  <details><summary>Which providers work?</summary><p>Eighteen, including OpenRouter (the default), OpenAI, Anthropic, Gemini, xAI, Groq, Mistral, DeepSeek, Together, Fireworks, Perplexity, Cerebras, any OpenAI-compatible endpoint, and Ollama (free, fully local). Four need no key at all &mdash; ChatGPT, Grok, and Kimi sign in with a device code, and Claude CLI uses your Claude Code sign-in. Full list in <a href="providers.html">Providers &amp; Keys</a>.</p></details>
   <details><summary>Where is my API key stored?</summary><p>In the desktop app: your operating system&rsquo;s keychain, handed to the local sidecar at start. It is sent only to the provider you chose, from your machine. Nothing goes to a StarNet server. See <a href="../legal/privacy.html">privacy</a>.</p></details>
-  <details><summary>How do I stop it spending money?</summary><p>Every conveyor line has a per-job budget ($2.00 unless you raise it). <b>SETTINGS &rsaquo; BUDGET</b> adds hard caps per run, per agent, per day, and globally, enforced against the real ledger. Use Stop in COMMS for the current task, and pause scheduled work in its own panel.</p></details>
+  <details><summary>How do I stop it spending money?</summary><p>Every conveyor line has a per-job budget ($2.00 unless you raise it). <b>SETTINGS &rsaquo; SPENDING LIMITS</b> adds hard caps per run, per agent, per day, and globally, enforced against the real ledger. Use Stop in COMMS for the current task, and pause scheduled work in its own panel.</p></details>
   <details><summary>What do StarNet Credits change?</summary><p>Nothing about how the app works &mdash; it&rsquo;s one more provider, <b>STARNET</b>, that runs on a prepaid balance instead of a key you manage. Linking a station opens an account on the billing service; payment always happens in your browser, never in the app. Optional, never required.</p></details>
 
   <h3 id="belts-and-lines">Belts and lines</h3>
   <details><summary>Do I need belts at all?</summary><p>No. Chatting with an agent in COMMS needs no belts. Belts are for jobs that should flow through several agents on their own. <a href="guides/conveyors.html">How conveyors work</a> explains the whole idea in five minutes.</p></details>
   <details><summary>The belt is dark and nothing moves</summary><p>Follow it to the end. You&rsquo;ll find an empty desk (<b>NO AGENT &mdash; CLICK</b>), a gap, or a belt clipping the corner of a signpost instead of going through it (<b>NOT FED</b>). The full list of floor messages is in <a href="guides/conveyors.html#somethings-not-running">the conveyor guide</a>.</p></details>
   <details><summary>It says WORK LINE LOOPS</summary><p>Two desks feed each other, which would run and bill forever. The station refuses to run it. Cut one belt &mdash; or, if you want a revision cycle on purpose, put a <b>LOOP</b> tile on it (up to 5 passes by default, 20 max).</p></details>
-  <details><summary>I don&rsquo;t want to build anything</summary><p>The <b>LINES</b> tool (<kbd>9</kbd> in REFIT) drops one of 19 finished layouts in a click. <a href="guides/first-line.html">Your first working line</a> walks through it.</p></details>
+  <details><summary>I don&rsquo;t want to build anything</summary><p>The <b>CONVEYOR LINES</b> tool (<kbd>9</kbd> in BUILD MODE) drops one of 20 finished layouts in a click. <a href="guides/first-line.html">Your first working line</a> walks through it.</p></details>
 
   <h3 id="agents-and-the-station">Agents and the station</h3>
   <details><summary>How many agents can I have?</summary><p>As many as you have bays for. Every bay is another agent running in parallel. Each needs a computer in its room (the floor says <b>NO COMPUTE</b> otherwise); everything else &mdash; dish, cabinet, workbench, core &mdash; is placed once and shared by the whole crew.</p></details>
-  <details><summary>Why can&rsquo;t my agent browse the web / read files?</summary><p>Because the gear isn&rsquo;t placed. A <b>DISH</b> grants WEB, an <b>INTEL CAB</b> grants FILES, a <b>WORKBENCH</b> grants TERMINAL, a <b>CORE</b> grants MEMORY, a <b>STUDIO</b> grants IMAGES. Place it in REFIT and the ability switches on. <a href="guides/crew.html">Your crew &amp; their gear</a>.</p></details>
+  <details><summary>Why can&rsquo;t my agent browse the web / read files?</summary><p>Because the gear isn&rsquo;t placed. A <b>DISH</b> grants WEB, an <b>INTEL CAB</b> grants FILES, a <b>WORKBENCH</b> grants TERMINAL, a <b>CORE</b> grants MEMORY, a <b>STUDIO</b> grants IMAGES. Place it in BUILD MODE and the ability switches on. <a href="guides/crew.html">Your crew &amp; their gear</a>.</p></details>
   <details><summary>How do I rename an agent or change its look?</summary><p><b>&#9787; CREW &rsaquo; &#9673; AGENTS</b> opens the dossier. The <b>&#9998;</b> beside the name renames; the <b>CONFIG</b> tab has a <b>SKIN</b> picker with a live preview. Both are cosmetic &mdash; nothing about the agent&rsquo;s record changes.</p></details>
   <details><summary>Does the level unlock anything?</summary><p>No. Levels are proof of work you rated well. Every tool, model, and permission is available from minute one. <a href="guides/goals.html">Goals, quests &amp; XP</a>.</p></details>
 
-  <h3 id="night-shift-and-phones">Night Shift and phones</h3>
-  <details><summary>Will it do things while I&rsquo;m away?</summary><p>Not until you turn the dial. INITIATIVE starts at <b>WAIT</b>. Even at <b>FREE</b>, REACH stays at <b>SANDBOX</b> &mdash; nothing leaves your machine unless you raise it yourself. <a href="guides/night-shift.html">Night Shift</a>.</p></details>
-  <details><summary>Can I talk to my agents from my phone?</summary><p>Yes &mdash; pair Telegram, Discord, Slack, Matrix, or Signal. Your agents show up as contacts. <a href="guides/channels.html">Run it from your phone</a>.</p></details>
+  <h3 id="night-shift-and-phones">Autonomy and phones</h3>
+  <details><summary>Will it do things while I&rsquo;m away?</summary><p>Not until you turn the dial. ON ITS OWN starts at <b>SUGGEST</b> &mdash; it lines up suggestions but never acts on its own. Even at <b>FREE</b>, REACH stays at <b>LOCAL ONLY</b> &mdash; nothing leaves your machine unless you raise it yourself. <a href="guides/night-shift.html">Set up autonomy</a>.</p></details>
+  <details><summary>Can I talk to my agents from my phone?</summary><p>Yes &mdash; pair Telegram, Discord, Slack, Matrix, or Signal. Your agents show up as contacts. Or pair the phone itself in <b>SETTINGS &rsaquo; REMOTE</b>. <a href="guides/channels.html">Run it from your phone</a>.</p></details>
   <details><summary>My Telegram bot says DMs BLOCKED</summary><p>Telegram requires owner pairing so the first stranger to DM your bot doesn&rsquo;t own it. Hit <b>PAIR OWNER</b> in the CHANNELS window, then send <code>/pair</code> plus the one-time code to the bot within 10 minutes.</p></details>
 </div>
 
 <h2 id="reach-a-human">Reach a human</h2>
 <div class="help-contact">
-  <a href="https://github.com/androoAGI/starnet/issues" target="_blank" rel="noopener"><span class="hk">BUG OR REQUEST</span><span class="hv">GitHub issues</span><span class="hn">Best for anything reproducible. Include your version (bottom of the SYSTEM window) and OS.</span></a>
+  <a href="https://github.com/androoAGI/starnet/issues" target="_blank" rel="noopener"><span class="hk">BUG OR REQUEST</span><span class="hv">GitHub issues</span><span class="hn">Best for anything reproducible. Include your version (SYSTEM &rsaquo; UPDATES) and OS.</span></a>
   <a href="mailto:androo.agi@gmail.com"><span class="hk">EMAIL</span><span class="hv">androo.agi@gmail.com</span><span class="hn">Trust failures, install problems, anything you&rsquo;d rather not post publicly.</span></a>
   <a href="https://github.com/androoAGI/starnet" target="_blank" rel="noopener"><span class="hk">READ THE SOURCE</span><span class="hv">github.com/androoAGI/starnet</span><span class="hn">MIT licensed. Every claim on this site can be checked against it.</span></a>
 </div>
@@ -150,6 +152,8 @@
     <a href="https://github.com/androoAGI/starnet-releases/releases/latest" target="_blank" rel="noopener">RELEASES</a>
     <a href="../pricing.html" data-pricing-link>PRICING</a>
     <a href="index.html">DOCS</a>
+    <a href="../market.html">SKILLS</a>
+    <a href="../maps.html">MAPS</a>
     <a href="help.html">HELP</a>
     <a href="https://github.com/androoAGI/starnet/issues" target="_blank" rel="noopener">COMMUNITY</a>
     <a href="../legal/privacy.html">PRIVACY</a>

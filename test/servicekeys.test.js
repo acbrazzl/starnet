@@ -112,6 +112,19 @@ const K = require('../sidecar/servicekeys.js');
   A.ok(block.indexOf('rk-secret-9999') < 0, 'block NEVER carries the key value');
   A.ok(block.indexOf('OFF_ONE_API_KEY') < 0, 'disabled key not advertised');
   A.ok(/never print, echo/i.test(block), 'block instructs the model not to leak the value');
+  // Windows: shell.exec is cmd.exe, where $NAME stays literal — the block must name the syntax that expands there
+  const winBlock = K.promptBlock(l1, { platform: 'win32' });
+  A.ok(winBlock.indexOf('%RESEND_API_KEY%') >= 0, 'win32 block names the cmd.exe %VAR% form');
+  A.ok(winBlock.indexOf('$env:RESEND_API_KEY') >= 0, 'win32 block names the PowerShell $env: form');
+  A.ok(K.promptBlock(l1, { platform: 'linux' }).indexOf('%RESEND_API_KEY%') < 0, 'posix block keeps $VAR (no cmd.exe syntax)');
+  A.ok(/Prefer web_request/.test(winBlock), 'with both routes, the block steers to web_request');
+  A.ok(!/Prefer web_request/.test(K.promptBlock(l1, { shell: true, request: false, platform: 'win32' })), 'never recommends a route the run lacks');
+  // verified platform notes ride under their key — only when the run HAS web_request, since they describe its calls
+  const notesFor = (env) => env === 'RESEND_API_KEY' ? 'POST /emails sends one message.' : '';
+  A.ok(K.promptBlock(l1, { request: true, notesFor }).indexOf('(API docs: https://resend.com/docs)\n  API notes: POST /emails sends one message.') >= 0, 'API notes ride under the key line');
+  A.ok(K.promptBlock(l1, { shell: true, request: false, notesFor }).indexOf('API notes') < 0, 'no notes without web_request');
+  A.eq(K.promptBlock(l1, { request: true, notesFor: () => { throw new Error('x'); } }), K.promptBlock(l1, { request: true }), 'a throwing notes source never breaks the block');
+  A.ok(/"in": "query"/.test(block), 'block teaches the auth query slot for ?key= APIs');
 }
 
 // ---- G2. reserved provider env vars: a KEYS paste must never become billing credentials ----
@@ -120,6 +133,8 @@ const K = require('../sidecar/servicekeys.js');
   // 'OpenRouter' derives OPENROUTER_API_KEY — exactly what providerRuntimeKey reads from process.env
   const r1 = K.upsert([], { name: 'OpenRouter', key: 'sk-or-x' }, 1, { reservedEnv: reserved });
   A.ok(r1.error && /model provider/i.test(r1.error), 'provider-shaped name refused with a pointer to SETTINGS');
+  A.ok(/OpenRouter Maps/.test(r1.error), 'the refusal suggests a product-specific name that saves (a Google Maps key is not a model key)');
+  A.ok(!K.upsert([], { name: 'OpenRouter Maps', key: 'k' }, 1, { reservedEnv: reserved }).error, 'the suggested name actually saves');
   // the scoped desktop form is reserved too ('Skynet OpenRouter' -> SKYNET_OPENROUTER_API_KEY)
   A.ok(K.upsert([], { name: 'Skynet OpenRouter', key: 'k' }, 1, { reservedEnv: reserved }).error, 'scoped provider var refused');
   // a Set works as well as an array, and a non-reserved name still passes with the option present
@@ -159,6 +174,17 @@ const K = require('../sidecar/servicekeys.js');
   A.ok(/OAuth|unattended/i.test(resolved.detail || ''), 'runtime refusal explains the policy');
   A.eq(K.toPublic(add.record).unattendedSupported, false, 'public shape exposes watched-only policy');
   A.ok(/unattended unsupported/i.test(K.promptBlock(add.list)), 'prompt truthfully labels watched-only access');
+}
+
+// ---- a MODEL-PROVIDER key name never resolves for an outbound request, and says why (2026-09-28) ----
+{
+  const reserved = { reservedEnv: new Set(['OPENROUTER_API_KEY', 'OPENROUTER_KEY']) };
+  A.eq(K.resolveForRequest([], 'OPENROUTER_API_KEY', 'interactive', reserved), { ok: false, reason: 'reserved' }, 'a provider key name resolves as reserved, not unknown');
+  A.eq(K.resolveForRequest([], 'NOPE_API_KEY', 'interactive', reserved), { ok: false, reason: 'unknown' }, 'an ordinary missing key is still unknown');
+  // a list saved before the name was reserved still carries the row: the reserved check runs first, so it is never spent
+  const legacy = K.upsert([], { name: 'OpenRouter', key: 'sk-or-legacy' }, 1).list;
+  A.eq(legacy[0].envVar, 'OPENROUTER_API_KEY', 'fixture: a pre-reservation row carrying the provider var');
+  A.eq(K.resolveForRequest(legacy, 'OPENROUTER_API_KEY', 'interactive', reserved), { ok: false, reason: 'reserved' }, 'a legacy row carrying a provider var is never spent');
 }
 
 // report() LAST — it is what calls process.exit(fail?1:0). This file ended in a bare console.log,

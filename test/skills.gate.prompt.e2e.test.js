@@ -13,6 +13,7 @@
    Zero real network, zero spend (fake key, mocked upstream). */
 'use strict';
 const A = require('./_assert.js');
+const { hostText } = require('./helpers/host-notes.js');
 const http = require('http');
 const fs = require('fs');
 const os = require('os');
@@ -22,6 +23,7 @@ const { bootToken } = require('./_httpToken.js');
 const { makeSkillStore } = require('../sidecar/skillstore.js');
 const { digestOf } = require('../sidecar/skills/gate.js');
 const skillGuard = require('../sidecar/skills/guard.js');
+const { allocatePort, BIND_REFUSED } = require('./helpers/ports.js');
 
 const HOST = '127.0.0.1';
 const INDEX = path.resolve(__dirname, '..', 'sidecar', 'index.js');
@@ -66,8 +68,8 @@ function boot(port, env, attemptsLeft) {
     const onData = d => {
       out += d.toString();
       if (!settled && out.indexOf('http://' + HOST + ':' + port) >= 0) { settled = true; resolve({ child, port }); }
-      else if (!settled && /already in use/i.test(out)) { settled = true; try { child.kill(); } catch (_) {}
-        if (attemptsLeft > 0) resolve(boot(port + 1, env, attemptsLeft - 1)); else reject(new Error('no free port')); }
+      else if (!settled && BIND_REFUSED.test(out)) { settled = true; try { child.kill(); } catch (_) {}
+        if (attemptsLeft > 0) resolve(allocatePort().then(next => boot(next, env, attemptsLeft - 1))); else reject(new Error('no free port')); }
     };
     child.stdout.on('data', onData); child.stderr.on('data', onData);
     child.on('error', e => { if (!settled) { settled = true; reject(e); } });
@@ -79,6 +81,8 @@ function boot(port, env, attemptsLeft) {
 function seed(ws) {
   const lines = [];
   const store = makeSkillStore({
+    // Fixture only: represent previously active authored versions; production model writes still stage.
+    stageReviews: false,
     io: { readAll() { return []; }, append(e) { lines.push(JSON.stringify(e)); } },
     clock: { now: () => Date.now() }, guard: skillGuard, digest: digestOf
   });
@@ -95,7 +99,7 @@ function seed(ws) {
   const risky = seeded.filter(s => s.name === 'Risky Deploy')[0];
   A.eq(risky.guardAction, 'ask', 'seed precondition: the risky skill carries an ask verdict');
 
-  const { child, port } = await boot(8900 + (process.pid % 30), {
+  const { child, port } = await boot(await allocatePort(), {
     SKYNET_WORKSPACES: ws, SKYNET_OPENROUTER_BASE: mock.base,
     SKYNET_SKILL_REVIEW: '0', SKYNET_SKILL_CURATOR: '0'
   }, 20);
@@ -118,7 +122,9 @@ function seed(ws) {
       const rd = r.body.getReader(); while (true) { const { done } = await rd.read(); if (done) break; }   // drain
       await new Promise(res => setTimeout(res, 250));   // let any aux call land so the window is complete
       const window = mock.requests.slice(start);
-      const systems = window.map(q => ((((q || {}).messages || [])[0] || {}).content) || '');
+      // every system-role message of a request: the run's skill index + any /skill preload are per-message, so since
+      // lean-prompt (2026-10-12) they ride the <run_context> system note with [RUNTIME], not the cached system prompt
+      const systems = window.map(q => hostText((q || {}).messages || []));   // + the notes that ride user-side on a non-Claude wire
       const main = systems.filter(s => s.indexOf('[RUNTIME]') >= 0).sort((a, b) => b.length - a.length)[0] || systems.sort((a, b) => b.length - a.length)[0] || '';
       return { system: main, all: JSON.stringify(window) };
     };

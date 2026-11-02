@@ -57,7 +57,9 @@
 .sn-menu .rt-simple-create .sp-time select { min-width: 70px; width: auto; padding: 8px 24px 8px 10px; }
 .sn-menu .rt-simple-create .sp-tz { margin-top: 0; }
 
-.sn-menu .rt-identity { display: grid; grid-template-columns: minmax(0,2fr) minmax(0,1fr); gap: 16px; }
+/* RUN BY lists workflows too (org P16): an even split keeps a name like RESEARCH + WRITE whole beside its chevron,
+   and align-items:start keeps a tall RUN BY from stretching the Name field */
+.sn-menu .rt-identity { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 16px; align-items: start; }
 .sn-menu .rt-identity .sn-menu-field { margin: 0 0 6px; }
 .sn-menu .rt-simple-create > [hidden] { display: none; }
 
@@ -138,9 +140,9 @@
 .sn-menu .cc-card > .cc-details { flex: 0 0 auto; }
 .sn-menu .cc-card > .cc-acts { flex: 0 0 auto; min-height: 36px; margin-top: 0; }
 .sn-menu .cc-card:has(> .cc-details[open]),
-.sn-menu .cc-card:has(> .cc-key:not([style*="none"])) { height: auto; min-height: 320px; }
+.sn-menu .cc-card:has(> .cc-key.cc-key-open) { height: auto; min-height: 320px; }
 .sn-menu .cc-card:has(> .cc-details[open]) > .cc-blurb,
-.sn-menu .cc-card:has(> .cc-key:not([style*="none"])) > .cc-blurb { display: block; overflow: visible; flex: 1 0 auto; }
+.sn-menu .cc-card:has(> .cc-key.cc-key-open) > .cc-blurb { display: block; overflow: visible; flex: 1 0 auto; }
 
 /* Skill library: matching glass surfaces with readable controls and instructions. */
 .sn-menu #sk-lib .sk-card { margin-bottom: 14px; border: 1px solid rgba(var(--ph-rgb), .22); border-radius: 12px; background: var(--menu-glass); box-shadow: inset 0 1px 0 rgba(var(--ph-bright-rgb), .1); }

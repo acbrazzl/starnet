@@ -75,6 +75,14 @@ A.ok(/function signatureOf/.test(journey) && /JSON\.stringify\(journey\)/.test(j
 A.ok(/sig === lastSig/.test(journey), 'an unchanged journey (same signature, new object) repaints NOTHING');
 A.eq((journey.match(/lastSig = null/g) || []).length >= 2, true, 'BOTH reset paths clear the signature (a re-init must not suppress the first repaint)');
 A.ok(/function rerender\(key, swap\)/.test(station), 'StationUI.rerender accepts the data-poke form (swap=false → no body crossfade)');
+// 2026-10-07 QUEST LOG lag: buildQuests resyncs every quest store, and a store poking rerender('quests') mid-build
+// recursed through the synchronous rerender ~1,600 frames deep. A poke during a build is owed ONE follow-up paint.
+{
+  const rb = (station.match(/let building = false, owed = false;\s*w\._render = \(swap\) => \{[\s\S]*?\n    \};/) || [''])[0];
+  A.ok(/if \(building\) \{ owed = true; return; \}/.test(rb), 'a rerender landing while the window is still building never re-enters the builder');
+  A.ok(/paint\(swap\);\s*if \(owed\) \{ owed = false; paint\(false\); \}/.test(rb), 'a poke owed mid-build gets exactly one follow-up data paint');
+  A.ok(/finally \{ building = false; owed = false; \}/.test(rb), 'a builder that throws can never wedge the window in "building"');
+}
 for (const f of ['goalstore', 'journeystore', 'maintqueststore', 'stationqueststore', 'workqueststore', 'queststatestore', 'questledgerstore', 'questrefreshstore']) {
   const src = read('frontend/app/' + f + '.js');
   A.ok(!/StationUI\.rerender\('quests'\)(?!, )/.test(src.replace(/StationUI\.rerender\('quests', false\)/g, '')), f + ': every background poke is a DATA poke (rerender(\'quests\', false)) — no crossfade blink from a poll');
@@ -92,7 +100,9 @@ A.ok(/the station had nothing it could honestly ground/.test(station), 'a reject
 const stationFns = station.slice(station.indexOf('function questGoDest'), station.indexOf('function buildQuests'));
 A.ok(/return 'session'/.test(station) && !/GO ▸ task board/.test(station), 'work/ledger quests route to their OWN session — the TASK BOARD misroute is dead');
 A.ok(/function questOpenSession/.test(station) && /\.find\(s => s && !s\.archived && s\.title === title\)/.test(station), 'START QUEST is idempotent by title (a second click returns to the same conversation)');
-A.ok(/Chat\.prefill\(/.test(station.slice(station.indexOf('function questOpenSession'), station.indexOf('function questSessionTitle') + 4000)), 'the ask is PREFILLED, never sent — no fabricated turns');
+A.ok(/Chat\.prefill\(/.test(station.slice(station.indexOf('function questOpenSession'), station.indexOf('function questSessionTitle') + 4000)), 'a quest the Commander performs, a revisit, or a busy COMMS keeps the PREFILL path');
+{ const qos = station.slice(station.indexOf('function questOpenSession'), station.indexOf('function questOpenSession') + 3000);
+  A.ok(/const startsWork = !existing && q\.executionMode === 'agent' && Chat\.send && !\(Chat\.isBusy && Chat\.isBusy\(\)\)/.test(qos), 'START QUEST sends only for an AGENT quest, only into its brand-new session, only when COMMS is free'); }
 A.ok(/q\.agentId && String\(q\.agentId\)/.test(station), 'a ledger quest binds its OWN agent; agent-less kinds fall to the hero');
 A.ok(/q\.id === 'st:crew'/.test(stationFns) && /return 'recruit'/.test(stationFns), 'the recruit quest routes to Recruitment Bay, never Refit');
 A.ok(/App\.openSummonBay/.test(station.slice(station.indexOf("body.querySelectorAll('.q-go')"), station.indexOf("body.querySelectorAll('.q-attest-yes')"))), 'the recruit destination opens the real Recruitment Bay surface');
@@ -187,7 +197,7 @@ const body = {
   set innerHTML(html) {
     rendered = html; buttons = { '.q-filter': [], '.q-mission': [], '[data-quest-view]': [], '.q-view-panel': [] };
     detailNodes = [resultDisclosure()];
-    for (const id of ['available', 'goals', 'progress', 'completed']) {
+    for (const id of ['pass', 'available', 'goals', 'progress', 'completed']) {
       buttons['.q-view-panel'].push({ id: 'q-view-' + id, hidden: false });
       buttons['[data-quest-view]'].push({ dataset: { questView: id }, attributes: {},
         setAttribute(k, v) { this.attributes[k] = v; },
@@ -211,13 +221,17 @@ const ctx = vm.createContext({ body, QuestStore: { view: () => ({ quests: questR
   esc: s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'),
   QUEST_KIND_TAG: { station: 'STATION', dossier: 'ABOUT YOU' }, GO_LABEL: {},
   questGoDest: () => null, questCompletesWhen: () => 'the recorded condition is met', workshopGrantOn: () => false,
-  questBriefingHtml: () => '', questTrackHtml: () => '', lifeGoalsHtml: () => '', journeyChaptersHtml: () => '', questRefreshHtml: () => '', journeyHtml: () => '',
+  passHtml: () => '<section class="bp"></section>', bpClaimed: () => 0, bpSetClaimed: () => {}, questBriefingHtml: () => '', questTrackHtml: () => '', lifeGoalsHtml: () => '', journeyChaptersHtml: () => '', questRefreshHtml: () => '', journeyHtml: () => '',
+  systemsHtml: () => '', wireSystems: () => {}, stationPrestigeHtml: () => '', consoleSection: {},   // STATION SYSTEMS + prestige blocks + deep-link view (front doors)
   rerender: () => ctx.buildQuests(body)
 });
 const journalSource = station.slice(station.indexOf('  function buildQuests(body)'), station.indexOf('    // COMMANDER JOURNEY writes')) + '\n}';
 vm.runInContext(journalSource, ctx);
 ctx.buildQuests(body);
-A.eq(body.dataset.questView, 'available', 'available quests lead on first open');
+A.eq(body.dataset.questView, 'pass', 'the battle pass leads on first open (Andrew 2026-10-19)');
+A.ok(rendered.includes('id="q-view-pass"') && rendered.includes('class="bp"'), 'the PASS view renders the pass');
+buttons['[data-quest-view]'][1].click();
+A.eq(body.dataset.questView, 'available', 'NOW is one tab over');
 detailNodes[0].open = false;
 ctx.buildQuests(body);
 A.eq(detailNodes[0].open, false, 'a result the user collapsed stays closed after a data repaint');
@@ -225,16 +239,16 @@ detailNodes[0].open = true;
 ctx.buildQuests(body);
 A.eq(detailNodes[0].open, true, 'a result the user expanded stays open after a data repaint');
 const beforeTab = rendered;
-buttons['[data-quest-view]'][1].click();
+buttons['[data-quest-view]'][2].click();
 A.eq(body.dataset.questView, 'goals', 'Goals tab selects its own view');
 A.eq(rendered, beforeTab, 'tab changes do not rebuild forms or discard entered values');
 A.eq(buttons['.q-view-panel'].filter(p => !p.hidden).map(p => p.id).join(','), 'q-view-goals', 'only the selected panel is exposed');
 ctx.buildQuests(body);
 A.eq(body.dataset.questView, 'goals', 'background refresh preserves the selected tab');
-buttons['[data-quest-view]'][1].keydown({ key: 'ArrowRight', preventDefault() {} });
+buttons['[data-quest-view]'][2].keydown({ key: 'ArrowRight', preventDefault() {} });
 A.eq(body.dataset.questView, 'progress', 'arrow keys move to the next tab');
 A.eq(focused, 'progress', 'keyboard selection moves focus with the tab');
-buttons['[data-quest-view]'][0].click();
+buttons['[data-quest-view]'][1].click();
 A.eq(body.dataset.questSelected, 'st:crew', 'journal initially selects the first available quest');
 A.eq((rendered.match(/class="gx-tro q-card /g) || []).length, 1, 'journal renders exactly one open briefing, not nine competing cards');
 buttons['.q-mission'][1].click();

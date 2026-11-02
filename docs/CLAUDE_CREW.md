@@ -82,25 +82,15 @@ Permission escalation defaults to deny. New sessions accept only `default` (ask;
 Control), `plan`, `acceptEdits` or `auto`. `bypassPermissions` and `dontAsk` are refused. The directory
 must be one Claude Code already trusts; otherwise the CLI's "workspace not trusted" error is shown as-is.
 
-## Claude as the Overseer's brain ("Claude · your login")
+## Claude as the Overseer's brain ("Claude Code" provider)
 
-Overseer setup and Settings list a **CLAUDE** provider (`claudecode`, tagged *YOUR LOGIN*) beside Anthropic.
-It runs the station's own agents on your Claude subscription through the local `claude` CLI. There is no API
-key; `providers/claude-cli.js` drives `claude -p` as a pure model:
+Upstream now ships this provider itself: **CLAUDE CODE** (`claude-cli`, `sidecar/providers/claude-cli.js`, see
+`docs/CLAUDE_CLI_PROVIDER.md`). The fork's earlier `claudecode` provider and its catalog-only MCP shim were retired
+in the 2026-11 upstream sync in favour of it. `claudecode` and `claude-login` stay as **aliases** of `claude-cli`
+(registry + the frontend normalizers), so a station saved with the old id still loads on the Claude login.
 
-- Claude Code's built-in tools are off (`--tools ""`), and StarNet's system prompt replaces Claude Code's
-  (`--system-prompt-file`).
-- User and project settings and hooks are not loaded (`--setting-sources ""`), and nothing is persisted
-  (`--no-session-persistence`).
-- StarNet's tools are advertised through a **catalog-only** MCP server (`providers/claude-cli-mcp.js`,
-  `--strict-mcp-config`). When Claude ends a message with `tool_use`, every tool call in that message is lifted
-  into the normal HarnessEvent stream and the child is ended. StarNet then runs the tools through its own
-  consent path, as for any provider. The MCP server has no implementations, so it can never be a side door.
-- Each request renders the conversation as a tagged transcript on stdin. It is stateless, like the other adapters.
-- Models are the CLI aliases `sonnet`, `opus` and `haiku`. Usage is reported for the context gauge; cost is 0
-  (subscription).
-- The provider shows as ready only when `claude auth status` reports a signed-in CLI. A missing or signed-out
-  CLI is an honest error, not a catalog.
+The Overseer session (below) keys on the normalized id: an interactive COMMS turn to the hero is routed to the
+persistent session when the hero's provider normalizes to `claude-cli`.
 
 ## The Overseer as one persistent Claude Code session (opt-in)
 
@@ -162,7 +152,7 @@ Chrome adds a shortcut rather than an installed app).
 ## Files
 
 - `sidecar/claude-crew.js` — pure parsing/argv guards + the injected-exec factory
-- `sidecar/providers/claude-cli.js`, `claude-cli-mcp.js` — the Claude-login brain + its catalog-only MCP server
+- `sidecar/providers/claude-cli.js` — upstream's Claude Code brain (`claude-cli`; the fork's `claudecode` id is an alias)
 - `sidecar/apiauth.js` — `parseRemoteHosts`, `isAllowedHost(host, remoteHosts)`, `isAllowedApiOrigin(origin, port, remoteHosts)`
 - `frontend/app/claude-crew.js` — floor bodies (`cc-<sessionId>`), the list, session and new-session cards
 - `dev/overlay-forward.js`, `dev/remote-station-zerotier.sh`, `dev/remote-station.sh` — phone access

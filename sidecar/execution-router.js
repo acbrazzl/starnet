@@ -13,6 +13,7 @@
    backendMatched:false so the UI can never claim a sandbox the harness is not running.
 */
 'use strict';
+const { swallow } = require('./failopen.js');
 
 function makeExecutionRouter(deps) {
   deps = deps || {};
@@ -173,10 +174,14 @@ function makeExecutionRouter(deps) {
     if (agentId != null) return callAgent('killAllBackground', agentId, []);
     let count = 0;
     const seen = new Set();
-    for (const env of Object.values(environments)) {
+    for (const [id, env] of Object.entries(environments)) {
       if (!env || seen.has(env) || typeof env.killAllBackground !== 'function') continue;
       seen.add(env);
-      count += Number(env.killAllBackground()) || 0;
+      const r = env.killAllBackground();
+      // an async reap (SSH round-trips) is dispatched, not proven: never counted, and its failure is a
+      // tagged note — not a process-level unhandledRejection the halt/shutdown callers can't catch.
+      if (r && typeof r.then === 'function') { r.then(null, swallow('execution.killAll.' + id)); continue; }
+      count += Number(r) || 0;
     }
     return count;
   }
@@ -211,6 +216,11 @@ function makeExecutionRouter(deps) {
     writeBackground: (agentId, bgId, opts) => callAgent('writeBackground', agentId, [bgId, opts]),
     closeBackgroundStdin: (agentId, bgId) => callAgent('closeBackgroundStdin', agentId, [bgId]),
     killBackground: (agentId, bgId) => callAgent('killBackground', agentId, [bgId]),
+    // null when the agent's backend has no event-driven wait: the shell.bg.wait tool falls back to polling status
+    waitBackground: (agentId, bgId, opts) => {
+      const env = forAgent(agentId);
+      return env && typeof env.waitBackground === 'function' ? env.waitBackground(agentId, bgId, opts) : null;
+    },
     spawnStdio: opts => fromOpts(opts).spawnStdio(opts),
     killAllBackground,
     _environments: environments

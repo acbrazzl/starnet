@@ -37,6 +37,9 @@ const GoalStore = (() => {
   let bound = false;
   let firing = false;           // re-entrancy guard while a decomposition confirm is mid-flight
   let creatingGoal = false;
+  // every stored text cap: UTF-16 units (bounded storage), never ending on half an emoji. Also heals a save written
+  // before this rule — hydrate runs every stored string through it (2026-10-21).
+  const cut = (s, n) => String(s == null ? '' : s).slice(0, n).replace(/[\uD800-\uDBFF]$/, '');
   /* THE STUBBORN-BELIEF SPEND LEAK (fixed 2026-08-04). A reply that parses to fewer than MIN_PATH milestones is
      unusable, and the old code marked NOTHING offered so a later, better reply could still land — which meant a
      belief the model simply cannot decompose re-paid the aux call at EVERY run end, forever. Two failed attempts
@@ -69,10 +72,10 @@ const GoalStore = (() => {
           if (!Number.isFinite(created)) continue;
           const ms = Array.isArray(g.milestones) ? g.milestones.map(m => ({
             id: String((m && m.id) || ''),
-            text: String((m && m.text) || '').slice(0, 140),
+            text: cut((m && m.text) || '', 140),
             status: (m && m.status === 'done') ? 'done' : 'open',
             questRef: (m && m.questRef != null) ? String(m.questRef) : null,
-            evidence: String((m && m.evidence) || '').slice(0, 160),
+            evidence: cut((m && m.evidence) || '', 160),
             source: m && m.source === 'commander' ? 'commander' : 'harness',
             doneAt: (m && Number.isFinite(Number(m.doneAt))) ? Number(m.doneAt) : null,
             journeySyncedAt: (m && m.journeySyncedAt != null && Number.isFinite(Number(m.journeySyncedAt))) ? Number(m.journeySyncedAt) : null
@@ -80,12 +83,12 @@ const GoalStore = (() => {
           if (!ms.length) continue;
           const status = ['done', 'retired', 'paused', 'archived'].includes(g.status) ? g.status : 'active';
           s.goals.push({
-            id: String(g.id), text: String(g.text || '').slice(0, 280),
-            successCondition: String(g.successCondition || '').slice(0, 500),
-            outcomeEvidence: String(g.outcomeEvidence || '').slice(0, 1000),
-            motivation: String(g.motivation || '').slice(0, 500),
-            constraints: String(g.constraints || '').slice(0, 500),
-            journal: (Array.isArray(g.journal) ? g.journal : []).filter(e => e && Number.isFinite(e.at) && e.text).map(e => ({ at: e.at, kind: String(e.kind || 'reflection').slice(0, 30), text: String(e.text).slice(0, 1000) })),
+            id: String(g.id), text: cut(g.text || '', 280),
+            successCondition: cut(g.successCondition || '', 500),
+            outcomeEvidence: cut(g.outcomeEvidence || '', 1000),
+            motivation: cut(g.motivation || '', 500),
+            constraints: cut(g.constraints || '', 500),
+            journal: (Array.isArray(g.journal) ? g.journal : []).filter(e => e && Number.isFinite(e.at) && e.text).map(e => ({ at: e.at, kind: String(e.kind || 'reflection').slice(0, 30), text: cut(e.text, 1000) })),
             focusedAt: Number(g.focusedAt) || 0,
             nextMilestoneId: ms.some(m => m.id === g.nextMilestoneId) ? g.nextMilestoneId : null,
             pendingRegistration: !!g.pendingRegistration,
@@ -96,8 +99,8 @@ const GoalStore = (() => {
         }
       }
       s.ideas = (Array.isArray(raw.ideas) ? raw.ideas : []).filter(i => i && i.id && i.text).slice(0, 100).map(i => ({
-        id: String(i.id), text: String(i.text).slice(0, 280), question: String(i.question || '').slice(0, 500),
-        learning: String(i.learning || '').slice(0, 1000), createdAt: Number(i.createdAt) || 0,
+        id: String(i.id), text: cut(i.text, 280), question: cut(i.question || '', 500),
+        learning: cut(i.learning || '', 1000), createdAt: Number(i.createdAt) || 0,
         goalId: i.goalId ? String(i.goalId) : null, archived: !!i.archived
       }));
       // rebuild the offered set from its FIFO order (capped) — pre-order saves fall back to key iteration once.
@@ -154,8 +157,11 @@ const GoalStore = (() => {
       if (g) {
         const pr = Goals.progress(g);
         const next = Goals.nextMilestone(g);
+        // the ordered plan rides along so the sidecar can settle a step and move to the next one with this
+        // window closed (sidecar/goal-advance.js) — ids + text + status only, never evidence or history.
         payload = { id: g.id, text: g.text, done: pr.done, total: pr.total, pct: pr.pct,
-          next: next ? next.text : null, milestoneId: next ? next.id : null };
+          next: next ? next.text : null, milestoneId: next ? next.id : null,
+          milestones: g.milestones.map(m => ({ id: m.id, text: m.text, status: m.status })) };
       }
       fetch('/api/goals', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ goal: payload }) }).catch(() => {});
     } catch (_) {}
@@ -195,13 +201,23 @@ const GoalStore = (() => {
   // SPEND-ONCE: a usable path is CACHED by the belief fingerprint — if the caller lost the beat moment after this
   // (paid) aux call (memory/study claimed it mid-round-trip), the next offer for the SAME belief state reuses the
   // cached path instead of re-calling the model. The cache clears the moment the belief is decided (markOffered).
-  async function proposeDecomposition() {
+  // `target` (optional, USER-STUDY LOOP): plan THIS goals belief — the onboarding meeting names the mission it
+  // just confirmed rather than taking whichever goals belief is first. It passes the same gates the proactive
+  // path does: a live goals belief, no tree yet, not already offered/declined in this exact state.
+  function eligible(target) {
+    if (!target || !target.id) return null;
+    const live = goalsBeliefs().find(b => b && String(b.id) === String(target.id) && b.text);
+    if (!live) return null;
+    if (state.goals.some(g => g.sourceBeliefId === String(live.id) && (g.status === 'active' || g.status === 'done'))) return null;
+    return state.offered[beliefFingerprint(live)] ? null : live;
+  }
+  async function proposeDecomposition(target) {
     // NOTE: no `firing` guard here — the offer flow (chat.js offerArc) sets firing BEFORE this call, so
     // gating on it deadlocked the arc into always returning null (re-entry is already blocked by
     // willOfferDecomposition + offerArc's isFiring() entry check).
     if (!ready()) return null;
     if (typeof Harness === 'undefined' || !Harness.chat) return null;
-    const belief = pendingDecomposition();
+    const belief = target ? eligible(target) : pendingDecomposition();
     if (!belief) return null;
     const fp = beliefFingerprint(belief);
     if (cachedProposal && cachedProposal.fp === fp) return { belief, texts: cachedProposal.texts.slice() };   // reuse the already-paid-for path
@@ -219,7 +235,9 @@ const GoalStore = (() => {
       // threads and recent activity are exactly what makes those milestones theirs rather than generic.
       const res = await Harness.chat({ system, messages: [{ role: 'user', content: directive }], agentId: 'agent', isTask: false, placed: [], internal: true, evidence: true });
       if (!res || res.error) return failed();
-      const texts = Goals.parseDecomposition(res.text, { redact: deps.redact });
+      // milestones read as plain words — the library's markdown → one line (no '**' / '`' typed at the Commander, none stored)
+      const plain = (typeof Deliverables !== 'undefined' && Deliverables.plainLine) ? Deliverables.plainLine : undefined;
+      const texts = Goals.parseDecomposition(res.text, { redact: deps.redact, plain });
       if (texts.length < MIN_PATH) return failed();   // under-decomposed / unusable — the confirm panel would drop it anyway
       delete decompFails[fp];
       cachedProposal = { fp, texts: texts.slice() };
@@ -336,7 +354,7 @@ const GoalStore = (() => {
         try {
           const r = await JourneyStore.noteMilestone({
             goalId: g.id, goalText: g.text, milestoneId: m.id, milestoneText: m.text,
-            evidence: m.evidence || ('completed: ' + String(m.text || '')).slice(0, 160),
+            evidence: m.evidence || cut('completed: ' + String(m.text || ''), 160),
             source: m.source || 'harness', agentId: m.source === 'commander' ? null : 'agent',
             goalDone: false
           });
@@ -355,7 +373,7 @@ const GoalStore = (() => {
     if (!g || condition.length < 4) return { ok: false, error: 'describe the observable result that means this goal is achieved' };
     if (typeof JourneyStore === 'undefined' || !JourneyStore.registerGoal) return { ok: false, error: 'journey service unavailable' };
     const r = await JourneyStore.registerGoal({ id: g.id, text: g.text, successCondition: condition });
-    if (r && r.ok) { g.successCondition = condition.slice(0, 500); g.pendingRegistration = false; save(); pushToSidecar(); poke(); }
+    if (r && r.ok) { g.successCondition = cut(condition, 500); g.pendingRegistration = false; save(); pushToSidecar(); poke(); }
     return r;
   }
 
@@ -365,8 +383,9 @@ const GoalStore = (() => {
     if (title.length < 4) return { ok: false, error: 'Tell StarNet a little about what you want to do first.' };
     if (typeof Harness === 'undefined' || !Harness.chat) return { ok: false, error: 'Planning is unavailable. You can still write your own plan below.' };
     try {
+      // keepEffort: the Commander asked for this plan and edits it — their reasoning effort, not the aux one
       const res = await Harness.chat({ system: deps.getSystem ? deps.getSystem() : '', agentId: 'agent',
-        isTask: false, placed: [], internal: true, evidence: true,
+        isTask: false, placed: [], internal: true, evidence: true, keepEffort: true,
         messages: [{ role: 'user', content: 'Help me shape this ambition into a small, editable starting plan: ' + title
           + '\nWhy it matters: ' + cleanNote(options.motivation, 500) + '\nConstraints: ' + cleanNote(options.constraints, 500)
           + '\nCurrent success idea: ' + cleanNote(options.successCondition, 500) + '\nCurrent steps: ' + cleanNote(options.steps, 1000)
@@ -398,7 +417,7 @@ const GoalStore = (() => {
     creatingGoal = true;
     // Save the user-authored goal and stable id before the network boundary. A lost response cannot
     // strand the path; the success-condition action retries this id, and sync reconciles an accepted write.
-    g.successCondition = condition.slice(0, 500); g.pendingRegistration = true;
+    g.successCondition = cut(condition, 500); g.pendingRegistration = true;
     g.focusedAt = Math.max(stamp, ...state.goals.map(g => (g.focusedAt || g.createdAt || 0) + 1));
     g.motivation = cleanNote(options && options.motivation, 500);
     g.constraints = cleanNote(options && options.constraints, 500);
@@ -414,7 +433,7 @@ const GoalStore = (() => {
     return { ok: false, saved: true, goalId: g.id, error: 'goal saved on this device; save its success condition to retry Journey registration' };
   }
 
-  const cleanNote = (text, limit = 1000) => Goals.scrubSecrets(String(text || '').trim()).slice(0, limit);
+  const cleanNote = (text, limit = 1000) => cut(Goals.scrubSecrets(String(text || '').trim()), limit);
   function record(g, kind, text) {
     (g.journal || (g.journal = [])).push({ at: now(), kind, text: cleanNote(text) });
     g.updatedAt = now(); save(); pushToSidecar(); poke();
@@ -503,7 +522,7 @@ const GoalStore = (() => {
     if (!g || typeof JourneyStore === 'undefined' || !JourneyStore.confirmGoal) return { ok: false, error: 'active goal unavailable' };
     const r = await JourneyStore.confirmGoal({ id: g.id, evidence: String(evidence || '').trim() });
     if (r && r.ok) {
-      g.status = 'done'; g.outcomeEvidence = String(evidence || '').trim().slice(0, 1000); g.updatedAt = now();
+      g.status = 'done'; g.outcomeEvidence = cut(String(evidence || '').trim(), 1000); g.updatedAt = now();
       save(); pushToSidecar(); poke(); celebrateGoalDone();
     }
     return r;
@@ -527,7 +546,7 @@ const GoalStore = (() => {
 
   function addStep(goalId, text) {
     const g = ready() && state.goals.find(g => g.id === goalId && g.status === 'active');
-    const clean = typeof Goals !== 'undefined' ? Goals.scrubSecrets(String(text || '').trim()).slice(0, 140) : '';
+    const clean = typeof Goals !== 'undefined' ? cut(Goals.scrubSecrets(String(text || '').trim()), 140) : '';
     if (!g || Goals.lowValue(clean) || g.milestones.length >= 100) return false;
     if (g.milestones.some(m => m.text.toLowerCase() === clean.toLowerCase() && m.status === 'open')) return false;
     g.milestones.push({ id: g.id + ':m' + (g.milestones.length + 1), text: clean, status: 'open', questRef: null,
@@ -571,14 +590,14 @@ const GoalStore = (() => {
   // step edges already celebrate via QuestState; this is the capstone for the goal itself.
   function celebrateGoalDone() {
     try { if (typeof SFX === 'object' && SFX.quest) SFX.quest(); } catch (_) {}
-    try { if (typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify('◆ goal achieved — your outcome has been recorded.', 'gold'); } catch (_) {}
+    try { if (typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify('◆ goal achieved — your outcome has been recorded.', 'gold', undefined, { kind: 'result', go: { term: 'quests' } }); } catch (_) {}
     noteGoalDone();
   }
   // the evidence line folded onto a completed milestone: prefer a real run summary, else name the milestone.
   function clipEvidence(runSummary, milestoneText) {
     const s = String(runSummary == null ? '' : runSummary).trim();
-    if (s) return ('done via: ' + s).slice(0, 160);
-    return ('completed: ' + String(milestoneText || '')).slice(0, 160);
+    if (s) return cut('done via: ' + s, 160);
+    return cut('completed: ' + String(milestoneText || ''), 160);
   }
   // FEEDBACK LOOP (§5): a milestone completing is a goal-progress note the Tier 1 Study engine can weight. Additive
   // + fail-open — a missing hook is a silent no-op; it never blocks the fold. Uses StudyStore's optional salience
@@ -653,6 +672,18 @@ const GoalStore = (() => {
       if (g.pendingRegistration) { g.pendingRegistration = false; changed = true; }
       if (known.successCondition && g.successCondition !== known.successCondition) { g.successCondition = known.successCondition; changed = true; }
       if (known.status === 'achieved') { g.status = 'done'; g.outcomeEvidence = known.evidence; changed = true; }
+    }
+    // A plan step the SIDECAR settled while this window was closed (every quest planned for it completed by
+    // contract — sidecar/goal-advance.js) is already a durable journey record: fold it onto the local tree with
+    // the journey's own evidence, and mark it synced (the journey already holds it, so the outbox never re-posts).
+    for (const done of (journey && journey.milestones || [])) {
+      const g = done && state.goals.find(x => x.id === done.goalId && x.status === 'active');
+      const m = g && g.milestones.find(x => x && x.id === done.milestoneId && x.status === 'open');
+      if (!m || questLive(m.questRef)) continue;   // a step with its own build in flight folds through that build
+      const at = Number(done.at) || now();
+      if (Goals.foldMilestoneDone(g, m.id, done.evidence || ('completed: ' + m.text), at).changed) {
+        m.source = 'harness'; m.journeySyncedAt = at; changed = true; bumpStudySalience(g, m);
+      }
     }
     if (changed) { save(); pushToSidecar(); }
     syncDrift(); reconcile(''); queueJourneySync();

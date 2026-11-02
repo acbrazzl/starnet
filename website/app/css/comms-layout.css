@@ -24,7 +24,7 @@
 
 /* One frame around a question, not a card nested inside another padded card. */
 #screen-game #chat-panel .cmsg.nudge:has(.task-conversation) { padding: 10px; }
-#screen-game #chat-panel .cmsg.nudge .task-conversation {
+#screen-game #chat-panel :is(.cmsg.nudge, .cmsg.consent) .task-conversation {   /* the question card is ONE 5px frame, never a card inside a card */
   padding: 0; margin: 0; border: 0; border-radius: 0; background: none; box-shadow: none;
 }
 #screen-game #chat-panel .task-conversation :is(.tc-caption, .tc-question, .tc-reason) { margin-bottom: 6px; }
@@ -53,7 +53,10 @@
 }
 @media (max-width: 860px) {
   body #screen-game.active {
-    grid-template-rows: calc(42px * var(--cz)) minmax(calc(72px * var(--cz)), .3fr) minmax(0, 1fr) minmax(38px, auto);
+    /* the CREW / station row holds the rail's head, a crew row, SESSIONS / PROJECTS, the search and a session (300px):
+       at 72px its floor let the row end mid-search and no session was reachable (the sweep 10-25). Short windows keep
+       their own scrolling rows below */
+    grid-template-rows: calc(42px * var(--cz)) minmax(calc(300px * var(--cz)), .3fr) minmax(0, 1fr) minmax(38px, auto);
     padding: calc(5px * var(--cz)); gap: calc(6px * var(--cz));
   }
 }

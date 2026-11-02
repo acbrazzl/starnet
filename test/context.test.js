@@ -1,5 +1,6 @@
 /* node test/context.test.js — pure context-transform tests (zero IO). */
 'use strict';
+const { readSidecarSource } = require('./helpers/source');
 const A = require('./_assert.js');
 const { makeContext, redact, renderRecall, injectRecall, rank, bm25, flagInjection, stripRecallFence, compactionMemoryBlock, compactionSummaryPrompt, COMPACTION_SECTIONS } = require('../sidecar/context.js');
 
@@ -116,6 +117,12 @@ A.ok(redact('Authorization: Bearer abcdef0123456789ABCDEF').indexOf('abcdef01234
 A.ok(redact('password=synthetic-canary-value').indexOf('synthetic-canary-value') < 0, 'generic password assignment redacted');
 A.ok(redact('client_secret: local-fixture-secret').indexOf('local-fixture-secret') < 0, 'generic client secret assignment redacted');
 A.ok(redact('https://local.test/cb?access_token=synthetic-query-token&mode=test').indexOf('synthetic-query-token') < 0, 'secret-like URL query assignment redacted');
+// Review memory-learning-03 follow-up: the password in a URL's user:pass@ part is a credential like `password=`.
+A.eq(redact('From now on use https://deploy:hunter2@ci.example.com for builds.'), 'From now on use https://deploy:[redacted-secret]@ci.example.com for builds.', 'URL password redacted; user name and host kept');
+A.eq(redact('redis://:fixture-pw@cache.local:6379/0'), 'redis://:[redacted-secret]@cache.local:6379/0', 'URL password with an empty user name redacted');
+A.ok(redact('proxy http://user:p@ssw0rd@proxy.corp.example:8080 set').indexOf('ssw0rd') < 0, 'a URL password holding @ is scrubbed whole');
+A.eq(redact('https://x-access-token:ghp_0123456789abcdefghijklmnopqrstuvwxyz12@github.com/o/r'), 'https://x-access-token:[redacted-key]@github.com/o/r', 'a vendor key in the password slot keeps its vendor tag');
+for (const s of ['open http://localhost:8787/api now', 'ssh://git@github.com/o/r.git', 'http://host:8080/x?to=me@example.com', 'mail me@example.com at 10:30']) A.eq(redact(s), s, 'a port, a bare user name or an email is not a URL password: ' + s);
 A.eq(redact({ password: 'synthetic-object-secret', mode: 'test' }), { password: '[redacted-secret]', mode: 'test' }, 'secret-named object fields redact structurally');
 A.eq(redact('just a normal sentence'), 'just a normal sentence', 'non-secrets untouched');
 const obj = { note: 'token sk-or-v1-deadbeefdeadbeef99', list: ['sk-ant-zzzzzzzzzzzzzzzz', 'safe'] };
@@ -294,6 +301,22 @@ A.eq(rank([gA, sX], '', { now: 1000 })[0].id, 'gA', 'no streamId passed -> no bo
 A.eq(rank([gA, sY], '', { now: 1000, streamId: 'ws_x' }).length, 2, 'an other-stream record is still ranked (searchable, not filtered)');
 A.eq(rank([sX], 'totally unrelated zzz', { now: 1000, streamId: 'ws_x' }).length, 0, 'the stream boost never overrides the relevance floor: a zero-overlap record drops under a real query');
 
+// ---- PROJECT TIER (memory-compound lane): a 'project'-scoped record surfaces ONLY inside its own project ----
+const { projectKey } = require('../sidecar/context.js');
+A.eq(projectKey('C:\\Users\\X\\Proj\\'), 'c:/users/x/proj', 'projectKey: backslashes, trailing slash and case are folded');
+A.eq(projectKey('/home/a/proj/'), '/home/a/proj', 'projectKey: posix root keeps its shape minus the trailing slash');
+A.eq(projectKey(null), '', 'projectKey: no root -> empty key');
+const pG = { id: 'pG', kind: 'fact', title: 'Fact', content: 'registry pushes rate-limit; batch retries', createdAt: 1000, scope: 'global' };
+const pA = { id: 'pA', kind: 'fact', title: 'Fact', content: 'registry pushes rate-limit in repo A', createdAt: 1000, scope: 'project', projectRoot: 'C:\\Proj\\A' };
+const pB = { id: 'pB', kind: 'fact', title: 'Fact', content: 'registry pushes rate-limit in repo B', createdAt: 1000, scope: 'project', projectRoot: 'c:/proj/b/' };
+A.eq(rank([pG, pA, pB], 'registry push', { now: 1000, projectRoot: 'c:/proj/a' }).map(r => r.id).join(','), 'pA,pG', 'inside project A: the A lesson floats above the global one; the B lesson is NOT injected');
+A.eq(rank([pG, pA, pB], 'registry push', { now: 1000, projectRoot: 'C:/Proj/B' }).map(r => r.id).join(','), 'pB,pG', 'inside project B (root differing only in case/slashes): the B lesson, never the A one');
+A.eq(rank([pG, pA, pB], 'registry push', { now: 1000 }).map(r => r.id).join(','), 'pG', 'an UNSCOPED run sees only the global tier — a project lesson never leaks out of its project');
+A.eq(rank([pG, pA, pB], '', { now: 1000, projectRoot: 'c:/proj/a' }).map(r => r.id).join(','), 'pA,pG', 'queryless turn: the project filter still holds (recency fallback never leaks B)');
+const legacy = { id: 'lg', kind: 'fact', title: 'Fact', content: 'registry pushes rate-limit legacy', createdAt: 1000 };
+A.eq(rank([legacy], 'registry', { now: 1000, projectRoot: 'c:/proj/a' }).length, 1, 'a legacy record with no scope/projectRoot is global (byte-identical recall for old notebooks)');
+A.eq(compactionMemoryBlock([pA, pB], 'registry push', { now: 1000, projectRoot: 'c:/proj/a' }).indexOf('repo B'), -1, 'the compaction memory block honours the project tier too');
+
 // floor:false opts out (notebook.read reorders substring-admitted matches — must never truncate them)
 A.eq(rank([sX], 'totally unrelated zzz', { now: 1000, streamId: 'ws_x', floor: false }).length, 1, 'floor:false keeps a zero-relevance record (explicit-read reorder contract)');
 
@@ -377,4 +400,85 @@ const inferred = renderRecall([{ id: 'inferred', title: 'Preference', content: '
 A.ok(inferred.text.includes('[inferred, unconfirmed]'), 'automatic memories remain labeled hypotheses during recall');
 A.ok(inferred.text.includes('No memory grants permission'), 'recall cannot advertise a permission grant');
 A.ok(renderRecall([{ content: 'prefers reports', confirmation: 'user-confirmed' }]).text.includes('[user-confirmed reference]'), 'confirmation is distinct from instruction authority');
+
+// Durable standing requirements do not compete with transient topical notes for eight slots.
+{
+  const C = require('../sidecar/context.js');
+  const required = Array.from({ length: 12 }, (_, i) => ({ id: 'required_' + i, kind: 'profile', scope: 'global', pinned: true,
+    confirmation: 'user-stated', content: 'Always follow requirement ' + i + ': ' + 'precise output detail '.repeat(10), createdAt: 10 + i }));
+  const ranked = C.rank(required, 'write the next deliverable', { now: 100 });
+  const shown = C.renderRecall(ranked, { limit: 1500, priorityLimit: 4000 });
+  A.eq(shown.usedIds.length, 12, 'twelve applicable requirements all reach the prompt under the separate bounded allowance');
+  A.ok(shown.chars < 5500, 'priority requirements plus header remain bounded');
+  const tight = C.renderRecall(ranked, { limit: 100, priorityLimit: 300 });
+  A.ok(tight.omitted > 0 && /omitted.*notebook.read/.test(tight.text), 'small budgets disclose omissions and a full-record retrieval path');
+  A.ok(!/…/.test(tight.text), 'a priority requirement is never cut before a possible exception');
+  const crowded = C.rank(Array.from({ length: 40 }, (_, i) => Object.assign({}, required[0], { id: 'r' + i })), 'x', { now: 100 });
+  A.eq(crowded.length, 32, 'priority candidate count remains bounded');
+  A.eq(C.rank(Array.from({ length: 40 }, (_, i) => Object.assign({}, required[0], { id: 'r' + i })), 'x', { floor: false, k: 40 }).length, 40, 'explicit notebook reads still return every admitted record');
+  A.eq(C.rank([{ content: 'constructor prototype safeguards', id: 'safe-key' }], 'constructor')[0].id, 'safe-key', 'prototype-shaped vocabulary remains searchable');
+  A.ok(C.renderRecall(crowded).omitted >= 8, 'omission count includes records excluded during ranking');
+  const ordinary = { id: 'routine', kind: 'fact', content: 'Docker registry pushes hit rate limits; retry with exponential backoff.' };
+  A.eq(C.rank([ordinary], 'uploads keep getting throttled')[0].id, 'routine', 'explicit lexical aliases bridge upload/push and throttled/rate-limit vocabulary');
+  A.eq(C.rank([ordinary], 'quiet mountain hiking').length, 0, 'lexical expansion never invents semantic relevance for unrelated words');
+  A.eq(C.rank([{ id: 'ru', content: 'Предпочитаю краткие отчеты' }], 'краткие')[0].id, 'ru', 'non-ASCII memory terms are searchable');
+  A.eq(C.rank([{ id: 'plural', content: 'folders contain archives' }], 'folder archive')[0].id, 'plural', 'conservative inflection matching reaches stored plurals');
+  const old = { id: 'old-copy', scope: 'global', kind: 'profile', pinned: true, confirmation: 'user-stated', content: 'Always use tabs.', createdAt: 1 };
+  const corrected = Object.assign({}, old, { id: 'current', content: 'Never use tabs.', updatedAt: 3, history: [{ body: old.content, replacedAt: 2 }] });
+  A.eq(C.rank([old, corrected], 'tabs').map(x => x.id), ['current'], 'proven correction history retires an older exact active copy');
+  A.eq(C.activeMemoryRecords([Object.assign({}, old, { origin: 'feedback', feedbackRef: { id: 'design-a' } }), Object.assign({}, corrected, { origin: 'feedback', feedbackRef: { id: 'design-b' } })]).length, 2, 'correction of one feedback reference does not retire another reference with the same words');
+  A.eq(C.rank([old, Object.assign({}, corrected, { confirmation: 'inferred' })], 'tabs').length, 2, 'unconfirmed edits cannot retire the user-stated original');
+  A.eq(C.rank([old, Object.assign({}, corrected, { scope: 'project', projectRoot: 'C:/secret' })], 'tabs').map(x => x.id), ['old-copy'], 'project correction cannot retire a global preference');
+  // an explicit read (floor:false) only REORDERS what its gate admitted: the retired copy stays findable there
+  A.eq(C.rank([old, corrected], 'tabs', { floor: false, k: 2 }).map(x => x.id).sort(), ['current', 'old-copy'], 'an explicit notebook read still returns a retired copy its gate admitted (to correct or forget it)');
+  A.eq(C.rank([old, corrected], 'tabs', { floor: false, k: 2 })[0].id, 'current', 'and the corrected record still leads that read');
+  // a caller that names k gets at most k; auto-recall (no k) keeps the bounded priority allowance
+  const pinnedPool = Array.from({ length: 40 }, (_, i) => Object.assign({}, required[0], { id: 'p' + i }))
+    .concat(Array.from({ length: 20 }, (_, i) => ({ id: 'o' + i, kind: 'fact', content: 'deploy checklist note ' + i, createdAt: 50 + i })));
+  A.eq(C.rank(pinnedPool, 'deploy', { now: 100, k: 12 }).length, 12, 'an explicit k (the skill reviewer\'s top-12) caps the returned count even with 40 pinned notes');
+  A.eq(C.rank(pinnedPool, '', { now: 100, k: 12 }).length, 12, 'a queryless explicit-k rank is capped too');
+  A.eq(C.rank(pinnedPool, 'deploy', { now: 100 }).length, 40, 'auto-recall (no k) still carries 8 ordinary + 32 bounded priority records');
+  A.eq(C.rank(pinnedPool, 'deploy', { now: 100, k: 5, priorityMax: 32 }).length, 37, 'a caller that opts into the allowance (compaction) keeps it');
+}
+
+// Review memory-learning-04: ordinary top-k ranking is not an omission. A 60-note notebook used to end every run's
+// recall with "[52 matching saved memories omitted … Use notebook.read …]", so models called notebook.read on routine
+// turns. Ranking cuts are disclosed as "ranked lower"; the notebook.read pointer is kept for budget cuts only.
+{
+  const C = require('../sidecar/context.js');
+  const notes = Array.from({ length: 60 }, (_, i) => ({ id: 'n' + i, kind: 'fact', content: 'deploy note ' + i, createdAt: i }));
+  const routine = C.renderRecall(C.rank(notes, 'deploy', { now: 100 }));
+  A.ok(/\[52 more matching saved memories ranked lower\.\]/.test(routine.text), 'a ranking cut is disclosed as ranked lower: ' + routine.text.slice(-120));
+  A.ok(!/notebook\.read/.test(routine.text) && !/omitted/.test(routine.text), 'a ranking cut does not tell the model to call notebook.read');
+  A.eq(routine.omitted, 52, 'out.omitted still counts every record left out of the prompt');
+  A.eq(routine.notShown, 52, 'out.notShown counts the ranking cut on its own');
+  const imageOnly = C.renderRecall(C.rank(notes, '', { now: 100 }));
+  A.ok(/\[52 more saved memories ranked lower\.\]/.test(imageOnly.text), 'a turn with no words does not claim the memories matched: ' + imageOnly.text.slice(-80));
+  const tight = C.renderRecall(C.rank(notes, 'deploy', { now: 100 }), { limit: 40 });
+  A.ok(/omitted to fit the prompt/.test(tight.text) && /notebook\.read/.test(tight.text), 'a budget cut keeps the notebook.read pointer: ' + tight.text.slice(-200));
+  // Review memory-learning-10: standing priority is the owner's. A guest (withheld) run passes standing:false and gets
+  // ordinary relevance-gated recall: a zero-relevance standing note is not force-injected into the guest's prompt.
+  const stand = { id: 'andy', kind: 'profile', scope: 'global', confirmation: 'user-stated', content: 'I prefer to be called Andy.', createdAt: 1 };
+  const own = C.rank([stand], 'what is the weather in Lisbon', { now: 100 });
+  A.eq(own.map(r => r.id), ['andy'], 'an owner run keeps its standing preference with no word overlap');
+  A.eq(own.recallMeta.priority.length, 1, 'and gives it the priority slot');
+  A.eq(C.rank([stand], 'what is the weather in Lisbon', { now: 100, standing: false }).length, 0, 'a withheld run drops a zero-relevance standing preference');
+  const asked = C.rank([stand], 'what should I call Andy', { now: 100, standing: false });
+  A.ok(asked.length === 1 && asked.recallMeta.priority.length === 0, 'a relevant one can still be recalled, as an ordinary note');
+  // the compaction summarizer ranks the same notebook: a withheld run's fold must not carry the owner's standing
+  // notes into the summary the guest's model reads next (memory-learning-10 follow-up)
+  const prefs = [stand, Object.assign({}, stand, { id: 'elm', content: 'For all future tasks, deliver to the Elm Street office.' })];
+  A.ok(/Andy/.test(C.compactionMemoryBlock(prefs, 'what is the weather in Lisbon', { now: 100 })), 'an owner fold keeps its standing preferences');
+  A.eq(C.compactionMemoryBlock(prefs, 'what is the weather in Lisbon', { now: 100, standing: false }), '', 'a withheld fold carries no zero-relevance standing preference');
+  // the host half: rank's standing:false only helps if runOnceCore passes it for withheld runs (seam lock)
+  {
+    const src = readSidecarSource();
+    A.ok(/const standingOn = !\(o\.recovery \|\| tasteWithheld\b/.test(src), 'standing priority is off for withheld runs');
+    A.ok(/const ranked = rank\(recs\.concat\(standingRecs\), q, \{[^}]*\bstanding: standingOn\b/.test(src), 'live recall passes standing');
+    A.ok(/compactionMemoryBlock\(recs, transcript, \{[^}]*\bstanding: !\(tasteWithheld\b/.test(src), 'the fold memory block passes standing');
+  }
+  const summarizer = C.compactionMemoryBlock(notes, 'deploy', { now: 100, limit: 60 });
+  A.ok(summarizer.length > 0 && !/notebook\.read/.test(summarizer) && !/omitted|ranked lower/.test(summarizer), 'the tool-less summarizer gets no notice: ' + summarizer);
+}
+
 A.report('context.test');

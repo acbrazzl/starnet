@@ -10,7 +10,7 @@
    real screen. Solid ink so there's never a flash of the wrong screen (the old #screen-connect .active
    bug); reuses the phosphor vars so it matches whatever theme is about to load. */
 #screen-boot { background: var(--ink); align-items: center; justify-content: center; }
-.boot-veil { text-align: center; opacity: .82; animation: boot-fade 2.4s ease-in-out infinite; }
+.boot-veil { text-align: center; opacity: .82; animation: boot-fade 2.4s steps(9, jump-none) infinite; }
 .boot-mark { color: var(--ph-bright); font-size: 30px; letter-spacing: 8px; text-shadow: 0 0 14px var(--ph-glow), 0 0 3px var(--ph-glow); }
 .boot-line { color: var(--ph-dim); font-size: 14px; letter-spacing: 3px; text-transform: uppercase; margin-top: 12px; }
 .boot-dots::after { content: '…'; animation: cc-blink 1.1s steps(1) infinite; }
@@ -27,6 +27,11 @@
    resolves to 1, i.e. these are the shipped numbers untouched.
    --chat-w (chatresize.js, the draggable COMMS seam) and --crew-w (leftrail.js, the CREW seam) are
    written in VISUAL px for the same reason, so a dragged width means the same thing at every text size. */
+/* Both seam widths are read ONLY by #screen-game's own grid (the element they are written on). A plain
+   custom property INHERITS, so every seam-drag frame re-styled every element of the station — ~1000 COMMS
+   spans, ~16ms a frame, a 20-30fps drag (10-02). Not inheriting, a width write re-styles one element. */
+@property --chat-w { syntax: '*'; inherits: false; }
+@property --crew-w { syntax: '*'; inherits: false; }
 #screen-game.active {
   display: grid;
   grid-template-rows: calc(64px * var(--cz)) 1fr calc(44px * var(--cz));
@@ -191,6 +196,10 @@ textarea {
   background-color: #000; border: 1px solid var(--ph-dim); border-radius: 4px; padding: 8px 11px; outline: none;
 }
 textarea::placeholder { color: var(--ph-dim); opacity: 1; }
+/* the corner grip of a resizable field is OS paint too (grey hatching on the APPS / WORKFLOWS fields): two phosphor ticks */
+textarea::-webkit-resizer {
+  background: linear-gradient(135deg, transparent 0 50%, var(--ph-dim) 50% 58%, transparent 58% 70%, var(--ph-dim) 70% 78%, transparent 78%);
+}
 /* buttons: neutralize the OS paint and NOTHING else. No box metrics, no radius, no shadow —
    measured the hard way: a draft of this block that also set border-radius/box-shadow leaked
    onto id-styled, class-less buttons (#ws-new, #estop-btn) that declare no radius of their
@@ -237,6 +246,20 @@ input[type=file]::file-selector-button:hover { border-color: var(--ph); backgrou
   top: 100%; border: 6px solid transparent; border-top-color: var(--ph);
 }
 .station-tip.below::after { top: auto; bottom: 100%; border-top-color: transparent; border-bottom-color: var(--ph); }
+/* THE BUILD LIBRARY'S TIP (2026-09-30): over the library's glass tiles the card is that glass — one hairline edge, the dark sheet,
+   8px, no glow — and it keeps its line breaks, so a tile's tip reads as its name, then what it does */
+.station-tip.glass-tip {
+  max-width: 300px; padding: 9px 12px; white-space: pre-line; color: var(--text);
+  background: linear-gradient(165deg, rgba(var(--ph-rgb),.09), transparent 55%), var(--panel2);
+  border: 1px solid rgba(var(--ph-rgb),.35); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.45);
+}
+.station-tip.glass-tip::first-line { color: var(--ph-bright); }
+/* A PATH TIP (org pass 10-14, P24): a saved file's key names its full path — wide enough that a real path reads in two or three
+   lines, its own line breaks kept (what the key does / where it is / the path), and the path breaks after a folder separator */
+.station-tip.path-tip { max-width: min(520px, 92vw); white-space: pre-line; }
+.station-tip.path-tip::first-line { color: var(--ph-bright); }
+.station-tip.glass-tip::after { border-top-color: rgba(var(--ph-rgb),.35); }
+.station-tip.glass-tip.below::after { border-top-color: transparent; border-bottom-color: rgba(var(--ph-rgb),.35); }
 @media (prefers-reduced-motion: reduce) {
   .station-tip { transition: none; transform: none; }
   .station-tip.show { transform: none; }
@@ -273,7 +296,7 @@ input[type=file]::file-selector-button:hover { border-color: var(--ph); backgrou
     repeating-linear-gradient(90deg, rgba(var(--ph-rgb),.30) 0 1px, transparent 1px 64px),
     repeating-linear-gradient(0deg, rgba(var(--ph-rgb),.30) 0 1px, transparent 1px 56px);
   box-shadow: inset 0 0 120px rgba(0,0,0,.75);
-  animation: sp-scroll 9s linear infinite;
+  animation: sp-scroll 9s steps(56, jump-end) infinite;
 }
 @keyframes sp-scroll { from { background-position: 0 0, 0 0; } to { background-position: 0 0, 0 56px; } }
 @media (prefers-reduced-motion: reduce) { .sp-grid { animation: none; } }
@@ -286,7 +309,7 @@ input[type=file]::file-selector-button:hover { border-color: var(--ph); backgrou
 .sp-logo {
   width: min(58vw, 640px); height: auto; image-rendering: auto; user-select: none;
   filter: drop-shadow(0 0 18px var(--ph-glow)) drop-shadow(0 0 60px var(--ph-glow2));
-  animation: sp-breathe 4.2s ease-in-out infinite;
+  animation: sp-breathe 4.2s steps(9, jump-none) infinite;
 }
 @keyframes sp-breathe {
   0%, 100% { filter: drop-shadow(0 0 18px var(--ph-glow)) drop-shadow(0 0 60px var(--ph-glow2)); }
@@ -616,7 +639,13 @@ body.no-curve #stage-wrap::before { background: none; box-shadow: none; }
    drag-select never smears button captions / speaker chips / timestamps into the copied prose. */
 #chat-log { user-select: text; }
 #chat-log .cmsg .body { cursor: text; }
-#chat-log button, #chat-log .who, #chat-log .cmsg-ts { user-select: none; }
+:is(#chat-log, #gc-log) :is(button, .who, .cmsg-ts, .tb-when) { user-select: none; }
+/* SELECTABLE WINDOWS (#87) — what a station window SAYS is text you can select and copy: a workflow's result,
+   a deliverable's WHAT CAME BACK, a dossier's notes. Same split as the transcript: the words select, the
+   controls never do, so a drag across a card copies prose and not button captions. Draggable cards and
+   role=button rows stay unselectable so a drag still moves them. */
+.term-body { user-select: text; }
+.term-body :is(button, summary, label, select, [role="button"], [draggable="true"], .bb) { user-select: none; }
 
 /* COPY — a hover-revealed ⧉ button at the top-right of an agent MESSAGE row (CSS keeps it off the work-log
    beats, which aren't prose). Flashes to ✓ on a successful copy. Touch/keyboard-focus reveal it too. */
@@ -767,6 +796,8 @@ body.no-curve #stage-wrap::before { background: none; box-shadow: none; }
 .consent-btn.consent-confirm:disabled { color: var(--ph-dim); border-color: rgba(var(--ph-rgb), .28);
   background: none; cursor: default; box-shadow: none; text-shadow: none; }
 .consent-result { font-size: 13px; letter-spacing: 0.5px; color: var(--ph); }
+/* org P02: a repeat ask's one line (what Always does) — a full-width quiet line under the keys; no card says it auto-denies */
+.consent-hint { flex-basis: 100%; width: 100%; color: var(--ph-dim); font-size: 11px; letter-spacing: .3px; margin-top: 2px; }
 .consent-result.err { color: var(--bad); }
 
 /* Cortex turn-in beat: reflection proposed durable memories — Keep / Edit / Discard (the formation loop) */
@@ -796,6 +827,9 @@ body.no-curve #stage-wrap::before { background: none; box-shadow: none; }
    .turnin-rate / consent-btns flex hosts. */
 .work-rate-hint { flex-basis: 100%; width: 100%; color: var(--ph); font-size: 11px; letter-spacing: .3px; opacity: .8; margin-bottom: 2px; }
 .turnin-rate .consent-btns, .cmsg.work-rate .consent-btns { margin-top: 0; }
+/* the "missed" thumb is the SAME up-pointing pixel SVG, flipped: the flip lived only in the glass skin (pipglass.css, non-HUD),
+   so HUD mode and ?glass=0 showed two identical up-thumbs and a tap on the "up" one on the right filed a miss (sweep 10-02) */
+.thumb-down .thumb-px { transform: rotate(180deg); }
 /* FLAT item row — the card is the only box. A second bordered box inside the gold inset read as
    stacked popups; the item is now a quiet row: soft kind pill + text, evidence + buttons below. */
 .turnin-item {
@@ -830,6 +864,8 @@ body.no-curve #stage-wrap::before { background: none; box-shadow: none; }
 .turnin-item > .turnin-queue { grid-column: 1 / -1; justify-self: start; min-width: 0; overflow-wrap: anywhere; }
 .turnin-item > .consent-result { grid-column: 1 / -1; min-width: 0; overflow-wrap: anywhere; }
 .turnin-item > .turnin-rate { grid-column: 1 / -1; min-width: 0; }
+/* the away digest's 'they wait in TO REVIEW' aside (org pass 10-14, P12 polish): a dim line of its own under the keys, never a chip */
+.turnin-rate > .turnin-keep { flex-basis: 100%; }
 .turnin-edit {
   grid-column: 1 / -1; width: 100%; box-sizing: border-box; min-width: 0;
   font: inherit; font-size: 14px; color: var(--ph-bright);
@@ -1139,6 +1175,9 @@ body.no-curve #stage-wrap::before { background: none; box-shadow: none; }
 .cd-meta { margin-top: 6px; font-size: 11px; color: var(--ph-dim); letter-spacing: 0.3px; }
 .cd-observed-tag { display: inline-block; margin-right: 6px; padding: 0 5px; font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink); background: var(--ph-dim); border-radius: 2px; vertical-align: 1px; }
 .cd-acts { margin-top: 8px; }
+/* the editor's per-detail count (releases#8): the briefing meter's own face, centred beside Save/Cancel, warn at the cap */
+.cd-acts > .cd-count { align-self: center; }
+.cd-count.warn { color: var(--warn); }
 /* guided starter chips (empty dims + the add editor): tap → the editor opens with the sentence started */
 .cd-starters { display: flex; flex-wrap: wrap; gap: 5px; margin: 2px 0 7px; }
 .cd-starter { font: inherit; font-size: 11px; letter-spacing: 0.4px; cursor: pointer; color: var(--ph-dim); background: transparent; border: 1px dashed var(--ph-faint); border-radius: 3px; padding: 2px 8px; }
@@ -1228,6 +1267,8 @@ body.no-curve #stage-wrap::before { background: none; box-shadow: none; }
 /* the typed-answer escape hatch: quieter than the suggestion (it is an affordance note, not content), but
    present — the chip row alone reads as "pick exactly one" when free text has always been accepted. */
 .tq-hint { font-size: 12px; color: var(--ph-dim); letter-spacing: 0.3px; margin-top: 4px; opacity: .75; }
+/* the connect door a task question carries when its run needed an unconnected service (one card, one slot) */
+.tq-door { display: block; margin-top: 8px; }
 
 /* TASTE EXTRACTION "my read" card (chat.js briefReadCard) — the mid-run announce-and-act read.
    REGISTER (2026-07-24): this is a CARD, not a work-log micro-line. It states what the run believes it was
@@ -1314,6 +1355,10 @@ body.no-curve #stage-wrap::before { background: none; box-shadow: none; }
 }
 .fnv-dialogue.show { opacity: 1; }
 .fnv-dialogue.no-anim { transition: none; }
+/* a MID-GAME OFFER (dialogue.js armOffer) ends above the message box: its bottom is set to the composer stack's top edge, and
+   the box rides above it, so the / menu and the model dock that open upward from the box are never under the panel */
+.fnv-dialogue.fnv-offer { border-bottom: 1px solid var(--ph-dim); }
+#chat-panel.fnv-offer-host #chat-inputrow { z-index: 31; }
 /* A body-level fixed panel, so its viewport caps carry the --sn-unzoom reciprocal (see style.css
    `.term`): a bare 70vh renders as 101vh at HUGE, and this panel is anchored to the BOTTOM, so the
    overflow leaves by the top — it would grow past the frame exactly where the speaker line is.
@@ -1383,7 +1428,7 @@ body.no-curve #stage-wrap::before { background: none; box-shadow: none; }
 /* SLASH COMMANDS — a filterable palette floating directly above the input. Phosphor list, selected row lit. */
 .chat-slash {
   position: absolute; left: 6px; right: 6px; bottom: calc(100% + 4px); z-index: 30;
-  max-height: 244px; overflow-y: auto;
+  max-height: min(244px, var(--comms-fit, 244px)); overflow-y: auto;
   background: var(--panel); border: 1px solid var(--ph); border-radius: 6px;
   box-shadow: 0 -6px 20px rgba(0,0,0,.6), 0 0 0 2px rgba(0,0,0,.5);
 }
@@ -1410,6 +1455,9 @@ body.no-curve #stage-wrap::before { background: none; box-shadow: none; }
 .queued-pill .queued-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 210px; opacity: .9; }
 /* .queued-x composes .x-btn (danger hover) — ghost delta only */
 .queued-x { border: none; background: transparent; color: var(--ph-dim); font-size: 12px; padding: 0 2px; border-radius: 3px; }
+/* SEND NOW — steers the live run with this queued line (chat.js sendQueuedNow) */
+.queued-now { flex: 0 0 auto; font-family: inherit; font-size: 12px; line-height: 1; cursor: pointer; color: var(--ph); background: transparent; border: 1px solid var(--ph-dim); border-radius: 3px; padding: 2px 6px; text-shadow: none; }
+.queued-now:hover, .queued-now:focus-visible { color: var(--ph-bright); border-color: var(--ph); }
 
 /* INTERRUPT — the HALT KEY. The one danger control in the composer row, shown only while the displayed
    stream is running (chat.js toggles [hidden] via updateControls), so it has to read as ARMED without
@@ -1529,8 +1577,9 @@ body.no-curve #stage-wrap::before { background: none; box-shadow: none; }
 .mdt-hint { color: var(--ph-dim); font-size: 10px; letter-spacing: 0.5px; margin-top: 6px; opacity: 0.85; }
 .model-dock {
   position: absolute; right: 8px; bottom: calc(100% + 8px); z-index: 80;
-  width: min(322px, calc(100vw - 34px)); max-height: min(70vh, 414px);
+  width: min(322px, calc(100vw - 34px)); max-height: min(70vh, 414px, var(--comms-fit, 100vh));
   display: flex; flex-direction: column; gap: 7px; padding: 9px;
+  overflow-y: auto; overscroll-behavior: contain;   /* --comms-fit: the room under the agent header (glass-comms.js) */
   color: var(--ph); background: var(--panel);
   border: 2px solid var(--ph); border-radius: 4px;
   box-shadow: 0 0 0 2px var(--ink), 0 0 22px var(--ph-glow2);
@@ -1542,6 +1591,11 @@ body.no-curve #stage-wrap::before { background: none; box-shadow: none; }
 }
 .model-dock-provider {
   color: var(--gold); font-size: 11px; white-space: nowrap;
+}
+/* which model this picker changes (the focused agent's own) — one dim line under the head */
+.model-dock-scope {
+  grid-column: 1 / -1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--ph-dim); font-size: 11px; letter-spacing: .6px;
 }
 .model-dock-current-model {
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -1609,6 +1663,16 @@ body.no-curve #stage-wrap::before { background: none; box-shadow: none; }
 }
 .model-dock-row-effort {
   min-width: 38px; text-align: right; font-size: 10px;}
+/* Tier badges (the cloud's editorial tier list): a matte tag between the name and the effort. */
+.model-dock-row:has(.model-dock-row-tiers) { grid-template-columns: minmax(0, 1fr) auto auto; }
+.model-dock-row-tiers { display: inline-flex; align-items: center; gap: 4px; }
+.model-dock-row-tier {
+  display: inline-flex; align-items: center; height: 18px; padding: 0 5px; white-space: nowrap;
+  font-size: var(--sn-type-meta, 14px); line-height: 1; letter-spacing: .3px;
+  color: var(--ph); background: rgba(0,0,0,.22); border: 1px solid rgba(var(--ph-rgb),.24); border-radius: 3px;
+}
+.model-dock-row-tier[data-tier="S"] { color: var(--ph-bright); border-color: rgba(var(--ph-rgb),.5); }
+.model-dock-row.sel .model-dock-row-tier { color: var(--ink); background: transparent; border-color: currentColor; }
 .model-dock-empty {   /* dim grade + size via the grouped empty rule (motion.css) */
   padding: 18px 6px; text-align: center;
 }
@@ -1631,7 +1695,9 @@ body.no-curve #stage-wrap::before { background: none; box-shadow: none; }
   .model-dock-model-name { max-width: 74px; font-size: 12px; letter-spacing: 0.3px; }
   .model-dock-effort-chip { display: none; }
   .model-dock-tip { max-width: min(74vw, 244px); }
-  .model-dock { position: fixed; left: 8px; right: 8px; bottom: 120px; width: auto; max-height: min(62vh, 410px); }
+  /* full composer width, rising from the composer's top edge. Never `fixed`: the blurred #chat-panel is a fixed
+     box's containing block, so a fixed bottom offset was measured from the PANEL's floor and sank into the composer. */
+  .model-dock { position: absolute; left: 8px; right: 8px; bottom: calc(100% + 8px); width: auto; max-height: min(62vh, 410px, var(--comms-fit, 100vh)); }
   .model-dock-list { max-height: 220px; }
 }
 
@@ -1639,7 +1705,7 @@ body.no-curve #stage-wrap::before { background: none; box-shadow: none; }
 /* mic HOT = the held selection block in red: solid inverted --bad with a breathing bloom */
 .mic-btn.rec {
   color: var(--ink); background: var(--bad);
-  animation: mic-pulse 1s infinite;
+  animation: mic-pulse 1s steps(8, jump-none) infinite;
 }
 .mic-btn.rec svg { filter: none; }
 @keyframes mic-pulse { 0%,100% { box-shadow: 0 0 4px var(--bad); } 50% { box-shadow: 0 0 16px var(--bad); } }
@@ -1655,7 +1721,7 @@ body.no-curve #stage-wrap::before { background: none; box-shadow: none; }
 }
 .voice-toggle.off:hover svg { filter: none; }
 /* agent-voice speaking: amber glow pulse on the chip */
-.voice-toggle.speaking { animation: chip-spk .8s infinite; }
+.voice-toggle.speaking { animation: chip-spk .8s steps(6, jump-none) infinite; }
 .voice-live[aria-pressed="true"] { color: var(--ink); background: var(--ph); box-shadow: 0 0 16px var(--ph-glow); }
 .voice-live[aria-pressed="true"] svg { filter: none; }
 
@@ -1745,7 +1811,7 @@ body.no-curve #stage-wrap::before { background: none; box-shadow: none; }
 .lv-pip {
   flex: 0 0 auto; width: 5px; height: 5px;
   background: var(--lv-accent); box-shadow: 0 0 6px var(--lv-accent);
-  animation: lv-pip 1.3s infinite;
+  animation: lv-pip 1.3s steps(8, jump-none) infinite;
 }
 @keyframes lv-pip { 0%, 100% { opacity: 1; } 50% { opacity: .28; } }
 /* the state WORD is gone from the resting module (Andrew, 2026-07-29). It was the widest thing in
@@ -1835,7 +1901,7 @@ body.no-curve #stage-wrap::before { background: none; box-shadow: none; }
   content: ''; position: absolute; inset: 0; width: 45%;
   pointer-events: none;
   background: linear-gradient(90deg, transparent, var(--ph-glow2), transparent);
-  animation: lv-sweep 1.6s var(--ease-soft) infinite;
+  animation: lv-sweep 1.6s steps(16, jump-none) infinite;
 }
 @keyframes lv-sweep {
   from { transform: translateX(-100%); }
@@ -2307,6 +2373,14 @@ body.crew-rail-off .crew-resizer { display: none; }
 /* while dragging: column-resize cursor everywhere + no text selection + canvas ignores the pointer */
 body.col-resizing { cursor: col-resize; user-select: none; }
 body.col-resizing #stage { pointer-events: none; }
+/* while dragging: COMMS rows scrolled out of view skip re-wrapping at every new width. A full COMMS
+   (the 400-row DOM cap) re-wrapped every row each frame — ~8ms of layout, a 30fps drag; this held 60
+   (10-02). Rows ON screen lay out as always, and every row lays out once at the final width on release.
+   `auto` keeps each row's real last height, so the scrollbar doesn't jump. Only DURING the drag — the
+   containment would clip a hover tip or glow reaching outside a row, and nothing hovers mid-drag; the
+   two one-line glow rows are left out for the same reason. chatresize.js keeps a pinned COMMS pinned. */
+#chat-log > .cmsg { contain-intrinsic-size: auto 90px; }
+body.col-resizing #chat-log > .cmsg:not(.broadcast):not(.trim-marker) { content-visibility: auto; }
 
 /* ---------- CREW / SESSIONS divider: drag the rail's own horizontal split (leftrail.js) ----------
    Same law as the column seams: THE HIT ZONE MUST SIT ON THE SEAM THE EYE SEES. Here the seam the
@@ -2340,8 +2414,14 @@ body.row-resizing { cursor: row-resize; user-select: none; }
 #crew.shut { padding: 0; }
 
 /* the v7 screen-flicker animation targets #app (which this app doesn't
-   have) — re-point it at the live station so the SETTINGS toggle works */
-body:not(.no-flicker) #screen-game.active { animation: flick 7s infinite; }
+   have) — re-point it at the live station so the SETTINGS toggle works.
+   #69: the dip is the LAST 4% of the old 7s cycle (flick-dip = 96%..100% of it, same opacities), played
+   once every 7s by StationUI's flicker clock. An infinite opacity animation on the whole screen made
+   the compositor re-draw the full window every vsync for the 96% of the cycle where nothing changes —
+   measured ~0.75 GPU-process cores with the world stopped. isolation keeps the stacking context the
+   running animation always created, so nothing above/below the station re-layers between dips. */
+body:not(.no-flicker) #screen-game.active { isolation: isolate; }
+body:not(.no-flicker) #screen-game.active.flick-dip { animation: flick-dip 280ms 1; }
 
 /* top bar: reuse the v7 logo (#logo, .logo-*) and .tb-stat; subtitle fit */
 #topbar .logo-sub { white-space: nowrap; }
@@ -2397,7 +2477,7 @@ body:not(.no-flicker) #screen-game.active { animation: flick 7s infinite; }
   color: var(--link-down); border-color: rgba(255,80,60,0.6);
   text-shadow: 0 0 6px rgba(255,80,60,0.9);
   box-shadow: 0 0 12px rgba(255,80,60,0.35), inset 0 0 10px rgba(0,0,0,0.6);
-  animation: pill-down-breathe 2.2s ease-in-out infinite;
+  animation: pill-down-breathe 2.2s steps(9, jump-none) infinite;
 }
 @keyframes pill-down-breathe { 0%,100% { opacity: 0.62; } 50% { opacity: 1; } }
 /* STANDBY: the bridge isn't proven up yet — a dim, neutral pill (never the confident ONLINE green). */
@@ -2440,7 +2520,7 @@ body:not(.no-flicker) #screen-game.active { animation: flick 7s infinite; }
   min-width: 16px; padding: 0 4px; border-radius: 8px; flex: 0 0 auto;
   font-size: 11px; line-height: 15px; letter-spacing: 0; text-align: center;
   color: var(--ink); background: var(--warn); text-shadow: none;
-  box-shadow: 0 0 8px var(--warn); animation: bb-alert 1.4s ease-in-out infinite;
+  box-shadow: 0 0 8px var(--warn); animation: bb-alert 1.4s steps(8, jump-none) infinite;
 }
 .bb-group.open .bb-grp-badge { animation: none; box-shadow: none; }
 @keyframes bb-alert { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
@@ -2455,6 +2535,15 @@ body:not(.no-flicker) #screen-game.active { animation: flick 7s infinite; }
   box-shadow: 0 0 0 3px rgba(0,0,0,.9), 0 -6px 26px rgba(0,0,0,.75), 0 0 20px var(--ph-glow2);
 }
 .bb-group.open .bb-menu { display: flex; }
+/* AN OPEN DOCK MENU IS ABOVE EVERY WINDOW (live walk 10-14, blocker). The menu's own z-index cannot leave #bottombar:
+   the glass deck is a stacking context (backdrop-filter) that ranks as z 0 inside #screen-game, UNDER #terms (z 50, where
+   every window stacks from U.zTop() 500 up). So CREW / WORK / BUILD / SYSTEM opened behind any open window, and BUILD MODE
+   and SETTINGS could not be reached until it closed. While a menu is open the deck itself rises over the window layer
+   (51 > 50); the windows keep their own order and still rise from the dock, and a click on a window closes the menu
+   (navdock) and drops the deck back. The drop waits out the menu's close fade (--t-fast), so a closing menu never
+   flashes behind a window. Locked by test/dock-focus-seams.test.js. */
+#screen-game #bottombar { z-index: 0; transition: z-index 0s linear var(--t-fast, 120ms); }
+#screen-game #bottombar:has(.bb-group.open) { z-index: 51; transition-delay: 0s; }
 .bb-menu .bb {
   display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
   border: 1px solid transparent; padding: 6px 10px; font-size: 15px; letter-spacing: 1.5px;
@@ -2470,6 +2559,18 @@ body:not(.no-flicker) #screen-game.active { animation: flick 7s infinite; }
 .bb-menu .bb:hover .bb-tx small, .bb-menu .bb:focus-visible .bb-tx small { color: var(--ph); }
 .bb-menu .bb:hover::before, .bb-menu .bb:hover::after { content: none; }  /* no pip-boy [..] brackets inside the menu */
 .bb-menu .bb.active { background: var(--ph-faint); color: var(--ph-bright); box-shadow: inset 0 0 0 2px var(--ph); }
+/* STATION SYSTEMS ONLINE (systems.js): on a fresh station a system's dock button is not shown until it comes
+   online — nothing is locked, every window still opens from every other door (slash, deep links, quests, the agent,
+   QUESTS › Progress). A system that just came online wears NEW until opened; its dock trigger carries a lit dot. */
+.bb-menu .bb[data-offline], .bb-menu .bb[hidden] { display: none; }
+.bb-menu .bb[data-fresh] .bb-tx b::after {
+  content: 'NEW'; margin-left: 8px; padding: 0 5px; font-size: 11px; letter-spacing: 1px;
+  color: var(--ink); background: var(--gold); border-radius: 3px; text-shadow: none;
+}
+.bb-group.has-fresh .bb-grp::after {
+  content: ''; display: inline-block; width: 6px; height: 6px; margin-left: 6px; border-radius: 50%;
+  background: var(--gold); box-shadow: 0 0 6px rgba(var(--gold-rgb), .8); vertical-align: middle;
+}
 
 /* MOBILE CONTROL REACHABILITY: navdock.js supplies the final zoom-aware horizontal
    clamp because each trigger has a different wrapped-row origin. CSS owns the maximum
@@ -2494,6 +2595,9 @@ body:not(.no-flicker) #screen-game.active { animation: flick 7s infinite; }
   animation: coach-in .35s ease-out;
 }
 .nav-coach[hidden] { display: none; }
+/* a window on screen means a dock was found: the hint steps back instead of lying over the window's corner (the sweep
+   10-25), and comes back with the empty station if it was never retired */
+body:has(#terms > .term:not(.term-min-hidden)) #nav-coach { visibility: hidden; }
 .nav-coach b { color: var(--ph-bright); font-weight: normal; }
 .nav-coach-x {
   flex: 0 0 auto; font-family: inherit; font-size: 12px; letter-spacing: 1px; cursor: pointer;
@@ -2560,7 +2664,7 @@ body:not(.no-flicker) #screen-game.active { animation: flick 7s infinite; }
 .kb-state.running { color: var(--ph-bright); }
 .kb-state.done { color: var(--gold); }
 .kb-state.failed { color: var(--bad); }
-.kb-live { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; background: var(--ph-bright); animation: wsPulse 1.15s ease-in-out infinite; }
+.kb-live { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; background: var(--ph-bright); animation: wsPulse 1.15s steps(8, jump-none) infinite; }
 
 /* SKILLS — honest capability readout (reuses v7 .perk-grid/.perk) */
 .term.skills-term { max-height: var(--term-band, calc(100vh * var(--sn-unzoom, 1) - 96px)); }
@@ -2836,6 +2940,7 @@ body:not(.no-flicker) #screen-game.active { animation: flick 7s infinite; }
   text-shadow: 0 0 5px var(--ph-glow2);
   box-shadow: inset 0 2px 6px rgba(0,0,0,.7);
   transition: border-color .12s, box-shadow .12s;
+  text-overflow: ellipsis;   /* a narrow rail ends the placeholder on an ellipsis, never a glyph cut in half */
 }
 /* id selector outranks the global input:focus rule, so restate the full focus shadow here */
 #ws-search:focus { border-color: var(--ph); box-shadow: inset 0 2px 6px rgba(0,0,0,.7), 0 0 10px var(--ph-glow2); }
@@ -2854,6 +2959,9 @@ body:not(.no-flicker) #screen-game.active { animation: flick 7s infinite; }
 .diag-pre { font-family: inherit; font-size: 11px; line-height: 1.4; color: var(--ph); margin: 0;
   padding: 8px 10px; border: 1px solid var(--ph-dim); border-radius: 2px; background: rgba(0,0,0,.25); }
 .diag-block-bar { display: flex; gap: 8px; margin-top: 6px; }
+/* COMMS failed-turn fallback: the block lands inside a flex .choice-row — take a full line under the pill. */
+.choice-row > .diag-block { flex: 1 0 100%; min-width: 0; margin-top: 2px; }
+.choice-row > .diag-block .diag-pre { overflow-wrap: anywhere; }
 /* fills whatever #ws-wrap was given rather than a fixed 40vh slice — the old cap made the list scroll
    while empty rail sat above it. min-height:0 so the flex child may actually shrink and scroll. */
 #workstreams {
@@ -2884,7 +2992,7 @@ body:not(.no-flicker) #screen-game.active { animation: flick 7s infinite; }
 .ws-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; background: var(--ph-dim); }
 .ws-dot.seen { background: var(--ph-dim); box-shadow: none; }
 .ws-dot.unseen { background: var(--gold); box-shadow: 0 0 7px rgba(var(--gold-rgb), .6); }
-.ws-dot.working { background: var(--ph-bright); animation: wsPulse 1.15s ease-in-out infinite; }
+.ws-dot.working { background: var(--ph-bright); animation: wsPulse 1.15s steps(8, jump-none) infinite; }
 /* NEEDS YOU gets its own RHYTHM, not just its own colour — faster, and dipping harder. The six
    preset themes separate --gold from --ph-bright by ΔE 38-57, so colour alone would do there; the
    CUSTOM theme does not. Its --gold is the base hue rotated +42°, and hue is meaningless at low
@@ -2893,7 +3001,7 @@ body:not(.no-flicker) #screen-game.active { animation: flick 7s infinite; }
    telling "the agent is working" from "it is blocked on you" would be a small lightness step.
    Rhythm survives every palette, and this is the one state on a fail-closed deny timer — so the
    more urgent beat is honest rather than decorative. */
-.ws-dot.needsyou { background: var(--gold); animation: wsPulseUrgent .72s ease-in-out infinite; }
+.ws-dot.needsyou { background: var(--gold); animation: wsPulseUrgent .72s steps(6, jump-none) infinite; }
 .ws-dot.connecting { background: transparent; border: 1px dashed var(--ph-dim); animation: none; }
 .ws-dot.failed { background: var(--bad); animation: none; box-shadow: none; }
 @keyframes wsPulseUrgent {
@@ -2924,7 +3032,8 @@ body:not(.no-flicker) #screen-game.active { animation: flick 7s infinite; }
 
 /* ---------- SESSION ROWS = INBOX (StationUI setting `sessionRow`, body.rows-inbox) ----------
    The SAME .ws-row markup, re-laid as a three-line card. The two extra spans (.ws-agent, .ws-receipt)
-   are ALWAYS in the DOM and simply display:none in COMPACT, so switching the setting is a repaint —
+   are ALWAYS in the DOM; direct-agent lines and receipts stay hidden in COMPACT, while group identity
+   has its own compact line below. Switching the setting is a repaint —
    renderRail is never re-run, and rail focus, scroll position and an in-place rename all survive it.
 
    Agent above the wrapping session title, then a quiet latest-message excerpt.
@@ -3136,6 +3245,48 @@ body.rows-inbox #workstreams .ws-kebab { grid-area: meta; }
 .ws-arch-row.on { color: var(--ph); }
 /* pinned rows sort to the top AND carry a small gold star so the "kept" state is legible at a glance */
 .ws-pin { flex: 0 0 auto; font-size: 10px; line-height: 1; color: var(--gold); text-shadow: 0 0 6px rgba(var(--gold-rgb),.5); }
+/* a GROUP row is told by its agent line alone: "ULTRON, CYPHER +3" (Andrew 10-13: no GROUP label at all). The names
+   ellipsize; the +N never does. Same font and colour as the line it sits in. */
+body.rows-inbox #workstreams .ws-agent.ws-agent-group { display: flex; align-items: baseline; min-width: 0; gap: .4em; }
+/* …and the names own that top line in INBOX too (rc walk 10-14: beside a "Connecting" status the names measured 0px wide,
+   and "NOVA, COPY" was cut even beside "4m"; walk 10-14 #6: they got 48-82 of the 123 px "ULTRON, CYPHER" needs). The pin and
+   time/status end the title line, as in COMPACT below. Where the names line never wraps, fitRailAgentLine (app.js) reads
+   "ULTRON +4" when two names still cannot fit; the glass INBOX headline wraps at a space instead (pipglass.css). */
+body.rows-inbox #workstreams .ws-row:has(> .ws-agent-group) {
+  grid-template-areas: "dot agent agent agent" "title title pin meta" "recpt recpt recpt recpt";
+}
+.ws-agent-names { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws-agent-more { flex: 0 0 auto; white-space: nowrap; }
+/* Group identity stays visible outside INBOX too. Give it a line of its own so a custom title does not
+   compete with two names and +N in the narrow rail. Match the existing markup rather than adding a row
+   class that the live ticker would have to maintain; single-agent and PROJECTS rows keep their layouts.
+   The names own that whole line (rc walk 10-14: a busy row read "NOVA, … +1  Working" — the status took the width two
+   short names needed; walk 10-14 #6: the time and an empty pin column left them 66 of the 74 px "ULTRON, CYPHER" needs
+   at 1440). TITLE FIRST (Andrew 10-27: a gold names line over an unaligned title "looks hideous"): the row opens on its
+   title like every other row — lamp, title, pin, time — and the names sit on the line under it, still a line of their
+   own, so no cell is shared across the two lines and a long status can never widen a track the names need. */
+body:not(.rows-inbox) #workstreams .ws-row:has(> .ws-agent-group) {
+  display: grid; grid-template-columns: 7px minmax(0, 1fr) auto auto;
+  grid-template-areas: "dot title pin meta" ". agent agent agent";
+  gap: 4px 7px;
+}
+body:not(.rows-inbox) #workstreams .ws-row:has(> .ws-agent-group) > .ws-dot { grid-area: dot; }
+body:not(.rows-inbox) #workstreams .ws-row:has(> .ws-agent-group) > :is(.ws-title, .ws-rename) { grid-area: title; }
+body:not(.rows-inbox) #workstreams .ws-row:has(> .ws-agent-group) > .ws-pin { grid-area: pin; }
+body:not(.rows-inbox) #workstreams .ws-row:has(> .ws-agent-group) > :is(.ws-meta, .ws-kebab) { grid-area: meta; }
+body:not(.rows-inbox) #workstreams .ws-agent.ws-agent-group {
+  display: flex; grid-area: agent; align-items: baseline; min-width: 0; gap: .4em;
+  font-size: 14px; line-height: 1.2; letter-spacing: .5px; color: var(--ph-dim);
+  white-space: nowrap; overflow: hidden;
+}
+/* Attention is a pending request, not another row setting. Its action retains a separate line and menu
+   cell; hover/focus must never replace the visible request with the kebab. The names keep a whole line, under the title. */
+body:not(.rows-inbox) #workstreams .ws-row.attn:has(> .ws-agent-group) {
+  grid-template-areas: "dot title title pin" ". agent agent agent" ". meta meta menu";
+}
+body:not(.rows-inbox) #workstreams .ws-row.attn:has(> .ws-agent-group) > .ws-kebab { grid-area: menu; }
+/* the hover/focus swap below hides every other row's meta for its kebab; this row's kebab has its own cell */
+body:not(.rows-inbox) #workstreams .ws-row.attn:not(.renaming):has(> .ws-agent-group):is(:hover, :focus-within) > .ws-meta:not(:empty) { display: block; }
 /* the ⋯ button is the discoverable twin of right-click: hidden until the row is hovered, where it takes the meta slot */
 .ws-kebab {
   display: none; flex: 0 0 auto; font-family: inherit; font-size: 15px; line-height: 1; letter-spacing: 1px;
@@ -3188,8 +3339,18 @@ body.rows-inbox #workstreams .ws-kebab { grid-area: meta; }
 .ws-menu-item.danger.armed .ws-menu-glyph { color: var(--ink); }
 .ws-menu-sep { height: 1px; margin: 3px 6px; background: var(--ph-dim); opacity: .5; }
 
-#chat-panel h3 .h3-right { display: inline-flex; align-items: baseline; gap: 8px; min-width: 0; flex: 0 1 auto; overflow: hidden; }
+#chat-panel h3 .h3-right { display: inline-flex; align-items: baseline; gap: 8px; min-width: 0; flex: 0 0 auto; max-width: 70%; overflow: hidden; }
+/* ORG P26: 'COMMS · <session>' — one line, ellipsized; a fault in #chat-status keeps its width first (.h3-right never shrinks) */
+#chat-panel h3 #comms-title { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#chat-panel h3 #comms-title .comms-session { letter-spacing: .5px; text-transform: none; opacity: .78; }
 #chat-panel h3 #chat-status { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+/* Idle "online" is noise in the COMMS header (Andrew 09-28): only run-state and link faults show. */
+#chat-panel h3 #chat-status.status-idle { display: none; }
+/* In-flight run state lives ONLY in the transcript's presence card (WORKING + tool + time). The header
+   copy (spinner + "working…"/"thinking…" + elapsed) was a duplicate — Andrew 10-03, asked 5×: never in the
+   header. Faults (stopping / station unreachable) still show here. */
+#chat-panel h3 #chat-status:is(.status-thinking, .status-working, .status-connecting, .status-approval),
+#chat-panel h3 #chat-elapsed { display: none !important; }
 #chat-status.status-thinking { color: var(--ph-bright); text-shadow: 0 0 7px var(--ph-glow2); }
 /* pre-confirmation: the sidecar hasn't acknowledged the run yet — dimmer than thinking (an honest "in transit") */
 #chat-status.status-connecting { color: var(--ph); opacity: .8; }
@@ -3214,7 +3375,7 @@ body.rows-inbox #workstreams .ws-kebab { grid-area: meta; }
 .chat-elapsed > .ce-num { min-width: 30px; text-align: right; }
 .chat-elapsed::before {
   content: ''; width: 5px; height: 5px; border-radius: 50%; background: var(--ink);
-  animation: chat-elapsed-pulse 1.1s ease-in-out infinite;
+  animation: chat-elapsed-pulse 1.1s steps(8, jump-none) infinite;
 }
 @keyframes chat-elapsed-pulse { 0%, 100% { opacity: .3; transform: scale(.82); } 50% { opacity: 1; transform: scale(1); } }
 @media (prefers-reduced-motion: reduce) { .chat-elapsed::before { animation: none; opacity: .8; } }
@@ -3246,7 +3407,7 @@ body.rows-inbox #workstreams .ws-kebab { grid-area: meta; }
 .ag-psweep {
   position: absolute; left: 0; right: 0; height: 20px; z-index: 2; pointer-events: none;
   background: linear-gradient(180deg, transparent, rgba(255, 205, 130, 0.16), transparent);
-  animation: ag-psweep 2.8s linear infinite;
+  animation: ag-psweep 2.8s steps(23, jump-none) infinite;
 }
 @keyframes ag-psweep { 0% { top: -20px; } 100% { top: 112px; } }
 .ag-info { flex: 1; min-width: 0; }
@@ -3262,10 +3423,10 @@ body.rows-inbox #workstreams .ws-kebab { grid-area: meta; }
   background: var(--ph-dim); flex: none;
 }
 .ag-sdot.on { background: var(--ok); box-shadow: 0 0 5px rgba(123,200,138,.55); }
-.ag-sdot.working { background: var(--gold); box-shadow: 0 0 7px rgba(var(--gold-rgb),.7); animation: sdot-pulse 1.1s infinite; }
-.ag-sdot.thinking { background: var(--ph-bright); box-shadow: 0 0 6px var(--ph-glow); animation: sdot-pulse .7s infinite; }
+.ag-sdot.working { background: var(--gold); box-shadow: 0 0 7px rgba(var(--gold-rgb),.7); animation: sdot-pulse 1.1s steps(8, jump-none) infinite; }
+.ag-sdot.thinking { background: var(--ph-bright); box-shadow: 0 0 6px var(--ph-glow); animation: sdot-pulse .7s steps(6, jump-none) infinite; }
 /* E2: link down → OFFLINE dot, red-phosphor breathing, matching the canvas LINK DOWN marker */
-.ag-sdot.down { background: var(--link-down); box-shadow: 0 0 6px rgba(255,80,60,.75); animation: sdot-pulse 2.2s infinite; }
+.ag-sdot.down { background: var(--link-down); box-shadow: 0 0 6px rgba(255,80,60,.75); animation: sdot-pulse 2.2s steps(9, jump-none) infinite; }
 @keyframes sdot-pulse { 0%,100%{ opacity:1; } 50%{ opacity:.3; } }
 
 /* 3-cell RPG stat grid */
@@ -3348,7 +3509,6 @@ body.rows-inbox #workstreams .ws-kebab { grid-area: meta; }
   .ag-skin-section { flex-direction: column; }
   .ag-skin-stage { flex: 0 0 auto; align-self: center; }
 }
-.ag-cmd-danger .ag-cmd-lbl { color: var(--bad); }
 .ag-del-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .ag-del { border-color: var(--bad) !important; color: var(--bad) !important; }
 .ag-del:hover:not(:disabled) { background: rgba(var(--bad-rgb),.12) !important; }
@@ -3380,8 +3540,8 @@ body.rows-inbox #workstreams .ws-kebab { grid-area: meta; }
 .gx-sec { display:flex; align-items:center; gap:7px; height:18px; border-bottom:1px solid var(--ph-glow2); margin-bottom:11px; }
 .gx-ref { font-family:inherit; font-size:11px; letter-spacing:.1em; color:var(--ink); background:var(--ph); padding:1px 6px; border-radius:2px; }
 .gx-ref.gold { background:var(--gold); }
-.gx-title { font-family:inherit; font-size:12px; letter-spacing:.16em; color:var(--ph); text-transform:uppercase; }
-.gx-tag { margin-left:auto; font-family:inherit; font-size:10px; letter-spacing:.1em; color:var(--ph-dim); }
+.gx-title { font-family:inherit; font-size:var(--sn-type-meta, 14px); letter-spacing:.16em; color:var(--ph); text-transform:uppercase; }
+.gx-tag { margin-left:auto; font-family:inherit; font-size:var(--sn-type-meta, 14px); letter-spacing:.1em; color:var(--ph-dim); }
 
 .gx-lbl { font-family:inherit; font-size:10px; letter-spacing:.12em; color:var(--ph-dim); text-transform:uppercase; }
 .gx-val { font-family:inherit; color:var(--ph-bright); }
@@ -3564,7 +3724,7 @@ body.rows-inbox #workstreams .ws-kebab { grid-area: meta; }
    chip treatment the kind badges use, so the headers stop being bare text with a number floated right. */
 .gx-quests .gx-sec { height: auto; padding-bottom: 6px; margin-bottom: 10px; }
 .gx-quests .gx-sec .gx-tag { border: 1px solid var(--ph-glow2); border-radius: 2px; padding: 0 6px;
-  font-size: 9.5px; line-height: 1.6; color: var(--ph); opacity: .85; font-variant-numeric: tabular-nums; }
+  font-size: var(--sn-type-meta, 14px); line-height: 1.6; color: var(--ph); opacity: .85; font-variant-numeric: tabular-nums; }
 /* the north star is the thing every quest below points at — give it the presence to lead the panel */
 .gx-quests .q-refresh-card { padding: 11px 13px; }
 .gx-quests .q-ns-text { font-size: 14px; line-height: 1.4; margin-top: 5px; }
@@ -3631,8 +3791,10 @@ body.rows-inbox #workstreams .ws-kebab { grid-area: meta; }
 .q-refresh-btn { flex:0 0 auto; }
 .q-refresh-due { margin:0; }
 .q-refresh-last { margin-top:4px; opacity:.85; }
-.q-outcome { display:inline-block; font-size:9px; letter-spacing:.06em; text-transform:uppercase; padding:0 5px; border-radius:2px; border:1px solid var(--ph-glow2); color:var(--ph-dim); }
-.q-oc-minted { color:var(--gold); border-color:var(--gold); }
+/* the outcome leads its own line, so it is set in that line's size (live walk 10-14: 'NOTHING PASSED' read at 10 px beside
+   its sentence — the no-shrunken-inline-chips law) */
+.q-outcome { display:inline-block; font-size:inherit; line-height:inherit; letter-spacing:.06em; text-transform:uppercase; padding:0 5px; border-radius:2px; border:1px solid var(--ph-glow2); color:var(--ph-dim); }
+.q-oc-minted, .q-oc-advanced { color:var(--gold); border-color:var(--gold); }
 .q-oc-none   { color:var(--ph); border-color:var(--ph-glow2); }
 .q-oc-skipped, .q-oc-rejected { color:var(--ph-dim); }
 .q-oc-error  { color:#e88; border-color:#e88; }
@@ -3718,7 +3880,9 @@ body.rows-inbox #workstreams .ws-kebab { grid-area: meta; }
 @media (max-width: 860px) {
   #screen-game.active {
     grid-template-rows: 60px minmax(300px, 1fr) 200px minmax(44px, auto);
-    grid-template-columns: 168px 1fr;
+    /* visual px like every frame dimension (* --cz): a flat 168px shrank with TEXT SIZE (151px at 90) under the
+       counter-zoomed SESSIONS / PROJECTS + key strip, which needs 190 at every TEXT SIZE (Andrew 10-25: the + key sat on PROJECTS) */
+    grid-template-columns: calc(196px * var(--cz)) 1fr;
     grid-template-areas:
       "top top"
       "left center"
@@ -4001,6 +4165,69 @@ body.crew-rail-off #screen-game.active {
 .refit-propsearch { display: flex; align-items: center; gap: 5px; width: 100%; min-width: 0; }
 .refit-propsearch .refit-searchfield { flex: 1 1 auto; min-width: 0; margin: 4px 0; font-size: 13.5px; letter-spacing: 1px; }
 .refit-searchclear { flex: 0 0 auto; font-size: 12px; padding-inline: 8px; line-height: 1; }
+/* MAKE A PROP — player-made props (userprops.js). Built from the REFIT glass recipes in refit-polish.css
+   (--refit-glass / --refit-edge, the .refit-tool-help card and its buttons, .refit-presets-entry for the door,
+   .station-build-art for the sketch well): matte glass, soft corners, no glow, no black CRT well. */
+.refit-makeprop {
+  width: 100%; min-width: 0; margin: 6px 0 4px; padding: 10px 11px; display: flex; flex-direction: column; gap: 7px;
+  border: 1px solid var(--refit-edge, rgba(var(--ph-rgb),.2)); border-radius: 9px;
+  background: var(--refit-glass, rgba(var(--ph-rgb),.04)); box-shadow: inset 0 1px rgba(var(--ph-bright-rgb),.08); text-shadow: none;
+}
+.refit-makeprop-head { display: flex; flex-direction: column; gap: 3px; font-family: 'VT323', monospace; }
+.refit-makeprop-head b { font-weight: normal; font-size: 15px; letter-spacing: 1px; color: var(--ph-bright); text-shadow: none; }
+.refit-makeprop-head small { font-size: 13px; line-height: 1.35; letter-spacing: .2px; color: var(--text); }
+.refit-makeprop-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.refit-makeprop-row .refit-searchfield { flex: 1 1 auto; min-width: 0; margin: 0; }
+.refit-makeprop-row .bb { flex: 0 0 auto; }
+.refit-makeprop-foot { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.refit-makeprop-status { flex: 1 1 auto; min-width: 0; font-family: 'VT323', monospace; font-size: 13px; letter-spacing: .3px; line-height: 1.35; color: var(--ph-dim); text-shadow: none; white-space: normal; }
+.refit-makeprop-status.busy, .refit-makeprop-status.ok { color: var(--ph-bright); }
+.refit-makeprop-status.bad { color: var(--bad); }
+/* the PROVIDERS door appears only after a not-linked / out-of-credit refusal; .bb sets display, so [hidden] needs the win */
+.refit-makeprop [hidden] { display: none !important; }
+/* buttons: the .refit-tool-help button recipe (quiet glass key), hover = the REFIT hover language */
+.refit-overlay .refit-makeprop .bb, .refit-overlay .refit-makeprop-door {
+  padding: 5px 10px; border: 1px solid var(--refit-edge, rgba(var(--ph-rgb),.2)); border-radius: 6px;
+  background: rgba(0,0,0,.15); box-shadow: none; text-shadow: none; color: var(--ph); font-size: 14px; letter-spacing: .6px;
+}
+.refit-overlay .refit-makeprop .bb:hover, .refit-overlay .refit-makeprop .bb:focus-visible { background: rgba(var(--ph-rgb),.14); border-color: var(--ph); color: var(--ph-bright); }
+.refit-overlay .refit-makeprop .bb:disabled { opacity: .45; background: rgba(0,0,0,.15); border-color: var(--refit-edge, rgba(var(--ph-rgb),.2)); color: var(--ph-dim); }
+/* the one paid step reads as the primary action: the selected-tile look, still matte */
+.refit-overlay .refit-makeprop #refit-makeprop-makeit { border-color: rgba(var(--ph-rgb),.55); background: rgba(var(--ph-rgb),.13); color: var(--ph-bright); }
+.refit-makeprop-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+/* the credits card: shown up front when the station has no StarNet credits (the .refit-presets-entry recipe) */
+.refit-makeprop-cta {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 7px; padding: 9px 10px; border: 1px solid rgba(var(--ph-rgb),.34); border-radius: 8px;
+  background: rgba(var(--ph-rgb),.06); box-shadow: inset 0 1px rgba(var(--ph-bright-rgb),.1); font-family: 'VT323', monospace;
+}
+.refit-makeprop-cta span { font-size: 13px; line-height: 1.35; letter-spacing: .2px; color: var(--text); }
+.refit-overlay .refit-makeprop .refit-makeprop-cta .bb { border-color: rgba(var(--ph-rgb),.55); background: rgba(var(--ph-rgb),.13); color: var(--ph-bright); }
+/* the sketch card: a .station-build-card (quiet inner glass) with the .station-build-art well */
+.refit-makeprop-preview {
+  display: flex; gap: 10px; align-items: flex-start; padding: 8px; border: 1px solid var(--refit-edge, rgba(var(--ph-rgb),.2)); border-radius: 8px;
+  background: rgba(var(--ph-rgb),.025); box-shadow: inset 0 1px rgba(var(--ph-bright-rgb),.06);
+}
+.refit-makeprop-preview img {
+  width: 96px; height: 96px; object-fit: contain; flex: 0 0 auto; padding: 4px; box-sizing: border-box; border: 1px solid var(--refit-edge, rgba(var(--ph-rgb),.2)); border-radius: 6px;
+  background: radial-gradient(ellipse at 50% 80%,rgba(var(--ph-rgb),.08),transparent 75%),rgba(0,0,0,.17); image-rendering: auto;
+}
+.refit-makeprop-previewtxt { display: flex; flex-direction: column; gap: 4px; min-width: 0; font-family: 'VT323', monospace; line-height: 1.3; }
+.refit-makeprop-previewtxt b { font-weight: normal; font-size: 16px; letter-spacing: .6px; color: var(--ph-bright); text-shadow: none; }
+.refit-makeprop-previewtxt span { font-size: 13px; letter-spacing: .2px; color: var(--text); }
+.refit-makeprop-previewtxt small { font-size: 12px; letter-spacing: .2px; color: var(--ph-dim); }
+.refit-makeprop-previewbtns { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 3px; }
+/* the EQUIPMENT door: the .refit-presets-entry recipe */
+.refit-overlay .refit-makeprop-door {
+  width: 100%; justify-content: flex-start; margin: 6px 0 4px; padding: 10px 12px; text-align: left;
+  border-color: rgba(var(--ph-rgb),.34); border-radius: 10px; background: var(--refit-glass, rgba(var(--ph-rgb),.04));
+  box-shadow: inset 0 1px rgba(var(--ph-bright-rgb),.12); color: var(--ph-bright); font-size: 15px;
+}
+.refit-overlay .refit-makeprop-door:hover { background: rgba(var(--ph-rgb),.14); border-color: var(--ph); }
+.refit-overlay .refit-makeprop-door { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; white-space: normal; }
+.refit-makeprop-door b { font-weight: normal; font-size: 15px; letter-spacing: 1px; color: var(--ph-bright); }
+.refit-makeprop-door small { font-size: 13px; line-height: 1.3; letter-spacing: .2px; color: var(--text); }
+.refit-makeprop-size { display: flex; align-items: center; gap: 6px; font-family: 'VT323', monospace; font-size: 14px; letter-spacing: .6px; color: var(--ph-dim); }
+.refit-makeprop-size .refit-makeprop-sizeval { font-weight: normal; min-width: 4ch; text-align: center; color: var(--ph-bright); text-shadow: none; font-variant-numeric: tabular-nums; }
 /* the result readout: a real count, or an honest miss — never an empty grid with no explanation */
 .refit-searchnote {
   width: 100%; margin: 2px 0 1px; font-size: 11px; letter-spacing: 1.5px;
@@ -4128,75 +4355,80 @@ body.crew-rail-off #screen-game.active {
 .refit-hue-auto.active { color: var(--ph-bright); }
 .refit-hue-auto .refit-matname { font-size: 11px; letter-spacing: 1.2px; }
 
-/* STARTER LINES — one-click pre-wired layouts (the beginner onramp) + the belt tool's intro line.
-   v2: a single column of UNIFORM cards, each the same anatomy top-to-bottom — schematic viewport
-   (a fixed-height dark stage so every card is the same size no matter the blueprint's footprint),
-   NAME + a derived footprint/dock chip, one dim purpose line. Hover speaks the gallery's phosphor
-   hover language (.refit-proptile), not a private green. The intro stays THE ONE SENTENCE and
-   doubles as the belt palette's idle state. */
-.refit-lineintro {
-  width: 100%; margin: 2px 0 4px; font-size: 12px; line-height: 1.35; letter-spacing: .6px;
-  color: var(--ph-dim); text-shadow: 0 0 5px var(--ph-glow2);
+/* THE CONVEYORS TAB (Build Library) — laid out like the Props tab beside it (2026-09-30, Andrew: "the long sentences underneath
+   each machine … I hate it … stop resorting back to the old ugly UI"). Two section keys (LINES · MACHINES — the prop-sections
+   row), then a grid of big glass tiles: a line's miniature or a machine's own art, its name, one small line. No sentence sits
+   under a tile; what a tile is for is its hover tip. The glass (edge, fill, radius, the lit active face) is the prop tile's —
+   refit-polish.css — and the type is the prop tile's roles (readability.css: names compact, small lines meta). */
+.refit-conv-sections { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin: 0 0 12px; }
+.refit-conv-sections .bb small { margin-left: 5px; opacity: .65; }
+/* BUILD YOUR OWN LINE: one full-width lit key at the top of the LINES section */
+.refit-ownline { display: flex; align-items: center; justify-content: center; width: 100%; min-height: 42px; margin: 0 0 14px; }
+/* a section's name across its grid row — the props' "FURNITURE / 128 ITEMS" voice, never a blurb */
+.refit-linegroup, .refit-machinegroup { grid-column: 1 / -1; margin: 12px 2px 2px; letter-spacing: 1.2px; color: var(--ph-dim); text-transform: uppercase; }
+.refit-linegrid > .refit-linegroup:first-child, .refit-machines > .refit-machinegroup:first-child { margin-top: 0; }
+.refit-goalhd { color: var(--gold); }
+/* (org P18) a folded shelf: its name + count, one click from open. A plain heading in the heading voice, never a glass key */
+/* (org D12) the folded shelves read as one tight, ruled list in the open headings' ink: full width, a hairline between them, no
+   12px heading gap stacked on the grid gap between two folded names */
+.refit-linegroup.refit-lineshelf-tog { display: flex; align-items: baseline; gap: 8px; width: 100%; margin: 6px 0 0; padding: 7px 4px; border: 0; border-top: 1px solid rgba(var(--ph-rgb),.16); border-radius: 0; background: none; box-shadow: none; font: inherit; color: var(--ph); text-align: left; cursor: pointer; }
+.refit-linegroup.refit-lineshelf-tog + .refit-linegroup.refit-lineshelf-tog { margin-top: -7px; }
+.refit-linegroup.refit-lineshelf-tog:hover, .refit-linegroup.refit-lineshelf-tog.open { color: var(--ph-bright); }
+.refit-linegroup.refit-lineshelf-tog:focus-visible { outline: 1px solid var(--ph); outline-offset: 2px; }
+.refit-lineshelf-tog small { color: var(--ph-dim); }
+/* MACHINES — three across, the prop tile: art, name, and the machine's wiring drawn small */
+.refit-machines { display: block; width: 100%; }
+.refit-machinegrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; width: 100%; margin-top: 6px; }
+/* (org D11 polish) a group of exactly four (BRANCH & COMBINE) sits four across, so FILTER never waits alone on a row of its own;
+   the art well may shrink with its narrower column but keeps its shape */
+.refit-machinegrid:has(> :nth-child(4):last-child) { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.refit-machinegrid:has(> :nth-child(4):last-child) .refit-machinetile-cv { max-width: 100%; height: auto !important; aspect-ratio: 76 / 50; }
+.refit-machinetile {
+  position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px;
+  min-width: 0; min-height: 118px; padding: 8px 4px; cursor: pointer; font-family: inherit; color: var(--ph-dim);
 }
-.refit-linegrid { display: flex; flex-direction: column; gap: 7px; width: 100%; }
-/* the LINE LIBRARY's section headers — a rule line + name + one-line blurb, matte phosphor */
-.refit-linegroup {
-  display: flex; flex-direction: column; gap: 1px; width: 100%; min-width: 0;
-  margin: 6px 0 0; padding: 5px 2px 0; border-top: 1px solid var(--ph-faint);
+.refit-machinetile-cv {
+  width: 76px; height: 50px; image-rendering: pixelated; pointer-events: none;
+  background: radial-gradient(ellipse 78% 78% at 50% 62%, rgba(130,170,150,.08), transparent 75%);
 }
-.refit-linegrid .refit-linegroup:first-child { margin-top: 0; border-top: 0; padding-top: 0; }
-.refit-linegroup-nm {
-  font-size: 12px; letter-spacing: 1.6px; color: var(--ph-bright); text-shadow: 0 0 6px var(--ph-glow2);
-}
-.refit-linegroup-why {
-  font-size: 11px; line-height: 1.3; letter-spacing: .5px; color: var(--ph-dim);
-  white-space: normal; overflow-wrap: break-word;
-}
+.refit-machinetile-nm { line-height: 1.1; letter-spacing: .5px; color: var(--ph-bright); text-align: center; }
+/* each machine's wiring as a tiny in→out diagram (fork / wait-bar / funnel / three-way / back arrow) — theme stroke, no fill */
+.refit-machinediagram { width: 34px; height: 20px; color: var(--ph-dim); fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; opacity: .8; pointer-events: none; }
+.refit-machinediagram .md-fill { fill: currentColor; stroke: none; }
+.refit-machinetile:hover .refit-machinediagram, .refit-machinetile.active .refit-machinediagram { color: var(--ph-bright); opacity: 1; }
+/* LINES — two across: the line's miniature, its name, one small line (steps · size, or its fit) */
+.refit-linegrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; width: 100%; align-items: start; }
+.refit-linecell { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
 .refit-linetile {
-  display: flex; flex-direction: column; align-items: stretch; gap: 4px; width: 100%; min-width: 0;
-  padding: 5px 6px 6px; cursor: pointer; border-radius: 5px; font-family: inherit; text-align: left;
-  background: rgba(0,0,0,.34); border: 1.5px solid var(--ph-faint); color: var(--ph);
+  display: flex; flex-direction: column; align-items: center; gap: 6px; width: 100%; min-width: 0;
+  padding: 8px 6px 9px; cursor: pointer; font-family: inherit; text-align: center; color: var(--ph-dim);
 }
-.refit-linetile:hover { border-color: var(--ph); color: var(--ph-bright); background: var(--ph-faint); }
-.refit-linetile.active {
-  border-color: var(--ph-bright); color: var(--ph-bright);
-  box-shadow: 0 0 10px var(--ph-glow), inset 0 0 14px rgba(0,0,0,.55);
-}
-/* the schematic stage: fixed height = uniform cards; the canvas centres inside at 1:1 */
-.refit-linetile-view {
-  display: flex; align-items: center; justify-content: center; width: 100%; height: 70px;
-  border-radius: 3px; background: #0b0f0e; box-shadow: inset 0 0 0 1px rgba(0,0,0,.55);
-}
+/* the miniature's stage: a recessed glass well of one height, so every tile is the same size */
+.refit-linetile-view { display: flex; align-items: center; justify-content: center; width: 100%; height: 64px; border-radius: 6px; background: rgba(0,0,0,.28); box-shadow: inset 0 1px 3px rgba(0,0,0,.35); }
 .refit-linetile-cv { display: block; max-width: 100%; image-rendering: pixelated; pointer-events: none; }
-.refit-linetile-hd { display: flex; align-items: center; justify-content: space-between; gap: 6px; width: 100%; }
-.refit-linetile .refit-matname { font-size: 12px; letter-spacing: 1.1px; text-align: left; }
-/* the stat chip mixes VT323 with fallback-font glyphs ('×' '·') — BOX-centred, never padded by
-   font metrics (the symbol-glyph law) */
-.refit-linetile-stat {
-  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
-  padding: 1px 5px; border: 1px solid var(--ph-faint); border-radius: 3px;
-  font-size: 10.5px; letter-spacing: 1px; line-height: 1.4;
-  color: var(--ph-dim); background: rgba(0,0,0,.3); white-space: nowrap;
-}
-/* one line of WHAT IT DOES; 2-line floor keeps every card the same height when a purpose wraps */
-.refit-linetile-why {
-  font-size: 11px; line-height: 1.3; letter-spacing: .4px; min-height: 29px;
-  color: var(--ph-dim); opacity: .9;
-}
-/* DECK-FIT HONESTY: a blueprint the current floor has nowhere to put. The card stays armable
-   (never gate the sandbox) — it just stops pretending. Dimmed schematic + the reason in the
-   warn amber the rest of REFIT uses for "this won't work yet", matte: no glow, no fill. */
-.refit-linetile.nofit { border-style: dashed; opacity: .82; }
+.refit-linetile .refit-matname { line-height: 1.15; letter-spacing: .5px; color: var(--ph-bright); text-align: center; white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: break-word; }
+.refit-linetile-stat { letter-spacing: .4px; color: var(--ph-dim); white-space: nowrap; }
+/* DECK-FIT HONESTY: a line the floor has nowhere to put stays armable (never gate the sandbox) — a dashed edge, a dimmed
+   miniature and its small line in the warn tone; FITS LAID OUT reads as an offer, not a refusal. Matte: no glow, no fill. */
+.refit-linetile.nofit { border-style: dashed; }
 .refit-linetile.nofit .refit-linetile-view { opacity: .5; }
-.refit-linetile-nofit {
-  width: 100%; margin-top: 1px; font-family: 'VT323', monospace;
-  font-size: 10.5px; letter-spacing: 1px; line-height: 1.3;
-  color: var(--warn); opacity: .9;
-}
-/* the operational footing sits INSIDE the shelf, directly under the cards */
+.refit-linetile.nofit:not(.laidfit) .refit-linetile-stat { color: var(--warn); }
+.refit-linetile.laidfit .refit-linetile-stat { color: var(--ph); }
+/* MAKE ROOM FOR IT (2026-09-27 audit B1): the way out of NO ROOM, a quiet key under its tile */
+.refit-linetile-makeroom { display: flex; width: 100%; justify-content: center; }
+/* START FROM INTENT: the goal's tile carries the gold edge */
+.refit-goalcell .refit-linetile { border-color: var(--gold); }
+/* SET UP BEFORE YOU PLACE: the armed tile's daily cap + review tries, across the grid right under it */
+.refit-lineprefs { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; }
+.refit-lineprefs-hd { letter-spacing: 1.2px; color: var(--ph); }
+.refit-lineprefs-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.refit-lineprefs-k { flex: 1 1 100%; letter-spacing: .8px; color: var(--ph-dim); }   /* the name on its own line, its keys in one row under it */
+.refit-lineprefs .bb.sm { min-width: 40px; }
+.refit-lineprefs .bb.sm[aria-pressed="true"] { border-color: var(--ph); color: var(--ph-bright); background: rgba(var(--ph-rgb),.14); }
+/* the ROOM tool's one-line footnote under its deck grid */
 .refit-linenote {
   width: 100%; margin-top: 2px; padding-top: 5px; border-top: 1px solid var(--ph-faint);
-  font-size: 10.5px; letter-spacing: 1.2px; line-height: 1.3;
+  font-size: 14px; letter-spacing: 1px; line-height: 1.3;
   font-family: 'VT323', monospace; color: var(--ph-dim); opacity: .85;
 }
 /* the guide card's lead — THE ONE SENTENCE above the three beats */
@@ -4208,11 +4440,13 @@ body.crew-rail-off #screen-game.active {
   box-shadow: inset 0 0 0 1.5px var(--ph), 0 0 12px var(--ph-glow2);
 }
 
+/* above the docked Workflow panel (z 4) and wrapping (2026-09-27 audit P6): a refusal is a sentence that names the fix — it used to
+   render UNDER the panel on one long line and get cut off at the screen edge */
 .refit-tip {
-  position: fixed; z-index: 3; display: none; pointer-events: none;
-  font-size: 13px; letter-spacing: 1px; padding: 2px 8px;
+  position: fixed; z-index: 6; display: none; pointer-events: none;
+  font-size: 13px; letter-spacing: 1px; padding: 3px 8px; line-height: 1.35;
   background: rgba(3,2,1,.94); border: 1px solid var(--ph-dim); color: var(--ph-bright);
-  text-shadow: 0 0 6px var(--ph-glow2); white-space: nowrap;
+  text-shadow: 0 0 6px var(--ph-glow2); white-space: normal; max-width: min(440px, 42vw);
   box-shadow: 0 2px 10px rgba(0,0,0,.7);
 }
 .refit-tip.ok { border-color: var(--ok); color: #aaffc8; }
@@ -4275,7 +4509,7 @@ body.crew-rail-off #screen-game.active {
 /* a brief attention pulse (undo button after a reclaim; dock button on first run) */
 @keyframes refit-pulse { 0%,100% { box-shadow: 0 0 0 0 var(--ph-glow2); } 50% { box-shadow: 0 0 0 3px var(--ph), 0 0 16px var(--ph-glow); } }
 .bb.pulse { animation: refit-pulse .45s ease-in-out 0 2; }
-#bb-build.refit-nudge { color: var(--ph-bright); animation: refit-pulse 2s ease-in-out infinite; }
+#bb-build.refit-nudge { color: var(--ph-bright); animation: refit-pulse 2s steps(9, jump-none) infinite; }
 
 /* first-use guide card */
 .station-build-box { box-sizing: border-box; width: min(850px, calc(94vw / var(--station-build-scale, 1))); max-height: calc(88vh / var(--station-build-scale, 1)); overflow: auto; padding: 22px; background: var(--panel); border: 1px solid var(--ph); color: var(--text); }
@@ -4360,6 +4594,13 @@ body.crew-rail-off #screen-game.active {
 .mc-overview { color: var(--ph-bright); font-size: 18px; margin: 6px 0 12px; }
 .mc-notice { padding: 12px 14px; border-left: 2px solid var(--gold); background: rgba(var(--gold-rgb),.055); color: var(--text); font-size: 16px; line-height: 1.5; margin-bottom: 12px; }
 .mc-notice b { display: block; color: var(--gold); font-size: 18px; margin-bottom: 4px; }
+/* SKILL MARKET cards: a warning status line (pulled / tampered), the last install/remove result on its card, and the
+   package's file list inside "Skill details" (plain rows, no browser bullets) */
+.mc-hint.skm-warn { color: var(--gold); }   /* .mc-hint is declared later with the same weight: out-rank it */
+.mc-hint.skm-result { color: var(--ok, var(--text)); }
+.mc-hint.skm-result.skm-result-bad { color: var(--gold); }
+.skm-files { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 2px; }
+.skm-files li { font-size: 14px; }
 .mc-inspect { border-top: 1px solid var(--ui-edge); padding-top: 6px; }
 .mc-inspect > summary { cursor: pointer; color: var(--ph); font-size: 16px; padding: 4px 0; }
 .mc-inspect > summary:focus-visible { outline: 2px solid var(--ph-bright); outline-offset: 2px; }
@@ -4502,11 +4743,25 @@ body.crew-rail-off #screen-game.active {
 .mc-pick-row { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
 .mc-pick-row > label { flex: 0 0 60px; color: var(--ph-dim); font-size: 12px; letter-spacing: .5px; }
 .mc-pick { flex: 1; min-width: 0; }
+/* the picker fills its cell (live walk 10-14: an inline-flex wrap in a block cell sized itself to the longest model name —
+   a 418 px select in a 242 px column ran past the card and the window and pushed the EFFORT select out of reach). With the
+   cell's width it shrinks the model select and wraps EFFORT under it when they do not fit side by side. */
+.mc-pick .mp-wrap { display: flex; width: 100%; }
 .mc-adv { margin: 4px 0 6px; }
 .mc-adv > summary { cursor: pointer; color: var(--ph-dim); font-size: 11px; letter-spacing: .5px; list-style: none; padding: 2px 0; }
 .mc-adv > summary::-webkit-details-marker { display: none; }
 .mc-adv > summary:hover { color: var(--ph); }
 .mc-adv[open] > summary { color: var(--ph); margin-bottom: 4px; }
+/* ONE FLAT LIST (UX night 10-26): CONNECTED's two "add your own" forms fold under their own lists; the closed line reads as
+   the action it opens, with the category folds' ＋ / − mark */
+.mc-add-fold { margin: 10px 0 6px; }
+.mc-add-fold > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 8px; padding: 8px 12px; border: 1px solid var(--ph-dim); color: var(--ph); }
+.mc-add-fold > summary::-webkit-details-marker { display: none; }
+.mc-add-fold > summary::before { content: '＋'; color: var(--ph-dim); }
+.mc-add-fold[open] > summary::before { content: '−'; }
+.mc-add-fold > summary:hover { color: var(--ph-bright); border-color: var(--ph); }
+.mc-add-fold > summary:focus-visible { outline: 1px solid var(--ph-bright); outline-offset: 2px; }
+.mc-add-fold[open] > .mc-form { margin-top: 10px; }
 /* BUDGET panel — number-input phosphor styling (the base rule at top only covers text/password) + label→input row.
    Additive: new selectors only, on-theme via the same vars. */
 input[type=number].key-input {
@@ -4526,6 +4781,14 @@ input[type=number].key-input:focus { border-color: var(--ph); box-shadow: inset 
 #budget-pools .bg-pool-hit { display: flex; align-items: center; gap: 10px; border: 1px solid var(--warn); background: rgba(0,0,0,.32); padding: 6px 9px; margin: 2px 0 8px; font-size: 12.5px; color: var(--warn); }
 #budget-pools .bg-pool-hit b { color: var(--ph-bright); }
 #budget-pools .bg-pool-hit .bb { flex: 0 0 auto; margin-left: auto; }
+/* INTERRUPTED-run rows — a run whose charge was never booked; the Commander enters it (SETTLE) or counts it at its
+   per-run limit. Rendered ONLY while /api/budget/status lists one. Same warn vocabulary as the CAP-HIT row; the
+   explanation lives in the row's data-tip, never a sentence under it. */
+#budget-unsettled .bg-unsettled { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; border: 1px solid var(--warn); background: rgba(0,0,0,.32); padding: 6px 9px; margin: 2px 0 8px; font-size: 12.5px; color: var(--warn); }
+#budget-unsettled .bg-un-what { flex: 1 1 180px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#budget-unsettled .bg-un-what b { color: var(--ph-bright); }
+#budget-unsettled .bg-un-usd { flex: 0 0 104px; width: 104px; font-size: 15px; padding: 4px 8px; text-align: right; }
+#budget-unsettled .bb { flex: 0 0 auto; }
 /* MODELS panel — the ordered fallback chain (P0-3). Additive: new selectors only, on-theme via the same vars. */
 .mc-list-fb { display: flex; flex-direction: column; gap: 4px; margin: 2px 0 4px; }
 .fbc-row { display: flex; align-items: center; gap: 6px; border: 1px solid var(--ph-dim); background: rgba(0,0,0,.32); padding: 4px 8px; }
@@ -4674,9 +4937,6 @@ select.fbc-sel:focus { border-color: var(--ph); box-shadow: inset 0 2px 5px rgba
 .cc-filter.cc-f-on { color: var(--ok); border-color: var(--ok); }
 .cc-filter.cc-f-on.active { color: var(--ink); background: var(--ok); border-color: var(--ok); }
 
-.cc-legend .cc-lg-none { color: var(--ok); font-weight: normal; }
-.cc-legend .cc-lg-key { color: var(--gold); font-weight: normal; }
-.cc-legend .cc-lg-oauth { color: var(--ph-dim); font-weight: normal; letter-spacing: .5px; }
 .cc-list { display: flex; flex-direction: column; gap: 14px; margin: 4px 0 10px; }
 .cc-group { display: flex; flex-direction: column; gap: 8px; }
 /* ⛔ A CLASS THAT SETS `display` DEFEATS THE `hidden` ATTRIBUTE. The UA sheet's `[hidden]{display:none}`
@@ -4684,6 +4944,19 @@ select.fbc-sel:focus { border-color: var(--ph); box-shadow: inset 0 2px 5px rgba
    set `.hidden = true` on 28 of 37 cards and every one of them stayed painted. It read as working only
    because the first category happens to be entirely one tier. Restate the rule at class specificity. */
 .cc-group[hidden], .cc-card[hidden] { display: none; }
+/* CATEGORY FOLDS (UX night 10-25): every category line is its own fold — the catalog's Popular open, the rest one line
+   each with its count, so CATALOG / SKILL MARKET / SKILL LIBRARY read as an index instead of a wall. The ＋ / − mark is
+   the ADD AN ABILITY router's and the dossier config groups'; the whole line is the target. */
+:is(details.cc-group, details.sk-fold) > summary { list-style: none; cursor: pointer; }
+:is(details.cc-group, details.sk-fold) > summary::-webkit-details-marker { display: none; }
+:is(details.cc-group, details.sk-fold) > summary .sec-nd { display: none; }
+:is(details.cc-group, details.sk-fold) > summary::after { content: '＋'; flex: 0 0 auto; color: var(--ph-dim); }
+:is(details.cc-group, details.sk-fold)[open] > summary::after { content: '−'; }
+:is(details.cc-group, details.sk-fold) > summary:hover :is(.sec-l, .sec-tag), :is(details.cc-group, details.sk-fold) > summary:hover::after { color: var(--ph-bright); }
+:is(details.cc-group, details.sk-fold) > summary:focus-visible { outline: 1px solid var(--ph-bright); outline-offset: 3px; }
+.skm-shelf { display: flex; flex-direction: column; gap: 14px; }
+.skm-shelf[hidden] { display: none; }
+.skm-shelf > .mc-hint { margin: -8px 0 0; }
 .cc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(224px, 1fr)); gap: 8px; }
 .cc-card { display: flex; flex-direction: column; gap: 6px; border: 1px solid var(--ph-dim); border-radius: var(--r-sm);
   padding: 9px 11px; box-shadow: var(--raise);
@@ -4719,6 +4992,9 @@ select.fbc-sel:focus { border-color: var(--ph); box-shadow: inset 0 2px 5px rgba
 .cc-home { font-size: 11px; letter-spacing: .5px; text-decoration: none; }
 .cc-home:hover { color: var(--ph); }
 .cc-key { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+/* setup links ("Create app password ↗") wear the chat-link paint, never the browser's default blue */
+.cc-key a { color: var(--gold); text-decoration: underline; }
+.cc-key a:hover { color: var(--ph); }
 .cc-steps { margin: 2px 0 4px 16px; padding: 0; font-size: 12px; line-height: 1.4; color: var(--ph-dim); }
 .cc-steps li { margin: 2px 0; }
 .cc-uri { display: flex; align-items: center; gap: 6px; margin-top: 2px; min-width: 0; }
@@ -4996,7 +5272,7 @@ select.fbc-sel:focus { border-color: var(--ph); box-shadow: inset 0 2px 5px rgba
   color: var(--link-down); background: rgba(0,0,0,0.92);
   border: 1px solid rgba(255,80,60,0.7); border-radius: var(--r-sm);
   box-shadow: 0 0 14px rgba(255,80,60,0.35);
-  animation: unsaved-pulse 1.1s ease-in-out infinite;
+  animation: unsaved-pulse 1.1s steps(8, jump-none) infinite;
 }
 @keyframes unsaved-pulse { 0%,100% { opacity: 0.72; } 50% { opacity: 1; } }
 
@@ -5128,8 +5404,12 @@ select.fbc-sel:focus { border-color: var(--ph); box-shadow: inset 0 2px 5px rgba
   display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px;
   margin: 14px 0 6px; font-size: var(--fs-1);
 }
+/* a sub-label (and its list) a painter hides — e.g. LIVE HELPERS while nothing runs — must actually hide */
+.set-sub[hidden], .key-list[hidden] { display: none !important; }   /* beats the scoped settings-pane display rules */
 .set-sub-k { color: var(--ph); letter-spacing: var(--ls-2); flex: 0 0 auto; }
 .set-sub-d { color: var(--ph-dim); letter-spacing: var(--ls-1); min-width: 0; }
+/* (org D10 polish) AUTOMATE's rail: ON ITS OWN sits over its rung (SUGGEST), never run together on one cramped line */
+.auto-init-head .set-sub { flex-direction: column; align-items: flex-start; gap: 3px; }
 
 /* ---------- SETTINGS ▸ NIGHT SHIFT — the live status GRID ----------
    Five readouts about ONE machine (state · mode · daily limit · last job · next job). They used to be
@@ -5145,8 +5425,11 @@ select.fbc-sel:focus { border-color: var(--ph); box-shadow: inset 0 2px 5px rgba
    missing readout. Separate cells simply aren't there when there is nothing to show. */
 .ns-grid {
   display: grid; gap: 8px; margin: 10px 0 12px;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  /* at most TWO across (a track is never narrower than half the row), one across under ~430px */
+  grid-template-columns: repeat(auto-fit, minmax(max(210px, calc(50% - 12px)), 1fr));
 }
+/* five readouts in two columns left NEXT JOB EARLIEST alone beside an empty slot: an odd last cell takes the full row */
+.ns-grid > .ns-cell:last-child:nth-child(odd) { grid-column: 1 / -1; }
 .ns-cell {
   display: flex; flex-direction: column; gap: 4px; padding: 9px 12px;
   border: 1px solid var(--ph-faint); border-left: 3px solid var(--ph-dim);
@@ -5160,6 +5443,9 @@ select.fbc-sel:focus { border-color: var(--ph); box-shadow: inset 0 2px 5px rgba
 .set-about.ns-away { margin: 0 0 2px; }
 .set-about.ns-note { margin: 0 0 6px; }
 .set-about.ns-note:empty { display: none; }
+/* LAST REPORT is the section's final block: its last line kept only a collapsing margin and sat on the rule below it.
+   Padding (not margin) holds the gap, so the line always clears whatever ends the pane. */
+#ns-report:not(:empty) { padding-bottom: 14px; }
 /* FOCUS: the readout is a line of its own above the steer field, so the input never sits mid-sentence.
    The row is capped at the pane measure — left to fill a wide console the input stretched the full ~960px
    and stranded its own STEER button alone against the far edge, a metre from the text it acts on. */
@@ -5242,7 +5528,9 @@ select.fbc-sel:focus { border-color: var(--ph); box-shadow: inset 0 2px 5px rgba
   border: 1px solid var(--ph-faint); border-left: 3px solid var(--ph-dim);
   background: rgba(0, 0, 0, 0.22); border-radius: var(--r-sm); padding: 6px 11px;
 }
-.perm-grants .set-row:has(> .bb) > span:first-child { flex: 1 1 auto; min-width: 0; font-size: 13px; }
+/* a class, never a bare `span`: every non-subject :has() rule's right-hand side joins ONE invalidation set Chrome
+   applies from <body> on DOM ticks — a bare `span` here re-styled every COMMS span each second (10-02) */
+.perm-grants .set-row > .perm-label { flex: 1 1 auto; min-width: 0; font-size: 13px; }
 .perm-grants .set-row:has(> .bb) > .bb { flex: 0 0 auto; margin-left: auto; }
 .perm-grants .set-about { margin-top: 4px; }
 .perm-grants .set-row:not(:has(> .bb)) { margin: 4px 0 0; opacity: 0.75; }
@@ -5316,7 +5604,9 @@ select.fbc-sel:focus { border-color: var(--ph); box-shadow: inset 0 2px 5px rgba
 /* the reach chip carries the plain meaning big and the house name small underneath */
 .pc-reach-chip { align-items: flex-start !important; }
 .pc-rl { display: flex; flex-direction: column; gap: 1px; line-height: 1.15; text-align: left; }
-.pc-rh { font-size: 9px; letter-spacing: 1px; opacity: 0.55; font-style: normal; }
+/* the reach rung's house name rides under its plain label; it was 9 px (10 px on screen, 60 of them on a 12-agent station —
+   live walk 10-14). It keeps its dim second-line voice at the station's smallest type, not a size of its own. */
+.pc-rh { font-size: var(--sn-type-meta, 14px); letter-spacing: 1px; opacity: 0.55; font-style: normal; }
 /* the merged crew row: a header line, then one labelled block per axis. Stacked, not columnar — each
    axis owns a chip strip AND a plain sentence, which cannot share a row honestly at this width. */
 /* THE ROW IS A <details> (2026-08-14). Collapsed it is ONE line that still answers the question — who,
@@ -5394,6 +5684,14 @@ select.fbc-sel:focus { border-color: var(--ph); box-shadow: inset 0 2px 5px rgba
 .sandbox-chip-fix { display: block; color: var(--bad); opacity: .9; margin: 0 0 4px; }
 .perm-crew-row .pc-truth .sandbox-chip, .perm-crew-row .pc-truth .sandbox-chip-fix { opacity: 1; }
 .perm-crew-row .pc-more { margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--ph-faint); }
+/* THE THREE ANSWERS, per agent (2026-10-04): the same three words as the station cards, as one even row
+   so the choice reads as one question. The exact reach ladder / asking / sandbox fold under MORE OPTIONS. */
+.perm-crew-row .pc-posture-chips { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin-top: 10px; }
+.perm-crew-row .pc-posture-chips .ov-vchip { justify-content: center; text-align: center; padding: 7px 8px; }
+.perm-crew-row .pc-posture-chips .ov-vchip.danger:not(.sel) { color: var(--bad); }
+.perm-crew-row .pc-exact { margin-top: 10px; }
+.perm-crew-row .pc-exact > summary { font-size: 13px; color: var(--ph-dim); cursor: pointer; }
+.perm-crew-row .pc-exact > summary:hover { color: var(--ph); }
 .perm-crew-row .pc-more .mc-acts { margin: 0 0 6px; }
 .perm-crew-row .pc-more .mc-acts:last-child { margin-bottom: 0; }
 .perm-crew-row .exec-ssh { margin: 0; }
@@ -5408,6 +5706,8 @@ select.fbc-sel:focus { border-color: var(--ph); box-shadow: inset 0 2px 5px rgba
 .con-searching .cc-service:not(:has(.cc-card.con-hit:not([hidden]))) { display:none; }
 .con-searching .cc-alternatives:not(:has(.cc-card.con-hit:not([hidden]))) { display:none; }
 .con-searching .cc-group > .sec .sec-tag { display:none; }
+.con-searching .skm-shelf:not(:has(.cc-card.con-hit:not([hidden]))) { display:none; }
+.con-searching .skm-shelf > .sec .sec-tag { display:none; }
 .con-searching .sk-state-sec, .con-searching .sk-lib-sum { display:none; }
 .cc-alternatives { margin-top:5px; padding:8px; border:1px solid var(--ph-dim); }
 .cc-alternatives:not(:has(.cc-card:not([hidden]))) { display:none; }
@@ -5453,6 +5753,8 @@ html select:not(.comms-agent-select) {
 html select option, html select optgroup {
   color: var(--text); background: var(--panel2, #0a0a08); font-style: normal;
 }
+/* a group label is a quiet heading over its options (the .mp-model voice), never the OS's heavy bold */
+html select optgroup { color: var(--ph-dim); font-weight: normal; }
 /* kill the OS number spinners app-wide — every numeric field here is a small
    typed integer (budget caps, timeouts, cooldowns); the spinner is pure chrome */
 input[type=number]::-webkit-inner-spin-button,
@@ -5480,6 +5782,8 @@ button:disabled, select:disabled, input:disabled, textarea:disabled {
 .ob-sec { font-size: 10px; letter-spacing: 2px; color: var(--ph-dim); margin: 10px 0 4px; }
 .ob-sec:first-child { margin-top: 0; }
 .ob-ask, .ob-out { white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow: auto; font-size: 12px; color: var(--text); }
+.ob-out.wf-md { white-space: pre-wrap; }   /* WHAT CAME BACK drawn by COMMS' renderer keeps a plain reply's own line breaks, as COMMS' .cmsg .body does (its blocks join with no whitespace) */
+.ob-cut { margin-top: 6px; color: var(--ph-dim); }   /* the 'output truncated' note sits under the answer, never inside it */
 /* dim helper copy inside windows — NOT .mc-detail (that's the CONNECTORS error-detail class, alarm-red) */
 .win-note { font-size: 12px; color: var(--ph-dim); line-height: 1.45; }
 .ob-acts { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-top: 12px; }
@@ -5743,6 +6047,12 @@ button:disabled, select:disabled, input:disabled, textarea:disabled {
 .dlv-said { font-size: 12px; line-height: 1.5; color: var(--text); opacity: 0.85; white-space: pre-wrap;
   word-break: break-word; max-height: 190px; overflow: auto; padding-right: 4px;
   scrollbar-width: thin; scrollbar-color: var(--ph-dim) transparent; }
+/* the closing message rendered (safeMarkdown: one block per line) — paragraphs and headings at the card's own size, no gaps */
+.dlv-said.md { white-space: normal; }
+.dlv-said.wf-md { white-space: pre-wrap; }   /* once COMMS' renderer draws it (proseSaid): a plain reply keeps its line breaks, as in COMMS */
+.dlv-said.md p, .dlv-said.md h1, .dlv-said.md h2, .dlv-said.md h3 { margin: 0 0 6px; font-size: inherit; line-height: inherit; }
+.dlv-said.md h1, .dlv-said.md h2, .dlv-said.md h3 { color: var(--ph-bright); font-weight: normal; letter-spacing: .6px; }
+.dlv-said.md code { font-family: inherit; color: var(--ph-bright); }
 
 /* the file list — one row per artifact, each openable on its own */
 .dlv-files { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
@@ -5791,10 +6101,21 @@ button:disabled, select:disabled, input:disabled, textarea:disabled {
 .con-intents + .con-rail-list { padding-left: 10px; }
 .ws-kind-filter { display: flex; gap: 3px; margin: 5px 0; }
 .ws-kind-filter button { flex: 1; min-width: 0; padding: 5px 2px; font-size: 11px; }
-.ws-auto-group { list-style: none; margin-top: 8px; }
-.ws-auto-group button { display: grid; width: 100%; min-width: 0; text-align: left; padding: 7px 8px; border: 1px solid var(--ph-faint); }
-.ws-auto-group span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ws-auto-group small { color: var(--ph-dim); font-size: 10px; }
+/* a routine is ONE rail row, its newest run (Andrew 10-15): "21 runs" on that row folds its older runs out under it.
+   Plain text in the row's own voice (the title's size in a one-line row), never a boxed header */
+#workstreams .ws-runs {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px; min-height: 0; padding: 0; margin: 0;
+  font: inherit; font-size: 14px; letter-spacing: .3px; color: var(--ph-dim); white-space: nowrap; cursor: pointer;
+  background: none; border: 0; box-shadow: none; text-shadow: none;
+}
+#workstreams .ws-runs::before {
+  content: ''; width: 0; height: 0; border-style: solid; border-width: 4px 0 4px 6px;
+  border-color: transparent transparent transparent currentColor; transition: transform var(--t-fast, .12s) ease;
+}
+#workstreams .ws-runs[aria-expanded="true"]::before { transform: rotate(90deg); }
+#workstreams .ws-runs:is(:hover, :focus-visible) { color: var(--ph-bright); }
+#workstreams .ws-runs:focus-visible { outline: 1px solid var(--ph); outline-offset: 3px; border-radius: 4px; }
+#workstreams .ws-row[data-runs="older"] { margin-left: 22px; }
 .ag-effective { margin: 8px 0; }
 .ag-effective .perk-desc { white-space: normal; }
 .cf-group-summary { overflow-wrap: anywhere; }
@@ -5824,5 +6145,12 @@ body:has(#screen-game.active)::before {
 /* Exact mutation review stays scrollable without clipping the payload. */
 .consent-payload { margin: 8px 0; }
 .consent-payload summary { cursor: pointer; }
-.consent-payload pre { max-height: 320px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.consent-payload pre { max-height: 320px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; font-family: inherit; }
+/* INSPECT FULL REQUEST: the copy key sits under the request it copies */
+.consent-full .consent-full-copy { display: inline-block; margin-top: 6px; }
+.consent-full .consent-full-copy[hidden] { display: none; }
+/* the station builder's card draws its plan (planpreview.js): the station preset cards' plate recipe, the card's width */
+.consent-plan { margin: 8px 0; }
+.consent-plan canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; }
+.consent-plan figcaption { margin-top: 6px; line-height: 1.5; color: var(--ph-dim); }
 .work-rate-reference { margin: 4px 0; overflow-wrap: anywhere; user-select: text; }

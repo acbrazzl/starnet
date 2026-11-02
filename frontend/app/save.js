@@ -4,7 +4,18 @@
 'use strict';
 
 const Save = (() => {
-  const KEY = 'starnet.save';
+  /* THIS WINDOW'S CRASH JOURNAL (wave-1 save-latch-kill; qa/bugs 27bae3d6). Every tab of one browser shares localStorage,
+     and the whole save used to live under the one key 'starnet.save': a tab reloaded while another tab ran booted THAT tab's
+     stale snapshot as its own work, and a crashed tab's unsent save was overwritten by the next persist of any other tab.
+     Now each window writes its own key: 'starnet.save' (LEGACY_KEY — the first window of a browser, and every save before
+     this change) or 'starnet.save.w.<window>' for a second live tab. CloudSave.openJournal() picks it at boot (a dead
+     window's journal is continued; a live window's is never touched) and calls useKey(); everything here reads and writes
+     key(). Before openJournal() runs, key() is the legacy key, exactly as before. */
+  const LEGACY_KEY = 'starnet.save';
+  const JOURNAL_KEY_RE = /^starnet\.save(?:\.w\.[A-Za-z0-9_-]{1,80})?$/;
+  let KEY = LEGACY_KEY;
+  function key() { return KEY; }
+  function useKey(k) { if (JOURNAL_KEY_RE.test(String(k || ''))) KEY = String(k); return KEY; }
   const PRE_MIGRATE_BACKUP_KEY = 'starnet.save.pre-migrate.backup';
   const LEGACY_SCHEMA = 'skynet.save';   // Skynet→StarNet rename: saves written before the rename carry this schema tag (the
   const SCHEMA = 'starnet.save';         // legacymigrate boot pass copies the OLD `skynet.save` localStorage KEY forward; load() still accepts the old TAG inside the value).
@@ -108,17 +119,45 @@ const Save = (() => {
   // convenience for callers that only need the yes/no forward-version verdict without the full status shape.
   function isFuture() { return loadStatus().status === 'future'; }
 
+  // #121: the save envelope, built ONCE per persist. persist() hands the same envelope to write() (the browser cache)
+  // and to the station file, so a cache that cannot hold it (the browser's per-site storage cap) never keeps the
+  // station file from receiving it. A state that already carries schema/version/updatedAt keeps them.
+  function envelope(state) { return Object.assign({ schema: SCHEMA, version: CURRENT, updatedAt: Date.now() }, state); }
+
+  // #121: the loadStatus() verdict for a save that did NOT come from the cache (the station file's copy, when the
+  // cache cannot hold it). Pure and in memory: never reads or writes localStorage. Same rules as loadStatus():
+  // not a save -> 'none'; written by a NEWER build -> 'future' (refused, untouched); otherwise migrated on a copy.
+  function fromDoc(input) {
+    try {
+      if (!input || typeof input !== 'object' || (input.schema !== SCHEMA && input.schema !== LEGACY_SCHEMA) || !input.agent) return { status: 'none', doc: null, version: 0 };
+      const v = Number(input.version || 0);
+      if (v > CURRENT) return { status: 'future', doc: null, version: v };
+      return { status: 'ok', doc: migrate(JSON.parse(JSON.stringify(input))), version: CURRENT };
+    } catch (e) { console.warn('[save] in-memory load failed:', e); return { status: 'error', doc: null, version: 0 }; }
+  }
+
   // returns the persisted doc (so callers can mirror the EXACT envelope to the durable sidecar), or null on
   // failure. The doc carries a fresh updatedAt stamp, which the sidecar uses to reject stale write-throughs.
+  // writeError() names why the last write failed (null after a success), so the UI only says "full" when the
+  // browser said quota (QuotaExceededError / NS_ERROR_DOM_QUOTA_REACHED / "exceeded the quota").
+  let lastWriteError = null;
+  /* SERIALIZE ONCE (idle CPU piece 3, 2026-10-20): the exact string this write produced — kept even when the cache refused
+     it — so persist() can hand it to CloudSave instead of CloudSave re-serializing the same multi-MB save to clone it.
+     takeWriteRaw() hands it over once and forgets it; it is the same bytes the cache was given. */
+  let lastRaw = null;
   function write(state) {
-    const doc = Object.assign({ schema: SCHEMA, version: CURRENT, updatedAt: Date.now() }, state);
-    try { localStorage.setItem(KEY, JSON.stringify(doc)); return doc; }
-    catch (e) { console.warn('[save] write failed:', e); return null; }
+    const doc = envelope(state);
+    lastRaw = null;
+    try { lastRaw = JSON.stringify(doc); localStorage.setItem(KEY, lastRaw); lastWriteError = null; return doc; }
+    catch (e) { lastWriteError = String((e && (e.name || e.code)) || 'error') + (e && e.message ? ': ' + e.message : ''); console.warn('[save] write failed:', e); return null; }
   }
+  function takeWriteRaw() { const raw = lastRaw; lastRaw = null; return raw; }
+  function writeError() { return lastWriteError; }
+  function writeQuotaFull() { return /quota/i.test(String(lastWriteError || '')); }
 
   function clear() { try { localStorage.removeItem(KEY); } catch (e) {} }
   function has() { try { return !!localStorage.getItem(KEY); } catch (e) { return false; } }
 
-  return { load, loadStatus, isFuture, write, clear, has, CURRENT, PRE_MIGRATE_BACKUP_KEY };
+  return { load, loadStatus, isFuture, write, takeWriteRaw, writeError, writeQuotaFull, envelope, fromDoc, clear, has, key, useKey, CURRENT, PRE_MIGRATE_BACKUP_KEY, LEGACY_KEY, JOURNAL_KEY_RE };
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports = Save;

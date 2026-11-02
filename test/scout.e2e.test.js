@@ -18,6 +18,10 @@
        guard: NO draft staged + a 'rejected' ledger note (visible failure, never a quiet nothing);
      · an extraction reply with INVENTED evidence folds to zero topics + an honest 'none' ledger note.
 
+   BOOT 3 — the archetype-seeded prospect mint (zero model spend).
+   BOOT 4 — a personalization PAUSE that lands while the extraction call is in flight wins: nothing folded,
+     persisted or noted from the late reply, and its spend is still booked.
+
    ZERO network, zero real key (the run key is a fake routed to the mock). Part of test:http. */
 'use strict';
 
@@ -29,6 +33,8 @@ const fs = require('fs');
 const { spawn } = require('child_process');
 const { bootToken } = require('./_httpToken.js');
 const Specialties = require('../shared/specialties.js');
+const Interests = require('../sidecar/interests.js');
+const { allocatePort, BIND_REFUSED } = require('./helpers/ports.js');
 
 const HOST = '127.0.0.1';
 const INDEX = path.resolve(__dirname, '..', 'sidecar', 'index.js');
@@ -42,18 +48,21 @@ function startMock(replies) {
     const server = http.createServer((req, res) => {
       if (req.url.indexOf('/models') >= 0) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ data: [{ id: 'test/model', context_length: 8000, pricing: { prompt: '0', completion: '0' }, supported_parameters: ['tools'] }] }));
+        const pricing = replies.priced ? { prompt: '0.000001', completion: '0.000002' } : { prompt: '0', completion: '0' };   // priced: spend is observable in the ledger
+        res.end(JSON.stringify({ data: [{ id: 'test/model', context_length: 8000, pricing, supported_parameters: ['tools'] }] }));
         return;
       }
       if (req.url.indexOf('/chat/completions') >= 0) {
-        let body = ''; req.on('data', d => { body += d; }); req.on('end', () => {
+        let body = ''; req.on('data', d => { body += d; }); req.on('end', async () => {
+          // holdExtraction: the extraction call stays in flight until the test calls mock.release() (pause-mid-flight arm)
+          if (replies.holdExtraction && body.indexOf('intake analyst') >= 0) await new Promise(r => { held.release = r; held.extraction = true; });
           res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
-          const text = t => {
+          const text = (t, usage) => {
             res.write('data: ' + JSON.stringify({ choices: [{ delta: { content: t } }] }) + '\n\n');
-            res.write('data: ' + JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 6, completion_tokens: 4, total_tokens: 10 } }) + '\n\n');
+            res.write('data: ' + JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: usage || { prompt_tokens: 6, completion_tokens: 4, total_tokens: 10 } }) + '\n\n');
             res.write('data: [DONE]\n\n'); res.end();
           };
-          if (body.indexOf('intake analyst') >= 0) { calls.push('extraction'); text(replies.extraction); }        // interests.buildDirective's system marker
+          if (body.indexOf('intake analyst') >= 0) { calls.push('extraction'); text(replies.extraction, replies.extractionUsage); }        // interests.buildDirective's system marker
           else if (body.indexOf('recipe author') >= 0) { calls.push('recipe'); text(replies.recipe); }            // scout.buildRecipeDirective's system marker
           else if (body.indexOf("station's recruiter") >= 0) { calls.push('recruiter'); text(replies.prospect || 'NONE'); }   // the LLM prospect authorship pass
           else { calls.push('run'); text('ok, done.'); }                                                          // the main task run itself
@@ -63,7 +72,9 @@ function startMock(replies) {
       res.writeHead(404); res.end();
     });
     const calls = [];   // which model passes actually fired — lets a boot assert a pass did NOT run (zero-spend paths)
-    server.listen(0, HOST, () => resolve({ server, base: 'http://' + HOST + ':' + server.address().port + '/api/v1', calls }));
+    const held = { extraction: false, release: null };
+    server.listen(0, HOST, () => resolve({ server, base: 'http://' + HOST + ':' + server.address().port + '/api/v1', calls, held,
+      release: () => { if (held.release) held.release(); } }));
   });
 }
 
@@ -74,7 +85,7 @@ function boot(port, env, attemptsLeft) {
     const onData = d => {
       out += d.toString();
       if (!settled && out.indexOf('http://' + HOST + ':' + port) >= 0) { settled = true; resolve({ child, port }); }
-      else if (!settled && /already in use/i.test(out)) { settled = true; try { child.kill(); } catch (_) {} if (attemptsLeft > 0) resolve(boot(port + 1, env, attemptsLeft - 1)); else reject(new Error('no free port')); }
+      else if (!settled && BIND_REFUSED.test(out)) { settled = true; try { child.kill(); } catch (_) {} if (attemptsLeft > 0) resolve(allocatePort().then(next => boot(next, env, attemptsLeft - 1))); else reject(new Error('no free port')); }
     };
     child.stdout.on('data', onData); child.stderr.on('data', onData);
     child.on('error', e => { if (!settled) { settled = true; reject(e); } });
@@ -93,6 +104,16 @@ function seedScoutState(ws) {
   fs.writeFileSync(path.join(ws, 'scout.state.json'), JSON.stringify({
     v: 1, state: { v: 1, staged, denylist: [], ledger: [], runsSinceMint: 5, lastMintAt: 0, lastKind: '', context: null }
   }));
+}
+
+// Positive persisted fixtures represent post-repair, clean observed activity. Old cache behavior
+// remains a separate negative in scout.http.test.js; do not promote legacy topics by hydration.
+function trustedInterests(label, now) {
+  const candidates = Interests.parse('TOPIC: ' + label + ' | EVIDENCE: ' + label,
+    { activityLines: ['Observed clean work: ' + label], requireExactEvidence: true });
+  let state = Interests.fresh(now);
+  for (let i = 0; i < 5; i++) state = Interests.fold(state, candidates, { now, trustedActivity: true });
+  return state;
 }
 
 async function driveRun(B, token, agentId, text) {
@@ -138,7 +159,7 @@ const QUIET = { SKYNET_THREAD_MINE: '0', SKYNET_SKILL_REVIEW: '0', SKYNET_SKILL_
     });
     const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'sk-scout-e2e-'));
     seedScoutState(ws);   // no interests file: the histogram starts COLD — warmth must be EARNED live
-    const { child, port } = await boot(8930 + (process.pid % 25), Object.assign({ SKYNET_WORKSPACES: ws, SKYNET_OPENROUTER_BASE: mock.base }, QUIET), 20);
+    const { child, port } = await boot(await allocatePort(), Object.assign({ SKYNET_WORKSPACES: ws, SKYNET_OPENROUTER_BASE: mock.base }, QUIET), 20);
     const B = 'http://' + HOST + ':' + port;
     try {
       const token = await bootToken(B, B);
@@ -173,6 +194,9 @@ const QUIET = { SKYNET_THREAD_MINE: '0', SKYNET_SKILL_REVIEW: '0', SKYNET_SKILL_
       // the durable files really landed on disk (restart-safety is the point of the server-side scout).
       const onDiskInterests = JSON.parse(fs.readFileSync(path.join(ws, 'scout.interests.json'), 'utf8'));
       A.ok(onDiskInterests.state && onDiskInterests.state.topics && Object.keys(onDiskInterests.state.topics).some(k => /nvidia/.test(k)), 'scout.interests.json persisted the extracted topic');
+      const trusted = onDiskInterests.state && onDiskInterests.state.trustedTopics && onDiskInterests.state.trustedTopics['nvidia-earnings-research'];
+      A.ok(trusted && trusted.n === 1, 'live exact-evidence extraction persists an independently counted trusted topic');
+      A.eq(trusted && trusted.ev.map(e => e.q), ['nvidia earnings call'], 'trusted disk evidence is the exact clean run fragment');
       const onDiskScout = JSON.parse(fs.readFileSync(path.join(ws, 'scout.state.json'), 'utf8'));
       A.ok((onDiskScout.state.staged || []).some(it => it.kind === 'recipe'), 'scout.state.json persisted the staged draft');
     } finally {
@@ -186,8 +210,9 @@ const QUIET = { SKYNET_THREAD_MINE: '0', SKYNET_SKILL_REVIEW: '0', SKYNET_SKILL_
   /* ================= BOOT 2 — the honest-failure chain (anti-silent-no-op) ================= */
   {
     const mock = await startMock({
-      // INVENTED evidence: quotes nothing in the real activity -> the extraction grounding guard must drop it.
-      extraction: 'TOPIC: quantum basket weaving | EVIDENCE: an invented quote citing zero observed activity',
+      // INVENTED evidence shares "pipeline" with real activity, so the old overlap parser accepted it.
+      // The live exact-evidence guard must drop the full invented quote.
+      extraction: 'TOPIC: quantum basket weaving | EVIDENCE: pipeline QUANTUM_SCOUT_INVENTED use imaginary context',
       // a WELL-FORMED recipe whose WHY cites nothing the station observed -> the parseRecipe grounding
       // guard must reject it (the new anti-invented-pitch arm), visibly, via the ledger.
       recipe: [
@@ -208,9 +233,9 @@ const QUIET = { SKYNET_THREAD_MINE: '0', SKYNET_SKILL_REVIEW: '0', SKYNET_SKILL_
     // WARM is pre-seeded here (boot 1 already proved warmth is earned live) so the mint attempt fires at all;
     // lastPassAt:0 leaves the extraction pass free to fire too — both failure arms exercise in one boot.
     fs.writeFileSync(path.join(ws, 'scout.interests.json'), JSON.stringify({
-      v: 1, state: { v: 1, topics: { 'kubernetes-ops': { label: 'kubernetes ops', w: 5, n: 5, lastAt: Date.now(), ev: [{ q: 'kubernetes ops', at: Date.now() }] } }, lastPassAt: 0, runsSincePass: 0 }
+      v: 1, state: Object.assign(trustedInterests('kubernetes ops', Date.now()), { lastPassAt: 0 })
     }));
-    const { child, port } = await boot(8960 + (process.pid % 25), Object.assign({ SKYNET_WORKSPACES: ws, SKYNET_OPENROUTER_BASE: mock.base }, QUIET), 20);
+    const { child, port } = await boot(await allocatePort(), Object.assign({ SKYNET_WORKSPACES: ws, SKYNET_OPENROUTER_BASE: mock.base }, QUIET), 20);
     const B = 'http://' + HOST + ':' + port;
     try {
       const token = await bootToken(B, B);
@@ -259,9 +284,9 @@ const QUIET = { SKYNET_THREAD_MINE: '0', SKYNET_SKILL_REVIEW: '0', SKYNET_SKILL_
     }));
     // a WARM topic whose words hit the broker archetype's own text; lastPassAt now -> extraction gap-suppressed.
     fs.writeFileSync(path.join(ws, 'scout.interests.json'), JSON.stringify({
-      v: 1, state: { v: 1, topics: { 'gpu-price-tracking': { label: 'gpu price tracking', w: 5, n: 5, lastAt: Date.now(), ev: [{ q: 'gpu price tracking', at: Date.now() }] } }, lastPassAt: Date.now(), runsSincePass: 0 }
+      v: 1, state: trustedInterests('gpu price tracking', Date.now())
     }));
-    const { child, port } = await boot(8890 + (process.pid % 25), Object.assign({ SKYNET_WORKSPACES: ws, SKYNET_OPENROUTER_BASE: mock.base }, QUIET), 20);
+    const { child, port } = await boot(await allocatePort(), Object.assign({ SKYNET_WORKSPACES: ws, SKYNET_OPENROUTER_BASE: mock.base }, QUIET), 20);
     const B = 'http://' + HOST + ':' + port;
     try {
       const token = await bootToken(B, B);
@@ -287,6 +312,56 @@ const QUIET = { SKYNET_THREAD_MINE: '0', SKYNET_SKILL_REVIEW: '0', SKYNET_SKILL_
       A.ok((onDisk.state.staged || []).some(it => it.kind === 'prospect' && it.draft && it.draft.archetypeId === 'broker'),
         'scout.state.json persisted the staged archetype draft');
     } finally {
+      try { child.kill(); } catch (_) {}
+      try { mock.server.close(); } catch (_) {}
+      await sleep(150);
+      try { fs.rmSync(ws, { recursive: true, force: true }); } catch (_) {}
+    }
+  }
+
+  /* ================= BOOT 4 — a PAUSE that lands mid-extraction wins (personalization authority) =================
+     runScoutCycle checked the pause once at entry, then folded + persisted whatever the extraction call returned.
+     Here the extraction call is HELD in flight; the Commander pauses learning; then the reply lands. Nothing may be
+     folded, persisted or noted (scanDocumentSource's re-check rule), and the call's spend is still booked. */
+  {
+    const mock = await startMock({
+      holdExtraction: true, priced: true, extractionUsage: { prompt_tokens: 1000, completion_tokens: 777, total_tokens: 1777 },
+      extraction: 'TOPIC: nvidia earnings research | EVIDENCE: nvidia earnings call',
+      recipe: 'NONE'
+    });
+    const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'sk-scout-e2e-'));
+    seedScoutState(ws);   // cold interests, exactly like BOOT 1's happy chain
+    const { child, port } = await boot(await allocatePort(), Object.assign({ SKYNET_WORKSPACES: ws, SKYNET_OPENROUTER_BASE: mock.base }, QUIET), 20);
+    const B = 'http://' + HOST + ':' + port;
+    try {
+      const token = await bootToken(B, B);
+      const directives = ['dig into the nvidia earnings call and what moved the stock', 'summarize the latest nvidia earnings call transcript for me', 'compare the nvidia earnings call guidance to last quarter'];
+      for (const d of directives) {
+        if (mock.held.extraction) break;
+        await driveRun(B, token, 'scout-e2e', d);
+        const until = Date.now() + 1500;
+        while (!mock.held.extraction && Date.now() < until) await sleep(50);
+      }
+      A.ok(mock.held.extraction, 'PAUSE ARM: the live extraction call is in flight (held by the mock)');
+      const off = await (await fetch(B + '/api/personalization', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-StarNet-Token': token, Origin: B }, body: JSON.stringify({ enabled: false }) })).json();
+      A.eq(off.enabled, false, 'PAUSE ARM: the Commander paused learning while the call was in flight');
+      const interestsFile = path.join(ws, 'scout.interests.json');
+      const before = fs.existsSync(interestsFile) ? fs.readFileSync(interestsFile, 'utf8') : null;
+      mock.release();
+      const ledgerFile = path.join(ws, 'ledger.jsonl');
+      const booked = () => { try { return fs.readFileSync(ledgerFile, 'utf8').split('\n').filter(Boolean).some(l => { try { const r = JSON.parse(l); return r.tokens >= 1777 && r.usd > 0; } catch (_) { return false; } }); } catch (_) { return false; } };
+      const until = Date.now() + 5000;
+      while (!booked() && Date.now() < until) await sleep(100);
+      A.ok(booked(), 'PAUSE ARM: the extraction call\'s spend is still booked to the ledger (truthful cost)');
+      await sleep(300);
+      const after = fs.existsSync(interestsFile) ? fs.readFileSync(interestsFile, 'utf8') : null;
+      A.eq(after, before, 'PAUSE ARM: scout.interests.json is byte-identical — the late reply folded nothing');
+      const s = await (await fetch(B + '/api/scout', { headers: { 'X-StarNet-Token': token, Origin: B } })).json();
+      A.ok(!(s.ledger || []).some(e => e.kind === 'interests' && e.outcome === 'folded'), 'PAUSE ARM: no "folded" note was written after the pause');
+      A.ok(!(s.interests || []).some(t => /nvidia/.test(t.topic)), 'PAUSE ARM: the topic never entered the histogram');
+      A.eq(mock.calls.indexOf('recipe'), -1, 'PAUSE ARM: the cycle drafted nothing after the pause');
+    } finally {
+      try { mock.release(); } catch (_) {}
       try { child.kill(); } catch (_) {}
       try { mock.server.close(); } catch (_) {}
       await sleep(150);

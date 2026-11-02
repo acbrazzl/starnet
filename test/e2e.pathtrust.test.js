@@ -7,12 +7,14 @@
    and revoking the grant makes the very next run prompt again. No real key, no network. */
 'use strict';
 const A = require('./_assert.js');
+const { userWords } = require('./helpers/host-notes.js');   // the user's own words: the run-context note leads the newest user message on this wire
 const http = require('http');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const { bootToken } = require('./_httpToken.js');
+const { allocatePort, BIND_REFUSED } = require('./helpers/ports.js');
 const HOST = '127.0.0.1';
 const INDEX = path.resolve(__dirname, '..', 'sidecar', 'index.js');
 
@@ -33,7 +35,7 @@ function startMockOpenRouter() {
           requests.push(msgs);
           const hasToolResult = msgs.some(m => m && m.role === 'tool');
           const lastUser = [...msgs].reverse().find(m => m && m.role === 'user');
-          const target = lastUser ? String(lastUser.content || '') : '';
+          const target = lastUser ? userWords(lastUser) : '';
           res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
           if (!hasToolResult) {
             res.write('data: ' + JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'r1', type: 'function', function: { name: 'fs_read', arguments: JSON.stringify({ path: target }) } }] } }] }) + '\n\n');
@@ -60,7 +62,7 @@ function boot(port, env, attemptsLeft) {
     const onData = d => {
       out += d.toString();
       if (!settled && out.indexOf('http://' + HOST + ':' + port) >= 0) { settled = true; resolve({ child, port }); }
-      else if (!settled && /already in use/i.test(out)) { settled = true; try { child.kill(); } catch (_) {} if (attemptsLeft > 0) resolve(boot(port + 1, env, attemptsLeft - 1)); else reject(new Error('no free port')); }
+      else if (!settled && BIND_REFUSED.test(out)) { settled = true; try { child.kill(); } catch (_) {} if (attemptsLeft > 0) resolve(allocatePort().then(next => boot(next, env, attemptsLeft - 1))); else reject(new Error('no free port')); }
     };
     child.stdout.on('data', onData); child.stderr.on('data', onData);
     child.on('error', e => { if (!settled) { settled = true; reject(e); } });
@@ -95,7 +97,7 @@ function boot(port, env, attemptsLeft) {
   const looseFile = path.join(repo2, 'index.js');
 
   const env = { SKYNET_WORKSPACES: ws, SKYNET_OPENROUTER_BASE: mock.base, STARNET_PROJECT_DISCOVERY_ROOTS: repo2 };   // NO FULL_ACCESS → the consent broker is live
-  let running = await boot(8760 + (process.pid % 40), env, 25);
+  let running = await boot(await allocatePort(), env, 25);
   let B = 'http://' + HOST + ':' + running.port;
   let token;
 
@@ -227,7 +229,7 @@ function boot(port, env, attemptsLeft) {
     // ---- 3b. RESTART-SAFE: the standing grant + project metadata survive a sidecar reboot on the same
     //          workspace (the top recurring bug class is "worked until restart"). ----
     try { running.child.kill(); } catch (_) {}
-    running = await boot(8830 + (process.pid % 40), env, 25);
+    running = await boot(await allocatePort(), env, 25);
     B = 'http://' + HOST + ':' + running.port;
     token = await bootToken(B, B);
     const permsR = await (await fetch(B + '/api/permissions', { headers: { 'X-StarNet-Token': token, Origin: B } })).json();

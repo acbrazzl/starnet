@@ -56,21 +56,24 @@
   const DEFAULT_MAX_CONSECUTIVE_FAILURES = 5;   // terminal failures in a row before a recurring job auto-pauses
   const ID_RE = /^[A-Za-z0-9_-]{1,40}$/;      // a single safe path component (matches index.js agentId guard)
   const iso = cron._internals.iso;            // ms(arg) -> ISO; deterministic (no zero-arg new Date)
+  // a fire's work-line stop facts, bounded (routing/line-fire.js lineFacts — the one shape the routine paths record)
+  const lineFactsOf = (typeof require === 'function') ? require('./routing/line-fire.js').lineFacts : function () { return null; };
 
   // fields a user may edit via updateJob. `id`, timestamps, run-state and counters are NOT editable here.
-  const EDITABLE = ['name', 'prompt', 'agentId', 'model', 'provider', 'deliver', 'skills', 'script', 'scriptTimeoutMs', 'workdir', 'contextFrom', 'monitorMode', 'misfire', 'unattendedGrants', 'noAgent', 'enabledToolsets', 'attachToSession', 'origin', 'runsLine'];
+  const EDITABLE = ['name', 'prompt', 'agentId', 'model', 'provider', 'deliver', 'skills', 'script', 'scriptTimeoutMs', 'workdir', 'contextFrom', 'monitorMode', 'misfire', 'unattendedGrants', 'noAgent', 'enabledToolsets', 'attachToSession', 'origin', 'runsLine', 'dockId'];
 
   /* UNATTENDED CAPABILITY GRANT (2026-07-25) — the capability families the Commander explicitly approved for
      THIS routine to use with nobody watching. Default EMPTY: a routine grants nothing extra unless the user
      ticked it, so every pre-existing job loads with no new power. 'workbench' = terminal (shell.exec) +
      verify.run. 'connectors' = the Commander's connected MCP servers (capability 'mcp:<connectorId>'); a
      connector the Commander switched OFF still contributes no tools, so this can never re-enable one.
+     'studio' = image_generate: the routine may make images with nobody there to approve each one.
 
      This list is STORAGE, not authority. sidecar/inputpolicy.js owns the authoritative whitelist
      (GRANTABLE_UNATTENDED) and re-filters it at the gate on every run, so a hand-edited or migrated
      cron.jobs.json can never widen a run past what the host models — the two filters are deliberately
      independent (defense in depth), which is also why this module needs no cross-require of the policy. */
-  const GRANTABLE = ['workbench', 'connectors'];
+  const GRANTABLE = ['workbench', 'connectors', 'studio'];
   function normGrants(v) {
     if (!Array.isArray(v)) return [];
     const out = [];
@@ -159,6 +162,7 @@
       lastRunAt: null, lastRunId: null, lastStatus: null, lastError: null, lastReason: null,
       // Bounded final output is the durable data plane for contextFrom. It is runtime data, never editable.
       lastOutput: null,
+      lastLine: null,   // the last fire's work-line stop facts { stopped?, unapproved?, partial? } (markRun)
       retryCount: 0,
       // misfire policy for a recurring job (see normMisfire above). null -> schedule-derived default.
       misfire: normMisfire(spec.misfire),
@@ -210,6 +214,11 @@
          answer (router.lineOfAgent), and a second copy on disk would be a second derivation that drifts the
          first time the Commander edits the floor. The flag records the INTENT; the line is looked up live. */
       runsLine: spec.runsLine === true,
+      /* FIRES AT A BAY (multi-bay agents, 2026-09-22): which of the agent's bays this routine fires at, when the
+         Commander picked one (the workflow panel's FIRES AT chips). OPTIONAL and additive — present only when a
+         safe id was given, so every existing job record is byte-identical. The fire resolves it against the
+         live plan (router.dockOf): a dock the floor no longer has falls back to the agent's ENTRY dock. */
+      ...(ID_RE.test(String(spec.dockId == null ? '' : spec.dockId)) ? { dockId: String(spec.dockId) } : {}),
       enabledToolsets: spec.enabledToolsets == null ? null : normList(spec.enabledToolsets, 16, /^[A-Za-z0-9:_-]{1,80}$/),
       attachToSession: spec.attachToSession === true,
       // ADDITIVE provenance (Recipe Marketplace R3): a sibling `meta` bag for caller-supplied provenance, e.g.
@@ -256,6 +265,8 @@
       const next = Object.assign({}, job);
       for (const k of EDITABLE) if (Object.prototype.hasOwnProperty.call(patch, k)) next[k] = patch[k];
       if (Object.prototype.hasOwnProperty.call(patch, 'misfire')) next.misfire = normMisfire(patch.misfire);
+      // dockId: a safe id or nothing (a cleared/garbage value removes the key — the job fires at the entry dock)
+      if (Object.prototype.hasOwnProperty.call(patch, 'dockId')) { if (ID_RE.test(String(patch.dockId == null ? '' : patch.dockId))) next.dockId = String(patch.dockId); else delete next.dockId; }
       // re-normalize through the whitelist: the EDITABLE loop above copies the RAW patch value, so without this
       // a patch could persist an ungrantable capability name (same trap misfire guards against).
       if (Object.prototype.hasOwnProperty.call(patch, 'unattendedGrants')) next.unattendedGrants = normGrants(patch.unattendedGrants);
@@ -377,6 +388,15 @@
      for this job, separate from the run outcome (a routine can succeed while its ping fails — that failure
      must be durable and visible, never swallowed). result = { ok:bool, error?:string, channel?:string }.
      Pure: `now` is injected. No-op-safe on an absent job (mapJob leaves the array unchanged). */
+  // A later occurrence must never overwrite an undelivered result. Bound retained
+  // work through backpressure, not by discarding the oldest notification.
+  const MAX_PENDING_DELIVERIES = 100;
+  function pendingDeliveries(job) {
+    return (Array.isArray(job && job.deliveryBacklog) ? job.deliveryBacklog : [])
+      .concat(job && job.finalization ? [job.finalization] : [])
+      .filter(f => f && f.state === 'pending');
+  }
+
   function markDelivery(jobs, id, result, ctx) {
     result = result || {}; ctx = ctx || {};
     const now = ctx.now || 0;
@@ -385,14 +405,93 @@
       const error = ok ? null : String(result.error != null ? result.error : 'delivery failed') +
         (result.channel ? ' [' + String(result.channel) + ']' : '');
       const next = Object.assign({}, job, { lastDeliveryAt: iso(now), lastDeliveryOk: ok, lastDeliveryError: error });
-      if (job.finalization && (!result.runId || String(result.runId) === String(job.finalization.runId))) {
-        next.finalization = Object.assign({}, job.finalization, {
-          state: ok ? 'delivered' : 'pending', attempts: (job.finalization.attempts || 0) + 1,
-          deliveredAt: ok ? iso(now) : null, lastError: error
+      // Legacy notifier outcomes lack a run id; they may update the status line,
+      // but cannot acknowledge unrelated durable result receipts.
+      const matches = f => f && result.runId && String(result.runId) === String(f.runId);
+      const update = f => {
+        const attempts = (f.attempts || 0) + 1;
+        return Object.assign({}, f, {
+          state: ok ? 'delivered' : 'pending', attempts: attempts,
+          deliveredAt: ok ? iso(now) : null, lastError: error,
+          deliveredTargets: Array.isArray(result.deliveredTargets) ? result.deliveredTargets.slice(0, 16) : (f.deliveredTargets || []),
+          nextAttemptAt: ok ? null : iso(now + Math.min(900000, 60000 * Math.pow(2, Math.min(attempts - 1, 4))))
         });
-      }
+      };
+      if (matches(job.finalization)) next.finalization = update(job.finalization);
+      if (Array.isArray(job.deliveryBacklog)) next.deliveryBacklog = job.deliveryBacklog
+        .map(f => matches(f) ? update(f) : f).filter(f => f.state === 'pending');
       return next;
     });
+  }
+
+  /* ONE CURRENT RESULT PER CHAT (upgrade review 2026-10-23). 0.13.x sent a routine's reply as one message, so every
+     digest past Telegram's 4096 / Discord's 2000 characters stayed `pending` for good (retried, never expired) and
+     each later fire queued another behind it. 0.14 splits long replies, so all of those became deliverable at once:
+     the first boot sent weeks of old digests in a burst. A chat gets the routine's NEWEST result per destination;
+     the older idle ones are closed as 'superseded' (never resent) and the newest carries the count, so the delivery
+     says how many earlier results did not come. Returns the SAME array when nothing changes. Pure: `now` is injected.
+     Who replaces whom (review 2026-10-23):
+       * a [SILENT] result sends nothing, so it never replaces a result and is never counted as one — it is left to
+         be acknowledged on its own (a monitor's quiet fire must not swallow the alert still waiting before it);
+       * a failure notice never replaces a real result: per destination the keepers are the newest result AND, when
+         it is newer still, the newest failure notice; every other receipt goes to the nearest NEWER keeper;
+       * `busy` = run ids whose send is in flight or whose acknowledgement is not yet on disk. A busy receipt is
+         never superseded (it may already have landed), and never takes over others either: its text is already on
+         the wire, so a count it gained could never be said. Receipts whose keeper is busy wait for a later pass. */
+  function deliveryDestination(f) {
+    const o = (f && f.origin) || {};
+    return [String((f && f.deliver) || 'local'), o.target || '', o.channel || '', o.chatId || '', o.threadId || '', o.sessionId || '', o.streamId || ''].join('\u0001');
+  }
+  function supersedeDeliveries(jobs, id, ctx) {
+    ctx = ctx || {};
+    const job = getJob(jobs, id);
+    const pending = pendingDeliveries(job).filter(f => f.outcome !== 'silent');
+    if (pending.length < 2) return jobs;
+    const busy = (Array.isArray(ctx.busy) ? ctx.busy : []).map(String);
+    const isBusy = f => busy.indexOf(String(f.runId)) >= 0;
+    const byDest = new Map();   // destination -> its receipts, oldest first (pendingDeliveries is oldest-first)
+    for (const f of pending) {
+      const d = deliveryDestination(f);
+      if (!byDest.has(d)) byDest.set(d, []);
+      byDest.get(d).push(f);
+    }
+    const drop = new Map();     // superseded receipt -> the receipt that replaces it
+    for (const list of byDest.values()) {
+      let result = -1, failure = -1;
+      list.forEach((f, i) => { if (f.outcome === 'failed') failure = i; else result = i; });
+      const keepers = [result, failure > result ? failure : -1].filter(i => i >= 0).sort((a, b) => a - b);
+      list.forEach((f, i) => {
+        if (keepers.indexOf(i) >= 0 || isBusy(f)) return;
+        const k = keepers.find(x => x > i);
+        if (k != null && !isBusy(list[k])) drop.set(f, list[k]);
+      });
+    }
+    if (!drop.size) return jobs;
+    const gained = new Map();   // a superseded receipt hands on the count it was already carrying
+    for (const [f, keep] of drop) gained.set(keep, (gained.get(keep) || 0) + 1 + (Number(f.superseded) || 0));
+    const at = iso(ctx.now || 0);
+    const mark = f => {
+      if (drop.has(f)) return Object.assign({}, f, { state: 'superseded', supersededAt: at, supersededBy: String(drop.get(f).runId || ''), nextAttemptAt: null });
+      if (gained.has(f)) return Object.assign({}, f, { superseded: (Number(f.superseded) || 0) + gained.get(f) });
+      return f;
+    };
+    return mapJob(jobs, id, (j) => {
+      const next = Object.assign({}, j);
+      if (j.finalization) next.finalization = mark(j.finalization);
+      if (Array.isArray(j.deliveryBacklog)) next.deliveryBacklog = j.deliveryBacklog.map(mark).filter(f => f && f.state === 'pending');
+      return next;
+    });
+  }
+  /* A routine the Commander PAUSED keeps its undelivered results until it is resumed — pausing it must not be the
+     moment its old results start arriving. A completed one-shot, an exhausted repeat and an auto-paused routine are
+     not 'paused' (their last result is the notice the Commander needs) and deliver as before. */
+  function deliveriesHeld(job) { return !!(job && job.enabled === false && job.state === 'paused'); }
+  /* undeliveredCount(job) -> the routine's results that have not reached their destination: every pending receipt plus
+     the earlier ones it superseded. This, not the receipt count, is what MAX_PENDING_DELIVERIES bounds — a chat that
+     refuses every message (bot blocked, chat deleted) keeps ONE receipt after the collapse, and counting receipts alone
+     let such a routine fire (and spend) forever. Once a result lands, its count is spent and the routine runs again. */
+  function undeliveredCount(job) {
+    return pendingDeliveries(job).reduce((n, f) => n + 1 + Math.max(0, Number(f.superseded) || 0), 0);
   }
 
   function markBlockedConfig(jobs, id, info, ctx) {
@@ -454,6 +553,23 @@
     }));
   }
 
+  /* markInterrupted — a RECURRING routine's run whose process died between fire and settlement (advance-before-run
+     already moved nextRunAt; markRun never ran). Honest abandonment: the record names THAT run instead of still
+     reporting the previous occurrence's ok. Nothing is re-armed, finalized or counted toward auto-pause — the run may
+     have acted, and its review/continuation lives in run recovery. A one-shot keeps its own fire-claim reclaim (G4.5);
+     a record that already settled this run or a LATER occurrence is left exactly as it is (idempotent per boot). */
+  function markInterrupted(jobs, id, info) {
+    info = info || {};
+    const runId = String(info.runId || ''), startedAt = Number(info.startedAt) || 0;
+    return mapJob(jobs, id, (job) => {
+      if (!runId || !startedAt || job.lastRunId === runId || !(job.schedule && (job.schedule.kind === 'interval' || job.schedule.kind === 'cron'))) return job;
+      const last = job.lastRunAt ? Date.parse(job.lastRunAt) : NaN;
+      if (isFinite(last) && last >= startedAt) return job;
+      return Object.assign({}, job, { lastRunId: runId, lastRunAt: iso(startedAt), lastStatus: 'error', lastReason: 'interrupted',
+        lastError: String(info.error || 'interrupted: StarNet stopped before this run finished'), state: job.enabled === false ? job.state : 'error' });
+    });
+  }
+
   function setNotepad(jobs, id, text, ctx) {
     ctx = ctx || {};
     return mapJob(jobs, id, (job) => Object.assign({}, job, {
@@ -488,6 +604,8 @@
       next.lastStatus = ok ? 'ok' : 'error';
       next.lastError = ok ? null : (result.error != null ? String(result.error) : 'error');
       if (ok && result.output != null) next.lastOutput = String(result.output).slice(0, 32000);
+      // the WORK LINE's stop facts for this fire (routing/line-fire.js lineFacts): null = no line, or a clean one
+      next.lastLine = lineFactsOf(result.line);
       if (ok && result.monitorHash != null) {
         next.monitorHash = String(result.monitorHash).slice(0, 200);
         next.monitorLastCheckedAt = iso(now);
@@ -509,18 +627,24 @@
         // permanently (+backoff per transient). The first transient of this occurrence stamps the anchor
         // (nextRunAt still holds the advance-before-run value); later retries keep the original.
         next.retryAnchorAt = job.retryAnchorAt || job.nextRunAt || null;
-        next.nextRunAt = iso(now + backoffMs);
+        // RAMPED BACKOFF (2026-10-01): 1×, 3×, 9× the base (90s → 4.5m → 13.5m by default). A fixed 90s burned
+        // all three retries inside ~5 minutes — shorter than most provider blips and network drops it exists for.
+        next.nextRunAt = iso(now + backoffMs * Math.pow(3, Math.min(job.retryCount || 0, 3)));
         next.state = 'error';                  // visible as failing-and-retrying, but still scheduled to fire
         return next;
       }
 
       // terminal: finalize this occurrence.
+      const pending = pendingDeliveries(job).filter(f => f.runId !== String(next.lastRunId || ''));
+      if (pending.length >= MAX_PENDING_DELIVERIES) throw new Error('routine delivery backlog is full; reconnect the destination');
+      next.deliveryBacklog = pending;
       next.lastUsd = Number.isFinite(Number(result.usd)) ? Number(result.usd) : 0;
       next.finalization = {
         id: String(next.lastRunId || job.id) + ':final', runId: String(next.lastRunId || ''), state: 'pending',
         outcome: ok ? (String(result.output || '').trim() === '[SILENT]' ? 'silent' : 'ok') : 'failed',
         result: ok ? String(result.output || '').slice(0, 32000) : '', error: ok ? null : next.lastError,
         usd: next.lastUsd, deliver: String(job.deliver || 'local'), origin: job.origin || null,
+        deliveryContext: { name: job.name, prompt: job.prompt, agentId: job.agentId, noAgent: job.noAgent, attachToSession: job.attachToSession },
         destination: String(job.deliver || 'local'), committedAt: iso(now), attempts: 0
       };
       next.retryCount = 0;
@@ -570,12 +694,23 @@
     return { version: ENVELOPE_VERSION, jobs: jobs };
   }
 
+  /* GRANTS BIND TO THE APPROVED INSTRUCTION (2026-09-23 security audit). Returns the unattended grants an AGENT
+     edit must drop: rewriting a granted routine's prompt would otherwise inherit the Commander's standing
+     workbench/connectors power for an instruction the Commander never saw. Pure; the Commander's own edit path
+     (POST /api/cron/update) does not call this. */
+  function grantsRevokedByAgentEdit(current, patch) {
+    if (!current || !patch || !Object.prototype.hasOwnProperty.call(patch, 'prompt')) return [];
+    if (String(patch.prompt == null ? '' : patch.prompt) === String(current.prompt == null ? '' : current.prompt)) return [];
+    return normGrants(current.unattendedGrants);
+  }
+
   function toEnvelope(jobs) { return { version: ENVELOPE_VERSION, jobs: (jobs || []).slice() }; }
 
   return {
     makeJob: makeJob,
     createJob: createJob,
     updateJob: updateJob,
+    grantsRevokedByAgentEdit: grantsRevokedByAgentEdit,
     pauseJob: pauseJob,
     resumeJob: resumeJob,
     triggerJob: triggerJob,
@@ -583,11 +718,17 @@
     renewOnceHeartbeat: renewOnceHeartbeat,
     markRun: markRun,
     markDelivery: markDelivery,
+    pendingDeliveries: pendingDeliveries,
+    supersedeDeliveries: supersedeDeliveries,
+    deliveriesHeld: deliveriesHeld,
+    undeliveredCount: undeliveredCount,
+    MAX_PENDING_DELIVERIES: MAX_PENDING_DELIVERIES,
     markBlockedConfig: markBlockedConfig,
     clearBlockedConfig: clearBlockedConfig,
     markMonitorCheck: markMonitorCheck,
     setNotepad: setNotepad,
     markUnfireable: markUnfireable,
+    markInterrupted: markInterrupted,
     UNFIREABLE_ERROR: UNFIREABLE_ERROR,
     DEFAULT_MAX_CONSECUTIVE_FAILURES: DEFAULT_MAX_CONSECUTIVE_FAILURES,
     removeJob: removeJob,

@@ -268,6 +268,32 @@ const beforeEvicted = sampler.stats().sampleCacheMisses;
 sampler.sample(35.000000001, 30);
 A.eq(sampler.stats().sampleCacheMisses, beforeEvicted + 1, 'an evicted moving position is evaluated again when revisited');
 
+// GEOMETRY-SCOPED VISIBILITY (2026-10-07): a flickering source clears the samples every frame, but the wall
+// occlusion behind them is remembered per wall set. Every sample must equal a cold engine's, bit for bit.
+{
+  const pick = h => JSON.stringify([h.rgb, h.color, h.strength, h.energy, h.dx, h.dy, h.coherence]);
+  const flick = k => ({ fixtures: [{ x: 30, y: 30, r: 50, rgb: '255,192,104', softness: 1.2 }],
+    lights: [Object.assign({}, source, { a: 0.5 + 0.01 * k, softness: 2 }), { x: 70, y: 28, r: 40, a: 0.4 + 0.02 * k, c: [90, 170, 255], softness: 1, originX: 66, originY: 24 }] });
+  const points = [[35, 30], [65, 30], [52, 24], [40.5, 17.25], [72, 40], [20, 44], [58.125, 31]];
+  const warm = Light.create({ canvasFactory }); warm.setGeometry(station(true));
+  let same = 0;
+  for (let k = 0; k < 6; k++) {
+    warm.prepare(flick(k));
+    for (const [x, y] of points) {
+      const cold = Light.create({ canvasFactory }); cold.setGeometry(station(true)); cold.prepare(flick(k));
+      if (pick(warm.sample(x, y)) === pick(cold.sample(x, y))) same++;
+      cold.dispose();
+    }
+  }
+  A.eq(same, 6 * points.length, 'remembered occlusion: every flickering-frame sample equals a cold engine\'s exactly');
+  A.eq(warm.stats().sampleCacheInvalidations >= 6, true, 'each power change still cleared the samples themselves');
+  warm.prepare(flick(0)); A.ok(warm.sample(65, 30).strength > 0, 'the open threshold passes light (warm caches)');
+  warm.setGeometry(station(false)); warm.prepare(flick(0));
+  const sealed = Light.create({ canvasFactory }); sealed.setGeometry(station(false)); sealed.prepare(flick(0));
+  A.eq(pick(warm.sample(65, 30)), pick(sealed.sample(65, 30)), 'a new wall set starts the occlusion caches over: the sealed door matches a cold engine');
+  warm.dispose(); sealed.dispose();
+}
+
 sampler.prepare({ lights: [Object.assign({}, sampleSource, { a: 0.6000001 })] });
 A.eq(sampler.stats().sampleCacheSize, 0, 'sub-byte source power changes invalidate samples immediately');
 A.ok(sampler.sample(35, 30).strength > firstSample.strength, 'a power change smaller than raster-key rounding still reaches sprite samples');
@@ -307,5 +333,141 @@ sampler.render(output,sampleFrame);
 A.eq(sampler.stats().preparations,preparedCount+2,'explicit frame refresh remains supported');
 sampler.dispose();
 A.eq(sampler.stats().sampleCacheSize, 0, 'dispose releases all sample descriptors');
+
+// KEY buffer (2026-09-22): the one pass that puts light ON a surface. It must be
+// absent unless asked for, composite as overlay between the dark film and the glow,
+// and keep its stamps tighter than the cut that made room for it.
+const keyed = Light.create({ canvasFactory }); keyed.setGeometry(station(true));
+const keyFrame = { fixtures: [{ x: 30, y: 30, r: 50, rgb: '255,192,104' }], lights: [source], ambient: 0.82 };
+const ops = [], keyOut = Object.assign(canvasFactory(96, 60).getContext('2d'), {
+  drawImage(img) { ops.push({ op: this.globalCompositeOperation, img }); } });
+keyed.render(keyOut, keyFrame);
+A.eq(keyed.stats().key, false, 'the key buffer is not allocated unless configured');
+A.eq(ops.filter(o => o.op === 'overlay').length, 0, 'an unkeyed station composites exactly as before');
+const plainSurfaces = surfaces.length, plainStamps = keyed.stats().cachedStamps;
+keyed.configure({ key: 1.5, keyReach: 0.5, shadeCool: 0.1 }); ops.length = 0;
+keyed.render(keyOut, keyFrame);
+A.eq(keyed.stats().key, true, 'configuring a key allocates its buffers');
+A.eq(surfaces.length - plainSurfaces - (keyed.stats().cachedStamps - plainStamps), 2,
+  'besides its own stamps, the key costs exactly one static and one per-frame surface');
+A.eq(ops.map(o => o.op).join(','), 'source-over,overlay,screen', 'the key lands between the dark film and the glow');
+A.ok(keyed.stats().cachedStamps > plainStamps, 'key stamps are cached separately from the full-radius cut stamps');
+const keyCut = fills.filter(f => /^rgb\(\d+,\d+,\d+\)$/.test(String(f.style))).pop();
+A.ok(keyCut && /^rgb\((\d+),(\d+),(\d+)\)$/.test(keyCut.style) && +RegExp.$1 < 128 && +RegExp.$3 > 128,
+  'shadeCool leans the unlit neutral toward blue, away from red');
+const steady = keyed.stats(), steadySurfaces = surfaces.length;
+ops.length = 0; keyed.render(keyOut, keyFrame);
+A.eq(keyed.stats().dynamicBuilds, steady.dynamicBuilds, 'a steady keyed frame reuses its composed maps');
+A.eq(surfaces.length, steadySurfaces, 'a steady keyed frame allocates nothing');
+keyed.configure({ key: 0, shadeCool: 0 }); ops.length = 0; keyed.render(keyOut, keyFrame);
+A.eq(keyed.stats().key, false, 'switching the key off releases its buffers');
+A.eq(ops.filter(o => o.op === 'overlay').length, 0, 'and the composite returns to the unkeyed path');
+keyed.dispose();
+
+// LIGHT GRID + KERNELS (2026-10-10, "slower since the new textures"): a sample walks only the sources whose reach covers
+// its grid cell, and a brightness-only frame reuses each point's geometry kernel — the descriptor stays exactly lightAt's
+{
+  const big = (() => { const COLS = 40, ROWS = 20, zg = new Array(COLS * ROWS).fill(null);
+    for (let y = 1; y <= 18; y++) for (let x = 1; x <= 38; x++) zg[y * COLS + x] = x <= 19 ? 'a' : 'b';
+    return { COLS, ROWS, TILE: 12, W: 480, H: 240, zoneGrid: zg, allRects: [{ x1: 1, y1: 1, x2: 38, y2: 18 }],
+      canStep: (x, y, nx, ny) => zg[y * COLS + x] === zg[ny * COLS + nx] || (y === 9 && ny === 9 && Math.abs(x - nx) === 1) }; })();
+  const lightsAt = (a, nudge) => Array.from({ length: 40 }, (_, i) => ({ x: 20 + (i * 53) % 440 + (nudge && i === 3 ? 7 : 0), y: 20 + (i * 37) % 200,
+    r: 18 + (i * 7) % 40, a: a * (0.3 + (i % 5) / 10), c: [255 - i * 3, 150 + i, 90 + i * 2], softness: (i % 3) * 0.6 }));
+  const points = Array.from({ length: 120 }, (_, i) => [15 + (i * 41.3) % 450, 15 + (i * 23.7) % 210]);
+  const view = h => JSON.stringify([h.rgb, h.strength, h.color, h.dx, h.dy, h.energy, h.coherence, h.source && [h.source.x, h.source.y, h.source.a]]);
+  const segs = Light.buildSegments(big);
+  const brute = (lights, x, y) => Light.lightAt(x, y, lights.map(s => Light.normalizeLight(s, false, 1)).filter(Boolean), segs);
+  const warm = Light.create({ canvasFactory }); warm.setGeometry(big);
+  warm.prepare({ lights: lightsAt(1) }); points.forEach(([x, y]) => warm.sample(x, y));
+  warm.prepare({ lights: lightsAt(0.5) });   // brightness only: the sample cache clears, the kernels stay
+  const walked = warm.stats().sampleSourcesWalked;
+  const reused = points.map(([x, y]) => warm.sample(x, y));
+  A.eq(warm.stats().sampleSourcesWalked, walked, 'a brightness-only frame re-samples every point without walking a source again');
+  const cold = Light.create({ canvasFactory }); cold.setGeometry(big); cold.prepare({ lights: lightsAt(0.5) });
+  const fresh = points.map(([x, y]) => cold.sample(x, y));
+  A.ok(reused.every((h, i) => view(h) === view(fresh[i])), 'a reused kernel gives the descriptor a fresh evaluation gives');
+  A.ok(fresh.every((h, i) => view(h) === view(brute(lightsAt(0.5), points[i][0], points[i][1]))), '...which is exactly lightAt over EVERY source');
+  A.ok(fresh.some(h => h.strength > 0) && fresh.some(h => h.strength === 0), '(the fixture spans lit and unlit points)');
+  A.ok(cold.stats().sampleSourcesWalked < points.length * 40 / 3, 'the grid walks only the sources that can reach a point');
+  warm.prepare({ lights: lightsAt(0.5, true) });   // a source MOVED: geometry changed, kernels rebuild
+  A.ok(points.every(([x, y]) => view(warm.sample(x, y)) === view(brute(lightsAt(0.5, true), x, y))), 'a moved source rebuilds the grid and every kernel');
+  warm.dispose(); cold.dispose();
+}
+
+// GROUNDING CLIP (review world-render-04): a standing body's wall clip is cached, but it was keyed on the shadow's length, which
+// moves with every flicker of a nearby screen, so the 24 wall rays were re-cast every frame anyway. The clip is keyed on the
+// body's maximum reach instead (shadowFor caps length at height * 0.7): a flickering light must not rebuild a still body's clip.
+{
+  const ground = Light.create({ canvasFactory }); ground.setGeometry(station(true));
+  const still = [{ x: 35, y: 30, width: 8, height: 20 }];
+  const flick = k => ({ lights: [Object.assign({}, source, { a: 0.5 + 0.05 * k, softness: 2 }),
+    { x: 70, y: 28, r: 40, a: 0.9 - 0.08 * k, c: [90, 170, 255], softness: 1, originX: 66, originY: 24 }] });
+  const lengths = new Set();
+  for (let k = 0; k < 6; k++) {
+    ground.prepare(flick(k));
+    lengths.add(Light.shadowFor(still[0], [], [], ground.sample(35, 30)).length.toFixed(6));
+    ground.drawGrounding(output, still);
+  }
+  A.ok(lengths.size > 1, '(the flicker really moves the shadow length)');
+  A.eq(ground.stats().groundClipBuilds, 1, 'a still body casts its wall clip once while a nearby light flickers');
+  ground.drawGrounding(output, [{ x: 36, y: 30, width: 8, height: 20 }]);
+  A.eq(ground.stats().groundClipBuilds, 2, 'a body that moved gets a fresh clip');
+  ground.setGeometry(station(false)); ground.prepare(flick(0)); ground.drawGrounding(output, still);
+  A.eq(ground.stats().groundClipBuilds, 3, 'a new wall set rebuilds the clip (a sealed door is respected)');
+  ground.dispose();
+}
+
+// NUMERIC LIGHT KEYS (2026-10-20, "eats my PC's resources"): the map keys rounded alpha to a byte, so a working screen's
+// ±1.5% flicker crossed byte boundaries and re-blitted the station-sized maps several times a second. The maps now hold a
+// 1.5-LSB band around the alpha they were built with; geometry, count and config still rebuild the same frame, and the
+// sample key still follows every exact alpha.
+{
+  const lit = Light.create({ canvasFactory }); lit.setGeometry(station(true));
+  const screens = Array.from({ length: 20 }, (_, i) => ({ x: 14 + (i % 10) * 7, y: 18 + Math.floor(i / 10) * 20, r: 26, c: [98, 255, 158], base: 0.16, seed: i * 0.7 }));
+  const screenK = (now, s) => 0.985 + 0.01 * Math.sin(now / 900 + s) + 0.005 * Math.sin(now / 2400 + s * 1.7);   // propsprites' 'screen' flicker
+  const at = (now, extra) => ({ fixtures: [{ x: 30, y: 30, r: 50, rgb: '255,192,104' }],
+    lights: screens.map(s => ({ x: s.x, y: s.y, r: s.r, c: s.c, a: s.base * screenK(now, s.seed) })).concat(extra || []) });
+  lit.render(output, at(0));
+  const b0 = lit.stats(), bytes = new Set();
+  let exactChanges = 0;
+  for (let f = 1; f <= 600; f++) {
+    const frame = at(f * 16.67), inv = lit.stats().sampleCacheInvalidations;
+    frame.lights.forEach(l => bytes.add(Math.round(l.a * 255)));
+    lit.render(output, frame);
+    if (lit.stats().sampleCacheInvalidations > inv) exactChanges++;
+  }
+  A.ok(bytes.size > 1, '(setup: the flicker really crosses byte boundaries, which the old byte key rebuilt on)');
+  A.eq(lit.stats().dynamicBuilds, b0.dynamicBuilds, '600 frames of screen flicker never rebuild the composed prop map');
+  A.eq(lit.stats().staticBuilds, b0.staticBuilds, '...nor the static fixture map');
+  A.eq(exactChanges, 600, 'the sample cache still follows every exact alpha change');
+  const steady = at(600 * 16.67);
+  lit.render(output, steady); const s1 = lit.stats();
+  steady.lights[3] = Object.assign({}, steady.lights[3], { a: steady.lights[3].a + 3 / 255 });
+  lit.render(output, steady);
+  A.eq(lit.stats().dynamicBuilds, s1.dynamicBuilds + 1, 'a 3/255 step (a light switching state) rebuilds that very frame');
+  lit.render(output, steady);
+  A.eq(lit.stats().dynamicBuilds, s1.dynamicBuilds + 1, '...exactly once');
+  const extra = { x: 70, y: 30, r: 20, c: [255, 120, 200], a: 0.12 };
+  for (const [what, next] of [['adding a light', at(600 * 16.67, [extra])], ['moving a light', at(600 * 16.67, [Object.assign({}, extra, { x: 71 })])],
+    ['recolouring a light', at(600 * 16.67, [Object.assign({}, extra, { x: 71, c: [255, 120, 210] })])],
+    ['a new planar origin', at(600 * 16.67, [Object.assign({}, extra, { x: 71, c: [255, 120, 210], originX: 72 })])], ['removing a light', at(600 * 16.67)]]) {
+    const before = lit.stats().dynamicBuilds; lit.render(output, next);
+    A.eq(lit.stats().dynamicBuilds, before + 1, what + ' rebuilds the prop map the same frame');
+  }
+  const base = at(600 * 16.67), ramp = [];
+  for (let i = 1; i <= 30; i++) {   // a slow fade, 0.6/255 a frame: the map follows it in steps of under 1.5/255
+    const before = lit.stats().dynamicBuilds, frame = at(600 * 16.67);
+    frame.lights[0] = Object.assign({}, base.lights[0], { a: base.lights[0].a + i * 0.6 / 255 });
+    lit.render(output, frame); ramp.push(lit.stats().dynamicBuilds - before);
+  }
+  A.eq(ramp.join(''), '001'.repeat(10), 'a fade rebuilds every third 0.6-LSB step: the map never lags 1.5 LSB behind the light');
+  const lift = lit.stats().dynamicBuilds; lit.configure({ propLift: 0.5 }); lit.render(output, base);
+  A.eq(lit.stats().dynamicBuilds, lift + 1, 'a prop config change rebuilds the prop map');
+  const st0 = lit.stats().staticBuilds; lit.render(output, Object.assign({}, base, { ambient: 0.72 }));
+  A.eq(lit.stats().staticBuilds, st0 + 1, 'an exposure change from prepare() rebuilds the static map (it never bumps configRevision)');
+  const fx = lit.stats().staticBuilds; lit.render(output, Object.assign({}, base, { ambient: 0.72, fixtures: [{ x: 30, y: 30, r: 50, rgb: '255,192,104', gain: 0.5 }] }));
+  A.eq(lit.stats().staticBuilds, fx + 1, 'a fixture dimmed past the band rebuilds the static map');
+  lit.dispose();
+}
 
 A.report('WorldLight spatial illumination');

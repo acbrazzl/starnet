@@ -6,6 +6,8 @@
 <link rel="manifest" href="manifest.webmanifest">
 <meta name="theme-color" content="#0b1020">
 <title>STARNET</title>
+<!-- no favicon file ships: an empty data: icon stops a full browser probing /favicon.ico (a 404 in the console on every load) -->
+<link rel="icon" href="data:,">
 <!-- VT323 — THE STARNET FONT — has exactly ONE source: the local @font-face in css/style.css
      (frontend/assets/fonts/vt323.woff2, SIL OFL, U+0-10FFFF — the whole range, no subsets).
      There is NO remote font link here and there must never be one again. The Google Fonts
@@ -25,14 +27,14 @@
 <link rel="stylesheet" href="css/settings.css?v=5">
 <link rel="stylesheet" href="css/commander.css">
 <link rel="stylesheet" href="css/channels.css?v=4">
-<link rel="stylesheet" href="css/quests.css?v=3">
+<link rel="stylesheet" href="css/quests.css?v=6">
 <link rel="stylesheet" href="css/tasks.css?v=1">
-<link rel="stylesheet" href="css/agent-dossier.css?v=7">
+<link rel="stylesheet" href="css/agent-dossier.css?v=8">
 <link rel="stylesheet" href="css/warroom.css">
 <link rel="stylesheet" href="css/safety.css">
 <link rel="stylesheet" href="css/tutorial.css">
 <link rel="stylesheet" href="css/workhub.css">
-<link rel="stylesheet" href="css/refit.css"><!-- REFIT build-modal form polish: rides the .refit-guide card, before motion.css so its focus ring layers on top -->
+<link rel="stylesheet" href="css/refit.css"><!-- BUILD MODE build-modal form polish: rides the .refit-guide card, before motion.css so its focus ring layers on top -->
 <!-- motion.css last: the Phase-1 premium motion + feedback layer builds ON TOP of every screen's styles -->
 <link rel="stylesheet" href="css/motion.css">
 <link rel="stylesheet" href="css/asciifx.css"><!-- ASCII-motion kit: decode/dissolve/typewriter vocabulary (asciifx.js); rides motion.css's token layer -->
@@ -42,15 +44,29 @@
 <link rel="stylesheet" href="css/interface.css">
 <link rel="stylesheet" href="css/refit-kit.css">
 <link rel="stylesheet" href="css/refit-polish.css?v=3">
+<link rel="stylesheet" href="css/refit-easy.css"><!-- BUILD MODE, easier + more fun (2026-10-01): the library shows its props, the selection card, the editor keys' look -->
+<link rel="stylesheet" href="css/linewatch.css"><!-- LINE WATCH: the crate-inspect card on the live floor + the Workflow panel's TODAY row -->
+<link rel="stylesheet" href="css/deskscreen.css"><!-- DESK SCREEN: click an agent's workstation → its live work -->
+<link rel="stylesheet" href="css/workflow-panel.css"><!-- the DOCKED Workflow panel of BUILD MODE (workflowpanel.js) — rides the refit glass tokens -->
+<link rel="stylesheet" href="css/workflows-window.css"><!-- WORK › WORKFLOWS (windows/workflows.js): the Workflow panel glass, restated on its own docked window -->
+<link rel="stylesheet" href="css/deliverables-glass.css"><!-- MY WORK › DELIVERABLES: the current glass on its keys, fields and lead line -->
 <link rel="stylesheet" href="css/utility-menus.css?v=1">
 <link rel="stylesheet" href="css/glass-demo.css">
 <link rel="stylesheet" href="css/glass-comms.css">
+<link rel="stylesheet" href="css/plugins.css"><!-- PLUGIN WINDOWS: the station chrome around a plugin's sandboxed page (pluginhost.js) -->
 <link rel="stylesheet" href="css/onboarding.css">
 <link rel="stylesheet" href="css/readability.css"><!-- Shared readable text roles at STANDARD; cabinet and CRT geometry are unchanged. -->
 <link rel="stylesheet" href="css/beat-cards.css"><!-- Transient work cards share glass materials and semantic text sizes. -->
 <link rel="stylesheet" href="css/overseer-setup.css">
 <link rel="stylesheet" href="css/comms-layout.css">
+<link rel="stylesheet" href="css/hudmode.css"><!-- HUD MODE (hudmode.js): the station folded to a small always-on-top panel -->
 <link rel="stylesheet" href="css/project-home.css">
+<link rel="stylesheet" href="css/outputbrowser.css">
+<link rel="stylesheet" href="css/stepin.css"><!-- STEP-IN: the Commander takes an agent's live browser (app/stepin.js) -->
+<link rel="stylesheet" href="css/crew-glass.css"><!-- CREW PANEL GLASS: the left rail as a Build Library sheet (plain header, card rows) -->
+<link rel="stylesheet" href="css/cabinet-clean.css"><!-- CABINET CLEAN: one shape + header for every panel, quiet widget pins, the CTX bar, title-only starters -->
+<link rel="stylesheet" href="css/pipglass.css"><!-- PIP-GLASS: glass panels in the Pip-Boy 3000 screen language (phosphor type, curved glass, ticked rules, lit rows, tab-strip dock, segmented gauges) -->
+<link rel="stylesheet" href="css/comms-convo.css"><!-- COMMS AS A CONVERSATION: the transcript's reading layer (bubbles, visible stamps, time breaks, run footer) — loaded last on purpose -->
 
 <link rel="stylesheet" href="css/titlebar.css"><!-- custom window chrome (Windows desktop shell): themed titlebar + MIN/MAX/CLOSE; inert unless body.sn-chrome (titlebar.js) -->
 
@@ -114,8 +130,8 @@
            initConnect(name, true, agent) unhides this and disables the identity fields; a fresh create hides it. -->
       <div id="cc-recovery" class="ov-recovery hidden" role="status"></div>
       <nav class="ov-setup-nav" aria-label="Overseer setup">
-        <button type="button" data-setup-step="identity" aria-controls="ov-identity"><span>01</span> Your Overseer</button>
-        <button type="button" data-setup-step="brain" aria-controls="ov-brain"><span>02</span> Connect a brain</button>
+        <button type="button" data-setup-step="identity" aria-controls="ov-identity">Your Overseer</button>
+        <button type="button" data-setup-step="brain" aria-controls="ov-brain">Connect a brain</button>
       </nav>
     </header>
 
@@ -123,7 +139,7 @@
 
       <!-- COLUMN 1 — THE HERO: the agent in its genesis pod (appearance) -->
       <div class="ov-hero">
-        <div class="ov-step"><b>01</b> APPEARANCE <span class="dim">— pick a face</span></div>
+        <div class="ov-step">APPEARANCE <span class="dim">— pick a face</span></div>
         <span class="ov-leadtag">YOUR FIRST AGENT</span>
         <div class="ov-pod">
           <figure class="ov-stage" aria-live="polite">
@@ -135,7 +151,7 @@
         <div class="ov-nameplate">
           <div class="ov-np-name" id="np-name">OVERSEER</div>
           <div class="ov-np-role">Overseer <span class="ov-dot">·</span> <span id="np-mode">asks for approval</span></div>
-          <figcaption id="skin-stage-name" class="skin-stage-name ov-skinname"></figcaption>
+          <figcaption class="skin-stage-name ov-skinname"><span class="ov-look-lbl">look:</span> <span id="skin-stage-name"></span></figcaption>
         </div>
 
         <div class="ov-pickrow">
@@ -173,7 +189,7 @@
 
       <!-- COLUMN 3 — THE BRAIN: the only REQUIRED step; sits last, beside the WAKE it feeds. -->
       <div class="ov-cfg ov-col-brain" id="ov-brain">
-        <div class="ov-step"><b>03</b> THE BRAIN <span class="ov-req">REQUIRED</span></div>
+        <div class="ov-step">THE BRAIN <span class="ov-req">REQUIRED</span></div>
         <div class="ov-field ov-field-brain">
           <div class="ov-section-heading" id="ov-provider-intro"><h3>Connect a brain</h3><p>Start with StarNet, or use a provider you already have.</p></div>
           <!-- BEGINNER FUNNEL: lead with the no-API-key path. A ChatGPT Plus/Pro login (Codex OAuth) needs
@@ -211,8 +227,6 @@
                 <button class="prov" data-prov="openrouter" aria-pressed="false">OPENROUTER</button>
                 <button class="prov" data-prov="openai" aria-pressed="false">OPENAI</button>
                 <button class="prov" data-prov="anthropic" aria-pressed="false">ANTHROPIC</button>
-                <!-- CLAUDE LOGIN: the local `claude` CLI's own sign-in (a Claude subscription) — no API key. See docs/CLAUDE_CREW.md. -->
-                <button class="prov prov-free" data-prov="claudecode" aria-pressed="false">CLAUDE <span class="prov-tag">YOUR LOGIN</span></button>
                 <button class="prov" data-prov="gemini" aria-pressed="false">GEMINI</button>
                 <!-- THE FREE PATH: a local model through Ollama — no key, no account, no bill. The tag makes the
                      zero-cost door visible at the moment the brain is chosen (issue #6 audit: it was invisible);
@@ -229,6 +243,9 @@
                 <button class="prov tail" data-prov="perplexity" aria-pressed="false">PERPLEXITY</button>
                 <button class="prov tail" data-prov="cerebras" aria-pressed="false">CEREBRAS</button>
                 <button class="prov tail" data-prov="custom" aria-pressed="false">CUSTOM</button>
+                <!-- CLAUDE CLI: the locally installed Claude Code CLI as the brain — no key; its own sign-in is the
+                     credential. #claude-cli-block below reports what the sidecar actually detected. -->
+                <button class="prov" data-prov="claude-cli" aria-pressed="false">CLAUDE CODE</button>
                 <!-- label is COMPUTED by setProviderRowExpanded() from the live .prov.tail count — never hardcoded -->
                 <button type="button" id="prov-more" class="prov-more" aria-expanded="false">＋ MORE</button>
               </div>
@@ -251,6 +268,12 @@
               <div class="codex-signin">
                 <div id="codex-status" class="codex-status">checking…</div>
                 <div id="codex-code" class="codex-code hidden"></div>
+                <!-- KIMI ACCOUNT REGION (#70): a kimi.ai account can only sign in at kimi.ai, a kimi.com one at kimi.com -->
+                <div id="kimi-region" class="codex-actions kimi-region hidden" role="group" aria-label="Kimi account region">
+                  <span class="dim">ACCOUNT REGION</span>
+                  <button type="button" class="btn" data-kimi-region="global" aria-pressed="false">GLOBAL · kimi.ai</button>
+                  <button type="button" class="btn" data-kimi-region="cn" aria-pressed="false">CHINA · kimi.com</button>
+                </div>
                 <div class="codex-actions">
                   <button type="button" id="btn-codex-signin" class="btn">⏼ SIGN IN WITH CHATGPT ▸</button>
                   <button type="button" id="btn-codex-open" class="btn hidden">↗ OPEN PAGE</button>
@@ -284,7 +307,37 @@
             <div id="ollama-block" class="hidden">
               <div class="codex-signin">
                 <div id="ollama-status" class="codex-status">checking for ollama on this machine…</div>
-                <div class="dim hint" id="ollama-hint">Free and fully local — no key, no account, no bill. Needs <b>Ollama</b> installed and running on this machine (ollama.com), with at least one model pulled (e.g. <code>ollama pull llama3.1</code>). Honest caveat: local models are smaller than the cloud ones — expect slower, rougher work on long tasks.</div>
+                <div class="dim hint" id="ollama-hint">Free and fully local — no key, no account, no bill. Needs <b>Ollama</b> installed and running on this machine (ollama.com), with at least one model pulled (e.g. <code>ollama pull qwen3:8b</code>). Honest caveat: local models are smaller than the cloud ones — expect slower, rougher work on long tasks.</div>
+              </div>
+            </div>
+
+            <!-- CLAUDE CLI block — the codex-block twin (same classes, same rhythm). Every line is a PROJECTION of the
+                 sidecar's /api/auth/claude-cli/status, which asks the user's own `claude auth status`: "signed in" is
+                 only ever said after the CLI proved it. SIGN IN WITH CLAUDE runs the CLI's own `claude auth login`;
+                 StarNet never holds the Claude credential (app.js claudeCli*). -->
+            <div id="claude-cli-block" class="hidden">
+              <div class="codex-signin">
+                <div id="claude-cli-status" class="codex-status">checking for Claude Code on this computer…</div>
+                <div id="claude-cli-install" class="claude-cli-install hidden">
+                  <div class="dim hint">Install Claude Code once — paste this into <span id="claude-cli-shell">a terminal</span>:</div>
+                  <code id="claude-cli-install-cmd" class="claude-cli-cmd"></code>
+                </div>
+                <div class="codex-actions">
+                  <button type="button" id="btn-claude-signin" class="btn hidden">⏼ SIGN IN WITH CLAUDE ▸</button>
+                  <button type="button" id="btn-claude-copy" class="btn hidden">⧉ COPY INSTALL COMMAND</button>
+                  <button type="button" id="btn-claude-guide" class="btn hidden">↗ INSTALL GUIDE</button>
+                  <button type="button" id="btn-claude-open" class="btn hidden">↗ OPEN SIGN-IN PAGE</button>
+                  <button type="button" id="btn-claude-cancel" class="btn hidden">✕ CANCEL</button>
+                  <button type="button" id="btn-claude-recheck" class="btn hidden">↻ CHECK AGAIN</button>
+                </div>
+                <div id="claude-cli-code-row" class="claude-cli-code-row hidden">
+                  <label class="dim hint" for="in-claude-code">Did the page show a code instead? Paste it here:</label>
+                  <div class="claude-cli-code-in">
+                    <input id="in-claude-code" class="key-input" type="text" autocomplete="off" spellcheck="false" placeholder="paste the code from the Claude page">
+                    <button type="button" id="btn-claude-code" class="btn">SUBMIT ▸</button>
+                  </div>
+                </div>
+                <div class="dim hint" id="claude-cli-hint">Uses your Claude subscription (Pro, Max, Team or Enterprise) through <b>Claude Code</b> on this computer. Claude Code keeps your sign-in — StarNet never sees or stores it. StarNet keeps every Claude Code tool switched off and runs its own, so your station's permissions still apply. Subscription turns are booked at $0; an API-key sign-in is booked at the cost Claude Code reports.</div>
               </div>
             </div>
 
@@ -520,7 +573,7 @@
       <!-- INSTRUMENT CLUSTER (topbar.js) — one cockpit gauge group: STATION (level + XP sliver) ·
            the session-status instruments (UPLINK / ONLINE / save) moved up from
            #bottombar .bb-right with their ids intact so their existing writers keep working. -->
-      <div class="tb-stat station tb-inst" id="tb-station" title="Your Commander level grows through recorded progress toward your life goals. Open the quest log to see the achievements behind it.">
+      <div class="tb-stat station tb-inst" id="tb-station" data-tip-host title="Your Commander level grows through recorded progress toward your life goals. Open the quest log to see the achievements behind it.">
         <svg class="tb-station-mark" viewBox="0 0 24 28" aria-hidden="true"><path d="M12 2 22 8v12l-10 6-10-6V8Z"/><path d="m6 11 6-4 6 4M6 16l6-4 6 4M6 21l6-4 6 4"/></svg>
         <span class="tb-lbl">COMMANDER</span>
         <b class="tb-val" id="gt-station">—</b>
@@ -541,9 +594,9 @@
   <aside id="left">
     <!-- The head carried an "N AGENTS" count that #crew-sum already implied one panel lower
          ("0 WORKING / 2 IDLE" totals the same roster and says more). Dropped 2026-07-27 — one fact, one place. -->
-    <h3>▮ CREW<span class="crew-h3-right"><button id="crew-search-toggle" class="crew-hide" type="button" title="Find an agent" aria-label="Find an agent" aria-expanded="false" aria-controls="crew-search-wrap">⌕</button><button id="crew-hide" class="crew-hide" type="button" title="Hide the crew rail" aria-label="Hide the crew rail" aria-expanded="true">◂</button></span></h3>
+    <h3>CREW<span class="crew-h3-right"><button id="crew-search-toggle" class="crew-hide" type="button" title="Find an agent" aria-label="Find an agent" aria-expanded="false" aria-controls="crew-search-wrap">⌕</button><button id="crew-hide" class="crew-hide" type="button" title="Hide the crew rail" aria-label="Hide the crew rail" aria-expanded="true">◂</button></span></h3>
     <div id="crew-search-wrap" class="crew-search-wrap" hidden>
-      <input id="crew-search" type="search" placeholder="Find an agent…" aria-label="Find an agent by name" autocomplete="off" aria-controls="crew">
+      <input id="crew-search" type="search" placeholder="Find an agent" aria-label="Find an agent by name" autocomplete="off" aria-controls="crew">
       <button id="crew-search-close" type="button" aria-label="Close agent search" title="Close agent search">✕</button>
     </div>
     <ul id="crew"></ul>
@@ -555,13 +608,14 @@
     <div id="crew-vresizer" class="row-resizer" title="drag to resize CREW vs SESSIONS (double-click to reset)" role="separator" aria-orientation="horizontal" aria-label="Resize the crew roster"></div>
     <div id="ws-wrap">
       <div class="ws-head"><span class="ws-view" role="tablist" aria-label="rail view"><button id="ws-tab-sessions" class="ws-tab on" role="tab" aria-selected="true" title="your saved conversations">SESSIONS</button><button id="ws-tab-projects" class="ws-tab" role="tab" aria-selected="false" title="trusted project folders">PROJECTS</button></span><span class="ws-head-acts"><button id="ws-new" title="start a new COMMS session">+ NEW</button><button id="ws-addproject" title="bless a folder as a trusted project" hidden>+ ADD</button></span></div>
-      <button id="ws-attention" class="ws-attention" type="button" aria-pressed="false" aria-controls="workstreams" hidden><span>Waiting for you</span><span id="ws-attention-count"></span><span id="ws-attention-clear" aria-hidden="true" hidden>✕</span></button>
+      <!-- NEEDS YOU (needsyou.js, 2026-10-11): every approval, question and failure on the station, each with its action -->
+      <section id="ws-needs" class="ws-needs" aria-label="Needs you" hidden></section>
       <!-- RAIL SEARCH (2026-07-17): the SESSION TOOLS window was retired — search lives ON the rail now
            (the one capability no other surface covered); per-session export moved into the row ⋯ menu.
            The head above stays SESSIONS/PROJECTS + NEW only (Commander directive, 2026-07-08). -->
       <div id="ws-rail-search" class="ws-rail-search">
-        <label><span class="sr-only">Search session titles and transcripts</span><input id="ws-search" type="search" placeholder="⌕ search sessions + transcripts" autocomplete="off"></label>
-        <div id="ws-kind-filter" class="ws-kind-filter" role="group" aria-label="Session view"><button type="button" data-ws-kind="all" aria-pressed="true" title="Show all sessions">ALL</button><button type="button" data-ws-kind="automated" aria-pressed="false" title="Show only automation sessions">AUTOMATED</button></div>
+        <label><span class="sr-only">Search session titles and transcripts</span><input id="ws-search" type="search" placeholder="search sessions + transcripts" autocomplete="off"></label>
+        
         <ul id="ws-search-results" aria-live="polite"></ul>
       </div>
       <ul id="workstreams"></ul>
@@ -592,7 +646,7 @@
 
   <aside id="chat-panel">
     <div id="comms-resizer" class="col-resizer" title="drag to resize COMMS" role="separator" aria-orientation="vertical" aria-label="Resize COMMS panel"><span class="col-resizer-grip"></span></div>
-    <h3><span id="comms-title">▮ COMMS</span><span class="h3-right"><span class="dim" id="chat-status" role="status" aria-live="polite" aria-atomic="true">offline</span><span class="chat-elapsed" id="chat-elapsed" aria-hidden="true"></span><button id="comms-expand" type="button" aria-label="Expand conversation" aria-pressed="false" aria-controls="chat-panel">EXPAND</button></span></h3>
+    <h3><span id="comms-title">COMMS</span><span class="h3-right"><span class="dim" id="chat-status" role="status" aria-live="polite" aria-atomic="true">offline</span><span class="chat-elapsed" id="chat-elapsed" aria-hidden="true"></span><button id="comms-hud" type="button" hidden aria-label="Open the HUD" title="HUD: fold StarNet into a small panel that stays above your game or video (Ctrl+Shift+H)">HUD</button></span></h3>
     <!-- AGENT LINE (chat.js): pick which roster agent you're talking to + a truthful readout of that agent's
          current model. The <select> options + the model text are filled from the LIVE roster (App.agents),
          never hardcoded — the header is honest about who's on the line and what they run on. -->
@@ -600,7 +654,7 @@
       <div class="comms-portrait" aria-hidden="true"><img id="comms-agent-portrait" alt="" hidden></div>
       <div class="comms-identity">
       <span class="comms-overline">ON THE LINE</span>
-      <label class="comms-agent-wrap" title="Who you're talking to">
+      <label class="comms-agent-wrap" data-tip-below data-tip="Who you’re talking to. Another agent opens its latest session; an empty session, not General, takes that agent.">
         <span class="comms-agent-sigil" aria-hidden="true">▸</span>
         <select id="comms-agent-select" class="comms-agent-select" aria-label="Select agent on the line"></select>
       </label>
@@ -638,7 +692,7 @@
       <!-- INTERRUPT: cancel just the active stream's run (also bound to Esc while COMMS is focused); hidden unless busy -->
       <!-- the HALT KEY glyph: ONE solid square, nothing around it. app.css flashes it on the station's
            1s steps(1) caret cadence while a run is live. The old ring-and-dot read as RECORD, not STOP. -->
-      <button id="chat-stop" class="chat-stop" type="button" title="Stop the running turn (Esc)" aria-label="Stop the running turn" hidden><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3.5" y="3.5" width="9" height="9" fill="currentColor"/></svg></button>
+      <button id="chat-stop" class="chat-stop" type="button" data-tip="Stop the running turn (Esc)" aria-label="Stop the running turn" hidden><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3.5" y="3.5" width="9" height="9" fill="currentColor"/></svg></button>
       <!-- ATTACH: open the file picker; also served by paste + drag-drop onto the composer (chat.js) -->
       <button id="chat-attach" class="chat-attach-btn" type="button" title="Attach a photo or file" aria-label="Attach a photo or file"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M11.6 5 6.9 9.7a1.5 1.5 0 0 0 2.1 2.1l4.9-4.8a2.9 2.9 0 0 0-4.1-4.1L4.9 7.8a4.3 4.3 0 0 0 6.1 6.1l4.2-4.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="miter"/></svg></button>
       <!-- data-no-tip + NO title: this owns the richer .model-dock-tip, so the station tooltip must not
@@ -683,36 +737,45 @@
          same Recruitment Bay in different modes — now a single #bb-recruit opens the bay once, and
          the class dossier offers BOTH verbs (summon new / deploy to current). -->
     <div class="bb-group" data-group="crew">
-      <button class="bb-grp" aria-haspopup="menu" aria-expanded="false" title="Your agents — dossiers, recruitment, and your own Commander file"><span class="bb-gi">☻</span>CREW</button>
+      <button class="bb-grp" data-hint="crew" aria-haspopup="menu" aria-expanded="false" title="Your agents — dossiers, recruitment, and your own Commander file"><span class="bb-gi">☻</span>CREW<span id="bb-crew-stepin-badge" class="bb-grp-badge" aria-label="agents waiting for you in STEP-IN" hidden></span></button>
       <div class="bb-menu" role="menu">
         <button class="bb" data-term="agents"><span class="bb-i">◉</span><span class="bb-tx"><b>AGENTS</b><small>each crew member's dossier — config, memory, record</small></span></button>
-        <button class="bb" id="bb-recruit" data-hint="recruit"><span class="bb-i">＋</span><span class="bb-tx"><b>RECRUIT</b><small>grow the crew — summon a class, or re-spec your agent</small></span></button>
-        <button class="bb" data-term="commander"><span class="bb-i">◈</span><span class="bb-tx"><b>COMMANDER</b><small>what the station has learned about you</small></span></button>
+        <button class="bb" id="bb-recruit" data-hint="recruit"><span class="bb-i">＋</span><span class="bb-tx"><b>RECRUIT</b><small>pick a class, or re-spec your agent</small></span></button>
+        <button class="bb" data-term="commander"><span class="bb-i">◈</span><span class="bb-tx"><b>YOU</b><small>what the station has learned about you</small></span></button>
+        <!-- STEP-IN shows ONLY while an agent is waiting for you (stepin.js badge); saved sign-ins live in SETTINGS › BROWSER -->
+        <button class="bb" data-term="stepin" hidden><span class="bb-i">⇆</span><span class="bb-tx"><b>STEP-IN</b><small>take an agent's browser when it needs you to sign in — and your saved sign-ins</small></span><span id="si-badge" class="badge" style="display:none"></span></button>
       </div>
     </div>
     <div class="bb-group" data-group="work">
       <button class="bb-grp" data-hint="work" aria-haspopup="menu" aria-expanded="false" title="The station's work — tasks, recipes, automation, quests"><span class="bb-gi">▤</span>WORK</button>
       <div class="bb-menu" role="menu">
-        <!-- WORK menu, one axis per entry (UX confusion audit 2026-07-15): RECIPES = WHAT to run,
-             ROUTINES = WHEN it runs, LOOPS = UNTIL it is done, TASKS = WHERE live work sits,
-             QUESTS = progress only. -->
-
-        <button class="bb" data-term="tasks" data-hint="task"><span class="bb-i">☑</span><span class="bb-tx"><b>TASKS</b><small>track planned work, review results &amp; mark complete</small></span></button>
-        <button class="bb" data-term="deliverables" data-hint="deliverable"><span class="bb-i">▣</span><span class="bb-tx"><b>DELIVERABLES</b><small>outputs, Workshop builds &amp; cleanup</small></span></button>
-        <button class="bb" id="bb-missions" data-hint="recipe"><span class="bb-i">❒</span><span class="bb-tx"><b>RECIPES</b><small>ready-made jobs to launch — they land on TASKS</small></span></button>
-        <button class="bb" data-term="automation" data-hint="automation"><span class="bb-i">∞</span><span class="bb-tx"><b>AUTOMATION</b><small>routines &amp; loops — any job on a schedule, or repeated until it’s done</small></span></button>
+        <!-- ONE MENU (front doors, 2026-10-01): the WORK dock is three doors. MY WORK = one window with tabs TASKS ·
+             DELIVERABLES · RECIPES; AUTOMATE = WORKFLOWS · SCHEDULES · GOAL LOOPS · AWAY WORK (stationui.js
+             FAMILIES). Each tab is still its own window, so every deep link and slash command lands exactly as before. -->
+        <button class="bb" id="bb-mywork" data-family="mywork" data-hint="mywork"><span class="bb-i">☑</span><span class="bb-tx"><b>MY WORK</b><small>tasks, finished work &amp; ready-made jobs</small></span></button>
+        <button class="bb" id="bb-automate" data-family="automate" data-hint="automate"><span class="bb-i">∞</span><span class="bb-tx"><b>AUTOMATE</b><small>workflows, schedules, loops &amp; away&nbsp;work</small></span></button>
         <button class="bb" data-term="quests" data-hint="quest"><span class="bb-i">⚑</span><span class="bb-tx"><b>QUESTS</b><small>small steps toward your goals &amp; recorded progress</small></span></button>
       </div>
     </div>
     <div class="bb-group" data-group="build">
-      <button class="bb-grp" data-hint="build" aria-haspopup="menu" aria-expanded="false" title="Shape the station — refit the floor, abilities, channels"><span class="bb-gi">⚒</span>BUILD</button>
+      <button class="bb-grp" data-hint="build" aria-haspopup="menu" aria-expanded="false" title="Shape the station — Build Mode, abilities and channels, new apps"><span class="bb-gi">⚒</span>BUILD</button>
       <div class="bb-menu" role="menu">
-        <button class="bb" id="bb-build" data-hint="refit"><span class="bb-i">⌂</span><span class="bb-tx"><b>REFIT STATION</b><small>place rooms, corridors &amp; gear</small></span></button>
-        <!-- direction-honest subtitles (audit finding 5): ABILITIES = the agent's tools OUT (switches, connectors,
-             skills); CHANNELS = YOUR way in. NAV CONDENSE 2: the SKILLS window merged into ABILITIES (per-agent
-             capability readout lives in the AGENTS dossier's SKILLS tab). -->
-        <button class="bb" data-term="connectors" data-hint="toolset"><span class="bb-i">⇄</span><span class="bb-tx"><b>ABILITIES</b><small>everything agents can do — toolsets, connectors, skills, your own hooks &amp; plugins</small></span></button>
-        <button class="bb" data-term="messaging" data-hint="channel"><span class="bb-i">✉</span><span class="bb-tx"><b>CHANNELS</b><small>your way in — talk to agents from Telegram, Slack, Discord</small></span></button>
+        <button class="bb" id="bb-build" data-hint="refit"><span class="bb-i">⌂</span><span class="bb-tx"><b>BUILD MODE</b><small>rooms, corridors, gear &amp; workflow lines</small></span></button>
+        <!-- ONE MENU (front doors, 2026-10-01; back in BUILD 10-02 — Andrew): CONNECT = one window with tabs ABILITIES (the agents' tools OUT — toolsets,
+             connectors, skills) · CHANNELS (YOUR way in — Telegram, Slack, Discord). Two tabs, never one card grid. -->
+        <button class="bb" id="bb-connect" data-family="connect" data-hint="connect"><span class="bb-i">⇄</span><span class="bb-tx"><b>CONNECT</b><small>services your agents use, and where you message them</small></span></button>
+        <!-- APPS: the way to the FIRST app (the APPS dock itself only appears once one exists) -->
+        <button class="bb" id="bb-newapp-build" data-hint="app"><span class="bb-i">＋</span><span class="bb-tx"><b>NEW APP</b><small>a dashboard, tracker, tool or game, built for you</small></span></button>
+      </div>
+    </div>
+    <!-- APPS (2026-09-29): HIDDEN until the Commander has an app (frontend/app/apps.js syncDock). Then: one entry per
+         app (filled in by apps.js), plus NEW APP and the manage window. -->
+    <div class="bb-group" data-group="apps" hidden>
+      <button class="bb-grp" data-hint="apps" aria-haspopup="menu" aria-expanded="false" title="Your apps — open one, or describe a new one"><span class="bb-gi">▦</span>APPS</button>
+      <div class="bb-menu" role="menu">
+        <div id="bb-apps-items" class="bb-apps-items"></div>
+        <button class="bb" id="bb-newapp" data-hint="app"><span class="bb-i">＋</span><span class="bb-tx"><b>NEW APP</b><small>a dashboard, tracker, tool or game, built for you</small></span></button>
+        <button class="bb" data-term="apps" data-hint="app"><span class="bb-i">▦</span><span class="bb-tx"><b>MANAGE APPS</b><small>refresh, rename or delete the apps your crew built for you</small></span></button>
       </div>
     </div>
     <div class="bb-group" data-group="system">
@@ -722,8 +785,8 @@
              (LOGBOOK / RESTORE tabs); openTerm keeps the old keys as deep links. UPDATES stays
              its own window (Andrew's call — check-it-now, not a setting). -->
         <button class="bb" data-term="manual" data-hint="manual"><span class="bb-i">§</span><span class="bb-tx"><b>FIELD MANUAL</b><small>first mission, controls &amp; station handbook</small></span></button>
-        <button class="bb" data-term="settings" data-hint="settings"><span class="bb-i">⚙</span><span class="bb-tx"><b>SETTINGS</b><small>keys, models, voice, data</small></span></button>
-        <button class="bb" data-term="updates" data-hint="update"><span class="bb-i">↑</span><span class="bb-tx"><b>UPDATES</b><small>version &amp; release notes</small></span></button>
+        <button class="bb" data-term="settings" data-hint="settings"><span class="bb-i">⚙</span><span class="bb-tx"><b>SETTINGS</b><small>models, keys, permissions, spending &amp; more</small></span></button>
+        <button class="bb" data-term="updates" data-hint="update"><span class="bb-i">↑</span><span class="bb-tx"><b>UPDATES</b><small>version &amp; release notes</small></span><span id="up-badge" class="badge" style="display:none"></span></button>
         <button class="bb" data-term="notifs" data-hint="notification"><span class="bb-i">▲</span><span class="bb-tx"><b>NOTIFICATIONS</b><small>alerts &amp; unread events</small></span><span id="nf-badge" class="badge"></span></button>
       </div>
     </div>
@@ -748,7 +811,9 @@
 
   <!-- one-time coach teaching the new grouped-dock model; dismissed on first dock open / ✕ (navdock.js) -->
   <div id="nav-coach" class="nav-coach" hidden>
-    <span>Your panels now live in <b>4 docks</b> down here — click one to open it. Talk to your agent up in <b>COMMS ▸</b></span>
+    <span>Everything you run lives in these <b>docks</b>&nbsp;— click one to open it. Talk to your agent in <b>COMMS ▸</b></span>
+    <!-- systems.js: a fresh station's dock grows as it is used; a returning power user can have it all now -->
+    <button id="nav-coach-all" class="nav-coach-x" data-tip="Bring every station system online in the dock now" hidden>SHOW EVERYTHING</button>
     <button id="nav-coach-x" class="nav-coach-x" aria-label="dismiss hint">GOT IT ✕</button>
     <span class="nav-coach-arrow">▾</span>
   </div>
@@ -760,11 +825,12 @@
 <script src="app/legacymigrate.js"></script>
 <script src="app/glass-boot.js"></script><!-- FIRST store-touching script: migrate starnet.* localStorage keys -> starnet.* before any store reads -->
 <script src="js/util.js"></script>
+<script src="app/pollgate.js"></script><!-- IDLE COST: the ONE owner of "is anyone looking?" for background polls (visible cadence unchanged, a 30 s floor while away, never a stop); MUST load before its consumers (queryspine, overseer, group-chat, stationui, world, widgets) -->
 <script src="app/asciifx.js"></script><!-- ASCII-motion kit (AsciiFX): decode/dissolve/typewriter primitives; must load before its consumers (chat.js, stationui.js) -->
 <script src="js/audio.js"></script>
 <script src="js/arcade.js"></script>
 <script src="app/backdrop-bake.js"></script>
-<script src="app/spacebg.js"></script><!-- THE VOID: shared deep-space backdrop (dense starfield + nebulas) — one sky for world.js AND build.js so REFIT never jumps the stars -->
+<script src="app/spacebg.js"></script><!-- THE VOID: shared deep-space backdrop (dense starfield + nebulas) — one sky for world.js AND build.js so BUILD MODE never jumps the stars -->
 <script src="app/terrain.js"></script><!-- THE GROUND: world-space ground layer for a LANDED station — pans AND zooms with the world (a backdrop must not), drawn under the station bake -->
 <script src="app/industrialtextures.js"></script>
 <script src="app/authored-prop-content.js"></script>
@@ -773,9 +839,10 @@
 <script src="app/authored-machine-config.js"></script>
 <script src="app/approved-sheet-effects.js"></script><script src="app/projection-prop-effects.js"></script><script src="app/propremaster.js"></script>
 <script src="app/authored-surface-mounts.js"></script><script src="app/propsprites.js"></script>
-<script src="app/propsearch.js"></script><!-- pure REFIT palette search matcher (flat lookup across all 120 props, both tiers) -->
+<script src="app/propsearch.js"></script><!-- pure BUILD MODE palette search matcher (flat lookup across all 120 props, both tiers) -->
 <script src="app/conveyor.js"></script>
 <script src="app/pipeline.js"></script>
+<script src="app/workflowline.js"></script><!-- pure readings of one conveyor line (run order, how-it-runs sentence, readiness, cost) from the compiled plan — the Workflow panel speaks only through it -->
 <script src="app/ghostline.js"></script><!-- GHOST PROJECTION (guided workflows Phase 3): a dashed projected crate loops an INCOMPLETE line so you watch the workflow before it exists — dedicated engine, never mixes with real telemetry -->
 
 <script src="app/propanchor.js"></script>
@@ -786,6 +853,8 @@
 <script src="app/skin-study-tone.js"></script><script src="app/skin-study-preview.js"></script>
 <script src="js/assets.js"></script>
 <script src="app/harness.js"></script>
+<script src="app/userprops.js"></script>
+<script src="app/apiticket.js"></script><!-- scoped short-lived URL tickets: links/tabs/SSE/beacon never carry the master API token (sidecar/apitickets.js verifies) -->
 <script src="app/queryspine.js"></script><!-- keyed Harness.api GET state: in-flight dedupe, last-good truth, TTL + subscriber-owned polling; MUST load before cron consumers -->
 <script src="app/updatecore.js"></script>
 <script src="app/updates.js"></script>
@@ -794,6 +863,9 @@
 <script src="app/titlebar.js"></script><!-- custom window chrome: renders the themed titlebar ONLY when the desktop shell sets __STARNET_CUSTOM_CHROME__ (Windows, decorations off) -->
 <script src="app/ctxgauge.js"></script>
 <script src="app/floorstats.js"></script>
+<script src="app/linewatch.js"></script><!-- LINE WATCH (pure): bay status lamps, the crate card resolver, per-line plate text -->
+<script src="app/cratecard.js"></script><!-- LINE WATCH: the crate-inspect station card (DOM) -->
+<script src="app/deskscreen.js"></script><!-- DESK SCREEN: an agent's live work on its workstation (DOM + bus fold) -->
 <script src="app/slaglog.js"></script>
 <script src="app/xp.js"></script>
 <script src="app/returns.js"></script><!-- pure return-ritual engine: while-away digest rows + the pending OUTBOX-crate ledger -->
@@ -806,6 +878,7 @@
 <script src="app/dossier.js"></script>
 <script src="app/understanding.js"></script><!-- NORTH STAR: pure "how well the station understands its Commander" read-model over the dossier (per-dim + overall confidence, weakest = the VOI question target) -->
 <script src="app/fork.js"></script><!-- R1 MID-TASK FORK: pure engine for the earned preference-fork (directive + FORK-marker parser + confidence gate); self-retiring once style is well-grounded -->
+<script src="app/memtruth.js"></script><!-- memory-truth: the ONE similarity + subject key every memory writer shares (study.js reads it); MUST load before study.js -->
 <script src="app/study.js"></script><!-- GROWTH Tier 1: pure STUDY engine (dossier Phase B) — parse/salience/dedup for work→belief proposals + ratings-taste + archetype classifier -->
 <script src="app/beatcard.js"></script><!-- shared COMMS post-run lifecycle; MUST load before chat.js -->
 <script src="app/recommend.js"></script><!-- THE RECOMMENDATION SPINE: pure one-voice arbiter over every proactive channel (evidence-or-silence); MUST load before chat.js -->
@@ -815,6 +888,7 @@
 <script src="app/verdictfollowup.js"></script>
 <script src="app/pitch.js"></script>
 <script src="app/quests.js"></script>
+<script src="app/battlepass.js"></script><!-- pure battle-pass projection (2026-10-19): Commander progression → tiers, streak, season, weekly challenges; cosmetic rewards only -->
 <script src="app/journey.js"></script><!-- pure Commander-journey helpers: metrics/domain labels; separate from XP and never gates -->
 <script src="app/goals.js"></script><!-- GROWTH Tier 2: pure GOAL-TREE engine (understanding → direction) — decompose/parse/progress/chaining/evidence-fold/retire + arc projection -->
 <script src="app/goalloop.js"></script><!-- /goal AUTONOMOUS LOOP (StarNet's "Ralph loop"): pure judge-verdict parse + continuation/preemption/budget state machine; chat.js supplies the aux judge call + persistence -->
@@ -849,7 +923,10 @@
 <script src="app/glossary.js"></script><!-- UX Wave-0: term -> one-sentence beginner map (data source for the hint layer) -->
 <script src="app/hint.js"></script><!-- UX Wave-0: shared data-hint tooltip layer (delegation → late-rendered windows work); loads after glossary.js -->
 <script src="app/armconfirm.js"></script><!-- UX Wave-0: reusable 2-step arm/confirm helper (opt-in; existing call sites unchanged) -->
+<script src="app/qr.js"></script><!-- QR encoder (byte mode, ECC M): draws the StarNet Remote pairing link -->
+<script src="app/remote-devices.js"></script><!-- SETTINGS › REMOTE: switch Remote on, pair a phone by QR, list/remove phones -->
 <script src="app/tooltip.js"></script><!-- station tooltip: adopts every [title] so the OS never paints its own bubble; self-starts, nothing to call -->
+<script src="app/typefloor.js"></script><!-- the windows' text floor: lifts any window text measured under the reading floor to it; self-starts, nothing to call -->
 <script src="app/agentid.js"></script>
 <script src="app/workstreams.js"></script>
 <script src="app/projects.js"></script>
@@ -883,6 +960,7 @@
 <script src="app/voice-stream.js"></script>
 <script src="app/voice.js"></script>
 <script src="app/voice-live.js"></script>
+<script src="app/places.js"></script><!-- PLACES: every window/tab a Commander can be shown — station.show (the agent opens it for them) -->
 <script src="app/stationcommands.js"></script>
 <script src="app/overseer.js"></script>
 <script src="app/project-home.js"></script>
@@ -891,24 +969,38 @@
 
 <script src="app/deliverables.js"></script><!-- backend-backed run artifact + Workshop library with bounded safe previews -->
 <script src="app/backdrop-preview.js"></script>
+<script src="app/railicons.js"></script><!-- RAIL ICONS: one drawn 16px line-icon set for every window side menu -->
 <script src="app/stationui.js"></script>
 <!-- extracted station windows — each registers itself via StationUI.registerWindow, so they MUST load after stationui.js and before app.js init -->
 <script src="app/windows/trophies.js"></script><!-- TROPHY CASE — real earned achievements + the LIVING TOOLS shelf -->
 <script src="app/windows/logbook.js"></script><!-- LOGBOOK dossier lane — per-agent run history (RUNS · SLAG · INSIGHTS; mounts in the AGENTS dossier). Registration order = dossier tab order: LOGBOOK before RESTORE. -->
 <script src="app/windows/rewind.js"></script><!-- RESTORE dossier lane — per-agent workspace checkpoints, two-step confirmed restore (mounts in the AGENTS dossier) -->
 <script src="app/windows/outbox.js"></script><!-- OUTBOX — FINISHED WORK: uncollected finished runs, readable + rateable accordion -->
+<script src="app/windows/workflows.js"></script><!-- WORK › WORKFLOWS: pick a workflow, send it a job, read the result, change it, send it again — its own docked window, never Build Mode -->
 <script src="app/windows/automation.js"></script><!-- AUTOMATION — the merged ROUTINES+LOOPS console window; owns the window slot + the lane registry the next two files register into -->
 <script src="app/schedpicker.js"></script><!-- the WHEN builder (cadence keys + day chips + clock) the ROUTINES lane mounts; types a real schedule into the same text input the form always posted -->
 <script src="app/windows/routines.js"></script><!-- ROUTINES lane — scheduled autonomous runs (thin CRUD client over /api/cron) -->
 <script src="app/windows/loops.js"></script><!-- LOOPS lane — standing objectives (thin polling client over /api/loops); needs loop-templates.js above -->
 <script src="app/windows/connectors.js"></script><!-- TOOLSETS & CONNECTORS — toolset kill-switches, MCP manager, catalog + service keys (Spotify flow embedded) -->
-<script src="app/windows/messaging.js"></script><!-- CHANNELS — messaging platforms catalog (Telegram/Discord/Slack/Matrix/Signal cards) -->
+<script src="app/windows/messaging.js"></script><!-- (STEP-IN follows) -->
+<script src="app/browserstream.js"></script><!-- one live picture of a real browser + optional input (BROWSER window) -->
+<script src="app/outputbrowser.js"></script><!-- BROWSER — agent-made web pages open in-app (sandboxed /view/ + /workshop-run/ frame), optional FOLLOW -->
+<script src="app/stepin.js"></script><!-- STEP-IN — an agent stuck on a sign-in / 2FA / human check hands you its live browser; you drive it, then HAND BACK --><!-- CHANNELS — messaging platforms catalog (Telegram/Discord/Slack/Matrix/Signal cards) -->
+<script src="app/apps.js"></script><!-- APPS: describe it, get it — the APPS window + dock, the bar under each app window, the build/change hand-off to COMMS -->
+<script src="app/pluginhost.js"></script><!-- PLUGIN WINDOWS: an approved plugin's screens as real station windows, a sandboxed frame + the starnet bridge (needs stationui.js + apiticket.js above) -->
 <script src="app/navdock.js"></script>
+<script src="app/systems.js"></script><!-- STATION SYSTEMS ONLINE: a fresh station's dock grows as it is used (reveal, never lock) — init from app.js on game entry -->
 <script src="app/emergency-control.js"></script>
 <script src="app/chatresize.js"></script>
+<script src="app/hudmode.js"></script><!-- HUD MODE: compact always-on-top panel (desktop window ops live in src-tauri/src/hud_mode.rs) -->
 <script src="app/leftrail.js"></script><!-- hide/show the CREW rail (◂ in the rail header · ▸ CREW drawer tab on the stage edge); persisted per machine -->
 
 <script src="app/worldmodel.js"></script>
+<script src="app/roomstyles.js"></script><!-- the zone styles the lead furnishes a room with when the Commander describes it part by part (vibe design) -->
+<script src="app/stationbuilder.js"></script><!-- the lead agent builds the station exactly: a fixed menu, planned on a copy, applied in one undo -->
+<script src="app/planpreview.js"></script><!-- the builder's approval card draws its plan: where it goes and what goes where -->
+<script src="app/linelayout.js"></script><!-- the line LAYOUT ENGINE: one line's graph in, every machine's tile and every link's belt out (conveyor-links phase C) -->
+<script src="app/lineedit.js"></script><!-- the Workflow panel's line edits (step, branch, review loop, sorter, remove, move, tidy, new line): graph edit → engine → one undo (phase D) -->
 <script src="app/stationbake.js"></script>
 <script src="app/crtlab.js"></script><!-- DEV-only CRT/lighting tuning panel; inert unless ?crtlab is in the URL -->
 <script src="app/projection-audit-panel.js"></script>
@@ -918,11 +1010,15 @@
 
 <script src="app/equipmenthelp.js"></script>
 <script src="app/stationtemplates.js"></script>
+<script src="app/buildshare.js"></script><!-- SHARED BUILDS: a station's layout as a file (presets dialog EXPORT / IMPORT) -->
+<script src="app/communitymaps.js"></script><!-- COMMUNITY MAPS: share a layout for review, build one from the signed gallery (presets dialog) -->
+<script src="app/workflowpanel.js"></script><!-- the DOCKED Workflow panel (BUILD MODE): one card for the whole line, beside the live floor -->
 <script src="app/build.js"></script>
 <script src="app/save.js"></script>
 <script src="app/cloudsavecore.js"></script><!-- pure retry/health brain (unit-tested); MUST load before cloudsave.js -->
 <script src="app/cloudsave.js"></script>
 <script src="app/freshstart.js"></script><!-- desktop escape: quarantine local station even when sidecar HTTP is unavailable -->
+<script src="app/datareset.js"></script><!-- #65 ERASE EVERYTHING + #61 RESET STATION BROWSER (Settings) -->
 <script src="app/backup.js"></script>
 <script src="app/dialogue.js"></script>
 <script src="app/wakemind.js"></script><!-- Interview 2.0: the pure engine behind the awakening's LIVE generated beats -->
@@ -991,9 +1087,15 @@
 <script src="app/widgets.js"></script><!-- widget rails: pinnable read-only telemetry instruments (insights/cron polls + run.end/queue.status/cron.fire folds); own localStorage key, never emits -->
 <script src="app/autosessions.js"></script><!-- surface an unattended cron/routine run as a readable SESSION: cron.fire → adopt a 'cron-<runId>' workstream (busy, no focus-steal), cron.result → fold its durable transcript; boot backfill for runs finished while closed. Read-only on U.bus (after app.js so App/Workstreams/Channels/Chat/U exist) -->
 <script src="app/claude-crew.js"></script><!-- CLAUDE CREW: the user's own `claude` CLI sessions as floor bodies (cc-<sessionId>); inert unless the sidecar has STARNET_CLAUDE_CREW=1; never enters the App roster -->
+<script src="app/briefing.js"></script><!-- THE ONE RETURN REPORT: boot + first input after a real absence → POST /api/away/briefing/deliver → ONE pinned "While you were away" session (sidecar composes every unattended outcome); the older return beats stand down while it is live -->
+<script src="app/needsyou.js"></script><!-- NEEDS YOU: every ask and failure waiting on the Commander, pinned atop SESSIONS -->
+<script src="app/delegated.js"></script><!-- DELEGATED WORK: one live card per dispatch in the conversation that asked; each worker's answer + receipt unfolds on it -->
+<script src="app/remoteview.js"></script><!-- StarNet Remote: the phone's STATION view. While a paired phone is looking, this page draws a still of the whole station with the real renderer (World.renderStill) and hands it to the sidecar (POST /api/remote/view) -->
+<script src="app/remotesessions.js"></script><!-- StarNet Remote: a conversation held from a phone is a desk SESSION too — adopt phone-started streams (GET /api/remote/recent + /api/runs backfill), show them busy while live, reload the open session when a phone turn lands. Read-only on U.bus -->
 <script src="app/warroom.js"></script>
 <script src="app/worldlab.js"></script>
 <script src="app/glass-demo.js"></script>
 <script src="app/glass-comms.js"></script>
+<script src="app/crewcards.js"></script><!-- CREW CARDS: run clock, live step and needs-your-OK frame on the CREW rail rows (css/crew-glass.css) -->
 </body>
 </html>

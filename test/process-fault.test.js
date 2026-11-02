@@ -6,6 +6,7 @@
    after a bounded delay so the shell watchdog restarts a clean process. Benign stdio EPIPE stays surface-only;
    STARNET_UNCAUGHT_KEEP_SERVING is the test-only opt-out. Section E proves it against a REAL node process. */
 'use strict';
+const { readSidecarSource } = require('./helpers/source');
 const A = require('./_assert.js');
 const fs = require('fs');
 const path = require('path');
@@ -28,6 +29,23 @@ function harness(extra) {
 }
 
 (async () => {
+  // ---- security audit 2026-09-25: the fault text reaches /api/health (unauthenticated), the crash ledger and the log.
+  //      It is scrubbed with the host redact() before truncation, so a credential in an error message never lands there.
+  {
+    const { redact } = require('../sidecar/context.js');
+    const recorded = [];
+    const { h, calls } = harness({ redact, breaker: { record: v => { recorded.push(v); return { tripped: false }; } } });
+    const key = 'sk-or-v1-' + 'a'.repeat(40);
+    h.onUncaught(new Error('fetch https://api.example/v1?api_key=plainsecret123 failed with ' + key + ' ' + 'x'.repeat(300)));
+    const f = h.fault();
+    A.ok(f.message.indexOf(key) < 0 && f.message.indexOf('sk-or-v1') < 0 && f.message.indexOf('plainsecret123') < 0, 'fault() (and so /api/health) carries no credential');
+    A.ok(recorded.length === 1 && recorded[0].summary.indexOf('plainsecret123') < 0, 'the crash-ledger summary is scrubbed');
+    A.ok(f.message.indexOf('[redacted-') >= 0, 'the redaction marker is visible, so the report stays honest');
+    const { h: h2 } = harness({ redact: () => { throw new Error('redactor broke'); } });
+    h2.onUncaught(new Error('token=abcdefgh1234'));
+    A.ok(h2.fault().message.indexOf('abcdefgh1234') < 0, 'a failing redactor withholds the message rather than leaking it');
+  }
+
   // ---- A. a genuine uncaught: surfaced FIRST (diagnostics ring intact), fault recorded, exit(1) scheduled after the delay ----
   {
     const { h, calls } = harness();
@@ -148,7 +166,7 @@ function harness(extra) {
 
   // ---- F. index.js wiring + Map bounds (source-level, mirrors the honesty asserts in sidecar.http.test.js) ----
   {
-    const src = fs.readFileSync(path.resolve(__dirname, '..', 'sidecar', 'index.js'), 'utf8');
+    const src = readSidecarSource();
     A.ok(/process\.on\('uncaughtException',\s*e\s*=>\s*processFault\.onUncaught\(e\)\)/.test(src), 'uncaughtException is routed through the fail-loud handler');
     A.ok(/process\.on\('unhandledRejection',\s*e\s*=>\s*surfaceProcessError\('unhandledRejection',\s*e\)\)/.test(src), 'unhandledRejection stays log-only');
     A.ok(/ENV\('UNCAUGHT_KEEP_SERVING'\)/.test(src), 'test opt-out env is honoured');
@@ -158,6 +176,27 @@ function harness(extra) {
     A.ok(/function quiesceForProcessFault\(\)[\s\S]*groupSessions\.halt/.test(src), 'fault quiesce halts group sessions');
     A.ok(/function quiesceForProcessFault\(\)[\s\S]*for \(const id of GENERIC_CHANNEL_IDS\) stopGenericChannel\(id\)/.test(src), 'fault quiesce disconnects generic channels');
     A.ok(/function quiesceForProcessFault\(\)[\s\S]*clearInterval\(livePricesRefreshTimer\)/.test(src), 'fault quiesce stops the live-price refresh timer');
+    // LINE TRIGGERS are contained like E-STOP contains them (2026-09-24 security review): poll timer cleared, queues
+    // dropped, trigger-hub runs killed — and the runner's halted() refuses any fire after a fault quiesced the process
+    const q = A.fnBody(src, 'function quiesceForProcessFault()');
+    A.ok(/contain\('triggers', \(\) => \{[\s\S]*clearInterval\(triggerPollTimer\);[\s\S]*triggerRunner\.haltAll\(\);[\s\S]*killAll\(null, \.\.\.triggerRunner\.inflights\(\)\);/.test(q), 'fault quiesce stops the folder poll, drops trigger queues and kills trigger-hub runs');
+    A.ok(/let triggerPollTimer = setInterval\(/.test(src), 'the trigger poll timer is clearable');
+    // (wave 2 repair, conveyor-backend-08 and its siblings) the containment is the station's OWN fault, never the Commander's E-STOP:
+    // every hub run it kills is marked faulted FIRST (halt.js markFaulted), so a chat's notice, a STEP THROUGH, a hand-off and RUN ONE
+    // REAL JOB name the fault — and a plain E-STOP never marks one
+    A.ok(/markFaulted\(tgInflight, dcInflight, \.\.\.genericInflights, \.\.\.tgBotInflights, devInflight, stepTest \? stepTest\.inflight : null\);\s*killAll\(runs, tgInflight, dcInflight, \.\.\.genericInflights, \.\.\.tgBotInflights, devInflight, stepTest \? stepTest\.inflight : null\);/.test(q), 'fault quiesce marks the channel, dev and step-test runs faulted before it kills them');
+    A.ok(/markFaulted\(\.\.\.triggerRunner\.inflights\(\)\);\s*killAll\(null, \.\.\.triggerRunner\.inflights\(\)\);/.test(q), '…the trigger runs');
+    A.ok(/markFaulted\(\.\.\.handoffRunner\.inflights\(\)\); killAll\(null, \.\.\.handoffRunner\.inflights\(\)\);/.test(q), '…the hand-off runs');
+    A.ok(/sampleInFlight\.stopCause = 'fault';[^\n]*markFaulted\(\(sampleHub && sampleHub\._internals\) \? sampleHub\._internals\.inflight : null\); killAll\(null,/.test(q), '…and the sample run, whose record and answer say the fault');
+    const estop = A.fnBody(src, 'function handleHalt(req, res)');
+    A.ok(/killAll\(runs,/.test(estop) && !/markFaulted|stopCause/.test(estop), 'the Commander\'s E-STOP marks no fault');
+    const sample = A.fnBody(src, 'async function runSampleJob(readArgs)');
+    // (quick win 26) the record's words are picked by routing/sample-verdict.js, handed the stop cause
+    A.ok(/stopCause: sampleInFlight\.stopCause/.test(sample) && /error: completed \? '' : problem\.jobError/.test(sample)
+      && require('../sidecar/routing/sample-verdict.js').sampleProblem({ stoppedByUser: true, stopCause: 'fault', onLine: true, runs: [] }).jobError === 'the station hit an internal fault and stopped this job',
+      'the sample job record words a fault stop as the fault');
+    A.ok(/\(stopped && sampleInFlight\.stopCause === 'fault'\) \? \{ error: 'stopped — the station hit an internal fault and stopped this job before it reached the OUTBOX', stoppedBy: 'fault' \} : null/.test(sample), 'the sample answer words it so too, and says stoppedBy fault');
+    A.ok(/halted: \(\) => cronHalted === true \|\| processFaultQuiesced === true,/.test(src), 'the trigger runner treats a fault-quiesced process as halted');
     const bump = A.fnBody(src, 'function bumpQueue(agentId, d)');
     A.ok(/queueDepth\.delete\(agentId\)/.test(bump), 'bumpQueue deletes a drained entry (bounded Map)');
     const cap = A.fnBody(src, 'function devCaptureReply(chatId, text)');

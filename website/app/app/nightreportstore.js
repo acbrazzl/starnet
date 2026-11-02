@@ -46,6 +46,8 @@ const NightReportStore = (() => {
   // honest to say (compose → hasReport). Fail-open: any missing dependency simply skips the beat.
   async function maybeReport() {
     if (fired) return;
+    // THE ONE RETURN REPORT folds the night shift into the single briefing session — this beat stands down
+    try { if (typeof Briefing !== 'undefined' && Briefing.ownsReturn && Briefing.ownsReturn()) { fired = true; return; } } catch (_) {}
     if (typeof NightReport === 'undefined' || typeof Chat === 'undefined' || !Chat.nudge) return;
     const awaySince = awayBoundary();
     const now = Date.now();
@@ -96,7 +98,7 @@ const NightReportStore = (() => {
     if (hasNight && report.idleReason) lines.push(report.idleReason);
     // the review-owed line (server-proven /api/workshop/pending): name each waiting build, say where it lives.
     if (pendingBuilds.length) {
-      lines.push('⚒ ' + pendingBuilds.length + ' build' + (pendingBuilds.length > 1 ? 's are' : ' is') + ' waiting for your review — each is a ⚒ session in your rail:');
+      lines.push('⚒ ' + pendingBuilds.length + ' build' + (pendingBuilds.length > 1 ? 's are' : ' is') + ' waiting for your review — each is its own session in your rail:');
       for (const p of pendingBuilds.slice(0, 5)) lines.push('   · ' + String(p.title || 'a deliverable'));
       if (pendingBuilds.length > 5) lines.push('   · …and ' + (pendingBuilds.length - 5) + ' more');
     }
@@ -108,7 +110,7 @@ const NightReportStore = (() => {
     const reveal = () => {
       if (typeof Chat === 'undefined' || typeof Chat.localLine !== 'function') return;
       const ds = (hasNight && report.drafts) || [];
-      if (!ds.length) { Chat.localLine('(the night shift left no draft bodies — the acts above are the record)'); return; }
+      if (!ds.length) { Chat.localLine('(autonomy left no draft bodies — the acts above are the record)'); return; }
       for (const d of ds) {
         if (!d || !d.title) continue;
         Chat.localLine('▤ ' + String(d.title).trim());
@@ -126,7 +128,7 @@ const NightReportStore = (() => {
         try { if (typeof App !== 'undefined' && App.openWorkstream) App.openWorkstream('workshop-' + String(pendingBuilds[0].runId)); } catch (_) {}
       }
     });
-    if (typeof World !== 'undefined' && World.say) { try { World.say((hasNight && report.actCount) || pendingBuilds.length ? '✦ there’s finished work waiting for you' : '✦ nothing to report from the night'); } catch (_) {} }
+    if (typeof World !== 'undefined' && World.say) { try { World.say((hasNight && report.actCount) || pendingBuilds.length ? '✦ there’s finished work waiting for you' : '✦ nothing to report from while you were away'); } catch (_) {} }
   }
 
   /* init({ enabled, agentId }) — called from enterGame, AFTER ReturnStore.init (so lastSeen() is the previous

@@ -8,6 +8,7 @@
      requiresConsent: prompt before running (write/execute/network; M1.4)
      timeoutMs      : per-tool execution bound (0 = none)
      preconditions  : machine-readable state requirements; strict identifiers only
+     resultScrub    : false opts a host tool out of the registry's stored-text result scrub (default true)
      run(args, ctx) : async; returns a string or { content, summary }; THROWS on error. */
 'use strict';
 (function (root, factory) {
@@ -59,7 +60,23 @@
       requiresConsent: !!def.requiresConsent,
       // CONFIRM EVERY TIME: a human yes for EACH call — above Full Access/Full Power and never cached (permissions.js)
       confirmEveryTime: !!def.confirmEveryTime,
+      // its OWN consent class (permissions.js dangerKey) — a cached "always" on a sibling tool of the same
+      // capability must never pre-approve this one. Dropped here before 2026-09-23, silently disabling it.
+      consentKey: typeof def.consentKey === 'string' && def.consentKey ? def.consentKey : null,
+      // revoked once the run has read untrusted content (taint.js) — for tools that PERSIST text another run obeys.
+      // A function is an action-aware lock: (args) => locked? (routine.manage / loop.manage leave pause/stop open)
+      taintLocked: typeof def.taintLocked === 'function' ? def.taintLocked : def.taintLocked === true,
+      // never approved by a cached grant, never left behind as one, and Full Access keeps its taint lock (permissions.js, taint.js)
+      freshConsent: def.freshConsent === true,
+      // never held behind an unsettled Task Brief (taskbrief-policy canMutate) — station setup such as team.summon. Dropped here
+      // until 2026-10-14, so the gate read the REGISTERED tool and still refused every hire (live proof, final-rc-seams lane)
+      // A function is an action-aware exemption: (args) => exempt? (station.control's setup actions only — seating crew in this
+      // chat, a rename, the look, an e-stop — while its other actions still wait for the brief)
+      briefExempt: typeof def.briefExempt === 'function' ? def.briefExempt : def.briefExempt === true,
       timeoutMs: def.timeoutMs || 0,
+      // false = the registry's stored-text result scrub skips this tool (registry.js resultScrubFor): a HOST tool whose
+      // result is external content or holds no stored text. Never honored for a connector registration (fail closed).
+      resultScrub: def.provenance === 'connector' ? true : def.resultScrub !== false,
       preconditions: normalizePreconditions(def.preconditions),
       run: def.run || (async () => { throw new Error('tool "' + def.name + '" has no run()'); })
     };

@@ -3,8 +3,9 @@
    within a batch, count cap, the NONE/empty/malformed/throw paths (a failed reflection never hurts the
    run), and determinism. Auto-proposals are candidates only — nothing is written here. */
 'use strict';
+const { readSidecarSource } = require('./helpers/source');
 const A = require('./_assert.js');
-const { reflect, parse, buildPrompt, worthReflecting, usedTools, reflectSalient, recordFromProposal, feedbackFor, highStakes } = require('../sidecar/reflect.js');
+const { reflect, parse, buildPrompt, worthReflecting, usedTools, reflectSalient, refusedAction, recordFromProposal, feedbackFor, highStakes } = require('../sidecar/reflect.js');
 const { redact } = require('../sidecar/context.js');
 const { makeClock } = require('../shared/clock-rng.js');
 
@@ -141,6 +142,23 @@ const { makeClock } = require('../shared/clock-rng.js');
   A.eq(reflectSalient([{ role: 'user', content: 'fix it' }, { role: 'tool', content: 'patched' }], false), true, 'a user turn + real tool work (no assistant prose) is salient');
   A.eq(reflectSalient(null, false), false, 'garbage in -> not salient (never throws)');
 
+  // ---- refusedAction (releases#7 / #9): a run whose approval was not given ends 'done' when the agent carries on, but its
+  //      work is not what was asked, so reflection proposes nothing from it (the reflector read a Deny as "never wants …") ----
+  const deniedRow = { callId: 'c1', name: 'fs_write', ok: false, isError: true, summary: 'denied' };
+  A.eq(refusedAction([{ callId: 'c0', name: 'fs_read', ok: true, isError: false, summary: 'read 3 lines' }, deniedRow]), true, 'a Deny on an approval card (the broker\'s denied summary) marks the run');
+  A.eq(refusedAction([{ callId: 'c0', name: 'fs_write', ok: false, isError: true, summary: 'error' }]), false, 'an ordinary tool failure is not a refusal (reflection still learns from a done run that recovered)');
+  A.eq(refusedAction([{ callId: 'c0', name: 'fs_write', ok: true, isError: false, summary: 'denied' }]), false, 'only an errored call counts');
+  A.eq(refusedAction([{ callId: 'c0', name: 'team_dispatch', ok: false, isError: true, summary: 'not run yet — waiting on the task brief' }]), false, 'a call the Task Brief held is not a refusal');
+  A.eq(refusedAction([]), false, 'no calls -> no refusal');
+  A.eq(refusedAction(null), false, 'garbage in -> false (never throws)');
+  {
+    const idx = readSidecarSource();
+    // memory-truth-1027: refusedAction feeds the ONE learning predicate (denied), which the reflection gate reads
+    A.ok(/denied: refusedAction\(execution\.toolTraceList\(\)\)/.test(idx) && /const _gateReflect = !!\(o\.reflect && [^\n]*_learn\.reflection && reflectSalient\(result\.messages, o\.recurring\)/.test(idx), 'the run-end REFLECTION gate skips a run whose approval was not given');
+    const LE = require('../sidecar/learning-eligibility.js');
+    A.eq(LE.passes(LE.runOutcome({ reason: 'done', denied: true, reflect: true, task: true })).reflection, false, '…through the predicate: a denied run is not reflected on');
+  }
+
   // recordFromProposal: a Kept proposal becomes the §5.2 notebook record (content mirrors into body for the
   // legacy title/body readers; title is the kind label; stats start at 0; provenance + clock injected).
   const prop = { id: 'prop_2', kind: 'profile', content: 'user prefers terse answers', scope: 'global', streamId: null };
@@ -156,6 +174,11 @@ const { makeClock } = require('../shared/clock-rng.js');
   A.eq(rec.trust, 0, 'trust starts at 0 — it rides the memory.feedback event log, never seeded');
   A.eq(rec.useCount, 0, 'useCount starts at 0');
   A.eq(rec.pinned, false, 'not pinned by default');
+  A.eq(rec.projectRoot, null, 'no project root on the proposal -> a global record (projectRoot null)');
+  // PROJECT TIER (memory-compound lane): a project-scoped proposal keeps its root on the record so rank() can key it
+  const projRec = recordFromProposal({ id: 'prop_9', kind: 'fact', content: 'the registry rate-limits pushes', scope: 'project', projectRoot: 'C:\\Proj\\A' }, { now: 1, id: 'note_9' });
+  A.eq(projRec.scope, 'project', 'project scope carried from the proposal');
+  A.eq(projRec.projectRoot, 'C:\\Proj\\A', 'projectRoot carried verbatim onto the record');
   // an Edit supplies replacement content; an unknown kind falls back to a Note label
   const edited = recordFromProposal(prop, { now: 1, id: 'note_4', content: '  fixed up text  ' });
   A.eq(edited.content, 'fixed up text', 'edited content used + trimmed');

@@ -58,6 +58,30 @@ function threeStageChain(sends) {
 }
 
 async function run() {
+  /* ---- 0. A LINE IS HANDED WHAT THE MEMBER ACTUALLY ASKED (token-burn audit 2026-10-17). Hops no longer replay the chat stream,
+          so the chain's original ask is the only place a downstream stage meets the quoted message a reply points at (or a
+          captionless voice note's transcript). The edit marker names a message the stage never saw: it stays out. ---- */
+  {
+    let handed = null;
+    const hub = makeChannelHub({
+      runOnce: runOnceFor({ tg_555: SCOUT_SAID }), store: fakeStore(),
+      send: () => Promise.resolve({ ok: true }), secrets: () => ({ key: 'k', model: 'm' }), classify: () => false, newId: idGen(),
+      chain: { stopNote: () => '', advance: async (o) => { handed = o.originalText; return { hops: [], text: SCOUT_SAID, agentId: 'tg_555', stopped: null }; } }
+    });
+    const first = dm('summarise this for the team');
+    first.replyTo = { text: 'QUOTED: Q3 revenue rose 14% on the new tier.', userName: 'Dana' };
+    await hub.onInbound(first);
+    A.ok(typeof handed === 'string' && handed.indexOf('QUOTED: Q3 revenue rose 14% on the new tier.') >= 0, 'a reply\'s quoted message reaches the line');
+    handed = null;
+    const msg = dm('summarize this for the team');   // the member edits their latest message (same messageId)
+    msg.replyTo = first.replyTo;
+    msg.edited = true;
+    await hub.onInbound(msg);
+    A.ok(typeof handed === 'string' && handed.indexOf('QUOTED: Q3 revenue rose 14% on the new tier.') >= 0 && handed.indexOf('summarize this for the team') >= 0,
+      'the line is handed the quoted message AND the member\'s words, as the entry run read them');
+    A.ok(handed.indexOf('the previous message was edited') < 0, 'the edit marker (a message the stage never saw) stays out of the line\'s ask');
+  }
+
   /* ---- A. THE DEFECT: the entry dock records ITS OWN text, never the delivered one ---- */
   {
     const sends = []; const store = fakeStore(); const events = [];
@@ -80,14 +104,19 @@ async function run() {
     A.eq(dockAssistant, [SCOUT_SAID], 'the ENTRY DOCK\'s transcript holds what IT said, not the delivered text');
     A.ok(dockAssistant.indexOf(EDITOR_SAID) < 0, 'the editor\'s paragraph is NOT fabricated into the dock\'s history');
 
-    // each hop still owns its own output
-    A.eq((store.hist.get('analyst') || []).filter(t => t.role === 'assistant').map(t => t.content), [ANALYST_SAID],
+    // each hop still owns its own output — under its per-CHAT hop key (sec-taint 09-25: hop history is keyed by
+    // chat lineage, never by the bare agentId every chat of that agent would share)
+    const keyOf = (said) => { const hit = store.appends.find(x => x.role === 'assistant' && x.content === said && x.a !== 'tg_555'); return hit ? hit.a : ''; };
+    const analystKey = keyOf(ANALYST_SAID), editorKey = keyOf(EDITOR_SAID);
+    A.ok(/^hop_[0-9a-f]{32}$/.test(analystKey) && /^hop_[0-9a-f]{32}$/.test(editorKey) && analystKey !== editorKey,
+      'each hop persists under its own per-chat hop key, not the bare agentId');
+    A.eq((store.hist.get(analystKey) || []).filter(t => t.role === 'assistant').map(t => t.content), [ANALYST_SAID],
       'the analyst\'s transcript holds the analyst\'s own output');
-    A.eq((store.hist.get('editor') || []).filter(t => t.role === 'assistant').map(t => t.content), [EDITOR_SAID],
+    A.eq((store.hist.get(editorKey) || []).filter(t => t.role === 'assistant').map(t => t.content), [EDITOR_SAID],
       'the delivering stage\'s transcript holds the delivered text');
 
     // the original symptom, stated directly: three stages had three IDENTICAL transcripts
-    const all = ['tg_555', 'analyst', 'editor'].map(id =>
+    const all = ['tg_555', analystKey, editorKey].map(id =>
       (store.hist.get(id) || []).filter(t => t.role === 'assistant').map(t => t.content).join('|'));
     A.eq(new Set(all).size, 3, 'all three stages have DISTINCT assistant turns (they were byte-identical)');
   }

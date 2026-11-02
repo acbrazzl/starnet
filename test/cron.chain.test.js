@@ -30,7 +30,8 @@ function setup(opts) {
     newId: () => 'run-' + (++idN), newAbort: () => new AbortController(), now: () => clock.now(),
     getKey: () => 'sk-test', defaultModel: 'test/model', persona: 'PERSONA', maxRunMs: 480000,
     advanceChain: opts.advanceChain ? (o) => { chainCalls.push(o); return opts.advanceChain(o); } : undefined,
-    stageBriefFor: opts.stageBriefFor
+    stageBriefFor: opts.stageBriefFor,
+    contextFor: opts.contextFor
   });
   return { driver, clock, events, runs, chainCalls, getJob: (id) => cronStore.getJob(store, id) };
 }
@@ -48,6 +49,19 @@ async function fireAndSettle(s, reply) {
 
 (async function () {
 
+  /* ---- A contextFrom ROUTINE HANDS ITS UPSTREAM CONTEXT DOWN THE LINE (token-burn audit 2026-10-17). Hops no longer replay
+         the fire's stream, so the handoff's "original request" is the only place a downstream stage meets the routine's
+         upstream material: it must be the ASSEMBLED prompt the entry run was given, not the bare directive. ---- */
+  {
+    const s = setup({ contextFor: () => 'UPSTREAM DIGEST: three findings from yesterday', advanceChain: async () => ({ text: 'WRITE-UP', hops: [{ agentId: 'writer' }], stopped: null }) });
+    await fireAndSettle(s, 'raw findings');
+    const entryText = JSON.stringify(s.runs[0].opts.messages || []);
+    A.ok(entryText.indexOf('UPSTREAM DIGEST') >= 0, 'fixture: the entry run was given the upstream context');
+    A.ok(s.chainCalls.length === 1 && s.chainCalls[0].originalText.indexOf('UPSTREAM DIGEST: three findings from yesterday') >= 0, 'the line is handed the upstream context as part of the original ask');
+    A.ok(s.chainCalls[0].originalText.indexOf('research the thing') > s.chainCalls[0].originalText.indexOf('UPSTREAM DIGEST'), '...with the routine directive after it, exactly as the entry run read it');
+    A.eq(s.chainCalls[0].ask, 'research the thing', '...and the bare directive as `ask` (what a SEND TO record carries on)');
+  }
+
   /* ---- the line's answer replaces stage one's, and the routine still settles OK ---- */
   {
     const s = setup({ advanceChain: async () => ({ text: 'THE FINISHED WRITE-UP', hops: [{ agentId: 'writer' }], stopped: null }) });
@@ -57,8 +71,41 @@ async function fireAndSettle(s, reply) {
     A.eq(s.chainCalls[0].text, 'raw findings about the thing', "handed stage one's real output");
     A.eq(s.chainCalls[0].originalText, 'research the thing', "and the routine's own prompt as the original ask");
     A.eq(s.chainCalls[0].streamId, 'cron-run-1', "hops ride the ROUTINE's stream so its session shows the whole line");
+    A.eq(s.chainCalls[0].runId, 'run-1', 'shipment identity is the exact scheduled entry run');
     A.eq(lastOf(s.events, 'cron.result').outcome, 'ok', 'the routine settles ok');
     A.eq(s.getJob('j1').lastStatus, 'ok', 'and its durable record is clean');
+  }
+
+  /* ---- (quick win 25, GitHub #122) a line that STOPPED SHORT says so on the routine's answer and record ----
+     The hub has always appended chain.stopNote and handed stopped/unapproved/partial to its outcome hook; the routine
+     took only the line's text, so a line that died at stage two delivered stage one's answer as if the line had run. */
+  {
+    const s = setup({ advanceChain: async () => ({ text: 'THE DRAFT', hops: [{ agentId: 'writer' }], stopped: 'editor failed: provider 500', unapproved: 'the review loop used all 2 passes, so the work went on unapproved', usd: 0.25 }) });
+    await fireAndSettle(s, 'raw findings');
+    const job = s.getJob('j1');
+    A.eq(job.lastStatus, 'ok', 'a line failure still never changes the routine\'s outcome');
+    A.ok(/^THE DRAFT\n\n⚠ the work line stopped early — editor failed: provider 500\.$/.test(job.lastOutput), 'the delivered answer says the line stopped early, and why: ' + JSON.stringify(job.lastOutput));
+    A.eq(job.lastLine, { stopped: 'editor failed: provider 500', unapproved: 'the review loop used all 2 passes, so the work went on unapproved' }, 'the routine\'s record keeps the line\'s stop facts');
+    A.ok(/stopped early/.test((job.finalization && job.finalization.result) || ''), 'and the delivery receipt carries the same words');
+    A.eq(job.lastUsd, 0.25, 'the line\'s hop spend is added to the entry run\'s (foldLineIntoFire)');
+    const { lineStopNote } = require('../sidecar/routing/line-fire.js');
+    const { makeChainRunner } = require('../sidecar/routing/chain.js');
+    A.eq(makeChainRunner({ plan: () => null, runAgent: async () => ({}) }).stopNote({ stopped: 'x' }), lineStopNote({ stopped: 'x' }), 'the channel hub and the routine say it in ONE wording (chain.stopNote is lineStopNote)');
+  }
+  {
+    // Run Now (index.js handleCronRun) calls chainRunner.advance itself: it must fold the line through the SAME helper
+    const { sidecarTopLevelFunction } = require('./helpers/source.js');
+    const runNow = sidecarTopLevelFunction('handleCronRun');
+    A.ok(runNow.length > 1000 && /chainRunner\.advance\(/.test(runNow), 'fixture: handleCronRun is sliced and runs the line');
+    A.ok(/foldLineIntoFire\(state, line\)/.test(runNow), 'Run Now folds its line through foldLineIntoFire (stop note + stop facts), like the scheduled fire');
+    A.ok(!/state\.buf = line\.text/.test(runNow), 'and no longer takes only the line\'s text');
+  }
+  {
+    // a clean line leaves no facts behind (and clears an earlier fire's)
+    const s = setup({ advanceChain: async () => ({ text: 'CLEAN', hops: [{ agentId: 'writer' }], stopped: null }) });
+    await fireAndSettle(s, 'raw');
+    A.eq(s.getJob('j1').lastLine, null, 'a clean line records no stop facts');
+    A.eq(s.getJob('j1').lastOutput, 'CLEAN', 'and adds no note');
   }
 
   /* ---- a TRUNCATED entry run buys no hops: the line advances only on reason 'done' ---- */
@@ -127,6 +174,13 @@ async function fireAndSettle(s, reply) {
     A.eq(s.chainCalls.length, 1, 'the line still advanced');
     A.eq(s.chainCalls[0].unattendedGrants, [], 'the advanceChain seam is handed an EMPTY grants list — hops never inherit authority');
     A.eq(lastOf(s.events, 'cron.result').outcome, 'ok', 'and the routine still settles ok');
+  }
+  // the images grant (2026-10-18) obeys the same law: the routine's own agent may make pictures, a later stage may not
+  {
+    const s = setup({ grants: ['studio'], advanceChain: async () => ({ text: 'line done', hops: [{ agentId: 'writer' }], stopped: null }) });
+    await fireAndSettle(s, 'stage one output');
+    A.eq(s.runs[0].opts.unattendedGrants, ['studio'], "stage one keeps the recorded images grant");
+    A.eq(s.chainCalls[0].unattendedGrants, [], 'a downstream hop is handed NO images grant');
   }
 
   /* ---- THE DOCK'S STANDING BRIEF RIDES A SCHEDULED ENTRY RUN (inbox-trigger, 2026-08-05). A routine's

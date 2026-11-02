@@ -133,4 +133,43 @@ for (const p of C.PLATFORMS) {
   A.ok(C.CATEGORY_ORDER.indexOf('Physical World') >= 0, 'Physical World category is declared in the order');
 }
 
+// ---- G. retired docs links heal; a vendor with no API of its own says so (2026-10-07 live audit) ----
+{
+  // a saved key stores its docsUrl and the prompt reads THAT copy — a moved vendor page must heal on load
+  for (const id of ['supliful', 'teemill', 'zazzle']) A.ok((C.byId(id).retiredDocsUrls || []).length > 0, id + ' lists the docs link it retired');
+  for (const p of C.PLATFORMS.filter(row => row.retiredDocsUrls)) {
+    const at = ' [' + p.id + ']';
+    A.ok(Array.isArray(p.retiredDocsUrls) && p.retiredDocsUrls.every(u => /^https:\/\//.test(u)), 'retired links are https strings' + at);
+    A.ok(p.retiredDocsUrls.indexOf(p.docsUrl) < 0, 'the current docs link is never listed as retired' + at);
+    for (const u of p.retiredDocsUrls) {
+      A.eq(C.healDocsUrl({ id: p.id, envVar: p.envVar, docsUrl: u }).docsUrl, p.docsUrl, 'a key saved with ' + u + ' heals' + at);
+      A.eq(C.healDocsUrl({ id: 'renamed-' + p.id, envVar: p.envVar, docsUrl: u + ' ' }).docsUrl, p.docsUrl, 'a key saved under another name heals by its env var' + at);
+    }
+  }
+  const typed = { id: 'supliful', envVar: 'SUPLIFUL_API_KEY', docsUrl: 'https://example.com/my-own-notes' };
+  A.eq(C.healDocsUrl(typed), typed, 'a docs link the Commander typed is never rewritten');
+  A.eq(C.healDocsUrl({ id: 'custom', envVar: 'CUSTOM_API_KEY', docsUrl: 'https://docs.supliful.com/' }).docsUrl, 'https://docs.supliful.com/', 'only the matching platform heals its own retired link');
+  A.eq(C.healDocsUrl(null), null, 'a missing record passes through');
+  // no public API of its own → the card must not claim one; the note says what the row really uses
+  A.eq(C.byId('supliful').apiVia, 'Shopify Admin API', 'Supliful names the API it actually uses');
+  for (const p of C.PLATFORMS.filter(row => row.apiVia)) {
+    A.ok(/no public API/i.test(p.note || '') && /\{your-store\}|https:\/\//.test(p.apiBase || ''), p.id + ' explains why it routes through ' + p.apiVia);
+  }
+}
+
+// ---- D. VERIFIED API NOTES (2026-10-12 user report: a Publisher agent hit a mockup endpoint that does not exist, sent
+//      partial variant lists in PUTs, and retyped ids from a truncated response). Notes ride the prompt, so they hold
+//      only facts checked against the vendor's own reference — and they reach a key saved under any name via its docs link. ----
+{
+  const n = C.notesFor('PRINTIFY_API_KEY');
+  const has = s => n.indexOf(s) >= 0;
+  A.ok(has('images[]') && has('no endpoint of their own'), 'Printify: mockups are the product images[], not an endpoint');
+  A.ok(has('EVERY variant'), 'Printify: a PUT that sends variants must send all of them');
+  A.ok(has('POST /v1/uploads/images.json') && has('GET /v1/uploads/{image_id}.json'), 'Printify: upload + read-back paths');
+  A.ok(has('${file:') && has('select'), 'Printify: notes point at the host-side file attach and select');
+  A.eq(C.notesFor('PRINTIFY_TOKEN_API_KEY', 'https://developers.printify.com/'), n, 'a key saved under another name still gets the notes via its docs link');
+  A.eq(C.notesFor('NOPE_API_KEY'), '', 'no row -> no notes');
+  for (const p of C.PLATFORMS) if (p.apiNotes) A.ok(typeof p.apiNotes === 'string' && p.apiNotes.length < 2000, 'apiNotes stay a short string [' + p.id + ']');
+}
+
 A.report('servicekeys-catalog.test.js');

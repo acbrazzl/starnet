@@ -17,11 +17,13 @@
   const P = require('node:path');
   const OS = require('node:os');
   const FS = require('node:fs');
-  const CP = require('node:child_process');
+  const CP = require('../../child-env.js').guardChildProcess(require('node:child_process'));   // Chrome never inherits station secrets
   const NET = require('node:net');
-  const { swallow } = require('../../failopen.js');
+  const { swallow, note: failNote } = require('../../failopen.js');
   const Challenge = require('./browserchallenge.js');
   const { deriveReadClient } = require('./browser-workflow.js');
+  const Orphans = require('./browser-orphans.js');   // #61: end only the station's OWN orphaned Chromium
+  const HandoffReasons = require('../../browser-handoff.js').REASONS.slice();   // STEP-IN: browser.need_human's closed reason list
   // UNTRUSTED-CONTENT FENCE (2026-07-25): page text, snapshots, console rows and dialog messages are all
   // authored by the SITE, not the Commander. web_* has fenced since the web lane; these reads did not, so
   // the most direct "read a hostile page" path arrived raw. Same marker pair as web — one model contract.
@@ -266,24 +268,73 @@
         blockedOpen = function () { return null; };
         Object.defineProperty(globalThis, 'open', { configurable: false, writable: false, value: blockedOpen });
       }
+      /* A LINK OR FORM AIMED AT A NEW WINDOW OPENS IN THIS TAB. These used to be cancelled outright (preventDefault +
+         stopImmediatePropagation), from before popups could be adopted - so an Etsy result (target="etsy.123") or any
+         target=_blank link did nothing at all while browser.click said "clicked". A target that names a frame ON this
+         page (<iframe name=pf>, <a target=pf>) is not a new window, so it is left alone.
+         TWO MODES, because Chrome reads the target when the default action RUNS, after every page listener:
+         - popups ADOPTED: retarget to _self and let the event go on, so the page's own handlers still run. A page that
+           sets the target back to _blank only gets a new tab the driver pauses and shims anyway.
+         - popups BLOCKED (the page-endpoint fallback): a new window here would be UNSHIMMED, so the event is still
+           cancelled before any page listener sees it, and this tab loads the destination itself. Nothing the page does
+           afterwards can re-aim it. (A link aimed at an in-page frame then loads in this top frame.) */
+      // by the frame ELEMENTS' names, never window[name]: named access also returns any element with that id. Only while
+      // popups are adopted - with them blocked, a page that removed the frame mid-click must still not get a new window.
+      const inPageFrame = n => ALLOW_POPUPS && !!n && !!document.querySelectorAll && Array.prototype.some.call(document.querySelectorAll('iframe[name],frame[name]'), f => f.name === n);
       const escapesTarget = (el, override) => {
         const base=document.querySelector&&document.querySelector('base[target]');
-        const t=String(override||el&&el.target||base&&base.target||'').trim().toLowerCase();
-        return !!t && t !== '_self' && t !== '_top' && t !== '_parent';
+        const raw=String(override||el&&el.target||base&&base.target||'').trim();
+        const t=raw.toLowerCase();
+        return !!t && t !== '_self' && t !== '_top' && t !== '_parent' && !inPageFrame(raw);
+      };
+      // the NATIVE setter, taken before page script runs: a page that no-ops setAttribute must not keep its _blank
+      const setAttr = Element.prototype.setAttribute;
+      const toSelf = (el, attr) => { if (el && el instanceof Element) setAttr.call(el, attr, '_self'); };
+      const nativeSubmit = globalThis.HTMLFormElement ? HTMLFormElement.prototype.submit : null;
+      const stop = e => { e.preventDefault(); e.stopImmediatePropagation(); };
+      // A download link keeps the old cancel (no page to load), and a javascript: href never runs here.
+      const loadHere = el => {
+        const href = el.href ? String(el.href) : '';
+        if (href && !/^\s*javascript:/i.test(href) && !(el.hasAttribute && el.hasAttribute('download'))) location.assign(href);
+      };
+      // form.submit() never fires a submit event, so nothing can re-aim it between here and the navigation. It also
+      // ignores the submitter, so the button's name=value and form* overrides are carried over for the one call.
+      const submitHere = (form, sub) => {
+        toSelf(form, 'target');
+        const undo = [];
+        if (sub && sub.name) {
+          const h = document.createElement('input');
+          h.type = 'hidden'; h.name = sub.name; h.value = sub.value;
+          form.appendChild(h); undo.push(() => h.remove());
+        }
+        for (const a of ['formaction', 'formmethod', 'formenctype']) {
+          if (!sub || !sub.hasAttribute || !sub.hasAttribute(a)) continue;
+          const own = a.slice(4), had = form.getAttribute(own);
+          form.setAttribute(own, sub.getAttribute(a));
+          undo.push(() => had === null ? form.removeAttribute(own) : form.setAttribute(own, had));
+        }
+        try { if (!escapesTarget(form)) nativeSubmit.call(form); } finally { undo.forEach(f => f()); }
       };
       globalThis.addEventListener('click', e => {
         const p=typeof e.composedPath==='function'?e.composedPath():[];
         const el=p.find(x => x instanceof HTMLAnchorElement || x instanceof HTMLAreaElement);
-        if(escapesTarget(el)){e.preventDefault();e.stopImmediatePropagation();}
+        if(!escapesTarget(el)) return;
+        if(ALLOW_POPUPS) return toSelf(el, 'target');
+        stop(e); loadHere(el);
       }, true);
       globalThis.addEventListener('submit', e => {
         const ft=e.submitter&&(e.submitter.formTarget||e.submitter.getAttribute&&e.submitter.getAttribute('formtarget'));
-        if(escapesTarget(e.target,ft)){e.preventDefault();e.stopImmediatePropagation();}
+        const escapes=ft?escapesTarget(e.target,ft):escapesTarget(e.target);
+        if(!escapes) return;
+        if(ALLOW_POPUPS) return ft ? toSelf(e.submitter, 'formtarget') : toSelf(e.target, 'target');
+        stop(e);
+        if(nativeSubmit && e.target instanceof HTMLFormElement) submitHere(e.target, e.submitter);
       }, true);
-      if (globalThis.HTMLFormElement) {
-        const nativeSubmit=HTMLFormElement.prototype.submit;
+      if (nativeSubmit) {
         Object.defineProperty(HTMLFormElement.prototype,'submit',{configurable:false,writable:false,value:function(){
-          if(escapesTarget(this)) return undefined;
+          if(escapesTarget(this)) toSelf(this, 'target');
+          // blocked mode: a target that still escapes (a lying getter) is refused, as before - never an unshimmed window
+          if(!ALLOW_POPUPS && escapesTarget(this)) return undefined;
           return nativeSubmit.call(this);
         }});
       }
@@ -367,9 +418,17 @@
     { path: 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe', headless: false },
     process.env.LOCALAPPDATA && { path: P.join(process.env.LOCALAPPDATA, 'Microsoft', 'Edge', 'Application', 'msedge.exe'), headless: false },
     { path: '/usr/bin/google-chrome', headless: false },
+    { path: '/usr/bin/google-chrome-stable', headless: false },
     { path: '/usr/bin/chromium-browser', headless: false },
     { path: '/usr/bin/chromium', headless: false },
-    { path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: false }
+    { path: '/snap/bin/chromium', headless: false },
+    { path: '/usr/bin/microsoft-edge', headless: false },
+    { path: '/usr/bin/brave-browser', headless: false },
+    { path: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: false },
+    { path: P.join(OS.homedir(), 'Applications', 'Google Chrome.app', 'Contents', 'MacOS', 'Google Chrome'), headless: false },
+    { path: '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge', headless: false },
+    { path: '/Applications/Chromium.app/Contents/MacOS/Chromium', headless: false },
+    { path: '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser', headless: false }
   ].filter(Boolean);
 
   function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
@@ -550,17 +609,28 @@
     h = String(h).toLowerCase();
     return h === '::1' || h === '::' || /^::ffff:/.test(h) || /^fe[89ab][0-9a-f]:/.test(h) || /^f[cd][0-9a-f]{2}:/.test(h);
   }
+  /* A refusal the HOST wrote (never page bytes): it does not taint the run (index.js taint observation), and its row
+     says why in a few words instead of "✗ error" (registry toolSummary). Live walkthrough 2026-10-13: an agent's
+     browser.navigate to its OWN saved file:// page was refused, the refusal latched "outside content", and a later
+     shell call was locked with a false reason. */
+  function hostRefusal(msg, summary) {
+    const e = new Error(msg);
+    e.hostAuthored = true;
+    if (summary) e.toolSummary = summary;
+    return e;
+  }
   function assertSafeUrl(raw) {
     let u;
-    try { u = new URL(raw); } catch (e) { throw new Error('invalid URL: ' + raw); }
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('only http(s) URLs are allowed');
+    try { u = new URL(raw); } catch (e) { throw hostRefusal('invalid URL: ' + raw, 'invalid URL'); }
+    if (u.protocol === 'file:') throw hostRefusal('only http(s) URLs are allowed. To check a file you saved, fs_read it; the Commander opens it from its deliverable card.', 'not a web address (file://)');
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw hostRefusal('only http(s) URLs are allowed', 'not a web address');
     const h = hostOf(u);
     const numericHost = /^\d+$/.test(h) || /^0x[0-9a-f]+$/i.test(h);
     const blockedName = h === 'localhost' || h === '0.0.0.0' || h.endsWith('.localhost') || h.endsWith('.local') ||
       h.endsWith('.internal') || h.endsWith('.lan') || h.endsWith('.intranet') || h.endsWith('.home') || h.endsWith('.corp');
     const bareName = h.indexOf('.') < 0 && h.indexOf(':') < 0 && !numericHost;
     if (blockedName || bareName || numericHost || isPrivateV4(h) || isPrivateV6(h)) {
-      throw new Error('refusing to navigate to private/loopback/intranet host: ' + h);
+      throw hostRefusal('refusing to navigate to private/loopback/intranet host: ' + h, 'private address refused');
     }
     return u;
   }
@@ -569,29 +639,68 @@
      attacker-controlled A record) walked straight through them. web_fetch has resolved every hop since the
      web lane (web.js assertResolvedSafe); browser.navigate — the tool that then RUNS the page's scripts —
      did not, so the weaker guard sat in front of the more capable tool.
-     Injectable + best-effort, byte-identical to web.js: a resolution failure is left for the navigation to
-     surface, and IP literals are already checked statically above. Pass lookup:null to disable (tests). */
+     Resolution fails closed. The owned browser's proxy pins each validated DNS answer to its TCP dial,
+     including page subresources. Pass lookup:null only in injected driver tests. */
   function nodeLookup(host) { const dns = require('node:dns'); return dns.promises.lookup(host, { all: true }); }
-  async function assertResolvedSafe(u, lookup) {
-    if (!lookup) return;
+  // every address the lookup answered, each one checked — [] for an IP literal or no lookup
+  async function resolveVerified(u, lookup) {
+    if (!lookup) return [];
     const h = hostOf(u);
-    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h) || h.indexOf(':') >= 0) return;   // already a literal
-    let addrs;
-    try { addrs = await lookup(h); } catch (e) { return; }
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h) || h.indexOf(':') >= 0) return [];   // already a literal
+    const addrs = await lookup(h);
+    if (!Array.isArray(addrs) || !addrs.length) throw new Error('no verified DNS address for ' + h);
     for (const a of (addrs || [])) {
       const ip = (a && a.address) || '';
+      if (!NET.isIP(ip)) throw new Error('resolver returned an invalid IP address for ' + h);
       if (isPrivateV4(ip) || isPrivateV6(ip)) throw new Error('refusing to navigate: ' + h + ' resolves to private address ' + ip);
     }
+    return addrs;
+  }
+  async function assertResolvedSafe(u, lookup) { return (await resolveVerified(u, lookup))[0]; }
+  /* The proxy's refusal behind a tunnel failure: the one for the host this navigation asked for, else the latest (a
+     redirect hop, e.g. etsy.com -> www.etsy.com, is refused under ITS name). */
+  function pickRefusal(list, url) {
+    if (!Array.isArray(list) || !list.length) return null;
+    let want = '';
+    try { want = new URL(url).hostname.toLowerCase().replace(/^\[|\]$/g, ''); } catch (e) { failNote('browser.refusal.host', e); }
+    for (let i = list.length - 1; i >= 0; i--) if (list[i] && list[i].host === want) return list[i];
+    return list[list.length - 1];
+  }
+  /* What the refusal means on THIS computer, in words a user can act on. The private-address case is the common one:
+     a DNS filter (Pi-hole, AdGuard, NextDNS, router parental controls), a VPN, a security app or the hosts file answers
+     0.0.0.0 / a private address for a name. A browser with its own secure DNS (DoH) skips that resolver, which is why
+     the same site can open in the user's everyday browser. A lookup or dial failure may be passing: the session's one
+     retry for NAVIGATION_FAILED covers it. */
+  function explainRefusal(r) {
+    const reason = String((r && r.reason) || 'refused');
+    const host = String((r && r.host) || 'the site');
+    const priv = /resolves to private address (\S+)/.exec(reason);
+    if (priv) {
+      return { code: 'NETWORK_REFUSED', text: 'StarNet\'s browser safety check refused it: this computer\'s DNS answered ' + priv[1] + ' for ' + host +
+        ', a private or blocked address. That answer usually comes from a DNS filter (Pi-hole, AdGuard, NextDNS, router parental controls), ' +
+        'a VPN, a security app or the hosts file on this computer. A browser using its own secure DNS can still open the site, so it may work there. ' +
+        'StarNet\'s browser uses no outside proxy, VPN or gateway: it connects from this computer. Fix or allow ' + host + ' in that DNS filter.' };
+    }
+    if (/ENOTFOUND|EAI_AGAIN|ESERVFAIL|ETIMEOUT|ECONNREFUSED.*53|getaddrinfo|no verified DNS address/i.test(reason)) {
+      return { code: 'NAVIGATION_FAILED', text: 'this computer could not look up ' + host + ' (' + reason + '). Its DNS did not answer for that name; ' +
+        'if it keeps failing, check this computer\'s DNS or VPN settings.' };
+    }
+    if (r && r.code === 'DIAL_FAILED') {
+      const every = /^could not reach any of /.test(reason);
+      return { code: 'NAVIGATION_FAILED', text: reason + ' from this computer: ' + (every ? 'every address its DNS gave was tried and none answered' : 'the address was found but did not answer') +
+        '. A firewall, VPN or security app may be blocking StarNet\'s connection to ' + host + '.' };
+    }
+    return { code: 'NETWORK_REFUSED', text: 'StarNet\'s browser safety check refused it: ' + reason };
   }
   // Separate from assertSafeUrl: public browsing retains its SSRF boundary. Only the workbench-
   // scoped browser.test_navigate tool may use this validator, and only for an agent's local dev UI.
   function assertLoopbackUrl(raw) {
     let u;
-    try { u = new URL(raw); } catch (e) { throw new Error('invalid local test URL: ' + raw); }
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('local browser tests allow http(s) only');
+    try { u = new URL(raw); } catch (e) { throw hostRefusal('invalid local test URL: ' + raw, 'invalid URL'); }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw hostRefusal('local browser tests allow http(s) only — they drive a dev server you started, not a saved file. To check a file you saved, fs_read it.', 'not a dev-server address');
     const h = hostOf(u);
     if (h !== 'localhost' && h !== '127.0.0.1' && h !== '::1') {
-      throw new Error('local browser tests are restricted to loopback (127.0.0.1/localhost/::1)');
+      throw hostRefusal('local browser tests are restricted to loopback (127.0.0.1/localhost/::1)', 'not a local address');
     }
     return u;
   }
@@ -599,10 +708,67 @@
   // different browser surface (no plugins/window.chrome and HeadlessChrome Client Hints) even when
   // its legacy UA is overridden. A shell remains a compatibility fallback when no full build exists.
   // Returns { path, headless } where headless=true means a visible window is impossible.
+  /* The Chromium StarNet downloaded itself (sidecar/browser-install.js) for a computer with no Chrome, Edge or
+     Chromium installed. The composition root registers the finder; it is used only when nothing installed exists. */
+  let extraChrome = () => null;
+  function setExtraChrome(fn) { extraChrome = typeof fn === 'function' ? fn : () => null; }
+  /* macOS EDITING SHORTCUTS (2026-10-01, proving the Mac). On a Mac, Chrome runs Cmd+A/C/X/Z, Cmd/Option+arrows and
+     their deletes in the BROWSER process (AppKit key bindings), which a CDP key event never reaches — Cmd+A would
+     select nothing and Cmd+Z undo nothing in the station browser. CDP's `commands` names the editing command instead
+     (what Puppeteer does on macOS). Elsewhere Blink runs those shortcuts itself from the key event: nothing is added. */
+  const MAC_META_COMMANDS = { a: 'SelectAll', c: 'Copy', x: 'Cut', ArrowLeft: 'MoveToBeginningOfLine', ArrowRight: 'MoveToEndOfLine',
+    ArrowUp: 'MoveToBeginningOfDocument', ArrowDown: 'MoveToEndOfDocument', Backspace: 'DeleteToBeginningOfLine' };
+  const MAC_ALT_COMMANDS = { ArrowLeft: 'MoveWordLeft', ArrowRight: 'MoveWordRight', Backspace: 'DeleteWordBackward', Delete: 'DeleteWordForward' };
+  function macEditingCommands(ev, platform) {
+    if ((platform || process.platform) !== 'darwin' || !ev || ev.type !== 'key' || ev.action === 'up') return null;
+    const m = Number(ev.modifiers) || 0, alt = m & 1, ctrl = m & 2, meta = m & 4, shift = m & 8;
+    const k = String(ev.key || ''), key = k.length === 1 ? k.toLowerCase() : k;
+    const moves = /^(Arrow|Backspace|Delete)/.test(k);
+    let cmd = null;
+    if (meta && !ctrl && !alt) cmd = key === 'z' ? (shift ? 'Redo' : 'Undo') : (MAC_META_COMMANDS[key] || null);
+    else if (alt && !ctrl && !meta) cmd = MAC_ALT_COMMANDS[k] || null;
+    if (!cmd) return null;
+    if (shift && moves && /^Move/.test(cmd)) cmd += 'AndModifySelection';
+    return [cmd];
+  }
+  /* WHO HOLDS THIS PROFILE (macOS / Linux). A running Chromium marks its user-data-dir with a SingletonLock symlink
+     whose target is "<hostname>-<pid>". A second Chromium started on that profile while the owner is still alive hands
+     its command line to the owner and exits ("exited before CDP ownership"). Returns the owner's pid when it is THIS
+     machine's and still alive, else null (no lock, a stale lock, or another host's). Pure: every effect is injected. */
+  function profileOwnerPid(o) {
+    o = o || {};
+    let target;
+    try { target = String((o.readlink || FS.readlinkSync)(P.join(String(o.dir || ''), 'SingletonLock'))); } catch (_) { return null; }
+    const m = /^(.*)-(\d+)$/.exec(target);
+    if (!m) return null;
+    if (m[1] !== (o.hostname || OS.hostname())) return null;
+    const pid = Number(m[2]);
+    try { (o.alive || (p => process.kill(p, 0)))(pid); return pid; } catch (_) { return null; }
+  }
+  /* LINUX + THE DOWNLOADED BROWSER (release review 2026-09-30). Chrome for Testing has no setuid sandbox helper and no
+     AppArmor profile; on Ubuntu 23.10+ / 24.04 (kernel.apparmor_restrict_unprivileged_userns = 1) it aborts with
+     "No usable sandbox!". An INSTALLED Chrome/Chromium ships the profile that lets it sandbox, so it is never
+     affected. Only in that exact case — our own download, on Linux, with the restriction on — the browser starts with
+     --no-sandbox (what Playwright does for its bundled Chromium); every other case keeps Chrome's sandbox. */
+  function needsNoSandbox(o) {
+    o = o || {};
+    if ((o.platform || process.platform) !== 'linux' || !o.chromePath) return false;
+    let own = null; try { own = o.ownChrome !== undefined ? o.ownChrome : extraChrome(); } catch (_) { own = null; }
+    if (!own || P.resolve(String(own)) !== P.resolve(String(o.chromePath))) return false;
+    try {
+      const read = o.readFile || (p => FS.readFileSync(p, 'utf8'));
+      return String(read('/proc/sys/kernel/apparmor_restrict_unprivileged_userns')).trim() === '1';
+    } catch (_) { return false; }   // no such setting: user namespaces are not restricted, the sandbox works
+  }
   function resolveChrome(wantHeaded, existsSync) {
     existsSync = existsSync || FS.existsSync;
     const exists = (c) => { try { return existsSync(c.path); } catch (_) { return false; } };
+    /* A WINDOW THE COMMANDER USES is their own installed Chrome / Edge / Chromium first — a Playwright test build shows
+       "Chrome for Testing" banners and is what sign-in pages trust least. Headless work keeps the old order. */
+    if (wantHeaded) for (const c of CHROME_CANDIDATES) { if (!c.headless && !/ms-playwright/.test(c.path) && exists(c)) return { path: c.path, headless: false }; }
     for (const c of CHROME_CANDIDATES) { if (!c.headless && exists(c)) return { path: c.path, headless: false }; }
+    let own = null; try { own = extraChrome(); } catch (e) { failNote('browser.extra-chrome', e); }
+    if (own && exists({ path: own })) return { path: own, headless: false };
     for (const c of CHROME_CANDIDATES) { if (c.headless && exists(c)) return { path: c.path, headless: true }; }
     return null;
   }
@@ -619,6 +785,18 @@
       this.id = 0;
       this.pending = new Map();
       this.handlers = new Map();
+      /* A DEAD BROWSER ANSWERS NOTHING. When Chromium exits (the station window closed, a crash) its socket closes,
+         and every command in flight used to sit out its whole timeout — and every later command went into a dead
+         socket and did the same (measured: 15 s per call after the station window was closed). Now the close fails
+         them at once, and `closed` lets the driver report itself dead so the session starts a fresh browser. */
+      this.closed = false;
+      const gone = () => {
+        if (this.closed) return;
+        this.closed = true;
+        for (const [id, p] of this.pending) { this.pending.delete(id); if (p.timer) clearTimeout(p.timer); p.reject(new Error('CDP connection closed: the browser went away')); }
+      };
+      ws.addEventListener('close', gone);
+      ws.addEventListener('error', gone);
       ws.addEventListener('message', e => {
         let m; try { m = JSON.parse(e.data); } catch (_) { return; }
         if (m.id && this.pending.has(m.id)) {
@@ -640,12 +818,14 @@
       const id = ++this.id;
       const budget = timeoutMs || this.timeoutMs;
       return new Promise((resolve, reject) => {
+        if (this.closed) { reject(new Error('CDP connection closed: the browser went away')); return; }
         const timer = setTimeout(() => { if (this.pending.has(id)) { this.pending.delete(id); reject(new Error('CDP timeout: ' + method)); } }, budget);
         if (timer && typeof timer.unref === 'function') timer.unref();
         this.pending.set(id, { resolve, reject, timer });
         const message = { id, method, params: params || {} };
         if (sessionId) message.sessionId = sessionId;
-        this.ws.send(JSON.stringify(message));
+        try { this.ws.send(JSON.stringify(message)); }
+        catch (e) { this.pending.delete(id); clearTimeout(timer); reject(new Error('CDP connection closed: ' + ((e && e.message) || e))); }
       });
     }
     on(method, fn) {
@@ -660,6 +840,7 @@
     const fetchImpl = deps.fetchImpl || (typeof fetch !== 'undefined' ? fetch : null);
     const WebSocketImpl = deps.WebSocketImpl || (typeof WebSocket !== 'undefined' ? WebSocket : null);
     const spawn = deps.spawn || CP.spawn;
+    const startPinnedProxy = require('./browser-proxy.js').startPinnedProxy;
     // HEADLESS BY DEFAULT (2026-07-07 direction): research must never open a window on the user's screen.
     // A window appears only when the CALL asked for one (deps.headed — browser.navigate visible:true, i.e.
     // the Commander asked to watch) and no headless env pins it down (CI/soak rigs still win). Legacy
@@ -677,7 +858,11 @@
     // reaches Chromium as an automation signal and sets navigator.webdriver.
     const cdpPort = deps.cdpPort == null ? DEFAULT_PORT : Number(deps.cdpPort);
     const privatePort = cdpPort === 0;
-    const profileDir = deps.profileDir || P.join(OS.tmpdir(), 'starnet-browser-' + process.pid);
+    // `let`: a launch the HELD persistent profile defeated moves, once, to a fresh temporary profile (heldFallback below)
+    let profileDir = deps.profileDir || P.join(OS.tmpdir(), 'starnet-browser-' + process.pid);
+    let heldFallback = null, heldFallbackDir = null, heldFailure = null;
+    // the durable station profile is in play only until a held-profile fallback moved this browser off it
+    const onPersistent = () => !!deps.profileIsPersistent && !heldFallback;
     // Page-realm safety/settle state must be readable by the driver, but fixed product-named globals
     // are an avoidable signature. Opaque per-profile slots preserve the contract without publishing
     // `__STARNET_*` on every site.
@@ -688,7 +873,7 @@
     const settleProbe = settleProbeSource(settleMarker);
     const stationMetrics = { width: 1440, height: 900, screenWidth: 1440, screenHeight: 900, deviceScaleFactor: 1, mobile: false };
     // Stale from a previous run on this profile; cleared so nothing can mistake it for live state.
-    const activePortFile = P.join(profileDir, 'DevToolsActivePort');
+    let activePortFile = P.join(profileDir, 'DevToolsActivePort');
     const timeoutMs = deps.timeoutMs || 15000;
     // Navigation is the one command whose duration is the SITE's to decide, not ours, so it gets its own
     // budget. Derived from timeoutMs (so an injected test rig scales with it) and floored well above it.
@@ -714,12 +899,25 @@
     if (attachPort !== null && (!Number.isInteger(attachPort) || attachPort < 1 || attachPort > 65535)) {
       throw new Error('browser attach: port must be an integer 1-65535');
     }
-    if (!chromePath && attachPort === null) throw new Error('browser unavailable: Chromium not found; set STARNET_CHROME');
+    // No browser on this computer: one is downloaded on first use when the host can (deps.ensureChromium), else refuse.
+    if (!chromePath && attachPort === null && typeof deps.ensureChromium !== 'function') throw new Error('browser unavailable: Chromium not found; set STARNET_CHROME');
     // We run headed only if requested AND the chosen binary can actually show a window.
-    const headed = wantHeaded && !binIsHeadlessOnly;
+    let headed = wantHeaded && !binIsHeadlessOnly;
 
     let proc = null, procExited = false, procError = null, procClosePromise = null, cdp = null, consoleLog = [], dialog = null, attachedPort = null;
-    const downloads = deps.downloadDir ? makeDownloadLedger(deps.downloadDir) : null;
+    let networkProxy = null, proxyFailed = false;
+    const proxyCloseResults = new WeakMap();   // retain each proxy's pending/failed cleanup across close callers
+    // true once tab 0's target went away and no other tab was left to take its place (see openerLost)
+    let pageLost = false;
+    const allowedLocalOrigins = new Set();
+    function allowLocal(url) {
+      allowedLocalOrigins.add(new URL(url).origin);
+      if (networkProxy) networkProxy.allowLocal(url);
+    }
+    // `let`, not const: the station's shared browser outlives a run, and the next agent to drive it must get its
+    // downloads in ITS OWN jail (setDownloadDir below). A per-run browser never changes these.
+    let downloadDir = deps.downloadDir || null;
+    let downloads = downloadDir ? makeDownloadLedger(downloadDir) : null;
     // Owned-browser identity is derived after CDP connects. Windows Chrome GUI binaries often emit
     // nothing for `chrome.exe --version`; launch-time probing alone left their UA as HeadlessChrome.
     // Attached Commander-owned Chrome is intentionally excluded from every override.
@@ -798,6 +996,12 @@
     const pageSessions = new Map();    // CDP sessionId -> targetId, for every adopted extra tab
     const tabWaiters = new Set();      // bounded observers waiting for popup adoption to become visible
     let activeSession = null;
+    /* TAB EPOCH: bumps whenever the tab the driver acts on went away underneath the agent (tab 0 closed while the agent
+       was on it - openerLost - or the selected tab closed). Refs carry node x/y, and click/type dispatch at those
+       coordinates on whatever tab is current - so a ref minted on the dead tab would land on a page the agent never
+       snapshotted. The session compares the epoch a ref was minted in with this one and refuses across a change, and an
+       input action in flight stops at the change (pinTab). */
+    let tabEpoch = 0;
     function wakeTabWaiters() {
       for (const wake of Array.from(tabWaiters)) {
         try { wake(); } catch (_) {}
@@ -863,6 +1067,44 @@
       // tab becomes tab 0, prepare and resume that first event as an ordinary background tab instead.
       prepareAdoptedPage(backgroundSession, backgroundTargetId, true);
     }
+    /* TAB 0 WENT AWAY (customer, 0.13.1 macOS: every call failed "Session with given id not found" while the browser
+       still read as alive). Under browser-level attach even the original tab is a session, and its target can go away
+       on its own: the Commander closes the tab or the window (macOS keeps Chrome running with no window), the site
+       calls window.close, a crashed or discarded tab detaches. Before this, openerSession kept the dead id forever.
+       If another tab is still open on our OWN browser, it becomes tab 0: it was adopted with the shim already in place
+       (prepareAdoptedPage), so isolation holds, and a signed-in popup is kept rather than thrown away. Otherwise
+       pageLost turns alive() false and the next call starts a fresh browser on the same profile. The Commander's own
+       Chrome is never re-pointed at whichever of their other tabs happens to be first: there the loss is reported. */
+    function openerLost() {
+      const dead = openerSession;
+      inflight.clear();   // the dead tab's requests never finish, and waitForSettle would burn its whole budget on them
+      const next = attachPort === null ? pageSessions.keys().next() : { done: true };
+      if (next.done) {
+        tabEpoch++;       // no page left at all: every ref (and any action in flight) is aimed at nothing
+        pageLost = true;
+        openerSession = null; openerTargetId = null; activeSession = null;
+        wakeTabWaiters();
+        return;
+      }
+      /* The epoch moves only when the agent was ON the dead tab (tab 0 not switched away from, or selected as itself).
+         An agent on a selected tab whose page is still open - an unrelated tab 0 closing, or its own tab being promoted
+         to tab 0 (the same page under a new index) - keeps its refs: refusing them said "the tab that snapshot was taken
+         on was closed" about a tab that was not. */
+      if (activeSession === null || activeSession === dead) tabEpoch++;
+      const sid = next.value, tid = pageSessions.get(sid) || null;
+      pageSessions.delete(sid);
+      openerSession = sid; openerTargetId = tid;
+      // a page target's main frame id is its target id: keeps lastResponse (the HTTP status navigate reports) truthful
+      mainFrameId = tid;
+      // the promoted tab is tab 0 now (null routes to it), and a selection of the dead tab must never outlive it
+      if (activeSession === sid || activeSession === dead) activeSession = null;
+      wakeTabWaiters();
+      // the screencast follows on its own (streamStart's watch restarts it when castTarget() changes)
+      cdp.send('Page.enable', {}, sid).catch(e => failNote('browser.opener-promote', e));
+      cdp.send('Network.enable', {}, sid).catch(e => failNote('browser.opener-promote', e));
+      cdp.send('DOM.enable', {}, sid).catch(e => failNote('browser.opener-promote', e));
+      if (deps.syntheticInputOnly !== false) cdp.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, sid).catch(e => failNote('browser.opener-promote', e));
+    }
     async function deriveStationIdentity(sessionId) {
       if (attachPort !== null) return null;
       let browserInfo = null, natural = null;
@@ -890,7 +1132,205 @@
       if (attachPort !== null || headed) return Promise.resolve();
       return cdp.send('Emulation.setDeviceMetricsOverride', stationMetrics, sessionId);
     }
-    async function connect() {
+    /* LAUNCH RETRY. Chromium exiting before we own its DevTools endpoint is almost always transient: a profile
+       still being released by the previous process, or a start that lost a race on a loaded machine. One failed
+       spawn used to fail the whole call (the agent then went hunting for other browsers). Two more tries, spaced
+       out, before the error is real. Attach mode never retries: that browser is not ours to start. */
+    /* CLEAN START. After a Chromium on this profile ended hard (the Commander closed the station window, a crash, a
+       killed sidecar), the next launch RESTORED its old tabs beside ours and was slow to report them: the driver's
+       first command then waited out whole CDP timeouts (measured: 2 of 3 relaunches stalled 15 s, one 46 s). The
+       browser we launch always starts on one blank tab, so forget the crashed session and mark the last exit clean.
+       Cookies, logins and site data live in other files and are untouched. */
+    /* ORPHANS ON OUR PROFILE. A Chromium that died at startup (measured on a starved machine: 100% CPU, <1 GB free)
+       can leave a helper process holding the profile's files, and every retry then exits at once against that lock
+       (EBUSY on Default/Sessions). Before a retry, end whatever still runs with THIS profile directory on its command
+       line. The directory is unique to this station/run (the proc ledger uses it as the same identity token), so
+       nothing else — never the Commander's own Chrome — can match. Only ever called for a browser we launched. */
+    let reclaimed = false;
+    // End a Chromium WE started together with its helper processes — instant, no process-table scan (that scan took
+    // >15 s on a starved machine). Windows needs /T for the tree; elsewhere the group dies with the browser.
+    /* ASYNCHRONOUS (release review 2026-09-30): taskkill (≤10 s) and the PowerShell profile sweep (≤15 s, measured >15 s
+       on a starved box) ran as synchronous child calls on the retry / revive / profile-wait paths — exactly when the
+       machine is starved — freezing every request and stream of the station for their whole run. */
+    function runQuiet(cmd, args, timeout) {
+      return new Promise((resolve, reject) => {
+        CP.execFile(cmd, args, { timeout, windowsHide: true, maxBuffer: 1024 * 1024 }, err => (err ? reject(err) : resolve()));
+      });
+    }
+    async function killTree(pid) {
+      if (!pid) return;
+      try {
+        if (process.platform === 'win32') await runQuiet('taskkill', ['/T', '/F', '/PID', String(pid)], 10000);
+        else process.kill(pid, 'SIGKILL');
+      } catch (e) {
+        if (e && (e.code === 128 || e.status === 128 || e.code === 'ESRCH')) return;   // 128/ESRCH: already gone
+        failNote('browser.kill-tree', e);
+        /* Measured 2026-09-30: `taskkill /T /F` can fail part-way through Chromium's tree (a helper exiting under it) and
+           leave the BROWSER process itself running — the profile stays locked and close() reports a stuck browser.
+           End the browser process directly; its helpers exit with it. */
+        try { process.kill(pid, 'SIGKILL'); } catch (e2) { if (!(e2 && e2.code === 'ESRCH')) failNote('browser.kill-tree.direct', e2); }
+      }
+    }
+    async function killProfileOrphans(dir) {
+      if (spawn !== CP.spawn || !dir) return;   // a test rig's fake spawn owns no real processes
+      const needle = String(dir).replace(/\\/g, '/');
+      try {
+        if (process.platform === 'win32') {
+          const esc = needle.replace(/'/g, "''");
+          const ps = "Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine.Replace('\\','/') -like '*--user-data-dir=" + esc + "*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
+          await runQuiet('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], 15000);
+        } else {
+          await runQuiet('pkill', ['-f', '--', '--user-data-dir=' + needle], 5000);
+        }
+      } catch (e) { if (!(e && (e.code === 1 || e.status === 1))) failNote('browser.launch-retry.orphans', e); }   // pkill exits 1 when nothing matched
+    }
+    /* NEVER START ON A PROFILE ANOTHER CHROMIUM STILL HOLDS. Measured 2026-09-30, Andrew's "go to github so i can
+       sign in": browser.login relaunches hidden → visible on the SAME profile; the visible one started while the
+       hidden one's processes were still letting go, handed off to them and exited — four times — and GitHub never
+       opened. On Windows a running Chromium holds `lockfile` in its user-data-dir; it can be removed only once every
+       process on the profile is gone. Wait for that (cheap when already free), and if it is still held after ~8 s,
+       end whatever runs on this profile (ours by construction) and go. POSIX uses a SingletonLock symlink that a
+       dead owner does not pin, so this is Windows-only. */
+    async function waitProfileFree(dir) {
+      if (!dir) return true;
+      if ((deps.platform || process.platform) !== 'win32') {
+        /* macOS / Linux: the SingletonLock symlink names the owner. Wait while that owner is alive (a closed window's
+           Chromium lingers for seconds), then end what is left on this profile — same rule as the Windows lockfile. */
+        for (let waited = 0; waited <= 8000; waited += 200) {
+          if (!profileOwnerPid({ dir, readlink: deps.readlinkSync, hostname: deps.hostname, alive: deps.pidAlive })) return true;
+          await sleep(200);
+        }
+        failNote('browser.profile-free', new Error('profile still held after 8 s: ending its processes'));
+        await killProfileOrphans(dir);
+        await sleep(600);
+        return false;
+      }
+      const lock = P.join(dir, 'lockfile');
+      for (let waited = 0; waited <= 8000; waited += 200) {
+        try { if (!FS.existsSync(lock)) return true; FS.rmSync(lock, { force: true }); return true; }
+        catch (e) { if (!/^(EBUSY|EPERM|EACCES)$/.test(String((e && e.code) || ''))) { failNote('browser.profile-free', e); return true; } }
+        await sleep(200);
+      }
+      failNote('browser.profile-free', new Error('profile still held after 8 s: ending its processes'));
+      await killProfileOrphans(dir);
+      await sleep(600);
+      return false;
+    }
+    function cleanStart(dir) {
+      const d = P.join(dir, 'Default');
+      for (const name of ['Sessions', 'Current Session', 'Current Tabs', 'Last Session', 'Last Tabs']) {
+        try { FS.rmSync(P.join(d, name), { recursive: true, force: true }); } catch (e) { failNote('browser.clean-start.rm', e); }
+      }
+      const pf = P.join(d, 'Preferences');
+      try {
+        if (!FS.existsSync(pf)) return;
+        const j = JSON.parse(FS.readFileSync(pf, 'utf8'));
+        if (j && j.profile && (j.profile.exit_type !== 'Normal' || j.profile.exited_cleanly !== true)) {
+          j.profile.exit_type = 'Normal'; j.profile.exited_cleanly = true;
+          FS.writeFileSync(pf, JSON.stringify(j));
+        }
+      } catch (e) { failNote('browser.clean-start.prefs', e); }
+    }
+    /* SINGLE-FLIGHT. Two callers reaching connect() together (the BROWSER window's picture poll and a navigation, or
+       the window's warm-up and a typed address) each launched their OWN Chromium on the same profile; the second
+       handed off to the first and exited — "spawned Chromium exited before CDP ownership" while a browser we started
+       held the profile — and the retries collided with it. One launch at a time: every concurrent caller awaits it. */
+    /* ORPHANED STATION BROWSER (#61, v0.12.5). A sidecar that ended hard (crash, guardian respawn, START FRESH /
+       RESTART — all TerminateProcess on Windows) leaves the Chromium it started running on the DURABLE profile, its
+       DevTools port open and its network proxy dead with its parent. Every launch on that profile then handed off to
+       it and "exited before CDP ownership", and the 8 s lock wait + blind sweep did not reliably clear it. Before a
+       launch on the persistent profile: if the profile is held, end exactly the processes on it that this sidecar did
+       not start (browser-orphans.js: exact --user-data-dir match, ancestry check, confirmed by re-listing), then
+       clear its stale locks. A browser of OURS that is still closing is left to waitProfileFree as before. */
+    const orphanSweep = typeof deps.orphanSweep === 'function' ? deps.orphanSweep
+      : (spawn === CP.spawn ? (o => Orphans.sweep(o)) : null);
+    let lastOrphanSweep = null;
+    async function healOrphans() {
+      if (!orphanSweep || !onPersistent() || attachPort !== null) return null;
+      let held = null;
+      try { held = (typeof deps.profileHeld === 'function' ? deps.profileHeld : (d => Orphans.profileHeld(d, { platform: deps.platform, readlink: deps.readlinkSync, hostname: deps.hostname, alive: deps.pidAlive })))(profileDir); }
+      catch (e) { failNote('browser.orphans.held', e); held = null; }
+      if (!held || !held.held) return null;
+      try { lastOrphanSweep = await orphanSweep({ profileDir, platform: deps.platform }); }
+      catch (e) { failNote('browser.orphans.sweep', e); lastOrphanSweep = { ok: false, error: String((e && e.message) || e), found: 0, killed: [], survivors: [] }; }
+      if (lastOrphanSweep && (lastOrphanSweep.found || lastOrphanSweep.error)) failNote('browser.orphans', new Error(Orphans.describeSweep(lastOrphanSweep)));
+      return lastOrphanSweep;
+    }
+    let connecting = null;
+    function connect() {
+      if (cdp) return Promise.resolve(cdp);
+      if (!connecting) connecting = connectWithRetry().finally(() => { connecting = null; });
+      return connecting;
+    }
+    async function connectWithRetry() {
+      if (cdp) return cdp;
+      if (heldFailure) throw heldFailure;   // the one held-profile fallback already failed: no relaunch loop on this driver
+      if (!chromePath && attachPort === null) {
+        const got = await deps.ensureChromium();   // single-flight download of Chrome for Testing
+        if (!got) throw new Error('browser unavailable: Chromium not found and none could be downloaded');
+        chromePath = got; binIsHeadlessOnly = false; headed = wantHeaded;
+      }
+      let lastErr = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try { return await connectOnce(); }
+        catch (e) {
+          lastErr = e;
+          if (attachPort !== null || !/exited before CDP ownership|could not attach to Chromium/.test(String((e && e.message) || ''))) throw e;
+          failNote('browser.launch-retry', e);
+          // our own attempt: its whole tree (a stuck one still holds the profile); a vanished one: sweep its orphans
+          if (proc && !procExited) await killTree(proc.pid); else if (spawn === CP.spawn) await killProfileOrphans(profileDir);
+          proc = null; procExited = false; procError = null; procClosePromise = null;
+          if (networkProxy) { const px = networkProxy; networkProxy = null; try { await px.close(); } catch (e2) { failNote('browser.launch-retry.proxy', e2); } }
+          await sleep(700 * (attempt + 1));
+        }
+      }
+      return heldProfileFallback(lastErr);
+    }
+    /* HELD PROFILE (customer report 2026-10-08, Windows 10, v0.13.1: the station browser never started — "spawned
+       Chromium exited before CDP ownership was established", six launch retries, lockfile never free). Some process
+       StarNet cannot see by command line (a chrome.exe started as administrator, an antivirus lock) holds the durable
+       profile, so every Chromium we start hands off to it and exits; the orphan sweep finds nothing to end. Bounded:
+       ONCE per driver, when the launch on the PERSISTENT profile failed by hand-off AND the profile is still held,
+       start on a fresh temporary profile (signed out — usingPersistentProfile() turns false and profileFallback() says
+       why). If that fails too, the error names the repair. The durable profile itself is never deleted. */
+    function persistentHeld() {
+      try {
+        const fn = typeof deps.profileHeld === 'function' ? deps.profileHeld
+          : (d => Orphans.profileHeld(d, { platform: deps.platform, readlink: deps.readlinkSync, hostname: deps.hostname, alive: deps.pidAlive }));
+        const h = fn(profileDir);
+        return !!(h && h.held);
+      } catch (e) { failNote('browser.orphans.held', e); return false; }
+    }
+    function profileHeldError(cause) {
+      const err = new Error('The station browser could not start: another process is holding the station browser\'s profile — '
+        + 'open SETTINGS › BROWSER › RESET STATION BROWSER, or end any chrome.exe that StarNet started (one started as '
+        + 'administrator can\'t be closed by StarNet), then try again');
+      err.code = 'BROWSER_PROFILE_HELD';
+      err.cause = cause;
+      return err;
+    }
+    async function heldProfileFallback(lastErr) {
+      const handedOff = /exited before CDP ownership|could not attach to Chromium/.test(String((lastErr && lastErr.message) || ''));
+      if (attachPort !== null || !deps.profileIsPersistent || heldFallback || !handedOff || !persistentHeld()) throw lastErr;
+      try { heldFallbackDir = FS.mkdtempSync(P.join(OS.tmpdir(), 'starnet-browser-' + process.pid + '-held-')); }
+      catch (e) { failNote('browser.profile-held-fallback', e); heldFailure = profileHeldError(lastErr); throw heldFailure; }
+      heldFallback = 'Saved sign-ins are not available this session: another process is holding the station browser profile, '
+        + 'so this browser started on a temporary profile.';
+      failNote('browser.profile-held-fallback', new Error('another process is holding the station browser profile ' + profileDir
+        + ': relaunching ONCE on a temporary profile, without saved sign-ins (' + String((lastErr && lastErr.message) || lastErr) + ')'));
+      profileDir = heldFallbackDir;
+      activePortFile = P.join(profileDir, 'DevToolsActivePort');
+      try { return await connectOnce(); }
+      catch (e) {
+        failNote('browser.profile-held-fallback', e);
+        if (proc && !procExited) await killTree(proc.pid);
+        proc = null; procExited = false; procError = null; procClosePromise = null;
+        if (networkProxy) { const px = networkProxy; networkProxy = null; try { await px.close(); } catch (e2) { failNote('browser.launch-retry.proxy', e2); } }
+        heldFailure = profileHeldError(e);
+        throw heldFailure;
+      }
+    }
+    async function connectOnce() {
       if (cdp) return cdp;
       /* ATTACH: no spawn, no profile dir, no proc ledger entry. `proc` deliberately stays null, which is
          what makes close() safe — it kills `owned`, and a browser we did not start is not ours to kill.
@@ -907,23 +1347,67 @@
       } else {
       try { FS.mkdirSync(profileDir, { recursive: true }); } catch (_) {}
       if (privatePort) { try { FS.rmSync(activePortFile, { force: true }); } catch (_) {} }
+      /* A REVIVED browser (the station window was closed, or Chromium died): whatever still runs on this profile is
+         the old one. Measured: after a normal window close the old Chromium lingered >10 s holding the profile, and a
+         relaunch waited on it forever; after a crash the first relaunch exited at once against the lock. Clear it
+         first, then start one clean browser. */
+      if (deps.reclaimProfile === true && !reclaimed) {
+        reclaimed = true;
+        /* NEVER KILL A NUMBER WE DO NOT OWN (release review 2026-09-30): Windows reuses process ids, so the dead
+           browser's pid can belong to an unrelated program by now. reclaimPid is asked NOW, and answers only while
+           the old driver still holds that process un-exited (its open handle pins the id). Otherwise the sweep
+           matches this browser's unique profile directory, which no other program carries. */
+        const ownPid = typeof deps.reclaimPid === 'function' ? deps.reclaimPid() : null;
+        if (ownPid) await killTree(ownPid); else await killProfileOrphans(profileDir);
+        await sleep(600);
+      }
+      await healOrphans();
+      await waitProfileFree(profileDir);
+      cleanStart(profileDir);
       // Allocated here, not by Chromium, so the launch carries no automation flag. Chromium still
       // writes the bound port into this profile's DevToolsActivePort, which stays the readiness proof.
       launchPort = privatePort ? await allocateEphemeralPort() : cdpPort;
+      if (spawn === CP.spawn && deps.networkProxy !== false) {
+        networkProxy = await startPinnedProxy({
+          validate: assertSafeUrl,
+          resolve: u => resolveVerified(u, ('lookup' in deps) ? deps.lookup : nodeLookup)
+        });
+        for (const origin of allowedLocalOrigins) networkProxy.allowLocal(origin);
+      }
       const args = ['--disable-blink-features=AutomationControlled', '--no-first-run', '--no-default-browser-check',
         '--remote-debugging-port=' + launchPort, '--window-size=1440,900',
         '--user-data-dir=' + profileDir];
+      if (networkProxy) args.push('--proxy-server=http://127.0.0.1:' + networkProxy.port,
+        '--proxy-bypass-list=<-loopback>');
+      if (needsNoSandbox({ chromePath })) { args.push('--no-sandbox'); failNote('browser.no-sandbox', new Error('downloaded Chromium on a Linux host that restricts user namespaces: running without the Chromium sandbox')); }
       args.push('--lang=' + hostBrowserLocale(deps));
       if (headed) {
-        // Visible window the user can watch (and hear — no --mute-audio in headed mode).
-        args.push('--new-window');
+        // Visible window the user can watch (and hear — no --mute-audio in headed mode). No --new-window: on a profile
+        // whose last Chrome did not exit cleanly (the window was closed hard, or it crashed) it made Chrome open a second
+        // tab beside its startup one, and the driver could bind to the tab that then went away — its first command hung
+        // for a full CDP timeout (measured: 2 of 3 relaunches stalled 15 s). Only a crash bubble is disabled on top.
+        args.push('--hide-crash-restore-bubble');
+        /* A COVERED WINDOW MUST KEEP DRAWING. Measured 2026-09-30 in the desktop app: StarNet's own window sits on top of
+           the station's Chrome window, Chrome's native occlusion tracking decides nobody can see it and stops painting,
+           and the in-app BROWSER view froze on the old page (0 frames/s) while the agent kept browsing. The BROWSER
+           window IS somebody watching, so a covered station window keeps rendering. Only the two flags that fix that:
+           background TABS keep Chrome's normal throttling (renderer backgrounding and timer throttling stay ON), so a
+           page left animating in another tab does not drain a laptop for hours (release review 2026-09-30). */
+        // macOS has its OWN occlusion checker, gated by the MacWebContentsOcclusion feature (read from Chromium's
+        // content/app_shim_remote_cocoa/web_contents_occlusion_checker_mac.mm, 2026-10-01): turned off by name too.
+        args.push('--disable-features=CalculateNativeWinOcclusion,MacWebContentsOcclusion', '--disable-backgrounding-occluded-windows');
       } else {
         args.push('--headless=new', '--hide-scrollbars', '--mute-audio');
       }
       args.push('about:blank');
       proc = spawn(chromePath, args, { stdio: 'ignore', windowsHide: !headed });
       procClosePromise = new Promise(resolve => {
-        if (proc && proc.on) proc.on('close', () => { procExited = true; resolve(true); });
+        // how it exited rides the launch error (procError): "exited before CDP ownership" alone never said why (user report, 10-28)
+        const child = proc;
+        if (proc && proc.on) proc.on('close', (code, signal) => {
+          if (proc === child && procError === null && (code !== null || signal)) procError = signal ? 'ended by ' + signal : 'exit code ' + code;
+          procExited = true; resolve(true);
+        });
         else resolve(true);
         if (proc && proc.on) proc.on('error', e => { procError = (e && e.message) || String(e); procExited = true; resolve(true); });
       });
@@ -938,7 +1422,10 @@
         }
       } catch (_) {}
       }
-      for (let i = 0; i < 40; i++) {
+      // A real window starts much slower than headless on a loaded machine (measured >10 s at 100% CPU): ~30 s for it.
+      // Headless full Chrome (the installed one) also missed ~10 s under a loaded gate (2026-09-30): ~20 s for it.
+      const readyTries = (headed && attachPort === null) ? 120 : 80;
+      for (let i = 0; i < readyTries; i++) {
         if (attachPort === null && procExited) throw new Error('spawned Chromium exited before CDP ownership was established' + (procError ? ': ' + procError : ''));
         try {
           // We chose launchPort ourselves, so it IS the endpoint — no DevToolsActivePort read-back.
@@ -980,10 +1467,8 @@
             attachedPort = port;
             // Browser.* download events are emitted on the root connection, not a page session. Register
             // before enabling downloads so a fast local/file response cannot finish between setup steps.
-            if (downloads) {
-              cdp.on('Browser.downloadWillBegin', event => { downloads.begin(event); });
-              cdp.on('Browser.downloadProgress', event => { downloads.progress(event); });
-            }
+            cdp.on('Browser.downloadWillBegin', event => { if (downloads) downloads.begin(event); });
+            cdp.on('Browser.downloadProgress', event => { if (downloads) downloads.progress(event); });
             if (deps.syntheticInputOnly !== false) {
               // New page targets do not inherit a target-scoped preload. Pause every related
               // target before its scripts run and close popups; inject the same shim into any
@@ -1007,6 +1492,12 @@
                     // The original tab. Its setup is finished by connect() below, which needs to
                     // await it; recording the session is all that happens here.
                     adoptOpenerSession(sid, info.targetId);
+                    /* …unless Chromium created it AFTER setAutoAttach: then it arrives PAUSED (waitForDebuggerOnStart),
+                       and a paused page never acknowledges Page.* — connect()'s very first Page.enable waited out the
+                       whole CDP timeout. Measured on relaunches of the station window after it was closed (a slower
+                       start): 2 of 4 stalled 15 s, and a snapshot 46 s. It is still the launch about:blank — nothing to
+                       protect yet, and connect() installs the shim before any navigation — so resume it now. */
+                    if (p.waitingForDebugger) Promise.resolve(cdp.send('Runtime.runIfWaitingForDebugger', {}, sid)).catch(e => failNote('browser.opener-resume', e));
                     return;
                   }
                   /* ADOPT, don't kill. A target=_blank link or a popup used to be closed outright
@@ -1077,8 +1568,10 @@
               frameSessions.delete(p.sessionId);
               pageSessions.delete(p.sessionId);
               wakeTabWaiters();
-              // A closed tab must never leave the driver pointed at a dead session.
-              if (activeSession === p.sessionId) activeSession = null;
+              // A closed tab must never leave the driver pointed at a dead session - nor its refs aimed at tab 0.
+              if (activeSession === p.sessionId) { activeSession = null; tabEpoch++; }
+              // …and that includes tab 0 itself
+              if (openerSession && p.sessionId === openerSession) openerLost();
             });
               let initialPageCount = 1;
               if (viaBrowser && attachPort !== null) {
@@ -1142,6 +1635,11 @@
               stationIdentity = await deriveStationIdentity(S);
               await installStationIdentity(S);
               await installStationMetrics(S);
+              /* …and LEAVE that page. The pinned network proxy refuses loopback, so the probe tab sat on "Access to
+                 127.0.0.1 was denied — HTTP ERROR 403" (the probe only needs the trustworthy ORIGIN, not the body).
+                 While browsers were invisible nobody saw it; the station browser SHOWED it to the Commander as the first
+                 thing on screen, and an agent reading the fresh page reported a Chrome error. Start on a blank page. */
+              try { await cdp.send('Page.navigate', { url: 'about:blank' }, S, navTimeoutMs); } catch (e) { failNote('browser.probe-leave', e); }
             }
             // Identify the top frame so a sub-frame's document response can never be mistaken for the
             // page's own status (an ad iframe 404 must not read as "the page 404'd").
@@ -1154,9 +1652,9 @@
                unreachable even by accident. Point Chrome at the agent's own downloads/ directory.
                Browser.setDownloadBehavior is browser-scoped and not always accepted on a page
                connection; Page.setDownloadBehavior is the deprecated page-scoped equivalent. Try both. */
-            if (deps.downloadDir) {
-              try { FS.mkdirSync(deps.downloadDir, { recursive: true }); } catch (_) {}
-              const behavior = { behavior: 'allow', downloadPath: deps.downloadDir };
+            if (downloadDir) {
+              try { FS.mkdirSync(downloadDir, { recursive: true }); } catch (_) {}
+              const behavior = { behavior: 'allow', downloadPath: downloadDir };
               try { await cdp.send('Browser.setDownloadBehavior', Object.assign({ eventsEnabled: true }, behavior)); }
               catch (_) { try { await cdp.send('Page.setDownloadBehavior', behavior); } catch (_) {} }
             }
@@ -1213,6 +1711,19 @@
        directly and are never given a sessionId. An explicit sessionId argument still wins, which is how
        snapshot/get_text reach individual iframe sessions. */
     let pageProxy = null;
+    // Chrome's -32001 for a session whose target is gone (CdpClient keeps only the message, not the code)
+    const TARGET_GONE = /Session with given id not found|No target with given id/i;
+    function tabGone(cause) {
+      const err = new Error(pageLost
+        ? 'the browser tab was closed and no other tab is open' + (attachPort === null
+          ? '; the next browser call starts a fresh browser on the same profile (sign-ins kept)'
+          : '; use browser.detach, then browser.attach to drive the tab Chrome is showing now')
+        : 'the first browser tab was closed; the next open tab is now tab 0 - take a fresh browser.snapshot');
+      err.code = 'TARGET_DETACHED';
+      err.cause = cause;
+      if (pageLost && attachPort !== null) err.revealTools = ['browser.detach', 'browser.attach'];   // deferred: the hint must make them callable
+      return err;
+    }
     async function page() {
       const c = await connect();
       if (!pageProxy || pageProxy.__cdp !== c) {
@@ -1220,14 +1731,58 @@
           __cdp: c,
           // NOTE the 4th arg: CdpClient.send takes a per-call timeout (navigation uses it). Dropping it
           // here would silently put navigation back on the 15s budget and re-open the stalled-session wedge.
-          send: (method, params, sessionId, timeoutMs) => c.send(method, params, sessionId !== undefined ? sessionId : (activeSession || openerSession || undefined), timeoutMs),
+          send: (method, params, sessionId, timeoutMs) => {
+            if (sessionId === undefined && pageLost) return Promise.reject(tabGone(new Error('Session with given id not found')));
+            const sid = sessionId !== undefined ? sessionId : (activeSession || openerSession || undefined);
+            return c.send(method, params, sid, timeoutMs).catch(e => {
+              /* BACKSTOP for a tab 0 that went away without its detach event reaching us. Only a DEFAULT-routed call
+                 that landed on tab 0 counts: an explicit iframe session going stale says nothing about the page. */
+              if (sessionId !== undefined || !sid || sid !== openerSession || !TARGET_GONE.test(String((e && e.message) || ''))) throw e;
+              openerLost();
+              throw tabGone(e);
+            });
+          },
           on: (n, fn) => c.on(n, fn)
         };
       }
       return pageProxy;
     }
-    async function evalJS(expression) {
+    /* PINNED INPUT (review 10-07). An input action is many sends with paced pauses between them, and default routing
+       re-picks activeSession || openerSession at EACH send - so when the tab closed part-way (tab 0 promoted, the
+       selected tab gone) the rest of the input went to whichever page took its place: a probe typed the first
+       character of a password into tab 0 and the other 36 into a promoted tab the agent never read, and the call
+       said "typed". pinTab() fixes the action to the session it started on and the tabEpoch at its start. Every send
+       goes to that session EXPLICITLY (a dead session fails, it never re-routes), and once the epoch moves the rest is
+       refused with REF_TAB_CLOSED. The epoch is read before any await, in the same turn as the session's ref check. */
+    function tabClosedMidAction(cause) {
+      const err = new Error('the browser tab this action started on was closed part-way through, so the rest of it was '
+        + 'NOT sent: nothing reached the page that took its place. Take a fresh browser.snapshot.');
+      err.code = 'REF_TAB_CLOSED';
+      if (cause) err.cause = cause;
+      return err;
+    }
+    async function pinTab() {
+      const epoch = tabEpoch;
       const c = await page();
+      if (tabEpoch !== epoch) throw tabClosedMidAction();
+      const sid = activeSession || openerSession || undefined;
+      return {
+        send: (method, params, sessionId, timeoutMs) => {
+          if (tabEpoch !== epoch) return Promise.reject(tabClosedMidAction());
+          const target = sessionId !== undefined ? sessionId : sid;
+          return c.send(method, params, target, timeoutMs).catch(e => {
+            if (sessionId !== undefined || !TARGET_GONE.test(String((e && e.message) || ''))) throw e;
+            // the proxy's BACKSTOP, for the pinned session: tab 0 died and its detach event has not reached us yet
+            if (target && target === openerSession) { openerLost(); throw tabGone(e); }
+            if (tabEpoch !== epoch) throw tabClosedMidAction(e);
+            throw e;
+          });
+        },
+        on: (n, fn) => c.on(n, fn)
+      };
+    }
+    async function evalJS(expression, pinned) {
+      const c = pinned || await page();
       const r = await c.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true });
       if (r.exceptionDetails) throw new Error('page eval failed: ' + ((r.exceptionDetails.exception && r.exceptionDetails.exception.description) || r.exceptionDetails.text || 'exception'));
       return r.result && r.result.value;
@@ -1282,13 +1837,15 @@
          pair on a listing page, which reads as "the browser is broken" rather than "that page did not load".
          Now: navigation gets its own larger budget, and on timeout we ALWAYS Page.stopLoading (best-effort,
          on a short budget of its own) so the session is usable for the very next call. */
+      let navResult = null;
+      const refusalMark = (networkProxy && typeof networkProxy.refusalMark === 'function') ? networkProxy.refusalMark() : 0;
       try {
-        await c.send('Page.navigate', { url }, undefined, navTimeoutMs);
+        navResult = await c.send('Page.navigate', { url }, undefined, navTimeoutMs);
       } catch (e) {
         if (!/CDP timeout/.test(String(e && e.message))) throw e;
         try { await c.send('Page.stopLoading', {}, undefined, Math.min(timeoutMs, 5000)); } catch (_) {}
         let host = url;
-        try { host = new URL(url).host; } catch (_) {}
+        try { host = new URL(url).host; } catch (e) { failNote('browser.load-fail.host', e); }
         throw new Error('the page did not finish loading within ' + Math.round(navTimeoutMs / 1000) + 's, so the ' +
           'navigation to ' + host + ' was stopped (the browser is still usable). The site may be slow, may be ' +
           'refusing automated browsers, or may be holding a challenge page. Try browser.get_text to see what ' +
@@ -1298,6 +1855,38 @@
       // only as the fallback for a page whose quiescence we cannot measure.
       await waitForSettle(c, { budgetMs: settleNavBudgetMs, fallbackMs: 900 });
       const finalUrl = await evalJS('location.href');
+      /* A NAVIGATION THAT NEVER LOADED (#61). Page.navigate reports a network failure in errorText and the tab
+         stays where it was — about:blank for a freshly launched browser. That errorText was ignored, so the caller
+         read "about:blank" as a redirect and told the agent "blocked unsafe redirect: only http(s) URLs are
+         allowed" (the Etsy report) while the real cause — here, a station proxy that had died — stayed hidden. */
+      const navError = navResult && navResult.errorText ? String(navResult.errorText) : '';
+      if (navError && !/^https?:/i.test(String(finalUrl || ''))) {
+        let host = url;
+        try { host = new URL(url).host; } catch (e) { failNote('browser.load-fail.host', e); }
+        /* A TUNNEL FAILURE IS A REFUSAL, NOT A DEAD PROXY (the Etsy reports, 2026-10-08). Measured with real Chromium:
+           ERR_TUNNEL_CONNECTION_FAILED is our LIVE proxy answering the CONNECT with a refusal (its DNS answer was
+           private, the lookup failed, the address did not answer). Restarting the browser changes none of that, and
+           "not answering" sent users hunting for a VPN or a remote gateway StarNet does not have. Name the reason. */
+        const refusal = (attachPort === null && networkProxy && typeof networkProxy.refusalsSince === 'function' &&
+          /ERR_TUNNEL_CONNECTION_FAILED/i.test(navError)) ? pickRefusal(networkProxy.refusalsSince(refusalMark), url) : null;
+        if (refusal) {
+          const why = explainRefusal(refusal);
+          const err = new Error('could not load ' + host + ': ' + navError + ' - ' + why.text);
+          err.code = why.code;
+          err.navigationError = navError;
+          err.refusal = refusal.reason;
+          throw err;
+        }
+        const viaProxy = /ERR_PROXY|ERR_TUNNEL_CONNECTION_FAILED|ERR_MANDATORY_PROXY/i.test(navError);
+        if (viaProxy && attachPort === null) proxyFailed = true;   // alive() turns false: the session starts a fresh browser + proxy
+        const err = new Error('could not load ' + host + ': ' + navError + (viaProxy
+          ? ' - the station browser network proxy is not answering' + (attachPort === null ? '; StarNet is restarting the browser' : ' (this browser was started by an earlier StarNet session: run browser.reset)')
+          : ''));
+        err.code = viaProxy ? 'STATION_PROXY_DOWN' : 'NAVIGATION_FAILED';
+        err.navigationError = navError;
+        if (viaProxy && attachPort !== null) err.revealTools = ['browser.reset'];   // deferred: the hint must make it callable
+        throw err;
+      }
       if (deps.syntheticInputOnly !== false) {
         const isolation = await evalJS(`(() => {
           const s=${inputStateExpr};
@@ -1337,14 +1926,24 @@
         const quad = box && box.model && box.model.content;
         if (!quad || quad.length < 2) return null;
         return { x: Math.round(quad[0]), y: Math.round(quad[1]) };
-      } catch (_) { return null; }
+      } catch (e) {
+        if (e && e.code === 'TARGET_DETACHED') throw e;   // tab 0 itself went away: see evalIn
+        return null;
+      }
     }
+    /* A failed read is "nothing readable" (null) - EXCEPT the tab itself going away. That error (the proxy's backstop
+       or a page already lost) used to be swallowed here too, so browser.snapshot answered [] - an empty page - for a
+       tab that no longer existed. It propagates; every other failure is noted and stays a null. */
     async function evalIn(c, expression, sessionId) {
       try {
         const r = await c.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId);
         if (r && r.exceptionDetails) return null;
         return r && r.result && r.result.value;
-      } catch (_) { return null; }
+      } catch (e) {
+        if (e && e.code === 'TARGET_DETACHED') throw e;
+        failNote('browser.eval-in', e);
+        return null;
+      }
     }
     async function snapshot(limit) {
       const c = await page();
@@ -1437,9 +2036,11 @@
     function center(node) {
       return { x: node.x + Math.max(1, Math.floor(node.w / 2)), y: node.y + Math.max(1, Math.floor(node.h / 2)) };
     }
-    async function click(node) {
-      const c = await page();
+    // Every input action below runs on a pinTab() channel: the tab it started on, or a refusal (see pinTab).
+    async function click(node) { return clickOn(await pinTab(), node); }
+    async function clickOn(c, node) {
       const downloadCursor = downloads ? downloads.cursor() : 0;
+      const tabsBefore = new Set(pageSessions.keys());
       const x = node.x + Math.max(1, Math.floor(node.w / 2));
       const y = node.y + Math.max(1, Math.floor(node.h / 2));
       await movePointer(c, { x, y }, 'none');
@@ -1460,25 +2061,40 @@
         if (receipt && receipt.status === 'unverified') return 'clicked\nChromium reported the download complete, but the host could not verify a readable saved file. Do not claim it was saved.';
         return 'clicked\nDownload started but did not complete within the browser action budget. No saved path was claimed. Use fs.list on downloads/ later to check for a completed file.';
       }
+      /* A popup the page opened (window.open: a checkout, SSO, a PDF viewer) is adopted as a NEW tab, and switching is
+         never implicit - so "clicked" alone left the agent reading the old page, unaware the result was elsewhere. */
+      const sessions = tabSessions();
+      const opened = sessions.findIndex((sid, i) => i > 0 && !tabsBefore.has(sid));
+      if (opened > 0) {
+        const here = Math.max(0, sessions.indexOf(activeSession || openerSession));
+        return 'clicked\nThis click opened a NEW tab (index ' + opened + '). You are still on tab ' + here
+          + '; use browser.tab_select ' + opened + ' to read it (browser.tabs lists every tab).';
+      }
       return 'clicked';
     }
     async function type(node, text) {
-      await click(node);
-      const c = await page();
+      const c = await pinTab();
+      await clickOn(c, node);   // the focusing click rides the SAME pin: one tab for the whole action
       const chars = Array.from(String(text || ''));
       const paced = Math.min(chars.length, 40);
       let at = 0;
-      for (let i = 0; i < paced; i++) {
-        const take = Math.ceil((chars.length - at) / (paced - i));
-        await c.send('Input.insertText', { text: chars.slice(at, at + take).join('') });
-        at += take;
-        if (i + 1 < paced) await inputPause(25, 70);
+      try {
+        for (let i = 0; i < paced; i++) {
+          const take = Math.ceil((chars.length - at) / (paced - i));
+          await c.send('Input.insertText', { text: chars.slice(at, at + take).join('') });
+          at += take;
+          if (i + 1 < paced) await inputPause(25, 70);
+        }
+      } catch (e) {
+        // say how much of the text reached the tab it was meant for before that tab went away
+        if (e && (e.code === 'REF_TAB_CLOSED' || e.code === 'TARGET_DETACHED')) e.message = at + ' of ' + chars.length + ' characters were typed before the tab closed; ' + e.message;
+        throw e;
       }
       await waitForSettle(c, { budgetMs: settleActionBudgetMs });
       return 'typed';
     }
     async function press(key) {
-      const c = await page();
+      const c = await pinTab();
       key = String(key || 'Enter');
       await c.send('Input.dispatchKeyEvent', { type: 'keyDown', key });
       await inputPause(25, 70);
@@ -1490,7 +2106,7 @@
     /* Hover is not a nicety: menus, tooltips and disclosure widgets render their real targets only on
        mouseover, so without it whole navigations are unreachable from a snapshot. */
     async function hover(node) {
-      const c = await page();
+      const c = await pinTab();
       const p = center(node);
       await movePointer(c, p, 'none');
       await waitForSettle(c, { budgetMs: settleActionBudgetMs });
@@ -1499,7 +2115,7 @@
     /* HTML5 drag-and-drop needs intermediate move events — a press/release pair at two points is
        ignored by every library that listens for dragover. */
     async function drag(from, to) {
-      const c = await page();
+      const c = await pinTab();
       const a = center(from), b = center(to);
       await movePointer(c, a, 'none');
       await c.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: a.x, y: a.y, button: 'left', clickCount: 1 });
@@ -1513,6 +2129,7 @@
        Set the value and fire the events a framework listens for. The agent supplies only a VALUE, never
        code: it is embedded as a JS string literal, so no page script can be composed from tool input. */
     async function selectOption(node, value) {
+      const c = await pinTab();
       const p = center(node);
       const lit = jsLiteral(value);
       const r = await evalJS(`(() => {
@@ -1527,8 +2144,8 @@
         sel.dispatchEvent(new Event('input', { bubbles: true }));
         sel.dispatchEvent(new Event('change', { bubbles: true }));
         return { ok: true, value: hit.value, label: (hit.label || hit.text || '').trim() };
-      })()`);
-      await waitForSettle(await page(), { budgetMs: settleActionBudgetMs });
+      })()`, c);
+      await waitForSettle(c, { budgetMs: settleActionBudgetMs });
       return r;
     }
     /* The viewport was pinned to the launch flag --window-size=1440,900, so mobile layouts and
@@ -1705,7 +2322,10 @@
       const sessions = tabSessions();
       const i = Number(index);
       if (!Number.isInteger(i) || i < 0 || i >= sessions.length) throw new Error('no such tab: ' + index + ' (there are ' + sessions.length + ')');
-      activeSession = sessions[i];
+      /* Tab 0 is selected as null ("whatever tab 0 is"), never by its session id: openerLost only clears a selection
+         of the PROMOTED tab, so a stored opener id outlived its tab and wedged the driver on a dead session (every
+         navigate "Session with given id not found", tabs() with no active tab, snapshot reading as an empty page). */
+      activeSession = i === 0 ? null : sessions[i];
       const c = await page();
       /* Intercept and emulation are session-scoped in CDP but run-scoped in intent: a tab adopted
          after they were set (a popup, a target=_blank checkout) has neither. Re-applying on focus is
@@ -1723,7 +2343,7 @@
       const sid = sessions[i];
       const targetId = pageSessions.get(sid);
       pageSessions.delete(sid);
-      if (activeSession === sid) activeSession = null;   // never leave the driver on a dead session   // never leave the driver on a dead session
+      if (activeSession === sid) { activeSession = null; tabEpoch++; }   // never leave the driver on a dead session (nor its refs aimed at tab 0)
       const c = await connect();
       if (targetId) { try { await c.send('Target.closeTarget', { targetId }); } catch (_) {} }
       return 'closed tab ' + i;
@@ -1733,30 +2353,10 @@
       await waitForSettle(await page(), { budgetMs: settleNavBudgetMs, fallbackMs: 500 });
       return evalJS('location.href');
     }
-    /* FILE UPLOAD. Without DOM.setFileInputFiles any form with an attachment step is a dead end.
-       The ref usually points at a styled LABEL, because real file inputs are routinely hidden — so
-       resolve from the click point to the actual <input type=file> (self, the label's control, or the
-       nearest one in the same container) and hand CDP that element's objectId. Paths are resolved and
-       jail-checked by the caller; this only ever sees absolute paths. */
-    async function upload(node, absPaths) {
-      const c = await page();
-      await c.send('DOM.enable');
-      const p = center(node);
-      const r = await c.send('Runtime.evaluate', { expression: `(() => {
-        const el = document.elementFromPoint(${p.x}, ${p.y});
-        if (!el) return null;
-        if (el.tagName === 'INPUT' && el.type === 'file') return el;
-        if (el.control && el.control.tagName === 'INPUT' && el.control.type === 'file') return el.control;
-        const lbl = el.closest && el.closest('label');
-        if (lbl && lbl.control && lbl.control.type === 'file') return lbl.control;
-        const scope = (el.closest && el.closest('form,fieldset,section,div')) || document;
-        return scope.querySelector('input[type=file]');
-      })()` });
-      const objectId = r && r.result && r.result.objectId;
-      if (!objectId) throw new Error('no file input found at this ref — snapshot the page and pick the upload control');
-      await c.send('DOM.setFileInputFiles', { files: absPaths, objectId });
-      await waitForSettle(c, { budgetMs: settleActionBudgetMs });
-      return absPaths.length + ' file(s) attached';
+    // #104: the pinned tab owns selection and its readback; never guess remote upload completion.
+    async function upload(node, absPaths, expectedFiles) {
+      return require('./browser-upload.js').selectFiles({ cdp: await pinTab(), node, paths: absPaths, expected: expectedFiles,
+        settle: c => waitForSettle(c, { budgetMs: settleActionBudgetMs }) });
     }
     async function testInput(action) {
       const a = Object.assign({}, action || {});
@@ -1823,7 +2423,7 @@
     // Scrolling is what triggers lazy-load / infinite-scroll, so it settles too — otherwise the very
     // content the scroll was meant to reveal is missing from the next snapshot.
     async function scroll(x, y) {
-      const c = await page();
+      const c = await pinTab();
       const totalX = Number(x) || 0, totalY = Number(y) || 0;
       const steps = inputBetween(3, 6);
       let sentX = 0, sentY = 0;
@@ -1875,12 +2475,21 @@
       return parts.join('').trim();
     }
     async function challengeStatus() {
-      const pageState = await evalJS(`(() => ({
-        title: String(document.title || '').slice(0, 300),
-        text: String(document.body && (document.body.innerText || document.body.textContent) || '').trim().slice(0, 1200)
-      }))()`);
+      // password/otp: does a VISIBLE sign-in or one-time-code field sit on this page? (STEP-IN hint only — booleans,
+      // never a field value.)
+      const pageState = await evalJS(`(() => {
+        const vis = el => { try { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; } catch (e) { return false; } };
+        const any = sel => { try { return Array.prototype.some.call(document.querySelectorAll(sel), vis); } catch (e) { return false; } };
+        return {
+          title: String(document.title || '').slice(0, 300),
+          text: String(document.body && (document.body.innerText || document.body.textContent) || '').trim().slice(0, 1200),
+          password: any('input[type=password]'),
+          otp: any('input[autocomplete="one-time-code"],input[name*="otp" i],input[id*="otp" i],input[name*="totp" i],input[name*="2fa" i]')
+        };
+      })()`);
       const detected = Challenge.detectChallenge(pageState || {});
-      return Object.assign({ title: pageState && pageState.title || '' }, detected);
+      const auth = Challenge.detectAuthWall(pageState || {});
+      return Object.assign({ title: pageState && pageState.title || '', authWall: auth.wall, authSignal: auth.signal }, detected);
     }
     async function readConsoleLog() {
       const c = await page();
@@ -1970,7 +2579,214 @@
       const r = await c.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
       return r.data || '';
     }
-    async function close() {
+    /* STEP-IN SURFACE (2026-09-29). While the Commander holds the wheel, THIS browser — same process, same page,
+       same profile — is streamed into a docked station window and driven by the Commander's own pointer and keys.
+       Frames go to the handoff host (sidecar/browser-handoff.js) and from there only to the station page; nothing
+       here ever returns page pixels or keystrokes to a tool result. Input is CDP Input.* on the page session, the
+       same synthetic path browser.test_input uses: it never touches the operating system's real cursor or keyboard.
+
+       WHY A CAPTURE LOOP AND NOT Page.startScreencast (measured 2026-09-29): in headless=new the screencast mixes
+       frames of the EMULATED 1440x900 viewport with frames of the hidden window's real content area (1424x749),
+       each labelled with its own size — so a click mapped off one frame lands somewhere else on the next.
+       Page.captureScreenshot always renders the emulated viewport, i.e. the exact CSS space Input.* coordinates
+       live in. The loop is fast right after the Commander acts and backs off when the page is still, and an
+       unchanged picture is never re-sent. */
+    const CAST_FAST_MS = 140, CAST_IDLE_MS = 700, CAST_IDLE_AFTER = 12;
+    let castOn = false, castHandler = null, castGen = 0, castKick = null, castSame = 0;
+    /* the generation the screencast was LAST started for. The frame listener below is attached once per connection and
+       outlives every start, so it must read the CURRENT generation, never one it captured (release review 2026-09-30:
+       it kept the first start's, so after any restart every screencast frame was dropped and the view fell back to the
+       slow capture loop — the "laggy" picture again). */
+    let castLiveGen = 0;
+    async function castSize(c) {
+      try {
+        const m = await c.send('Page.getLayoutMetrics', {});
+        const v = (m && (m.cssVisualViewport || m.visualViewport)) || {};
+        if (v.clientWidth > 0 && v.clientHeight > 0) return { width: Math.round(v.clientWidth), height: Math.round(v.clientHeight) };
+      } catch (e) { failNote('browser.cast-size', e); }
+      return { width: stationMetrics.width, height: stationMetrics.height };
+    }
+    /* SCREENCAST FIRST (2026-09-30, Andrew: the in-app browser was "SUPER laggy"). The capture loop above polls a
+       full screenshot every 140-700 ms. Chrome's screencast PUSHES a frame whenever the page repaints (up to the
+       display rate, nothing while still), which is what makes a streamed browser feel live. Each frame carries its
+       own CSS size, and — the headless=new trap measured above — a frame whose size is not the page viewport's is
+       dropped, never shown with the wrong geometry. If no usable frame arrives, the capture loop takes over. */
+    let castRoot = null, castSession, castMode = null, castExpect = null, castGood = 0, castWatch = null;
+    const castTarget = () => activeSession || openerSession || undefined;
+    async function startScreencast(c, gen) {
+      const root = c.__cdp;
+      if (castRoot !== root) {
+        castRoot = root;
+        root.on('Page.screencastFrame', (p, sid) => {
+          // ACK every frame on the session that sent it, or Chrome stops sending
+          root.send('Page.screencastFrameAck', { sessionId: p.sessionId }, sid).catch(swallow('browser.cast-ack'));
+          if (!castOn || castMode !== 'screencast' || castLiveGen !== castGen || (sid || undefined) !== castSession) return;
+          const m = p.metadata || {};
+          const w = Math.round(m.deviceWidth || 0), h = Math.round(m.deviceHeight || 0);
+          if (!(w > 0 && h > 0) || !p.data) return;
+          if (castExpect && (Math.abs(w - castExpect.width) > 2 || Math.abs(h - castExpect.height) > 2)) return;
+          castGood++;
+          try { if (castHandler) castHandler({ data: p.data, mime: 'image/jpeg', width: w, height: h }); } catch (e) { failNote('browser.cast-frame', e); }
+        });
+      }
+      castLiveGen = gen;
+      castSession = castTarget();
+      castExpect = await castSize(c);
+      await root.send('Page.startScreencast', { format: 'jpeg', quality: 70, maxWidth: castExpect.width, maxHeight: castExpect.height, everyNthFrame: 1 }, castSession);
+    }
+    async function stopScreencast() {
+      if (castWatch) { clearInterval(castWatch); castWatch = null; }
+      if (castMode !== 'screencast' || !castRoot) return;
+      try { await castRoot.send('Page.stopScreencast', {}, castSession); } catch (e) { failNote('browser.cast-stop', e); }
+    }
+    /* A MINIMIZED STATION WINDOW IS A DEAD PICTURE (Andrew 2026-10-02: "I can't interact with the browser whatsoever from
+       the built in browser, I have to manually 'show window' and then I can control it"). Measured: with the station's
+       Chrome window minimized the page is hidden and renders nothing — the in-app picture sat at 0 frames/s while the
+       Commander's clicks and keys DID land, so the BROWSER window looked like a frozen mirror; SHOW WINDOW un-minimized
+       it, which is why it then "worked". While the in-app picture is in use (a stream runs, or the Commander clicks into
+       it) a minimized window is put back to normal — Windows keeps it behind the active app (no focus steal) and it
+       renders again. Only our own headed window; never an attached browser. */
+    let keepShownBusy = false;
+    async function keepWindowShown() {
+      // only over the connection that is already open: this must NEVER start (revive) a browser the Commander closed
+      if (!headed || attachPort !== null || keepShownBusy || !cdp || cdp.closed || procExited) return false;
+      keepShownBusy = true;
+      try {
+        const c = cdp, sid = activeSession || openerSession || undefined;
+        const w = await c.send('Browser.getWindowForTarget', {}, sid);
+        if (w && w.bounds && w.bounds.windowState === 'minimized') {
+          await c.send('Browser.setWindowBounds', { windowId: w.windowId, bounds: { windowState: 'normal' } }, sid);
+          return true;
+        }
+      } catch (e) { failNote('browser.keep-shown', e); }
+      finally { keepShownBusy = false; }
+      return false;
+    }
+    async function streamStart(onFrame) {
+      const c = await page();
+      await keepWindowShown();
+      castHandler = typeof onFrame === 'function' ? onFrame : null;
+      await stopScreencast();
+      castOn = true; castSame = 0; castGood = 0;
+      const gen = ++castGen;
+      if (deps.screencast !== false) {
+        try {
+          castMode = 'screencast';
+          await startScreencast(c, gen);
+          // the tab can change under the stream (a popup adopted, a tab selected): follow it; and if the screencast
+          // gives nothing usable within ~1.5 s, fall back to the capture loop rather than show a frozen picture
+          let ticks = 0;
+          castWatch = setInterval(() => {
+            if (!castOn || gen !== castGen) { clearInterval(castWatch); castWatch = null; return; }
+            ticks++;
+            if (ticks % 3 === 0) keepWindowShown().catch(e => failNote('browser.keep-shown', e));   // minimized while watched (~1.5 s)
+            if (castTarget() !== castSession) startScreencast(c, gen).catch(e => failNote('browser.cast-retarget', e));
+            if (ticks === 3 && castGood === 0) { failNote('browser.cast-fallback', new Error('no screencast frames')); clearInterval(castWatch); castWatch = null; castMode = null; stopScreencastSafe(); startCaptureLoop(c, gen); }
+          }, 500);
+          return true;
+        } catch (e) { failNote('browser.cast-start', e); castMode = null; }
+      }
+      await startCaptureLoop(c, gen);
+      return true;
+    }
+    function stopScreencastSafe() { if (castRoot) castRoot.send('Page.stopScreencast', {}, castSession).catch(swallow('browser.cast-stop')); }
+    async function startCaptureLoop(c, gen) {
+      castMode = 'capture';
+      let last = '';
+      // the first frame is taken before we return, so the window never opens on a blank screen
+      const shoot = async () => {
+        const size = await castSize(c);
+        const r = await c.send('Page.captureScreenshot', { format: 'jpeg', quality: 72, captureBeyondViewport: false });
+        if (!r || !r.data || !castOn || gen !== castGen) return;
+        if (r.data === last) { castSame++; return; }
+        last = r.data; castSame = 0;
+        try { if (castHandler) castHandler({ data: r.data, mime: 'image/jpeg', width: size.width, height: size.height }); } catch (e) { failNote('browser.cast-frame', e); }
+      };
+      await shoot();
+      (async () => {
+        while (castOn && gen === castGen) {
+          await new Promise(resolve => { const t = setTimeout(resolve, castSame >= CAST_IDLE_AFTER ? CAST_IDLE_MS : CAST_FAST_MS); castKick = () => { clearTimeout(t); resolve(); }; });
+          castKick = null;
+          if (!castOn || gen !== castGen || !cdp || castMode !== 'capture') break;
+          try { await shoot(); } catch (_) { await sleep(CAST_IDLE_MS); }
+        }
+      })();
+    }
+    async function streamStop() {
+      await stopScreencast();
+      castOn = false; castHandler = null; castGen++; castMode = null;
+      if (castKick) { try { castKick(); } catch (e) { failNote('browser.cast-kick', e); } }
+      return true;
+    }
+    /* Re-point downloads at another agent's jail (the station's shared browser changes hands between runs). Before
+       Chrome is connected this only records the folder — connect applies it; after, Chrome is told at once. The
+       ledger is replaced with the folder: a receipt is only ever a claim about the CURRENT driver's own jail. */
+    async function setDownloadDir(dir) {
+      const next = dir ? String(dir) : null;
+      if (!next || next === downloadDir) return false;
+      downloadDir = next;
+      downloads = makeDownloadLedger(next);
+      if (!cdp) return true;
+      try { FS.mkdirSync(next, { recursive: true }); } catch (e) { failNote('browser.download-dir.mkdir', e); }
+      const behavior = { behavior: 'allow', downloadPath: next };
+      try { await cdp.send('Browser.setDownloadBehavior', Object.assign({ eventsEnabled: true }, behavior)); }
+      catch (e) { failNote('browser.download-dir.browser', e); try { await cdp.send('Page.setDownloadBehavior', behavior); } catch (e2) { failNote('browser.download-dir.page', e2); } }
+      return true;
+    }
+    // One sanitized event from the handoff host (browser-handoff.js sanitizeInput owns the vocabulary).
+    async function humanInput(ev) {
+      const c = await page();
+      ev = ev || {};
+      // the Commander just acted: show the result at the fast cadence, starting now
+      castSame = 0;
+      if (castKick && !(ev.type === 'mouse' && ev.action === 'move')) { const k = castKick; castKick = null; setTimeout(k, 60); }
+      if (ev.type === 'mouse') {
+        if (ev.action === 'down') await keepWindowShown();   // clicking into the picture of a minimized window: show it first
+        const type = ev.action === 'move' ? 'mouseMoved' : ev.action === 'down' ? 'mousePressed' : 'mouseReleased';
+        const button = ev.action === 'move' ? (ev.button || 'none') : (ev.button || 'left');
+        const buttons = button === 'left' ? 1 : button === 'right' ? 2 : button === 'middle' ? 4 : 0;
+        await c.send('Input.dispatchMouseEvent', { type, x: ev.x, y: ev.y, button, buttons: ev.action === 'up' ? 0 : buttons, clickCount: ev.clickCount || 0, modifiers: ev.modifiers || 0 });
+        return true;
+      }
+      if (ev.type === 'wheel') {
+        await c.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: ev.x, y: ev.y, deltaX: ev.dx || 0, deltaY: ev.dy || 0, modifiers: ev.modifiers || 0 });
+        return true;
+      }
+      if (ev.type === 'key') {
+        const base = { key: ev.key, code: ev.code, windowsVirtualKeyCode: ev.keyCode || 0, nativeVirtualKeyCode: ev.keyCode || 0, modifiers: ev.modifiers || 0 };
+        const commands = macEditingCommands(ev, deps.platform);
+        if (commands) base.commands = commands;
+        if (ev.action === 'up') await c.send('Input.dispatchKeyEvent', Object.assign({ type: 'keyUp' }, base));
+        else if (ev.text) await c.send('Input.dispatchKeyEvent', Object.assign({ type: 'keyDown', text: ev.text, unmodifiedText: ev.text }, base));
+        else await c.send('Input.dispatchKeyEvent', Object.assign({ type: 'rawKeyDown' }, base));
+        return true;
+      }
+      if (ev.type === 'text') { await c.send('Input.insertText', { text: String(ev.text || '') }); return true; }
+      throw new Error('unsupported handoff input');
+    }
+    // Where the page is, for the handoff header and the agent's resume line — browser history, not page script.
+    async function pageInfo() {
+      const c = await page();
+      try {
+        const h = await c.send('Page.getNavigationHistory', {});
+        const cur = h && Array.isArray(h.entries) ? h.entries[h.currentIndex] : null;
+        if (cur) return { url: String(cur.url || ''), title: String(cur.title || '') };
+      } catch (e) { failNote('browser.page-info', e); }
+      return { url: '', title: '' };
+    }
+    // False once the Chromium WE started has exited (the Commander closed the station browser window, or it crashed),
+    // and once no page target is left to drive (tab 0 went away with no other tab to take its place: openerLost).
+    function alive() {
+      if (proxyFailed || pageLost) return false;
+      // our own pinned proxy stopped listening (closed/errored): the browser behind it can load nothing
+      if (networkProxy && typeof networkProxy.listening === 'function' && !networkProxy.listening()) return false;
+      return !(proc && procExited) && !(cdp && cdp.closed);
+    }
+    // the Chromium we started, while it has not exited — never a number that may have been reused since
+    function ownedPid() { return proc && proc.pid && !procExited ? proc.pid : null; }
+    // Raise the station browser's window (the Commander asked to see it).
+    async function bringToFront() { const c = await page(); await c.send('Page.bringToFront'); return true; }
+    async function close(opts) {
       const owned = proc, waitForClose = procClosePromise;
       async function exitedWithin(ms) {
         if (!waitForClose) return false;
@@ -1978,30 +2794,60 @@
         try { return await Promise.race([waitForClose, new Promise(resolve => { timer = setTimeout(() => resolve(false), ms); })]); }
         finally { clearTimeout(timer); }
       }
-      // Only OUR persistent browser: a forced kill can lose newly written login cookies. Browser.close
-      // flushes Chromium's profile stores. An attached user browser has no owned process and is never closed.
-      let exited = false;
-      if (owned && cdp && deps.profileIsPersistent) {
-        let timer;
-        try {
-          await Promise.race([cdp.send('Browser.close').catch(swallow('browser.profile.close')), new Promise(resolve => { timer = setTimeout(resolve, 1500); })]);
-        } finally { clearTimeout(timer); }
-        exited = await exitedWithin(2000);
+      let closeError = null;
+      try {
+        // Only OUR persistent browser: a forced kill can lose newly written login cookies. Browser.close
+        // flushes Chromium's profile stores. An attached user browser has no owned process and is never closed.
+        let exited = false;
+        if (owned && cdp && onPersistent()) {
+          let timer;
+          try {
+            await Promise.race([cdp.send('Browser.close').catch(swallow('browser.profile.close')), new Promise(resolve => { timer = setTimeout(resolve, 1500); })]);
+          } finally { clearTimeout(timer); }
+          exited = await exitedWithin(2000);
+        }
+        try { cdp && cdp.close(); } catch (_) {}
+        // only a process that has NOT exited is still ours to kill: an exited one's id may already be someone else's
+        if (owned && !exited && !procExited) { if (process.platform === 'win32' && owned.pid && spawn === CP.spawn) await killTree(owned.pid); else { try { owned.kill('SIGKILL'); } catch (e) { failNote('browser.close.kill', e); } } }
+        cdp = null;
+        if (owned && waitForClose && !exited) {
+          // a force-killed process can take seconds to leave on a busy Windows box (antivirus holding a freshly unpacked
+          // browser's files, measured 2026-09-30): wait long enough before calling it stuck
+          exited = await exitedWithin(8000);
+          if (!exited) throw new Error('owned Chromium did not exit after synthetic test session closed');
+        }
+        // Retain ownership after a failed close: a later close must still prove exit before deleting the profile.
+        proc = null;
+      } catch (e) {
+        closeError = e;
+        throw e;
+      } finally {
+        // The proxy owns sockets even when Chromium cannot be confirmed closed. Release them without
+        // replacing the original shutdown error or reaching profile cleanup on that failed path.
+        if (networkProxy) {
+          const proxy = networkProxy;
+          let closing = proxyCloseResults.get(proxy);
+          if (!closing) {
+            closing = Promise.resolve().then(() => proxy.close());
+            proxyCloseResults.set(proxy, closing);
+          }
+          try {
+            await closing;
+            if (networkProxy === proxy) networkProxy = null;
+          } catch (e) { if (!closeError) throw e; failNote('browser.close.proxy', e); }
+        }
       }
-      try { cdp && cdp.close(); } catch (_) {}
-      try { if (owned && !exited) owned.kill('SIGKILL'); } catch (_) {}
-      cdp = null; proc = null;
-      if (owned && waitForClose && !exited) {
-        exited = await exitedWithin(3000);
-        if (!exited) throw new Error('owned Chromium did not exit after synthetic test session closed');
-      }
-      if (deps.cleanupProfile === true) { try { FS.rmSync(profileDir, { recursive: true, force: true }); } catch (_) {} }
+      // keepProfile: a dead browser being replaced — its successor is about to start on this same directory
+      if (deps.cleanupProfile === true && !(opts && opts.keepProfile)) { try { FS.rmSync(profileDir, { recursive: true, force: true }); } catch (_) {} }
+      // the held-profile fallback's temporary dir is this driver's alone (a successor makes its own): always removed —
+      // by its OWN variable, so the durable station profile can never be the one deleted
+      if (heldFallbackDir) { try { FS.rmSync(heldFallbackDir, { recursive: true, force: true }); } catch (e) { failNote('browser.profile-held-fallback.rm', e); } }
     }
     // visible() is the TRUTH the model reports: true only if the controlled window is
     // actually on the user's screen. Headless mode, or a headless-only binary fallback in
     // a headed request, both read as not visible.
     function visible() { return headed; }
-    return { navigate, snapshot, click, type, press, hover, drag, selectOption, viewport, forward, upload, tabs, waitForTabCount, selectTab, closeTab, inspect, evalPublic, waitFor, pdf, intercept, emulate, usingPersistentProfile: () => !!deps.profileIsPersistent, testInput, testEval, testState, scroll, back, getText, challengeStatus, handleDialog, screenshot, close, consoleLog: readConsoleLog, networkLog: () => netLog.map(r => Object.assign({}, r)), lastDialog: () => dialog, lastResponse: () => lastResponse, visible, headed, headlessFallback: wantHeaded && binIsHeadlessOnly, attachedPort: () => attachedPort, profileDir };
+    return { navigate, snapshot, click, type, press, hover, drag, selectOption, viewport, forward, upload, tabs, waitForTabCount, selectTab, closeTab, inspect, evalPublic, waitFor, pdf, intercept, emulate, usingPersistentProfile: onPersistent, profileFallback: () => heldFallback, testInput, testEval, testState, scroll, back, getText, challengeStatus, handleDialog, screenshot, streamStart, streamStop, humanInput, pageInfo, setDownloadDir, alive, ownedPid, bringToFront, close, consoleLog: readConsoleLog, networkLog: () => netLog.map(r => Object.assign({}, r)), lastDialog: () => dialog, lastResponse: () => lastResponse, tabEpoch: () => tabEpoch, visible, headed, headlessFallback: wantHeaded && binIsHeadlessOnly, attachedPort: () => attachedPort, allowLocal, profileDir, lastOrphanSweep: () => lastOrphanSweep };
   }
 
   function makeBrowserSession(deps) {
@@ -2044,6 +2890,11 @@
     function profileDeps() {
       // cleanupProfile:false is load-bearing — the durable profile must never ride the ephemeral rm on close.
       if (acquirePersistent()) return { profileDir: deps.persistentProfile.dir, cleanupProfile: false, profileIsPersistent: true };
+      // The STATION's shared browser (browser-view.js) holds the profile while it is open, which can be for a long time.
+      // A run that loses to IT browses on its own temporary profile (signed out, and its handoff says `remembered:
+      // false` truthfully) rather than erroring or closing the browser the Commander is using. Against another RUN the
+      // old rule stands: wait, then refuse — two runs never silently swap account identity.
+      if (deps.persistentProfile && !attachedToUserBrowser && typeof deps.persistentProfile.fallback === 'function' && deps.persistentProfile.fallback()) return { profileIsPersistent: false };
       if (deps.persistentProfile && !attachedToUserBrowser) throw new Error('the station browser profile is in use by another agent run — retry after it finishes; saved logins were not replaced');
       return { profileIsPersistent: false };
     }
@@ -2055,6 +2906,7 @@
       for (let elapsed = 0; ; elapsed += 100) {
         if (signal && signal.aborted) throw new Error('browser session wait cancelled');
         if (acquirePersistent()) return;
+        if (typeof deps.persistentProfile.fallback === 'function' && deps.persistentProfile.fallback()) return;   // profileDeps goes temporary
         if (!reported && typeof deps.onProfileWait === 'function') { deps.onProfileWait(true); reported = true; }
         if (elapsed >= limit) throw new Error('the station browser profile is in use by another agent run — retry after it finishes; saved logins were not replaced');
         await new Promise((resolve, reject) => {
@@ -2077,12 +2929,27 @@
                        profile dir (cookies/logins survive the swap). Headless is the default; a visible
                        window exists only while the Commander asked for one. */
     function wantedHeaded(wantVisible) {
+      // THE STATION BROWSER (browser-view.js) is a real window the Commander uses, whatever an individual call asks
+      // (a local test page, a visible:false navigate): only a headless pin (CI/soak env, legacy rigs) keeps it hidden.
+      if (deps.preferVisible === true && deps.forceHeadless !== true) return !headlessRequested(deps.env) && deps.headless !== true;
       return deps.forceHeadless === true ? false
         : (wantVisible === undefined ? (driverHeaded === null ? false : driverHeaded)
           : (!!wantVisible && !headlessRequested(deps.env) && deps.headless !== true));
     }
+    /* The window was closed or Chromium died: forget that driver so the next call starts a fresh one on the same
+       profile (sign-ins intact), instead of failing every call against a dead socket. Refs die with the page. */
+    let reviveNext = false, revivePid = null;
+    function reviveIfDead() {
+      if (!driver || injected || attachedToUserBrowser || typeof driver.alive !== 'function' || driver.alive()) return false;
+      const dead = driver; driver = null; driverHeaded = null; version++; navEpoch++; reviveNext = true;
+      // asked again at reclaim time (not now): by then the old process may have exited and its id be reused
+      revivePid = typeof dead.ownedPid === 'function' ? () => dead.ownedPid() : null;
+      Promise.resolve().then(() => dead.close({ keepProfile: true })).catch(e => failNote('browser.dead-driver.close', e));
+      return true;
+    }
     function ensureDriver(wantVisible) {
       if (teardownFailure) throw teardownFailure;
+      reviveIfDead();
       const headed = wantedHeaded(wantVisible);
       if (driver) {
         /* An ATTACHED session never mode-switches. The relaunch below rebuilds the driver WITHOUT
@@ -2095,7 +2962,8 @@
         // Callers with an explicit mode must use ensureDriverMode(), which awaits that teardown.
         throw new Error('browser mode switch requires awaited teardown');
       }
-      driver = makeDriver(Object.assign({}, deps, profileDeps(), { headed }));
+      driver = makeDriver(Object.assign({}, deps, profileDeps(), { headed }, reviveNext ? { reclaimProfile: true, reclaimPid: revivePid } : {}));
+      reviveNext = false; revivePid = null;
       driverHeaded = headed;
       return driver;
     }
@@ -2110,35 +2978,147 @@
       // The reference is cleared BEFORE propagating so a later mode-less call cannot reconnect that headed,
       // unshimmed driver. The latch blocks every later action in this run rather than spawning against a profile
       // whose ownership is now unknown.
+      // A different browser is a different DOCUMENT: navEpoch moves with version at both sites, or a stale ref would be
+      // role+text "recovered" onto whatever the new browser shows (refs die with the browser, as in reviveIfDead).
       if (driver) {
         const closing = driver;
         try { await closing.close(); }
         catch (e) {
-          driver = null; driverHeaded = null; version++;
+          driver = null; driverHeaded = null; version++; navEpoch++;
           teardownFailure = e instanceof Error ? e : new Error(String(e || 'browser teardown failed'));
           throw teardownFailure;
         }
         driver = null; driverHeaded = null;
       }
+      version++; navEpoch++;   // any element refs belong to the torn-down browser - even if the new one fails to start
       driver = makeDriver(Object.assign({}, deps, profileDeps(), overrides));
       driverHeaded = !!overrides.headed;
-      version++;   // any element refs belong to the torn-down browser
       return driver;
     }
     async function ensureDriverMode(wantVisible) {
+      reviveIfDead();
       const headed = wantedHeaded(wantVisible);
       if (!driver) return ensureDriver(wantVisible);
       if (attachedToUserBrowser || injected || driverHeaded === headed) return driver;
       return relaunch({ headed });
     }
-    function refFor(node) {
+    /* THE TAB A REF WAS MINTED ON. The driver's tabEpoch bumps when the tab it acts on went away underneath us (tab 0
+       closed and another tab promoted, the selected tab closed). Nodes act by their x/y, so a ref from the dead tab would
+       click or type on whatever page took its place - one the agent never snapshotted (a signed-in checkout or SSO popup)
+       - and report a bare "clicked". A tab mark is { driver, epoch }; only the SAME driver's epochs compare (a fresh
+       driver already bumped version and navEpoch). syncTab turns a change the session has not seen yet into a document
+       change (version + navEpoch), so role+text recovery can never re-find the "same" control on the new tab.
+       The mark names its driver by a small id (0 = none), never the object: refs and old marks outlive the driver they
+       were minted on, and holding the driver itself kept every replaced browser alive for the life of the session. */
+    const driverIds = new WeakMap();
+    let driverIdSeq = 0;
+    function driverId(d) {
+      if (!d || (typeof d !== 'object' && typeof d !== 'function')) return 0;
+      let id = driverIds.get(d);
+      if (!id) { id = ++driverIdSeq; driverIds.set(d, id); }
+      return id;
+    }
+    let seenTab = { d: 0, e: 0 };
+    function tabMark() {
+      const d = driver;
+      return { d: driverId(d), e: (d && typeof d.tabEpoch === 'function') ? d.tabEpoch() : 0 };
+    }
+    function syncTab() {
+      const m = tabMark();
+      if (m.d && m.d === seenTab.d && m.e !== seenTab.e) { version++; navEpoch++; }
+      seenTab = m;
+      return m;
+    }
+    /* THE TAB THE AGENT LAST READ. press and scroll take no ref, so the ref check never saw them: after tab 0 closed
+       and another tab was promoted, browser.press Enter went to that tab - which could submit a form the agent never
+       read. lookedAt is the tab mark of the last snapshot, find, navigate or tab_select; a ref-less input refuses when
+       the same driver has moved to another tab since (a fresh driver starts a fresh page: nothing to compare). */
+    let lookedAt = { d: 0, e: 0 };
+    function requireReadTab(what) {
+      const now = syncTab();
+      if (now.d && now.d === lookedAt.d && now.e !== lookedAt.e) {
+        const err = new Error(what + ' was refused: the tab you last read was closed and another page took its place, so it '
+          + 'would land on a page you have not read. Take a fresh browser.snapshot (browser.tabs lists what is open).');
+        err.code = 'REF_TAB_CLOSED';
+        throw err;
+      }
+    }
+    /* RETIRED REFS. `refs` holds the refs of the current document's last few DOM reads only. A ref minted before the
+       document changed can never act again (version moves with navEpoch) and is never recovered (recovery refuses
+       across navEpoch), so its node is dead weight - and the map used to keep every one, for the life of the station
+       browser. A click that navigates moves no navEpoch, so the plain snapshot-click loop never changed "document"
+       either (review 2026-10-21: 2000 pages = 160 000 entries, +35 MB): refs of the same document older than its last
+       KEEP_REF_READS reads retire too - recovery re-finds a renumbered ref from a recent read, not one many reads ago.
+       All a later use of a retired ref still needs is WHICH refusal it gets: its tab mark (a closed tab) and whether it
+       was minted on THIS document (the plain stale refusal) or an earlier one (the page navigated). So retired entries
+       collapse into seq ranges per tab mark and document (refs are numbered in order, one read shares one mark), and
+       every earlier document shares epoch -1: a handful of ranges, however long the session runs.
+       ONLY READS THE AGENT SEES MINT REFS (review 2026-10-21). Stale-ref recovery re-reads the page itself. Counted as
+       a read, every recovered action pushed one more version through the window, so after ~7 recoveries the refs the
+       agent was actually holding retired and recovery refused them; minted uncounted, a session that recovers on every
+       click (a pagination "Next" clicked over and over) added a whole read of refs per click that nothing ever retired
+       (2000 clicks = 160 000 entries again). So recovery mints NO refs for its re-read: it acts on the re-found node
+       directly. Only an ambiguity refusal, which names its candidates for the agent to pick from, mints theirs - a
+       read the agent sees, counted like any other. */
+    const KEEP_REF_READS = 8;
+    const retiredRefs = [];   // [{ lo, hi, tab, epoch }] ascending, inclusive seq ranges; epoch -1 = an earlier document
+    const refReads = [];      // the versions of the agent's reads that minted the live refs, oldest first (at most KEEP_REF_READS)
+    function addRetired(lo, hi, epoch, tab) {
+      const last = retiredRefs[retiredRefs.length - 1];
+      if (last && last.hi === lo - 1 && last.epoch === epoch && last.tab.d === tab.d && last.tab.e === tab.e) last.hi = hi;
+      else retiredRefs.push({ lo, hi, epoch, tab: { d: tab.d, e: tab.e } });
+    }
+    function retireOld() {
+      // a range retired on a document the session has since left is now "earlier" too, and joins its neighbour
+      const left = retiredRefs[retiredRefs.length - 1];
+      if (left && left.epoch !== -1 && left.epoch !== navEpoch) { retiredRefs.pop(); addRetired(left.lo, left.hi, -1, left.tab); }
+      const keepFrom = refReads[0];
+      // insertion order is seq order, and version and navEpoch only grow along it: the first kept entry ends the sweep
+      for (const [ref, r] of refs) {
+        if (r.navEpoch === navEpoch && r.version >= keepFrom) break;
+        const n = Number(ref.slice(1));
+        addRetired(n, n, r.navEpoch === navEpoch ? navEpoch : -1, r.tab);
+        refs.delete(ref);
+      }
+    }
+    function refEntry(ref) {
+      const key = String(ref || '');
+      const live = refs.get(key);
+      if (live) return live;
+      const m = /^b([1-9]\d*)$/.exec(key);
+      if (!m) return null;
+      const n = Number(m[1]);
+      for (let i = retiredRefs.length - 1; i >= 0; i--) {
+        const g = retiredRefs[i];
+        if (n > g.hi) return null;
+        if (n >= g.lo) return { version: -1, navEpoch: g.epoch, tab: g.tab, node: null };   // minted here, its node released
+      }
+      return null;
+    }
+    function refFor(node, mark) {
+      if (refReads[refReads.length - 1] !== version) {   // the first ref of a new read
+        refReads.push(version);
+        if (refReads.length > KEEP_REF_READS) refReads.shift();
+        retireOld();
+      }
       const ref = 'b' + (++seq);
-      refs.set(ref, { version, navEpoch, node });
+      refs.set(ref, { version, navEpoch, tab: mark || tabMark(), node });
       return ref;
     }
+    // the tab a read was taken on (its mark) has been closed since: anything from that read would land on another page
+    function tabClosedSince(mark, ref) {
+      const now = syncTab();
+      if (!(mark && mark.d && mark.d === now.d && mark.e !== now.e)) return null;
+      const err = new Error('stale browser ref: ' + ref + ' - the tab that snapshot was taken on was closed, so it would '
+        + 'land on a different page. Take a fresh browser.snapshot.');
+      err.code = 'REF_TAB_CLOSED';   // never recovered: there is no "same element" on another tab
+      return err;
+    }
     function requireRef(ref) {
-      const r = refs.get(String(ref || ''));
+      const r = refEntry(ref);
       if (!r) throw new Error('unknown browser ref: ' + ref + ' (take a fresh browser.snapshot)');
+      const closed = tabClosedSince(r.tab, ref);
+      if (closed) throw closed;
       if (r.version !== version) throw new Error('stale browser ref: ' + ref + ' (refs expire after each browser.snapshot)');
       return r.node;
     }
@@ -2162,18 +3142,19 @@
       catch (e) {
         // Only a STALE ref is recoverable - an unknown one was never minted here, so there is nothing to
         // re-find, and a genuine failure thrown by act() must propagate untouched.
-        if (!/^stale browser ref/.test(String(e && e.message))) throw e;
-        const known = list.map(r => refs.get(String(r || '')));
+        if (!/^stale browser ref/.test(String(e && e.message)) || (e && e.code === 'REF_TAB_CLOSED')) throw e;
+        const known = list.map(refEntry);
         if (known.some(k => !k)) throw e;
         if (known.some(k => k.navEpoch !== navEpoch)) {
           throw new Error('stale browser ref: ' + list.join('/') + ' - the page navigated since that snapshot, '
             + 'so it points at the previous page. Take a fresh browser.snapshot.');
         }
+        if (known.some(k => !k.node)) throw e;   // a retired ref of this page: its node was released, nothing to re-find
         const wants = known.map(k => nodeIdentity(k.node));
         if (wants.some(w => !w.replace(/ /g, '').trim())) throw e;   // an unlabelled node: nothing to match on
         /* ONE re-snapshot resolves EVERY ref in the call. Snapshotting per-ref would invalidate the refs
            resolved by the previous pass - which is exactly what makes a two-ref drag unrecoverable. */
-        const fresh = await snapshot(SNAP_DEFAULT);
+        const { nodes: fresh, mark } = await readNodes(SNAP_DEFAULT);
         const nodes = [];
         for (let i = 0; i < list.length; i++) {
           const hits = fresh.filter(n => nodeIdentity(n) === wants[i]);
@@ -2182,11 +3163,15 @@
               + ', which is no longer on the page. Take a fresh browser.snapshot.');
           }
           if (hits.length > 1) {
+            // the refusal names the candidates, so the agent now holds them: they are minted, like any read it sees
             throw new Error('stale browser ref: ' + list[i] + ' - ' + hits.length + ' elements now match '
-              + describeNode(known[i].node) + ' (' + hits.map(h => h.ref).join(', ') + '), so which one you '
+              + describeNode(known[i].node) + ' (' + hits.map(h => refFor(h, mark)).join(', ') + '), so which one you '
               + 'meant is ambiguous. Take a fresh browser.snapshot and pick one.');
           }
-          nodes.push(requireRef(hits[0].ref));
+          // the mark was taken before the re-read: a tab that went away during it leaves the re-found node dead
+          const closed = tabClosedSince(mark, list[i]);
+          if (closed) throw closed;
+          nodes.push(hits[0]);
         }
         return { out: await act(nodes), recovered: true };
       }
@@ -2202,10 +3187,66 @@
       const local = opts.local === true;
       const validate = local ? assertLoopbackUrl : assertSafeUrl;
       const u = validate(url);
-      if (!local) await assertResolvedSafe(u, doLookup);   // refuse names that RESOLVE private (rebinding)
+      if (!local) {
+        try { await assertResolvedSafe(u, doLookup); }   // refuse names that RESOLVE private (rebinding)
+        catch (e) {
+          // a PUBLIC name answered privately is this computer's DNS filter/VPN far more often than an attack: say which
+          if (/resolves to private address/.test(String(e && e.message))) e.message += '. ' + explainRefusal({ host: hostOf(u), reason: e.message }).text;
+          throw e;
+        }
+      }
       const wantedMode = local ? false : ('visible' in opts ? !!opts.visible : undefined);
-      const d = wantedMode === undefined ? ensureDriver() : await ensureDriverMode(wantedMode);
-      const finalUrl = await d.navigate(u.href);
+      let d = wantedMode === undefined ? ensureDriver() : await ensureDriverMode(wantedMode);
+      if (local && typeof d.allowLocal === 'function') d.allowLocal(u.href);
+      /* From the first d.navigate the page is changing, whatever this call ends up saying: an error page, a tab still
+         on about:blank, a blocked redirect whose cleanup navigation failed. Every error path below throws, so the refs
+         die HERE - not only on success - or an old ref would click at its coordinates on the page the failure left. */
+      version++; navEpoch++;
+      let finalUrl;
+      try { finalUrl = await d.navigate(u.href); }
+      catch (e) {
+        // The browser died under this call (the station window was closed, Chromium crashed): start a fresh one on the
+        // same profile and go there ONCE. Opening an address is safe to repeat; a click or a submit never is, so only
+        // navigate does this — every other call reports the loss and the next one starts the fresh browser.
+        // …and the same ONCE for a browser whose own network proxy died (#61): the driver reported STATION_PROXY_DOWN
+        // and now reads as dead, so reviveIfDead() ends it and the retry starts a fresh browser with a fresh proxy.
+        if (e && e.code === 'NAVIGATION_FAILED') {
+          // a load that failed outright (the driver read Page.navigate's errorText): the same one retry the error-page
+          // path below always gave a just-started browser; a second failure reaches the agent with the real error
+          await sleep(600);
+          finalUrl = await d.navigate(u.href);
+        } else if (e && e.code === 'TARGET_DETACHED' && typeof d.alive === 'function' && d.alive()) {
+          // tab 0 was closed and another open tab took its place: open the address there, ONCE
+          finalUrl = await d.navigate(u.href);
+        } else {
+          // …and the same ONCE when tab 0 was closed with no other tab left (TARGET_DETACHED on a driver now dead)
+          const revivable = /CDP connection closed/.test(String((e && e.message) || '')) || (e && (e.code === 'STATION_PROXY_DOWN' || e.code === 'TARGET_DETACHED'));
+          if (!revivable || !reviveIfDead()) throw e;
+          d = wantedMode === undefined ? ensureDriver() : await ensureDriverMode(wantedMode);
+          if (local && typeof d.allowLocal === 'function') d.allowLocal(u.href);
+          finalUrl = await d.navigate(u.href);
+        }
+      }
+      /* CHROME'S OWN ERROR PAGE is not a redirect (measured 2026-09-30 at 88% CPU: the first load in a just-started
+         window landed on chrome-error://chromewebdata and was reported as "blocked unsafe redirect"). Opening an address
+         is safe to repeat: try once more, then say plainly that the page did not load. */
+      if (finalUrl && /^chrome-error:/i.test(String(finalUrl))) {
+        await sleep(600);
+        finalUrl = await d.navigate(u.href);
+        if (finalUrl && /^chrome-error:/i.test(String(finalUrl))) {
+          throw new Error('could not load ' + u.host + ': the browser showed an error page (the site did not answer, or the network is down)');
+        }
+      }
+      /* NOT A REDIRECT EITHER (#61): a tab still on about:blank after a navigation means the page never loaded (a
+         driver predating errorText, or a load the browser abandoned). Saying "blocked unsafe redirect: only http(s)
+         URLs are allowed" for that sent the agent hunting for a redirect that never happened. Genuine non-http(s)
+         destinations (data:, file:, javascript:, chrome:, custom app schemes) are still refused as unsafe redirects. */
+      if (finalUrl && /^about:blank(?:[?#]|$)/i.test(String(finalUrl))) {
+        const blank = new Error('could not load ' + u.host + ': the page never loaded (the browser is still on about:blank). '
+          + 'The site may have refused the connection, or the station browser lost its network; try again, or run browser.reset');
+        blank.revealTools = ['browser.reset'];   // deferred: the hint must make it callable
+        throw blank;
+      }
       if (finalUrl) {
         try {
           validate(finalUrl);
@@ -2224,6 +3265,7 @@
       localOrigin = local ? u.origin : null;
       version++;
       navEpoch++;   // a new document: every existing ref is now unrecoverable, not merely renumbered
+      lookedAt = syncTab();   // the agent asked for this page: it is the one a press or scroll may now land on
       return finalUrl || u.href;
     }
     // A driver predating this accessor (an injected test fake) simply reports no status.
@@ -2231,11 +3273,19 @@
       const d = driver;
       return (d && typeof d.lastResponse === 'function') ? d.lastResponse() : null;
     }
-    async function snapshot(limit) {
-      const nodes = await ensureDriver().snapshot(limit);
+    // a fresh DOM read: every earlier ref is now stale. Stale-ref recovery reads through this alone (see RETIRED REFS).
+    async function readNodes(limit) {
+      const d = ensureDriver();
+      // the mark is taken BEFORE the read: a tab that goes away mid-snapshot leaves these refs dead, never re-aimed
+      const mark = syncTab();
+      const nodes = await d.snapshot(limit);
       version++;
-      const out = (nodes || []).map(n => Object.assign({}, n, { ref: refFor(n) }));
-      return out;
+      lookedAt = mark;
+      return { nodes: nodes || [], mark };
+    }
+    async function snapshot(limit) {
+      const { nodes, mark } = await readNodes(limit);
+      return nodes.map(n => Object.assign({}, n, { ref: refFor(n, mark) }));
     }
     /* Every ref-taking ACTION runs through recovery. The disclosure is appended to the driver's own answer
        rather than swallowed: the agent asked to act on ref b7 and we acted on a node we re-found, so it has
@@ -2251,7 +3301,7 @@
     }
     async function click(ref) { const d = ensureDriver(); return actOnRef(ref, n => d.click(n)); }
     async function type(ref, text) { const d = ensureDriver(); return actOnRef(ref, n => d.type(n, text)); }
-    async function press(key) { return ensureDriver().press(key); }
+    async function press(key) { const d = ensureDriver(); requireReadTab('browser.press'); return d.press(key); }
     // A driver that predates one of these (an injected fake) says so plainly instead of throwing a
     // TypeError the agent cannot interpret.
     function driverFn(d, name) {
@@ -2270,7 +3320,7 @@
       return out;
     }
     async function forward() { const d = ensureDriver(); version++; navEpoch++; return driverFn(d, 'forward')(); }
-    async function upload(ref, absPaths) { const d = ensureDriver(); return actOnRef(ref, n => driverFn(d, 'upload')(n, absPaths)); }
+    async function upload(ref, absPaths, expectedFiles) { const d = ensureDriver(); return actOnRef(ref, n => driverFn(d, 'upload')(n, absPaths, expectedFiles)); }
     async function inspect(ref) { const d = ensureDriver(); return actOnRef(ref, n => driverFn(d, 'inspect')(n)); }
     // wait() is READ-ONLY and takes no ref, so it needs no recovery — it is the tool an agent reaches for
     // precisely when it does NOT yet know what is on the page.
@@ -2290,13 +3340,16 @@
       const q = String((query && query.text) || '').trim().toLowerCase();
       const role = String((query && query.role) || '').trim().toLowerCase();
       if (!q && !role) throw new Error('browser.find needs text or role to match on');
-      const nodes = await ensureDriver().snapshot(FIND_SCAN_CAP);
+      const d = ensureDriver();
+      const mark = syncTab();   // taken before the read, as in snapshot
+      const nodes = await d.snapshot(FIND_SCAN_CAP);
       version++;
+      lookedAt = mark;
       const hits = [];
       for (const n of (nodes || [])) {
         if (role && String(n.role || '').toLowerCase() !== role) continue;
         if (q && String(n.text || '').toLowerCase().indexOf(q) < 0) continue;
-        hits.push(Object.assign({}, n, { ref: refFor(n) }));
+        hits.push(Object.assign({}, n, { ref: refFor(n, mark) }));
         if (hits.length >= Math.max(1, Math.min(50, Number(limit || 20)))) break;
       }
       // `scanned` and `capped` describe the VISIBLE scan only. A below-fold or closed-menu control is not in
@@ -2336,6 +3389,9 @@
        WHAT IT COSTS, STATED PLAINLY: every login the Commander has. That is why eval is refused above,
        why the tool requires consent, and why we never kill the process on close. */
     async function attach(port) {
+      // The station browser is the one the Commander and the agents share: it never becomes some other Chrome
+      // (an agent once attached it to a debugging port it found on the machine — another tool's browser).
+      if (deps.noAttach === true) throw new Error('browser.attach is not available here: this is the station browser you share with the Commander. Use browser.navigate in it instead.');
       const p = Number(port);
       if (!Number.isInteger(p) || p < 1 || p > 65535) throw new Error('browser.attach: port must be an integer 1-65535');
       // Probing BEFORE the relaunch means a wrong port reports "nothing is listening" while the run still
@@ -2367,6 +3423,30 @@
         return { ok: false, error: 'browser.attach: nothing is listening on 127.0.0.1:' + port + '. Use browser.login for a saved StarNet session. Advanced attachment requires Chrome launched with --remote-debugging-port=' + port + ' and a separate --user-data-dir; current Chrome does not expose its default profile this way.' };
       }
     }
+    /* RESET (#61): the supported way out of a wedged station browser - what an agent used to try with a shell kill
+       (refused, rightly) and had no other path for. Ends THIS session's own browser (and its network proxy), then
+       ends any ORPHANED Chromium on the durable station profile (one a previous StarNet process started and left
+       behind) and clears that profile's stale locks. Never touches the Commander's own Chrome (exact profile match)
+       nor a live browser this StarNet started (ancestry check). The next browser call starts a fresh browser and
+       proxy. Saved sign-ins live in the profile's files and are kept. Returns a truthful receipt. */
+    async function reset() {
+      const out = { closedOwn: false, closeError: null, sweep: null, attached: attachedToUserBrowser };
+      if (attachedToUserBrowser) return out;   // the Commander's own Chrome is never ours to end: browser.detach
+      if (driver && !injected) {
+        const d = driver;
+        driver = null; driverHeaded = null; version++; navEpoch++;
+        try { await d.close(); out.closedOwn = true; }
+        catch (e) { out.closeError = String((e && e.message) || e); }
+      }
+      const pp = deps.persistentProfile;
+      const sweepFn = typeof deps.orphanSweep === 'function' ? deps.orphanSweep
+        : (deps.driver || deps.makeDriver ? null : (o => require('./browser-orphans.js').sweep(o)));   // test rigs inject theirs
+      if (pp && pp.dir && sweepFn) {
+        try { out.sweep = await sweepFn({ profileDir: pp.dir }); }
+        catch (e) { out.sweep = { ok: false, error: String((e && e.message) || e), found: 0, killed: [], survivors: [], locks: { removed: [], failed: [] } }; }
+      }
+      return out;
+    }
     async function detach() {
       if (!attachedToUserBrowser) return 'Not attached; nothing to detach.';
       const port = attachedUserPort;
@@ -2396,10 +3476,18 @@
     }
     async function evalPublic(expression) {
       const gate = evalAllowed();
-      if (!gate.ok) throw new Error('browser.eval is refused: ' + gate.reason + ', and arbitrary page ' +
-        'script there could read the cookies and storage of accounts you are signed into. Use ' +
-        'browser.inspect for computed styles/attributes/shadow DOM, browser.get_text for content, or ' +
-        'browser.test_eval on your own localhost server.');
+      if (!gate.ok) {
+        /* Name only tools that exist, and REVEAL the one that is deferred: browser.inspect is not advertised until a
+           tool_search finds it, so pointing at it without the reveal sent the agent after a tool it could not call
+           (and the "test_eval" tool it also named never existed). The refusal stays an error; the registry carries the reveal. */
+        const err = new Error('browser.eval is refused: ' + gate.reason + ', and arbitrary page ' +
+          'script there could read the cookies and storage of accounts you are signed into. Use ' +
+          'browser.inspect (by ref from browser.snapshot) for computed styles/attributes/shadow DOM, or ' +
+          'browser.get_text for content. On your own localhost server, browser.test_snapshot and browser.test_state read the page.');
+        err.revealTools = ['browser.inspect'];
+        err.toolSummary = 'eval refused';
+        throw err;
+      }
       const d = ensureDriver();
       return driverFn(d, 'evalPublic')(expression);
     }
@@ -2408,7 +3496,14 @@
     // must die — a ref silently re-aimed at another page is the worst outcome available here.
     // A tab switch is a different DOCUMENT, exactly like a navigation — refs minted on tab 0 must never be
     // recoverable against tab 2's page, so this bumps the epoch and not just the ref version.
-    async function selectTab(i) { const d = ensureDriver(); const out = await driverFn(d, 'selectTab')(i); version++; navEpoch++; return out; }
+    async function selectTab(i) {
+      const d = ensureDriver();
+      const mark = tabMark();   // before the switch, like snapshot's: a tab lost during it leaves press/scroll refused
+      const out = await driverFn(d, 'selectTab')(i);
+      version++; navEpoch++;
+      lookedAt = mark;
+      return out;
+    }
     async function closeTab(i) { const d = ensureDriver(); const out = await driverFn(d, 'closeTab')(i); version++; return out; }
     async function requireLocalDriver() {
       if (!localMode) throw new Error('browser.test_input requires browser.test_navigate to a loopback URL first');
@@ -2436,7 +3531,7 @@
       return d.testState(selector);
     }
     async function testSnapshot(limit) { await requireLocalDriver(); return snapshot(limit); }
-    async function scroll(x, y) { return ensureDriver().scroll(x, y); }
+    async function scroll(x, y) { const d = ensureDriver(); requireReadTab('browser.scroll'); return d.scroll(x, y); }
     async function back() { version++; navEpoch++; return ensureDriver().back(); }
     async function getText(selector) { return ensureDriver().getText(selector); }
     async function challengeStatus() {
@@ -2484,20 +3579,43 @@
       if (!attended || typeof attended.prompt !== 'function') {
         throw new Error('browser.login needs a watched COMMS session — an unattended run cannot open a login window for the Commander');
       }
-      if (headlessRequested(deps.env) || deps.headless === true) {
+      if (deps.stationLogin !== true && (headlessRequested(deps.env) || deps.headless === true)) {
         throw new Error('browser.login unavailable: this host pins the browser headless (STARNET_BROWSER_HEADLESS)');
       }
       const u = assertSafeUrl(url);
       await assertResolvedSafe(u, doLookup);   // same rebinding bar as navigate — a login window is not a weaker surface
       const host = hostOf(u);
       const approved = d => !!d && d !== 'deny';
-      if (!approved(await attended.prompt({ tool: 'browser.login', scope: 'execute', argsSummary: host }))) {
+      // fresh: both asks approve THIS sign-in only. askHuman marks the prompt freshConsent, so handleConsent applies and
+      // echoes a standing answer (always, full, session) as 'once': no surface confirms a grant the station never made
+      if (!approved(await attended.prompt({ tool: 'browser.login', scope: 'execute', argsSummary: host, fresh: true }))) {
         return { status: 'declined', host };
       }
       // The durable profile is what makes the login outlive this run. When a host wires one, contention is a
       // hard stop (logging into a throwaway profile would silently lose the session at run end — dishonest);
       // a host with NO persistent profile still gets a within-run login on its ephemeral profile.
       await waitForProfile(signal);
+      /* THE STATION BROWSER (sidecar/browser-view.js) is ALREADY the browser the Commander sees and uses — in the
+         station's BROWSER window, or as its own Chrome window — on the durable profile. So a sign-in there needs no
+         relaunch at all: open the page right here and show it. Measured 2026-09-30 (Andrew: "go to github so i can
+         sign in … FAILS IMMEDIATELY"): the relaunch below closes and restarts Chromium twice on one profile, and on a
+         busy machine the restart raced the old process's shutdown (>8 s) and never opened GitHub. */
+      if (deps.stationLogin === true) {
+        const at = await navigate(u.href);
+        if (typeof deps.onLoginOpen === 'function') { try { await deps.onLoginOpen({ host, url: at }); } catch (e) { failNote('browser.login.show', e); } }
+        let doneHere = false;
+        /* FROZEN while the Commander signs in (release review 2026-09-30): the same rule as a STEP-IN handoff — a
+           browser tool called in parallel in this turn (snapshot, get_text, screenshot, console) must not read a page
+           they are typing a password or a 2FA code into. thaw() also retires every ref minted before. */
+        const wasFrozen = frozenBy;
+        if (!wasFrozen) freeze('sign-in at ' + host);
+        try { doneHere = approved(await attended.prompt({ tool: 'browser.login.done', scope: 'execute', argsSummary: host, fresh: true })); }
+        finally {
+          if (!wasFrozen) thaw();
+          if (typeof deps.onLoginClose === 'function') { try { deps.onLoginClose({ host }); } catch (e) { failNote('browser.login.close', e); } }
+        }
+        return { status: doneHere ? 'done' : 'unconfirmed', host, url: at || u.href, station: true };
+      }
       // Headed + real input: forceHeadless is HOST authority for model-driven navigation; this relaunch is
       // human-consented (the prompt above), so it may override it. syntheticInputOnly:false drops the popup
       // block and input shims — SSO login flows need real popups and the human's real pointer.
@@ -2511,15 +3629,63 @@
         if (!vis) throw new Error('no full Chrome found — only a headless-shell binary, so a visible login window is impossible; install Chrome or set STARNET_CHROME');
       } catch (e) {
         // restore the shimmed headless posture before surfacing the failure
-        await relaunch({ headed: false });
+        await relaunch({ headed: deps.preferVisible === true ? wantedHeaded(undefined) : false });
         throw e;
       }
-      const done = approved(await attended.prompt({ tool: 'browser.login.done', scope: 'execute', argsSummary: host }));
+      const done = approved(await attended.prompt({ tool: 'browser.login.done', scope: 'execute', argsSummary: host, fresh: true }));
       // Done or cancelled, the window closes and research mode resumes on the SAME profile — any cookies the
       // site set during the attempt are already durable.
-      await relaunch({ headed: false });
+      await relaunch({ headed: deps.preferVisible === true ? wantedHeaded(undefined) : false });
       return { status: done ? 'done' : 'unconfirmed', host, url: finalUrl || u.href };
     }
+    /* STEP-IN: hand THIS browser — same process, same page, same profile — to the Commander.
+       handoffSurface() is what the handoff host drives (stream frames out, human input in). It never relaunches:
+       the Commander must land on exactly the page the agent was stuck on, with whatever state it had.
+       freeze()/thaw() bracket the handoff. While frozen the agent's browser tools are refused (makeBrowserTools'
+       wrapper reads frozen()), so the agent cannot snapshot, read text, screenshot or read the console while a
+       human is typing a password into the page. thaw() kills every ref: the human changed the page. */
+    let frozenBy = null;
+    function handoffSurface() {
+      const d = driver;
+      if (!d || (typeof d.alive === 'function' && !d.alive())) throw new Error('no browser page is open — navigate to the page that needs the Commander first');
+      for (const fn of ['streamStart', 'streamStop', 'humanInput', 'pageInfo']) {
+        if (typeof d[fn] !== 'function') throw new Error('this browser cannot be handed to the Commander (driver has no ' + fn + ')');
+      }
+      // A sign-in lasts past this run only on the durable station profile (the leased one) — say which, truthfully.
+      // …and a driver the HELD profile moved to a temporary one remembers nothing, lease or not
+      const heldNote = (typeof d.profileFallback === 'function' && d.profileFallback()) || '';
+      const remembered = !attachedToUserBrowser && !heldNote && (leaseHeld || (typeof d.usingPersistentProfile === 'function' && d.usingPersistentProfile() === true));
+      return {
+        profileNote: heldNote,
+        startStream: onFrame => d.streamStart(onFrame),
+        stopStream: () => d.streamStop(),
+        input: ev => d.humanInput(ev),
+        pageInfo: () => d.pageInfo(),
+        front: typeof d.bringToFront === 'function' ? () => d.bringToFront() : null,
+        visible: driverHeaded === true,
+        remembered
+      };
+    }
+    function freeze(id) { frozenBy = String(id || 'handoff'); }
+    function thaw() {
+      if (frozenBy === null) return;
+      frozenBy = null;
+      version++; navEpoch++;   // the Commander drove the page: refs minted before the handoff point at a page that may be gone
+    }
+    function frozen() { return frozenBy; }
+    /* THE STATION'S SHARED BROWSER (sidecar/browser-view.js) changes hands: the Commander browses in it between
+       runs, and different agents drive it on different runs. handTo() is called as a run takes it:
+         · every ref dies (the page may be one the Commander opened or changed — the same rule thaw() applies
+           after a handoff);
+         · downloads are re-pointed at the driving agent's own jail. */
+    async function handTo(info) {
+      version++; navEpoch++;
+      const dir = info && info.downloadDir ? String(info.downloadDir) : null;
+      if (!dir) return;
+      deps.downloadDir = dir;   // a driver not yet built reads this at creation
+      if (driver && typeof driver.setDownloadDir === 'function') await driver.setDownloadDir(dir);
+    }
+    function hasDriver() { return !!driver; }
     async function close() {
       try { if (driver && driver.close) await driver.close(); }
       finally { releasePersistent(); }
@@ -2534,19 +3700,26 @@
       const d = driver || null;
       return !!(d && d.headlessFallback);
     }
+    // the driver's held-profile fallback note ('' when it runs on the profile it was given)
+    function profileNote() {
+      const d = driver || null;
+      return (d && typeof d.profileFallback === 'function' && d.profileFallback()) || '';
+    }
     function attachedPort() {
       const d = driver || null;
       return d && typeof d.attachedPort === 'function' ? d.attachedPort() : null;
     }
-    return { waitForProfile, navigate, snapshot, click, type, press, hover, drag, select: selectOption, viewport, forward, upload, tabs, selectTab, closeTab, inspect, evalPublic, evalAllowed, wait, find, pdf, intercept, emulate, attach, detach, attachedToUser: () => attachedToUserBrowser, testInput, testEval, testState, testSnapshot, scroll, back, getText, challengeStatus, consoleLog, networkLog, dialog, vision, screenshot, login, close, visible, headlessFallback, attachedPort, lastResponse, _internals: { refs, version: () => version, navEpoch: () => navEpoch, localMode: () => localMode, localOrigin: () => localOrigin, leaseHeld: () => leaseHeld } };
+    return { waitForProfile, reset, navigate, snapshot, click, type, press, hover, drag, select: selectOption, viewport, forward, upload, tabs, selectTab, closeTab, inspect, evalPublic, evalAllowed, wait, find, pdf, intercept, emulate, attach, detach, attachedToUser: () => attachedToUserBrowser, testInput, testEval, testState, testSnapshot, scroll, back, getText, challengeStatus, consoleLog, networkLog, dialog, vision, screenshot, login, handoffSurface, freeze, thaw, frozen, handTo, hasDriver, close, visible, headlessFallback, profileNote, attachedPort, lastResponse, _internals: { refs, version: () => version, navEpoch: () => navEpoch, localMode: () => localMode, localOrigin: () => localOrigin, leaseHeld: () => leaseHeld } };
   }
 
   function makeBrowserTools(deps) {
     deps = deps || {};
     const session = deps.session || makeBrowserSession(deps);
     const allowVisible = deps.allowVisible === true;
-    const read = (name, description, schema, run) => ({ name, capability: 'web', impact: 'synthetic-browser', scope: 'read', requiresConsent: false, timeoutMs: 20000, description, schema, run });
-    const exec = (name, description, schema, run, consent) => ({ name, capability: 'web', impact: 'synthetic-browser', scope: 'execute', requiresConsent: consent !== false, timeoutMs: 20000, description, schema, run });
+    // resultScrub false: a browser tool's result is the PAGE (text, snapshot, eval, console, network), external content
+    // the task may have to transcribe, not a station store (registry.js resultScrubFor; review r3)
+    const read = (name, description, schema, run) => ({ name, capability: 'web', impact: 'synthetic-browser', scope: 'read', requiresConsent: false, timeoutMs: 20000, resultScrub: false, description, schema, run });
+    const exec = (name, description, schema, run, consent) => ({ name, capability: 'web', impact: 'synthetic-browser', scope: 'execute', requiresConsent: consent !== false, timeoutMs: 20000, resultScrub: false, description, schema, run });
     const testRead = (name, description, schema, run) => ({ name, capability: 'workbench', impact: 'synthetic-browser', scope: 'read', requiresConsent: false, timeoutMs: 20000, description, schema, run });
     const testExec = (name, description, schema, run) => ({ name, capability: 'workbench', impact: 'synthetic-browser', scope: 'execute', requiresConsent: false, timeoutMs: 20000, description, schema, run });
     /* SCREENSHOTS WERE WRITE-ONLY. screenshot() had exactly one consumer — vision() — which handed the
@@ -2558,6 +3731,9 @@
     const shotFsp = deps.fsp, shotPath = deps.pathMod, shotRoot = deps.root;
     const canSaveShots = !!(shotFsp && shotPath && shotRoot);
     const shotJail = canSaveShots ? require('./fs.js').makeFsTools({ fsp: shotFsp, pathMod: shotPath, root: shotRoot })._internals : null;
+    // Upload reads share fs.read authority; screenshot/PDF outputs retain their private workspace shelf.
+    const uploadJail = canSaveShots ? require('./fs.js').makeFsTools({ fsp: shotFsp, pathMod: shotPath, root: shotRoot,
+      pathTrust: typeof deps.pathTrust === 'function' ? deps.pathTrust : undefined })._internals : null;
     async function saveShot(ctx, b64) {
       if (!canSaveShots) return null;
       const aid = (ctx && ctx.agentId) || 'agent';
@@ -2603,6 +3779,17 @@
     // ~30s to commit, and the tool budget must sit ABOVE that so the driver's own timeout fires first and
     // gets to run its Page.stopLoading recovery. An outer abort here would strand the stalled navigation.
     const NAV_TOOL_TIMEOUT_MS = 45000;
+    /* STEP-IN hints. A wall or a sign-in form names browser.need_human ONLY when this run can actually hand the
+       browser over (a handoff host is wired) — advertising a door that is not there would be the lie. The hint
+       never decides for the agent: a login box in a page header is not a reason to stop a research task. */
+    const canHandOff = !!(deps.handoff && typeof deps.handoff.request === 'function');
+    function stepInHint(reason) {
+      return canHandOff ? ' STEP-IN: you may not solve this yourself - call browser.need_human {reason:"' + reason + '"} to hand this browser to the Commander, and continue when they hand it back.' : '';
+    }
+    function authHint(status) {
+      if (!canHandOff || !status || !status.authWall) return '';
+      return ' This page shows ' + (status.authSignal || 'a sign-in field') + '. You never type the Commander\'s credentials or codes: if the task needs this account, call browser.need_human {reason:"' + status.authWall + '"} so they can do it in this same browser; otherwise carry on without signing in.';
+    }
     const tools = [
       Object.assign(read('browser.navigate', 'Navigate the AGENT-CONTROLLED browser to a public http(s) URL. HEADLESS in ordinary agent runs: it never opens a window or uses the user\'s input. Private, loopback, intranet, and unsafe redirects remain refused; use browser.test_navigate for a local dev server.', { type: 'object', required: ['url'], properties: navProps },
         async a => {
@@ -2611,10 +3798,10 @@
           const challenge = await session.challengeStatus();
           if (challenge && challenge.challenged) {
             let host = url;
-            try { host = new URL(url).host; } catch (_) {}
+            try { host = new URL(url).host; } catch (e) { failNote('browser.load-fail.host', e); }
             const http = describeResponse(session.lastResponse && session.lastResponse());
             return {
-              content: 'Browser reached a human-verification wall at ' + host + http.text + '. This is not page content. If the Commander is available, use browser.attach for their own Chrome or browser.login when sign-in is required; otherwise report the wall plainly.',
+              content: 'Browser reached a human-verification wall at ' + host + http.text + '. This is not page content. If the Commander is available, use browser.attach for their own Chrome or browser.login when sign-in is required; otherwise report the wall plainly.' + stepInHint('captcha'),
               summary: 'verification wall' + http.summary
             };
           }
@@ -2628,7 +3815,8 @@
           // HONEST STATUS. Without this the agent cannot tell a 403/404 from a page that simply
           // rendered nothing, and will happily read an error page back as the answer.
           const http = describeResponse(session.lastResponse && session.lastResponse());
-          return { content: 'Browser navigated to ' + url + http.text + suffix, summary: 'navigated' + http.summary };
+          const held = session.profileNote ? session.profileNote() : '';
+          return { content: 'Browser navigated to ' + url + http.text + suffix + authHint(challenge) + (held ? ' ' + held : ''), summary: 'navigated' + http.summary };
         }), { timeoutMs: NAV_TOOL_TIMEOUT_MS }),
       testRead('browser.test_navigate', 'Open an agent-owned local dev URL (127.0.0.1/localhost/::1 only) in the HEADLESS CDP browser for UI/game testing. In normal runs serverId must name this agent\'s running shell background server. Physical pointer/keyboard locks are emulated inside the page, so they never reach Windows.', { type: 'object', required: localNavRequired, properties: { url: { type: 'string' }, serverId: { type: 'string' } } },
         async (a, ctx) => {
@@ -2680,7 +3868,20 @@
         }),
       exec('browser.detach', 'Stop driving the Commander\'s own Chrome and go back to the station browser. Their browser keeps running and every tab stays open — this only lets go of it.', { type: 'object', properties: {} },
         async () => ({ content: await session.detach(), summary: 'detached' }), false),
-      read('browser.find', 'Find visible elements in the current viewport by text and/or role, and get refs you can click or type into. Prefer this over browser.snapshot on a busy viewport: snapshot lists the first 80 interactive elements, while this scans up to 200 and returns only what matches. It does not scan below the fold or inside closed menus; scroll or open the menu and try again. Refs from earlier snapshots expire, same as after any snapshot.',
+      // #61: the supported recovery when the browser is wedged (navigations fail with proxy/connection errors, a new
+      // browser "exited before CDP ownership", the profile is locked). An agent never needs a shell kill for this.
+      exec('browser.reset', 'Recover a stuck station browser: closes the browser this run started (and its network proxy), ends any ORPHANED StarNet browser left running on the station profile by an earlier StarNet process, and clears that profile\'s stale locks. Use it when pages fail with proxy or connection errors, or a new browser exits before it can be controlled. Never touches the Commander\'s own Chrome. Saved sign-ins are kept. The next browser call starts fresh.', { type: 'object', properties: {} },
+        async () => {
+          if (typeof session.reset !== 'function') return { content: 'browser.reset is not available for this browser.', summary: 'reset unavailable' };
+          const r = await session.reset();
+          if (r.attached) return { content: 'This run is attached to the Commander\'s own Chrome, which StarNet never closes. Use browser.detach to let go of it.', summary: 'attached: not reset' };
+          const parts = [r.closedOwn ? 'Closed this run\'s browser and its network proxy.' : (r.closeError ? 'Could not close this run\'s browser: ' + r.closeError + '.' : 'This run had no browser open.')];
+          parts.push(r.sweep ? 'Station profile: ' + Orphans.describeSweep(r.sweep) + '.' : 'No station profile sweep was available here.');
+          const clean = !r.closeError && (!r.sweep || r.sweep.ok);
+          parts.push(clean ? 'The next browser call starts a fresh browser.' : 'The browser may still be stuck: the Commander can use Settings > BROWSER > RESET STATION BROWSER, or restart StarNet.');
+          return { content: parts.join(' '), summary: clean ? 'browser reset' : 'browser reset incomplete' };
+        }, false),
+      read('browser.find', 'Find visible elements in the current viewport by text and/or role, and get refs you can click or type into. Prefer it over browser.snapshot on a busy viewport: snapshot lists the first 80 interactive elements; this scans up to 200 and returns only matches. It does not scan below the fold or inside closed menus (scroll or open the menu and retry). Refs from earlier snapshots expire, as after any snapshot.',
         { type: 'object', properties: { text: { type: 'string' }, role: { type: 'string' }, limit: { type: 'number' } } },
         async a => {
           const r = await session.find({ text: a.text, role: a.role }, a.limit);
@@ -2702,7 +3903,7 @@
       /* browser.wait is READ scope and needs no consent: it changes nothing, it only looks. Its whole
          purpose is to replace the guessed sleep, which is the single biggest source of flaky agent
          browsing — and a tool the agent must pay a consent prompt for is a tool it will skip. */
-      read('browser.wait', 'Wait until something is true on the page, instead of guessing a delay: an element matching a CSS selector becomes visible, some text appears, or the URL contains a string. Set gone:true to wait for it to DISAPPEAR (a spinner, a "Saving..." banner). Every other browser action already waits for the page to settle by itself — reach for this when you are waiting on a specific thing, like search results loading or a redirect landing. It reports honestly whether the condition actually became true.',
+      read('browser.wait', 'Wait until something is true on the page instead of guessing a delay: an element matching a CSS selector becomes visible, some text appears, or the URL contains a string. gone:true waits for it to DISAPPEAR (a spinner, a "Saving..." banner). Every other browser action already waits for the page to settle; use this for a specific thing, like search results loading or a redirect landing. It reports honestly whether the condition became true.',
         { type: 'object', properties: { selector: { type: 'string' }, text: { type: 'string' }, urlContains: { type: 'string' }, gone: { type: 'boolean' }, timeoutMs: { type: 'number' } } },
         async a => {
           const r = await session.wait({ selector: a.selector, text: a.text, urlContains: a.urlContains, gone: a.gone === true }, a.timeoutMs);
@@ -2720,6 +3921,8 @@
       exec('browser.click', 'Click a visible element by ref from the latest browser.snapshot. If the click downloads a file, the result waits for Chromium and verifies the saved file under downloads/; pass that exact path to fs.read (Word .docx files are extracted automatically).', { type: 'object', required: ['ref'], properties: { ref: { type: 'string' } } },
         async a => {
           const content = await session.click(a.ref);
+          // the new-tab note names browser.tab_select / browser.tabs, which are deferred: the hint must make them callable
+          if (/opened a NEW tab/.test(content)) return { content, summary: 'clicked, opened a new tab', control: { revealTools: ['browser.tab_select', 'browser.tabs'] } };
           return { content, summary: /Download completed/.test(content) ? 'download completed' : 'clicked' };
         }),
       exec('browser.type', 'Click/focus an element by ref from the latest browser.snapshot, then type text into it.', { type: 'object', required: ['ref', 'text'], properties: { ref: { type: 'string' }, text: { type: 'string' } } },
@@ -2741,7 +3944,7 @@
         async a => ({ content: 'Viewport is now ' + await session.viewport(a.width, a.height, { mobile: a.mobile === true, scale: a.scale }) + ' — take a fresh browser.snapshot.', summary: 'viewport' }), false),
       exec('browser.forward', 'Go forward in browser history (the counterpart of browser.back).', { type: 'object', properties: {} },
         async () => ({ content: 'Browser moved forward to ' + await session.forward(), summary: 'forward' }), false),
-      read('browser.tabs', 'List the browser tabs. A link with target="_blank", a checkout popup or a PDF opens a NEW tab — it is listed here, and browser.tab_select switches to it. Tab 0 is the one you started in.', { type: 'object', properties: {} },
+      read('browser.tabs', 'List the browser tabs. A popup the page opens (window.open: a checkout, an SSO sign-in, a PDF viewer) becomes a NEW tab — it is listed here, browser.click says when one opened, and browser.tab_select switches to it. A link with target="_blank" opens in the current tab. Tab 0 is the one you started in.', { type: 'object', properties: {} },
         async () => {
           const list = await session.tabs();
           // FENCED: a tab TITLE is `document.title` — fully attacker-controlled, and a popup a hostile page
@@ -2756,21 +3959,29 @@
         async a => ({ content: 'Now on tab ' + a.index + ': ' + await session.selectTab(a.index) + ' — take a fresh browser.snapshot.', summary: 'tab ' + a.index }), false),
       exec('browser.tab_close', 'Close a tab by index from browser.tabs. Tab 0 cannot be closed.', { type: 'object', required: ['index'], properties: { index: { type: 'number' } } },
         async a => ({ content: await session.closeTab(a.index), summary: 'tab closed' })),
-      exec('browser.upload', 'Attach files from your workspace to a file-upload control on the page. "ref" is the upload control (or its visible label) from the latest browser.snapshot; "paths" are workspace-relative files. Submitting the form is a separate click.', { type: 'object', required: ['ref', 'paths'], properties: { ref: { type: 'string' }, paths: { type: 'array', items: { type: 'string' } } } },
+      exec('browser.upload', 'Select files in a page file input and read back the selection. A relative path resolves in this run\'s trusted project, otherwise its private workspace; absolute paths use the same path permission check as fs.read. "ref" is the file input, its associated label, or a control beside exactly one file input from the latest browser.snapshot. This may trigger the website\'s upload handler, but the receipt proves selection only: inspect its thumbnail/status or network response before claiming the website received the file.', { type: 'object', required: ['ref', 'paths'], properties: { ref: { type: 'string' }, paths: { type: 'array', items: { type: 'string' } } } },
         async (a, ctx) => {
-          if (!canSaveShots) throw new Error('browser.upload needs a workspace; this run has none');
+          if (!uploadJail) throw new Error('browser.upload needs a workspace; this run has none');
           const aid = (ctx && ctx.agentId) || 'agent';
           const rels = Array.isArray(a.paths) ? a.paths : [a.paths];
-          if (!rels.length) throw new Error('browser.upload needs at least one path');
-          // Resolve through the SAME jail as fs.* — an upload must never be able to post a file from
-          // outside the agent's workspace (resolveInside throws on '..', absolute paths, escapes).
-          const abs = [];
+          if (!rels.length || rels.some(p => typeof p !== 'string' || !p.trim())) throw new Error('browser.upload needs at least one non-empty file path');
+          const abs = [], expected = [];
           for (const rel of rels) {
-            const r = await shotJail.resolveInside(aid, String(rel));
-            await shotFsp.stat(r.abs);   // fail loudly here, not silently inside the page
-            abs.push(r.abs);
+            const r = await uploadJail.resolveInside(aid, rel, { scope: 'read', ctx });
+            const stat = await shotFsp.stat(r.abs);
+            if (!stat.isFile()) throw new Error('browser.upload needs a regular file: ' + rel);
+            await shotFsp.access(r.abs, FS.constants.R_OK);
+            abs.push(r.abs); expected.push({ name: shotPath.basename(r.abs), size: stat.size });
           }
-          return { content: await session.upload(a.ref, abs) + ': ' + rels.join(', ') + '. Submit the form when ready.', summary: 'uploaded ' + abs.length };
+          const receipt = await session.upload(a.ref, abs, expected);
+          if (!receipt || receipt.status !== 'selected' || !Array.isArray(receipt.files)
+            || receipt.files.length !== expected.length || receipt.files.some((f, i) => f.name !== expected[i].name || f.size !== expected[i].size)) {
+            throw new Error('browser.upload did not return verified file-selection evidence; inspect the page before retrying');
+          }
+          return { content: 'File selection verified. ' + (receipt.retained ? 'The input still holds the requested files. ' : 'The input was cleared, replaced, or no longer retains the selection after a file-selection event. ')
+            + fenceExternal(JSON.stringify(receipt), 'file input readback from the controlled browser')
+            + '\nRemote upload/server acceptance is not verified. Inspect the page\'s thumbnail/status or network response before reporting upload success. Submit the form only when the task requires it.',
+            summary: 'selected ' + receipt.files.length + ' file(s)' };
         }),
       exec('browser.back', 'Go back in browser history.', { type: 'object', properties: {} },
         async () => ({ content: 'Browser went back to ' + await session.back(), summary: 'back' }), false),
@@ -2829,7 +4040,7 @@
           const challenge = await session.challengeStatus();
           if (challenge && challenge.challenged) {
             return {
-              content: 'The current page is a human-verification wall, not readable page content. Use browser.attach for the Commander\'s own Chrome or browser.login when sign-in is required; otherwise report the wall plainly.',
+              content: 'The current page is a human-verification wall, not readable page content. Use browser.attach for the Commander\'s own Chrome or browser.login when sign-in is required; otherwise report the wall plainly.' + stepInHint('captcha'),
               summary: 'verification wall'
             };
           }
@@ -2847,7 +4058,56 @@
           const r = await session.login(a.url, ctx && ctx.signal);
           if (r.status === 'declined') return { content: 'Commander declined to open a login window for ' + r.host + '. Continue without authentication and say what is blocked.', summary: 'login declined' };
           if (r.status === 'unconfirmed') return { content: 'Login window for ' + r.host + ' closed without a Done confirmation. Any cookies the site set were saved to the station profile; verify with browser.navigate whether you are signed in before relying on it.', summary: 'login unconfirmed' };
-          return { content: 'Commander finished logging in at ' + r.host + '. The browser is back in headless research mode. Done is a human confirmation, not authentication proof: use browser.navigate to verify the account and access before continuing.', summary: 'login done' };
+          return { content: 'Commander finished logging in at ' + r.host + (r.station ? '. You are on the same page in the same shared browser, signed in on its saved profile.' : '. The browser is back in headless research mode.') + ' Done is a human confirmation, not authentication proof: use browser.navigate to verify the account and access before continuing.', summary: 'login done' };
+        }
+      },
+      /* STEP-IN (2026-09-29): the agent hands its OWN live browser to the Commander and waits. Scope 'read' is the
+         truth about the agent's effect — it pauses; it changes nothing itself — and it keeps a stuck agent from
+         needing a settled Task Brief just to ask for help. The wait is the handoff host's (own id, 30 minutes,
+         restarted when the Commander takes the wheel), never the consent channel's auto-deny. The tool budget sits
+         above the longest legal handoff (30 min waiting + 30 min held) so the host, not a tool timeout, ends it. */
+      {
+        name: 'browser.need_human', capability: 'web', impact: 'synthetic-browser', scope: 'read', requiresConsent: false, timeoutMs: 61 * 60 * 1000,
+        // Kept short on purpose: every word here is sent on every turn (test/payload.budget.test.js). The rest of the
+        // contract — open the page first, the 30-minute wait — is in the tool's own replies.
+        description: 'A page needs a human (sign-in, 2FA, CAPTCHA, payment): hand THIS browser to the Commander; continue when they hand it back. Never type their credentials or solve CAPTCHAs.',
+        schema: { type: 'object', required: ['reason', 'note'], properties: {
+          reason: { type: 'string', enum: HandoffReasons },
+          note: { type: 'string' }
+        } },
+        run: async (a, ctx) => {
+          const host = deps.handoff;
+          if (!host || typeof host.request !== 'function') {
+            return { content: 'STEP-IN is not available in this run, so the Commander cannot take this browser. Report plainly what the page needs from them (sign-in, verification) and what you could not do.', summary: 'no handoff host' };
+          }
+          const surface = session.handoffSurface();
+          const at = await surface.pageInfo();
+          if (!at.url || /^about:/i.test(at.url)) throw new Error('no page is open to hand over - navigate to the page that needs the Commander first');
+          const handle = host.request({ reason: a && a.reason, note: a && a.note, url: at.url, title: at.title, remembered: surface.remembered, surface, signal: ctx && ctx.signal });
+          session.freeze(handle.id);
+          let outcome;
+          try { outcome = await handle.done; }
+          finally { session.thaw(); }
+          if (outcome.state === 'returned') {
+            let now = { url: '', title: '' };
+            try { now = await surface.pageInfo(); } catch (e) { failNote('browser.handoff-page-info', e); }
+            const kept = surface.remembered
+              ? ' Their sign-in is kept in the station browser profile, so later runs start signed in.'
+              : ' This run uses a temporary browser profile, so the sign-in lasts only for this run.';
+            return {
+              content: 'The Commander finished and handed the browser back (handoff ' + outcome.id + '). It is now at ' + (now.url || 'an unknown page') + '.'
+                + (now.title ? ' ' + fenceExternal('Page title: ' + now.title, 'page title from the controlled browser') : '')
+                + ' Every element ref from before the handoff is gone: take a fresh browser.snapshot (browser.test_snapshot on a local test page) before acting. Handing back is a human confirmation, not proof of authentication - check the page shows the signed-in account.' + kept,
+              summary: 'handed back'
+            };
+          }
+          if (outcome.state === 'cancelled') {
+            return { content: 'The Commander could not complete this step (they pressed CAN\'T DO IT on handoff ' + outcome.id + '). Do not retry the same wall. Take another route, or report exactly what is blocked.', summary: 'human could not' };
+          }
+          if (outcome.state === 'expired') {
+            return { content: 'Nobody took the browser within 30 minutes, so handoff ' + outcome.id + ' expired. Do not try to get around the wall. Report plainly that the page needs the Commander and what you could not finish.', summary: 'handoff expired' };
+          }
+          return { content: 'The run was stopped while waiting on handoff ' + outcome.id + '.', summary: 'handoff ' + outcome.state };
         }
       },
       read('browser.vision', 'Capture the current viewport and answer a question about what is on screen (vision rides the session\'s own model when no dedicated vision key exists — never ask the user for an API key). If no vision route is available this returns a clear "unavailable" result — it never fabricates a description.', { type: 'object', properties: { question: { type: 'string' } } },
@@ -2946,15 +4206,28 @@
     // Reserve before driver creation, within the tool's existing abort/timeout budget. Local test tools
     // and explicit attach/detach retain their separate lifecycle; login keeps its human-consent boundary.
     for (const tool of tools) {
-      if (/^browser\.(test_|attach$|detach$|login$)/.test(tool.name)) continue;
+      if (/^browser\.(test_|attach$|detach$|login$|need_human$)/.test(tool.name)) continue;
       const run = tool.run;
       tool.run = async (args, ctx) => {
         if (typeof session.waitForProfile === 'function') await session.waitForProfile(ctx && ctx.signal);
         return run(args, ctx);
       };
     }
+    /* STEP-IN FROZEN RULE. While the Commander holds this browser (a browser.need_human handoff is live) the agent
+       may not touch it: no snapshot, no get_text, no screenshot/vision, no console, no clicks. A parallel tool call
+       in the same turn as need_human is the real path to this — refuse it BEFORE the tool runs, so nothing is read
+       off a page a human is typing a password into. browser.need_human itself is exempt (it is the wait). */
+    for (const tool of tools) {
+      if (tool.name === 'browser.need_human') continue;
+      const run = tool.run;
+      tool.run = async (args, ctx) => {
+        const held = typeof session.frozen === 'function' ? session.frozen() : null;
+        if (held) throw new Error('FROZEN: the Commander holds this browser (' + (/^sign-in/.test(String(held)) ? String(held) : 'STEP-IN handoff ' + held) + '). No browser tool may read or drive the page until they hand it back.');
+        return run(args, ctx);
+      };
+    }
     return { tools, session, register(reg) { tools.forEach(t => reg.register(t)); return reg; }, _internals: { assertSafeUrl, assertLoopbackUrl, assertResolvedSafe, isPrivateV4, isPrivateV6, makeBrowserSession, makeCdpDriver, makeDownloadLedger, findChrome, resolveChrome, headlessRequested, SYNTHETIC_INPUT_BOOTSTRAP, CHROME_CANDIDATES } };
   }
 
-  return { makeBrowserTools, _internals: { assertSafeUrl, assertLoopbackUrl, assertResolvedSafe, isPrivateV4, isPrivateV6, makeBrowserSession, makeCdpDriver, makeDownloadLedger, findChrome, resolveChrome, headlessRequested, SYNTHETIC_INPUT_BOOTSTRAP, SETTLE_BOOTSTRAP, SETTLE_PROBE, SETTLE_QUIET_POLLS, describeResponse, jsLiteral, normalizeBrowserLocale, detectBrowserVersion, makeLaunchIdentity, browserVersionFrom, cleanBrandRows, makeCdpIdentity, CHROME_CANDIDATES } };
+  return { makeBrowserTools, _internals: { CdpClient, assertSafeUrl, assertLoopbackUrl, assertResolvedSafe, resolveVerified, isPrivateV4, isPrivateV6, makeBrowserSession, makeCdpDriver, makeDownloadLedger, findChrome, resolveChrome, setExtraChrome, needsNoSandbox, profileOwnerPid, macEditingCommands, headlessRequested, SYNTHETIC_INPUT_BOOTSTRAP, SETTLE_BOOTSTRAP, SETTLE_PROBE, SETTLE_QUIET_POLLS, describeResponse, pickRefusal, explainRefusal, jsLiteral, normalizeBrowserLocale, detectBrowserVersion, makeLaunchIdentity, browserVersionFrom, cleanBrandRows, makeCdpIdentity, CHROME_CANDIDATES } };
 });

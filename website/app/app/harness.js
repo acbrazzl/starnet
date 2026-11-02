@@ -39,6 +39,10 @@ const Harness = (() => {
   let contextByKey = {};     // agentId\0streamId -> { used, model, runId, sentEstimate, live }
   let runModels = {};        // runId -> model from agent.run.start, for events that omit model
   let runConv = {};          // runId -> { key, sentEstimate } registered by chat() at run.start
+  /* CONTEXT REVISION (idle CPU piece 3, 2026-10-20): bumped by every write to contextByKey / overheadByModel (and a run's
+     registration), so a reader that memoizes on it — chat.js contextRef, which the 1 s station tick reads — recomputes
+     exactly when a reading can move, and does nothing while nothing has. */
+  let contextRev = 0;
   /* HARNESS OVERHEAD, LEARNED FROM A REAL REQUEST (agentId\0model -> tokens).
      A request carries far more than the visible dialogue: system prompt, every tool schema, and the
      sidecar's manual/capability/skill/memory dressing. On a seeded station that measured ~13.1k tokens
@@ -74,7 +78,7 @@ const Harness = (() => {
   })();
   function rememberOverhead(key, cal) {
     if (!cal) return;
-    overheadByModel[key] = cal;
+    overheadByModel[key] = cal; contextRev++;
     try {
       const keys = Object.keys(overheadByModel);
       if (keys.length > OVERHEAD_MAX) { for (const k of keys.slice(0, keys.length - OVERHEAD_MAX)) delete overheadByModel[k]; }
@@ -85,6 +89,10 @@ const Harness = (() => {
   // side prompts on the SAME agentId — their prompt_tokens must never overwrite the agent's real
   // context occupancy (they made the gauge snap back to ~1% right after every real turn).
   const internalRuns = new Set();   // runIds whose cost events are gauge-invisible
+  // runIds of delegated WORKER runs seen on a lead's stream (orchestration FORWARD). Their tool steps reach U.bus for
+  // the floor, but a worker's kit is the sidecar's autonomous office — not its room — so room-gap readers (the
+  // station-quest generator) must not read a worker's web/files call as a missing prop. Bounded: oldest drop first.
+  const delegatedRuns = new Set();
 
   // Composite map keys join on U+0000, built with String.fromCharCode so no raw NUL byte ever lands in
   // this source file (a literal one makes the whole file invisible to grep). No id can contain it.
@@ -99,6 +107,7 @@ const Harness = (() => {
   function registerRun(runId, agentId, streamId, messages) {
     if (!runId) return;
     runConv[runId] = { key: convKey(agentId, streamId), sentEstimate: estOf(messages), calibrated: false, agentId: String(agentId || 'agent') };
+    contextRev++;
   }
 
   // Fold ONE token-bearing agent.cost payload into the per-conversation context occupancy. Called from
@@ -129,6 +138,7 @@ const Harness = (() => {
       used: payload.tokensIn, model: m, runId: payload.runId || '',
       sentEstimate: reg ? reg.sentEstimate : -1, baseline: baseline || 0, live: true
     };
+    contextRev++;
   }
   // A run ended: its measurement stops being "what the model is holding right now". The reading stays
   // (it is still the last real thing we know) but drops out of live mode, so contextState projects the
@@ -141,6 +151,7 @@ const Harness = (() => {
     if (rec && rec.runId === rid) rec.live = false;
     else { for (const k in contextByKey) { if (contextByKey[k] && contextByKey[k].runId === rid) contextByKey[k].live = false; } }
     delete runConv[rid];
+    contextRev++;
   }
 
   // Desktop (Tauri) build: the BYOK key lives in the OS keychain — never in localStorage and
@@ -166,6 +177,16 @@ const Harness = (() => {
   let _alternateCountByProvider = Object.create(null);
   let apiToken = (typeof window !== 'undefined' && window.__STARNET_API_TOKEN__) ? String(window.__STARNET_API_TOKEN__) : '';
   let apiTokenPromise = null;
+  /* A PAGE THE STATION KEPT ITS KEY FROM (review threads-backend-05 / sidecar-index-06). The sidecar serves this page
+     without its key when it cannot prove this browser runs as the station's own OS user (sidecar/peerowner.js: the
+     lookup failed or timed out, the connection could not be traced, it belongs to another account, or the platform
+     has no check) and says why in window.__STARNET_TOKEN_WITHHELD__. Every keyed /api call is then refused exactly
+     like a stale page, but this is NOT a restarted station: the page says why + the owner's escape hatch, never
+     "the station restarted". For a LASTING reason (another account, no check here) re-reading the page only re-runs
+     the same failing check, so it never does. For a TRANSIENT one (the lookup failed or timed out, the connection
+     could not be traced) re-running the check is the fix: a refused call re-reads '/' at most once a minute
+     (withheldRetryDue) and the page adopts its key in place when the check passes. '' = the page has its key. */
+  let tokenWithheld = (typeof window !== 'undefined' && !window.__STARNET_API_TOKEN__ && window.__STARNET_TOKEN_WITHHELD__) ? String(window.__STARNET_TOKEN_WITHHELD__) : '';
 
   // TRUE only for our OWN sidecar API — a same-origin request under /api/. The X-StarNet-Token this gates is a
   // PRIVATE local credential; a naive substring match on '/api/' would attach it to third-party URLs that merely
@@ -215,33 +236,246 @@ const Harness = (() => {
     if (!apiTokenPromise) apiTokenPromise = Promise.resolve('').then(t => { apiTokenPromise = null; return t; });
     return apiTokenPromise;
   }
+  /* STALE-TOKEN RECOVERY (#39, 2026-09-30). The token is a PER-LAUNCH secret the sidecar injects into the page it
+     serves (sidecar/index.js serveStatic), so in browser mode a sidecar restart — START FRESH's exit(75), a crash
+     respawn, a container restart — mints a NEW one while this open page keeps sending the old one. Every /api/ call
+     then 403s, and each surface misread it as its own failure: START FRESH greyed out forever after it SUCCEEDED,
+     the connect screen said "catalog offline", a rename looked saved and silently reverted.
+     The recovery is the page's own boot path, not a reload: re-read the token from the same-origin page the sidecar
+     serves ('/'), adopt it, and REPLAY the refused request once. That keeps every bit of unsaved page state (a reload
+     would drop it) and makes the refused save actually land. Exactly-once is safe: rejectBadApiToken answers BEFORE
+     any route runs, so the refused request had no effect.
+     NARROW BY CONSTRUCTION — it never swallows a real 403:
+       · only a 403 whose body is exactly 'forbidden token' (rejectBadApiToken's own reply) counts; a route's own
+         refusal ('forbidden', 'forbidden host/origin', JSON errors) passes through untouched;
+       · a replay needs PROOF of a rotation — the served page carries a token different from the one just refused;
+         the same token back (or none) is a real fault, reported by onStale, never retried;
+       · at most ONE replay per request and ONE in-flight page read shared by every concurrent 403, so no loop.
+     No new exposure: '/' is the page every load already reads; a foreign site gets an opaque response (no CORS on
+     static routes) and the Host pin stops rebinding. Desktop never gets here — the Tauri shell hands every respawn
+     the same launch token (src-tauri main.rs), and its bundled page is not served by the sidecar.
+     Self-contained on purpose (every dependency injected): test/stale-token-recovery.test.js lifts it by source. */
+  function staleTokenRecovery(o) {
+    const MARK = 'forbidden token';
+    const TOKEN_RE = /window\.__STARNET_API_TOKEN__=("(?:[^"\\]|\\.)*")/;
+    let inflight = null;
+    function isStaleReply(res) {
+      if (!res || res.status !== 403 || typeof res.clone !== 'function') return Promise.resolve(false);
+      let copy; try { copy = res.clone(); } catch (_) { return Promise.resolve(false); }   // the caller keeps an unread body
+      return Promise.resolve(copy.text()).then(t => String(t || '').trim() === MARK, () => false);
+    }
+    function refresh(sent) {
+      const cur = o.getToken();
+      if (cur && cur !== sent) return Promise.resolve(cur);   // a concurrent 403 already adopted the fresh token
+      if (!inflight && !o.canRefresh()) return Promise.resolve('');   // a read in flight is joined, never asked for twice
+      if (!inflight) {
+        inflight = Promise.resolve()
+          .then(() => o.rawFetch('/', { cache: 'no-store', credentials: 'same-origin' }))
+          .then(r => (r && r.ok) ? r.text() : '')
+          .then(html => {
+            const m = TOKEN_RE.exec(String(html || ''));
+            let t = '';
+            try { t = m ? String(JSON.parse(m[1])) : ''; } catch (_) { t = ''; }
+            if (!t || t === sent) return '';   // no rotation proven: this 403 is not ours to fix
+            o.setToken(t);
+            if (o.onRecovered) o.onRecovered();
+            return t;
+          }, () => '')
+          .then(t => { inflight = null; return t; }, () => { inflight = null; return ''; });
+      }
+      return inflight;
+    }
+    // The response the caller sees: the original, or ONE replay carrying the fresh token.
+    function settle(res, sent, replay) {
+      return isStaleReply(res).then(stale => {
+        if (!stale) return res;
+        return refresh(sent).then(fresh => {
+          if (!fresh || fresh === sent) { if (o.onStale) o.onStale(); return res; }
+          return replay ? replay(fresh) : res;   // an unreplayable (stream) body: the NEXT call carries the fresh token
+        });
+      });
+    }
+    return { settle, isStaleReply, refresh };
+  }
+  /* ONE reading of a refused /api/* reply, for every surface that must say WHY a call failed: voice synthesis, the
+     push-to-talk transcript and the Live Voice probe each used to decide on their own that any 403 meant "the station
+     restarted". A 403 is a restart only when the stale-token recovery below PROVED it (state.sessionStale: the station
+     rotated its key and this page could not adopt it). A page the station kept its key from (state.tokenWithheld) is
+     never "restarted" — a reload only re-runs the same ownership check — and any other 403 is the route's own
+     refusal. state.sessionStale undefined = a caller with no recovery state, read as before (a stale session).
+     Pure over its two arguments: Harness.classifyApiFailure binds the live state, and tests lift it by source.
+     → null for a reply that is not a failure, else { code, status, terminal, staleSession, tokenWithheld, message }. */
+  function classifyApiFailure(response, state) {
+    if (!response || response.ok !== false) return null;
+    const s = state || {};
+    const status = Number(response.status) || 0;
+    if (status === 403 && s.tokenWithheld) {
+      return { code: 'token_withheld', status, terminal: true, staleSession: false,
+        tokenWithheld: s.withheldNotice || 'StarNet could not confirm this browser is yours — see the station notice.',
+        message: 'this browser was not verified as your own account — see the station notice' };
+    }
+    if (status === 403 && s.sessionStale !== false) {
+      return { code: 'stale_session', status, terminal: true, staleSession: true, tokenWithheld: '',
+        message: 'the station restarted — reload the page to reconnect' };
+    }
+    if (status === 403) {
+      return { code: 'forbidden', status, terminal: true, staleSession: false, tokenWithheld: '',
+        message: 'the station refused this request (HTTP 403)' };
+    }
+    // no answer, a timeout, a rate limit or a server fault may clear on its own; any other status will not
+    const transient = status === 0 || status === 408 || status === 429 || status >= 500;
+    return { code: transient ? 'station_unavailable' : 'http_error', status, terminal: !transient, staleSession: false, tokenWithheld: '',
+      message: 'unreachable (HTTP ' + status + ')' };
+  }
+  // Set when a stale-token 403 could NOT be recovered in place — the one state where the honest answer is
+  // "reload this page". Surfaces read it (Harness.sessionStale) so they stop blaming the network or the catalog.
+  // NOT set for a page the station kept its key from (tokenWithheld): that is not a restart (tokenWithheldNotice says why).
+  let sessionStale = false;
+  let staleNotified = false;
+  /* ONE HONEST LINE WHILE THE PAGE IS REFUSED (live walk 10-14: after a sidecar restart every poll 403'd and nothing on screen
+     said why). The first re-read of '/' can come back without the new key — the station's ownership check timed out on a
+     loaded box — and every later refused call tries again, so the page usually reconnects by itself seconds later. The old
+     notice said "could not reconnect" and was gone in four seconds while the 403s went on. Now it is ONE alert kept in
+     NOTIFICATIONS until the page reconnects (then marked handled, and the toast is replaced in place by "reconnected"); it
+     says the page keeps trying, and a click on the toast takes the reload door COMMS error rows already offer.
+     The same words are the kept bell row, which has no door (a bell row opens only a session or a window), so they never say
+     "click here" (review 10-14: the row promised a click that did nothing). And the alert belongs to the page that raised it:
+     the next page life marks it handled at boot (bootNotices), so a reload never leaves it in the bell, unread. */
+  const STALE_KEY = 'station-restarted';
+  // "keeps trying" only where it is true: a page served by the sidecar re-reads '/' on every refused call; a desktop page never does
+  const staleLine = () => 'The station restarted and this page has not picked up its new key yet. '
+    + (!DESKTOP && !(typeof window !== 'undefined' && window.__STARNET_API__) ? 'It keeps trying on its own; reload this page to reconnect now.' : 'Reload this page to reconnect.');
+  function reloadThisPage() {
+    const door = typeof Friendly !== 'undefined' && Friendly.actionButton ? Friendly.actionButton({ action: 'reload' }) : null;
+    if (door && door.run) door.run(); else if (typeof location !== 'undefined' && location.reload) location.reload();
+  }
+  /* While the page is refused, '/' is re-read at most every few seconds (live walk 10-14). Each read runs the station's
+     ownership lookup (netstat + tasklist on Windows), and a read per refused poll — 236 in under two minutes in the live
+     check — only adds load to the very lookup that is timing out. The first refused call after a restart still reads at
+     once, so a clean restart reconnects as fast as before. */
+  const STALE_RETRY_MS = 3000;
+  let pageReadAt = -Infinity;
+  function staleRetryDue() { return !sessionStale || Date.now() - pageReadAt >= STALE_RETRY_MS; }
+  function stationUI(method, args) {
+    try { if (typeof StationUI !== 'undefined' && StationUI && StationUI[method]) StationUI[method].apply(StationUI, args); } catch (_) {}
+  }
+  function stationNotify(text, cls, opts) { stationUI('notify', [text, cls, undefined, opts]); }
+  // A withheld reason that re-running the ownership check can clear: the lookup failed or timed out (a loaded box), or
+  // the connection had no row yet (a race). Another account, or a platform with no check, never passes on a retry.
+  function withheldRetryable(reason) {
+    return reason === 'lookup-failed' || reason === 'peer-not-found';
+  }
+  // The withheld notice: why (sidecar/peerowner.js reason, in plain words), what it means, and the owner's way out —
+  // for a transient reason a reload (it re-runs the check) BEFORE the hatch that turns the check off.
+  function tokenWithheldNotice(reason) {
+    const r = String(reason || '');
+    if (!r) return '';
+    const why = r === 'lookup-failed' ? 'the ownership check timed out or failed'
+      : r === 'peer-not-found' ? 'the connection could not be traced'
+      : r === 'other-user' ? 'the connection belongs to another account'
+      : r === 'unsupported-platform' ? 'this system can’t run the ownership check'
+      : 'the ownership check did not pass';
+    return 'StarNet could not confirm this browser runs as your own user account (' + why + '), so it won’t take commands from this page. '
+      + (withheldRetryable(r) ? 'Reload this page to run the check again. If it keeps failing, open' : 'Open')
+      + ' StarNet from the desktop app, or if this is your own browser, restart StarNet with STARNET_TRUST_LOCAL_PEERS=1.';
+  }
+  // Shown ONCE per page life — at boot (init) or on the first refused call, whichever comes first — and kept in
+  // NOTIFICATIONS as one alert (key folds a repeat after a reload), because it outlives a toast's few seconds. A page
+  // that boots WITH its key marks an alert left by an earlier withheld page as handled, so the bell never keeps
+  // saying the station won't take commands after the owner fixed it.
+  let withheldNotified = false;
+  function noteTokenWithheld() {
+    if (!tokenWithheld) { stationUI('settleNotifs', ['token-withheld']); return; }
+    if (withheldNotified) return;
+    withheldNotified = true;
+    stationNotify(tokenWithheldNotice(tokenWithheld), 'warn', { kind: 'alert', key: 'token-withheld' });
+  }
+  // A NEW PAGE LIFE (Harness.init): say what is true of THIS page — why its key was withheld, or settle an earlier withheld
+  // alert — and mark a "station restarted" alert raised by an earlier page handled. That page is gone; this one booted with
+  // whatever key the station gave it, and a refused call of its own raises the alert again if it is still true.
+  function bootNotices() {
+    noteTokenWithheld();
+    stationUI('settleNotifs', [STALE_KEY]);
+  }
+  // A transient withheld reason re-runs the check (re-reads '/') at most once a minute, and only on a refused call.
+  const WITHHELD_RETRY_MS = 60000;
+  let withheldTriedAt = -Infinity;
+  function withheldRetryDue() {
+    if (!withheldRetryable(tokenWithheld)) return false;
+    const now = Date.now();
+    if (now - withheldTriedAt < WITHHELD_RETRY_MS) return false;
+    withheldTriedAt = now;
+    return true;
+  }
+  const staleToken = staleTokenRecovery({
+    rawFetch: (u, init) => { pageReadAt = Date.now(); return window.fetch(u, init); },   // '/' is not an API URL, so the wrapper passes it straight through
+    getToken: () => apiToken,
+    setToken: t => { apiToken = t; try { window.__STARNET_API_TOKEN__ = t; } catch (_) {} },   // apiticket.js mints from the window copy
+    // a withheld page re-reads '/' only when a transient retry is due (last: withheldRetryDue stamps the attempt)
+    canRefresh: () => !DESKTOP && !(typeof window !== 'undefined' && window.__STARNET_API__) && (!tokenWithheld || withheldRetryDue()) && staleRetryDue(),
+    onRecovered: () => {
+      sessionStale = false; staleNotified = false;
+      if (tokenWithheld) {   // the re-run ownership check passed: not a restart, and the withheld alert is now handled
+        tokenWithheld = '';
+        stationUI('settleNotifs', ['token-withheld']);
+        stationNotify('The ownership check passed on retry — this page can drive the station now.', 'good');
+        return;
+      }
+      stationUI('settleNotifs', [STALE_KEY]);   // the "has not picked up its new key" alert is handled now
+      stationNotify('The station service restarted — this page reconnected on its own.', 'good', { key: STALE_KEY });
+    },
+    onStale: () => {
+      if (tokenWithheld) { noteTokenWithheld(); return; }   // not a restart: say why the key was kept, never "restarted"
+      sessionStale = true;
+      if (!staleNotified) { staleNotified = true; stationNotify(staleLine(), 'warn', { kind: 'alert', key: STALE_KEY, onClick: reloadThisPage }); }
+    }
+  });
   if (typeof window !== 'undefined' && window.fetch && !window.__STARNET_FETCH_HARDENED__) {
     const rawFetch = window.fetch.bind(window);
     window.fetch = function (u, init) {
       if (!isApiUrl(u)) return rawFetch(u, init);
-      return ensureApiToken().then(t => rawFetch(u, withApiToken(init, t)));
+      // A Request input's body is single-use: keep a clone for the replay. A streamed body cannot be replayed at all.
+      const isReq = typeof Request !== 'undefined' && u instanceof Request;
+      let again = u;
+      try { if (isReq) again = u.clone(); } catch (_) { again = null; }
+      const body = init && init.body;
+      const replayable = again != null && !(body && typeof body.getReader === 'function');
+      return ensureApiToken().then(t => rawFetch(u, withApiToken(init, t)).then(res => {
+        noteStationReply(true);   // #137: the first answer after a silence re-syncs the desktop endpoints
+        return staleToken.settle(res, t, replayable ? fresh => rawFetch(again, withApiToken(init, fresh)) : null);
+      }, e => {
+        if (!(e && e.name === 'AbortError')) noteStationReply(false);   // no answer at all (a caller's abort is not one)
+        throw e;
+      }));
     };
     window.__STARNET_FETCH_HARDENED__ = true;
   }
 
   /* desktop: load the keychain "configured?" flag once at boot, before the connect screen reads it */
   async function init() {
+    bootNotices();   // a page the station kept its key from says why before its first refused call; an earlier page's restart alert is handled
     await ensureApiToken();
     // BEFORE the desktop early-return on purpose: managed credits live in the SIDECAR, not the keychain, so
     // they are configured identically in a browser build and a packaged one. Probing after the return would
     // leave configured('starnet') false forever anywhere that isn't Tauri — including every dev session.
     await refreshCreditsConfigured();
-    if (!DESKTOP) return;
+    if (!DESKTOP) { syncEngineKeysOnBoot(); return; }   // #89: never awaited — boot must not wait on it
+    pushDesktopEndpoints();   // #137: never awaited — the station's copy of each endpoint matches this window's
     let loaded = false;
     try {
       const status = await invoke('harness_provider_key_status');
       if (Array.isArray(status)) {
+        // #93: the keychain knows nothing about managed credits (KEYCHAIN_PROVIDERS has no starnet), so rebuilding
+        // the map from it erased the /api/credits answer probed just above — every desktop boot then read the
+        // linked station as unlinked (resume, pickers, KeyCTA) until SETTINGS re-probed. The sidecar owns it.
+        const starnet = !!_configuredByProvider.starnet;
         _configuredByProvider = Object.create(null);
         status.forEach(s => {
           const p = normalizeProviderId(s && s.provider);
           _configuredByProvider[p] = !!(s && s.configured);
           _alternateCountByProvider[p] = Math.max(0, Number(s && s.alternateCount) || 0);
         });
+        _configuredByProvider.starnet = starnet;
         _configured = !!_configuredByProvider.openrouter;
         loaded = true;
       }
@@ -277,10 +511,15 @@ const Harness = (() => {
   // connect screen demanding an API key they deliberately do not have.
   //
   // Called again after a link/unlink so selecting STARNET does not wait for a page reload.
+  // creditsEpoch: every call is "the account may have changed" — SETTINGS' shared credits read (stationui.js
+  // creditsRead) never serves an answer from an older epoch, whichever screen did the linking (review 10-14).
+  let creditsEpoch = 0;
   async function refreshCreditsConfigured() {
     selectionRevision++;
+    creditsEpoch++;
     try {
-      const r = await fetch('/api/credits?history=0', { cache: 'no-store' });
+      // probe=1: an unconfigured station answers 200 { configured:false } instead of the STORE's 404 (no console error on every load)
+      const r = await fetch('/api/credits?history=0&probe=1', { cache: 'no-store' });
       const j = (r && r.ok) ? await r.json() : null;
       _configuredByProvider.starnet = !!(j && j.configured);
     } catch (_) { _configuredByProvider.starnet = false; }
@@ -310,8 +549,9 @@ const Harness = (() => {
     if (p === 'cerebras') return 'cerebras';
     // managed credits — bearer is the linked device token (mirrors app.js + registry.js aliases)
     if (p === 'starnet' || p === 'starnet-cloud' || p === 'managed') return 'starnet';
-    if (p === 'claudecode' || p === 'claude-code' || p === 'claude-cli' || p === 'claude-login') return 'claudecode';   // the local claude CLI login (subscription, no key)
+    if (p === 'claudecode' || p === 'claude-login') return 'claude-cli';   // the fork's old id for the Claude login (saved configs) -> upstream's claude-cli
     if (p === 'ollama' || p === 'ollama-local') return 'ollama';
+    if (p === 'claude-cli' || p === 'claude-code' || p === 'claude-code-cli') return 'claude-cli';
     if (p === 'custom' || p === 'openai-compatible' || p === 'local' || p === 'vllm' || p === 'lmstudio') return 'custom';
     return 'openrouter';
   }
@@ -338,13 +578,13 @@ const Harness = (() => {
   function providerNeedsKey(provider) {
     const p = normalizeProviderId(provider);
     // codex/grok/kimi authenticate by device-code OAuth tokens held sidecar-side; ollama/custom are keyless
-    // endpoints; starnet's bearer is the linked device token, which the user never sees, let alone pastes.
-    return p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'custom' && p !== 'starnet' && p !== 'claudecode';
+    // endpoints; starnet's bearer is the linked device token, which the user never sees, let alone pastes;
+    // claude-cli authenticates with the local Claude CLI's own sign-in.
+    return p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'custom' && p !== 'starnet' && p !== 'claude-cli';
   }
   function configured(provider) {
     const p = normalizeProviderId(provider);
-    if (p === 'ollama') return true;
-    if (p === 'claudecode') return true;                   // the local claude CLI login: nothing to store; listModels proves sign-in
+    if (p === 'ollama' || p === 'claude-cli') return true;
     if (p === 'custom' && getBaseUrl(p)) return true;
     // STARNET MANAGED is configured IFF the sidecar reports live credits — in BOTH modes. It must not fall
     // through to the keyless branch below, which would answer "configured" for every station simply because
@@ -369,8 +609,10 @@ const Harness = (() => {
     // probe + app.js's status refresh) is the only local truth; in the browser the active-provider pick stands in.
     if (p === 'grok' || p === 'kimi') return DESKTOP ? !!_configuredByProvider[p] : (getProv() === p);
     if (p === 'ollama') return false;                      // an endpoint is configuration, never a credential
-    if (p === 'claudecode') return false;                  // the claude CLI's own login is not a StarNet-held credential
-    if (p === 'custom' && !getKey(p)) return false;        // a keyless custom endpoint must not manufacture a key row
+    if (p === 'claude-cli') return false;                  // the local CLI's own sign-in is not a StarNet credential
+    // a keyless custom endpoint must not manufacture a key row. On desktop getKey is '' by design, so the keychain
+    // map below is the custom key's only truth (GitHub #111: a saved desktop CUSTOM key read as keyless).
+    if (p === 'custom' && !DESKTOP && !getKey(p)) return false;
     if (DESKTOP) return !!(_configuredByProvider[p] || (p === 'openrouter' && _configured));
     if (!!readScoped(LS.key, p)) return true;              // a real key is stored in this browser
     // DEV seed: the host may hold a server-side runtime key for the seeded provider. It is not a given —
@@ -402,6 +644,7 @@ const Harness = (() => {
         .catch(e => { setDesktopConfigured(p, false); throw e; });
     }
     writeScoped(LS.key, p, k || '');
+    return syncEngineKey(p).then(engine => ({ engine }));   // #89: resolves (never rejects) with whether routines have it
   };
   function keyPoolSize(provider) {
     const p = normalizeProviderId(provider || getProv());
@@ -413,21 +656,194 @@ const Harness = (() => {
     const cleaned = Array.from(new Set((Array.isArray(keys) ? keys : []).map(k => String(k || '').trim()).filter(Boolean))).slice(0, 8);
     if (DESKTOP) {
       return invoke('harness_store_provider_key_pool', { provider: p, keys: cleaned })
-        .then(count => { _alternateCountByProvider[p] = Math.max(0, Number(count) || 0); return count; });
+        .then(count => { _alternateCountByProvider[p] = Math.max(0, Number(count) || 0); return { count }; });
     }
     writeScoped(LS.keyPool, p, JSON.stringify(cleaned));
-    return Promise.resolve(cleaned.length);
+    // #89: the station's copy follows the backups too — resolves { count, engine } like setKey's { engine }
+    return syncEngineKey(p).then(engine => ({ count: cleaned.length, engine }));
+  }
+  /* #89 THE STATION KEEPS A COPY. In the browser build a key lives in this page's localStorage and rides each
+     interactive /api/run — so chat works — but a scheduled routine, Run Now, the night shift or a line hop runs with
+     no page attached and resolves its key on the station. So whenever a provider's key, backups or endpoint change
+     here (and once per page boot for what is already saved), hand the station that provider's FULL config through the
+     token-gated /api/providers/engine-key; an all-empty config removes the station's copy. The desktop app (keychain)
+     and dev (server-held key) never call it, nor do the sign-in providers. Never rejects — the key is already saved in
+     this browser either way — and resolves { ok, error? }: whether unattended runs have it (presence only; the station
+     never echoes a key back).
+     localStorage is per ORIGIN (localhost:8787, 127.0.0.1:8787 and a forwarded port are three separate stores), so each
+     page remembers per provider the station revision it last proved (ENGINE_SYNC_SLOT { rev, pending }). A boot
+     hand-over carries that revision and the station takes it only if nothing changed since — an older page can never
+     put back a key the Commander rotated or removed elsewhere. A save or REMOVE that failed to reach the station is
+     `pending`: the next page boot retries it (on the same condition) until the station confirms it. */
+  const ENGINE_SYNC_SKIP = { codex: 1, grok: 1, kimi: 1, starnet: 1, 'claude-cli': 1 };
+  const ENGINE_SYNC_SLOT = 'starnet.byok.engineSync';
+  const ENGINE_RETRY_NOTE = ' — this page retries the next time it loads';
+  function engineConfigOf(p) {
+    let keyPool = [];
+    try { const pool = JSON.parse(readScoped(LS.keyPool, p) || '[]'); if (Array.isArray(pool)) keyPool = pool; } catch (_) { keyPool = []; }
+    return { provider: p, key: readScoped(LS.key, p) || '', keyPool, baseUrl: readScoped(LS.baseUrl, p) || '' };
+  }
+  function engineSyncState(p) {
+    try {
+      const s = JSON.parse(localStorage.getItem(providerSlot(ENGINE_SYNC_SLOT, p)) || 'null');
+      if (s && typeof s === 'object') return { rev: String(s.rev || ''), pending: s.pending === true };
+    } catch (_) { /* unreadable = this page has proved nothing yet */ }
+    return { rev: '', pending: false };
+  }
+  function setEngineSyncState(p, s) {
+    try {
+      if (!s.rev && !s.pending) localStorage.removeItem(providerSlot(ENGINE_SYNC_SLOT, p));
+      else localStorage.setItem(providerSlot(ENGINE_SYNC_SLOT, p), JSON.stringify({ rev: s.rev || '', pending: !!s.pending }));
+    } catch (_) { /* storage full/blocked: the next explicit save still hands the station its copy */ }
+  }
+  async function syncEngineKey(provider, boot) {
+    const p = normalizeProviderId(provider || getProv());
+    if (DESKTOP || DEVMODE || ENGINE_SYNC_SKIP[p]) return { ok: true, skipped: true };
+    const config = engineConfigOf(p);
+    const removing = !(config.key || config.keyPool.length || config.baseUrl);
+    const state = engineSyncState(p);
+    const body = boot ? Object.assign({}, config, { boot: true, ifRev: state.rev }) : config;
+    let out, retry = false;
+    try {
+      const r = await fetch('/api/providers/engine-key', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const text = await r.text().catch(() => '');
+      let j = {}; try { j = JSON.parse(text) || {}; } catch (_) { j = {}; }
+      if (r.ok && j.ok) {
+        out = { ok: true, keySource: String(j.keySource || ''), unattendedReady: !!j.unattendedReady };
+        // stale = another page changed this provider on the station since this one last did: keep the revision this
+        // page proved (never the newer one — that would let this page's older config win its next boot)
+        if (j.stale) out.stale = true;
+        setEngineSyncState(p, { rev: j.stale ? state.rev : String(j.rev || ''), pending: false });
+      } else {
+        retry = r.status >= 500;
+        out = { ok: false, error: j.error ? String(j.error) : removing
+          ? 'the station refused to delete its copy of this connection (HTTP ' + r.status + ') — routines and other unattended runs keep using it until a retry succeeds'
+          : 'the station refused to keep a copy for routines (HTTP ' + r.status + ') — chat in this browser still works' };
+      }
+    } catch (_) {
+      retry = true;
+      out = { ok: false, error: removing
+        ? 'the station could not be reached to delete its copy of this connection — routines and other unattended runs keep using it until a retry succeeds'
+        : 'the station could not be reached to keep a copy for routines — chat in this browser still works' };
+    }
+    if (!out.ok) {
+      if (retry) { setEngineSyncState(p, { rev: state.rev, pending: true }); out.error += ENGINE_RETRY_NOTE; }
+      console.warn('[harness] ' + p + ': ' + out.error);
+    }
+    return out;
+  }
+  // once per page boot: every provider this browser holds a key, backup pool or endpoint for, plus any whose last
+  // change (a save OR a REMOVE) never reached the station. Each rides as a BOOT hand-over (see above): it fills a
+  // station that holds nothing and retries this page's own failed change, but never overwrites a newer one.
+  function syncEngineKeysOnBoot() {
+    if (DESKTOP || DEVMODE) return Promise.resolve([]);
+    const seen = new Set();
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = String(localStorage.key(i) || '');
+        if (k === LS.key || k === LS.keyPool || k === LS.baseUrl) seen.add('openrouter');
+        for (const base of [LS.key, LS.keyPool, LS.baseUrl, ENGINE_SYNC_SLOT]) if (k.indexOf(base + '.') === 0) seen.add(normalizeProviderId(k.slice(base.length + 1)));
+      }
+    } catch (_) { return Promise.resolve([]); }   // storage unavailable: nothing saved here to hand over
+    const jobs = [];
+    for (const p of seen) {
+      const c = engineConfigOf(p);
+      if (c.key || c.keyPool.length || c.baseUrl || engineSyncState(p).pending) jobs.push(syncEngineKey(p, true));
+    }
+    return Promise.all(jobs);
+  }
+  /* #137 DESKTOP ENDPOINT HAND-OVER. On the desktop app the OS keychain holds provider KEYS only; a provider's endpoint
+     (a CUSTOM base URL, an Ollama that is not on this machine) lives in this window's storage, and the station keeps
+     the CUSTOM / Ollama copy it was last handed (sidecar/index.js DESKTOP_ENDPOINTS_FILE — before 0.14.0 that copy was
+     memory, so every app restart or respawn left routines, Run Now, line hops, channels and phone runs failing "no
+     CUSTOM base URL is saved on this station" while chat kept working; a cloud provider's override is still held for
+     the session only). The window is the source: once per page boot (init), after ENGINE
+     RESTART, and on the first answer after this page saw the station stop answering, the page hands the station every
+     endpoint slot it holds — a cleared slot as a clear — so the station's copy matches this window. With NO key, so the
+     keychain is never touched (harness_store_provider_key writes the keychain only when a key is given). Never rejects
+     and never awaited by boot; a failed hand-over is logged and tried again at the next come-back. */
+  function desktopEndpointsHeld() {
+    const held = new Map();
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = String(localStorage.key(i) || '');
+        const p = k === LS.baseUrl ? 'openrouter' : (k.indexOf(LS.baseUrl + '.') === 0 ? normalizeProviderId(k.slice(LS.baseUrl.length + 1)) : '');
+        // starnet's endpoint is the linked account's (the sidecar resolves it); the shell would file it under openrouter
+        if (!p || p === 'starnet' || held.has(p)) continue;
+        held.set(p, String(readScoped(LS.baseUrl, p) || '').trim());   // '' = this window cleared it: the station forgets its copy
+      }
+    } catch (_) { /* storage unavailable: no endpoint saved here to hand over */ }
+    return held;
+  }
+  let endpointHandOver = null;
+  function pushDesktopEndpoints() {
+    if (!DESKTOP) return Promise.resolve([]);
+    if (endpointHandOver) return endpointHandOver;   // one hand-over in flight at a time
+    const jobs = [];
+    desktopEndpointsHeld().forEach((baseUrl, provider) => {
+      jobs.push(Promise.resolve().then(() => invoke('harness_store_provider_key', { provider, baseUrl }))
+        .then(() => ({ provider, ok: true }), e => {
+          console.warn('[harness] ' + provider + ': could not hand the station its endpoint: ' + ((e && e.message) || e));
+          return { provider, ok: false };
+        }));
+    });
+    endpointHandOver = Promise.all(jobs).then(out => { endpointHandOver = null; return out; });
+    return endpointHandOver;
+  }
+  // the /api fetch wrapper reports each call: false = the station did not answer at all (a refused connection while it
+  // respawns), true = it answered. The first answer after a silence re-syncs the endpoints (a change made in the gap).
+  let stationSilent = false;
+  function noteStationReply(answered) {
+    if (!DESKTOP) return;
+    if (!answered) { stationSilent = true; return; }
+    if (!stationSilent) return;
+    stationSilent = false;
+    pushDesktopEndpoints();
+  }
+  // #62: no provider key contains whitespace — a key pasted out of a narrow SSH terminal can carry a line wrap (or a
+  // zero-width char from a web page) in its MIDDLE, which .trim() never removed. Strip them all (the sidecar does too).
+  const cleanKey = k => String(k == null ? '' : k).replace(/[\s\u200b-\u200d\u2060\ufeff]+/g, '');
+  /* #62: WHY a key check failed, in words. The sidecar's /api/providers/validate answers 200 with { error } for a
+     provider verdict, but the route itself can be refused before it runs (403 forbidden origin/host/token, 423 frozen)
+     with a non-JSON body — which used to fold into "the provider did not verify this key" while the provider was
+     never even asked. Name the station's refusal and its fix instead. PURE (test-locked). */
+  function keyCheckFailure(status, j, text) {
+    j = j || {};
+    if (j.error) return String(j.error);
+    const t = String(text == null ? '' : text).trim().slice(0, 80);
+    if (status >= 200 && status < 300) return 'the provider did not verify this key';
+    // a page the station KEPT its key from refuses every key save with 'forbidden token' too — that is not a restart
+    // (review threads-backend-05). The typeof guard keeps this pure when a test lifts it on its own.
+    const withheld = typeof tokenWithheld === 'string' && tokenWithheld;
+    const hint = /forbidden origin/.test(t) ? ' — this page’s address doesn’t match the station; open StarNet at the exact address you forward to it'
+      : /forbidden host/.test(t) ? ' — StarNet answers only on localhost / 127.0.0.1; reach it through a port forward, not a hostname'
+      : /forbidden token/.test(t) && withheld ? ' — this browser was not verified as running under your own user account, so the station kept its key from this page (see the notice)'
+      : /forbidden token/.test(t) ? ' — the station restarted since this page loaded; reload the page'
+      : '';
+    return 'the station refused the key check (HTTP ' + status + (t && !/^[{<]/.test(t) ? ' ' + t : '') + ')' + hint;
+  }
+  // the key check's failure in words a first-time user can act on: an unreachable or overloaded PROVIDER is not a
+  // key problem, and "fetch failed (ECONNREFUSED)" / "credential probe HTTP 503" say nothing to a beginner. Same
+  // classifier the run errors use (Friendly); the raw cause rides along in brackets. Anything else passes through.
+  function keyCheckLine(why) {
+    let kind = '';
+    try { kind = (typeof Friendly !== 'undefined' && Friendly.friendlyError) ? Friendly.friendlyError(new Error(why)).kind : ''; } catch (_) {}
+    if (kind === 'provider_unreachable') return 'couldn’t reach the AI provider — check your internet connection, VPN or proxy, then try again (' + why + ')';
+    if (kind === 'provider_server_error') return 'the AI provider’s servers are having trouble right now — wait a moment and try again (' + why + ')';
+    return why;
+  }
+  async function postKeyCheck(route, body) {
+    const r = await fetch(route, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const text = await r.text().catch(() => '');
+    let j = {}; try { j = JSON.parse(text) || {}; } catch (_) { j = {}; }
+    return { r, j, text };
   }
   async function validateAndSetKeyPool(keys, provider) {
     const p = normalizeProviderId(provider || getProv());
-    const cleaned = Array.from(new Set((Array.isArray(keys) ? keys : []).map(k => String(k || '').trim()).filter(Boolean))).slice(0, 8);
+    const cleaned = Array.from(new Set((Array.isArray(keys) ? keys : []).map(cleanKey).filter(Boolean))).slice(0, 8);
     for (const candidate of cleaned) {
-      const r = await fetch('/api/providers/validate', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider: p, key: candidate, baseUrl: getBaseUrl(p) || '', model: p === getProv() ? getModel() : '' })
-      });
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok || !j.credentialVerified) throw new Error(String(j.error || 'a backup key was rejected') + ' — your previous backup pool is unchanged');
+      const { r, j, text } = await postKeyCheck('/api/providers/validate', { provider: p, key: candidate, baseUrl: getBaseUrl(p) || '', model: p === getProv() ? getModel() : '' });
+      if (!r.ok || !j.credentialVerified) throw new Error((r.ok && !j.error ? 'a spare key was rejected' : keyCheckFailure(r.status, j, text)) + ' — your previous spare keys are unchanged');
     }
     return setKeyPool(cleaned, p);
   }
@@ -454,18 +870,23 @@ const Harness = (() => {
     // and the next prompt re-measures): blank the gauge honestly rather than show a stale fill.
     // The learned overheads survive — they are keyed BY MODEL, so switching back re-uses the
     // calibration that model already earned instead of going blind again.
-    if ((m || '') !== prev) { contextByKey = {}; runConv = {}; }
+    if ((m || '') !== prev) { contextByKey = {}; runConv = {}; contextRev++; }
   };
   const getProv = () => normalizeProviderId(localStorage.getItem(LS.prov) || 'openrouter');
   const setProv = p => { selectionRevision++; localStorage.setItem(LS.prov, normalizeProviderId(p || 'openrouter')); };
   const getBaseUrl = provider => readScoped(LS.baseUrl, provider);
+  // GitHub #111: a rejected desktop endpoint store used to be swallowed, so SETTINGS said "saved" while the station never
+  // got the endpoint. setBaseUrl still never rejects; it resolves the failure in the { engine } shape warnIfStationLacksKey reads.
+  function desktopEndpointFailed(p, e) {
+    console.warn('[harness] ' + p + ': desktop endpoint store failed: ' + ((e && e.message) || e));
+    return { engine: { ok: false, error: 'the endpoint change is saved in this window, but the desktop could not apply it to the station — retry ✎ ENDPOINT URL before running' } };
+  }
   const setBaseUrl = (u, provider) => {
     selectionRevision++;
     const p = normalizeProviderId(provider || getProv());
     writeScoped(LS.baseUrl, p, u || '');
-    if (DESKTOP) {
-      return invoke('harness_store_provider_key', { provider: p, baseUrl: u || '' }).catch(() => {});
-    }
+    if (DESKTOP) return invoke('harness_store_provider_key', { provider: p, baseUrl: u || '' }).catch(e => desktopEndpointFailed(p, e));
+    return syncEngineKey(p).then(engine => ({ engine }));   // #89: an endpoint saved here reaches unattended runs too (resolves { engine } like setKey)
   };
   function defaultReasoningEffortForProvider(provider) {
     const p = normalizeProviderId(provider);
@@ -489,6 +910,18 @@ const Harness = (() => {
   }
   const getReasoningEffort = provider => normalizeReasoningEffort(readScoped(LS.effort, provider) || defaultReasoningEffortForProvider(provider));
   const setReasoningEffort = (e, provider) => writeScoped(LS.effort, provider || getProv(), normalizeReasoningEffort(e));
+  // 0.12.5 reasoning migration (App calls it once per save, see app.js migrateLegacyReasoning): drop an inherited OFF
+  // for providers whose 0.12.4 dock locked every model at OFF while the adapter sent nothing, so the provider default
+  // applies again instead of 0.12.5 sending reasoning_effort 'none'.
+  function clearLegacyReasoningOff(providers) {
+    for (const raw of (Array.isArray(providers) ? providers : [])) {
+      const p = normalizeProviderId(raw);
+      try {
+        const stored = localStorage.getItem(providerSlot(LS.effort, p));
+        if (stored && normalizeReasoningEffort(stored) === 'none') localStorage.removeItem(providerSlot(LS.effort, p));
+      } catch (_) { /* storage unavailable: nothing inherited to clear */ }
+    }
+  }
 
   /* per-million pricing for a model id, if known from the catalog */
   function priceOf(id) {
@@ -506,6 +939,12 @@ const Harness = (() => {
   function contextLimitOf(id) {
     const m = catalogModel(id);
     return (m && m.context_length) || 0;
+  }
+  // the window a RUN on this route works in (the sidecar's /api/models runWindow: the model's own, stopped at a
+  // long-context price tier the spend caps do not price); 0 = the catalog did not say
+  function runWindowOf(id) {
+    const m = catalogModel(id);
+    return (m && m.runWindow) || 0;
   }
 
   /* Context-window occupancy for ONE conversation — the question the bottom-bar gauge actually asks
@@ -537,7 +976,11 @@ const Harness = (() => {
     const hasRec = !!(rec && rec.used > 0 && rec.model);
     const model = (hasRec && rec.model) || getModel() || '';
     const limit = contextLimitOf(model);
-    const base = { agentId: aid, streamId: String(streamId || ''), model, limit };
+    // runWindow: the window a RUN on this route works in, so the place it folds (runWindowOf: the model's window stopped
+    // at a long-context price tier, final-polish 10-23). The gauge measures against it; `limit` stays the model's own
+    // window, which composer fit checks keep using (the sidecar folds a run inside the smaller one)
+    const run = runWindowOf(model);
+    const base = { agentId: aid, streamId: String(streamId || ''), model, limit, runWindow: (run > 0 && limit > 0 && run < limit) ? run : limit };
 
     // 1. in flight — report what the provider says the model is holding this second
     if (hasRec && rec.live) return Object.assign(base, { used: rec.used, measured: true, projected: false });
@@ -572,9 +1015,13 @@ const Harness = (() => {
       pricing: (m && m.pricing) || null,
       context_length: (m && +m.context_length) || 0,
       supportsTools: (m && typeof m.supportsTools === 'boolean') ? m.supportsTools : (params.length ? params.indexOf('tools') >= 0 : true),
-      supportsReasoning: !!(m && m.supportsReasoning),
+      // unknown stays unknown (null) — false would lock the model dock to reasoning OFF (sidecar publicModel, same law)
+      supportsReasoning: (m && typeof m.supportsReasoning === 'boolean') ? m.supportsReasoning : null,
       supported_parameters: params,
-      reasoningEfforts: Array.isArray(m && m.reasoningEfforts) ? m.reasoningEfforts.slice() : []
+      reasoningEfforts: Array.isArray(m && m.reasoningEfforts) ? m.reasoningEfforts.slice() : [],
+      defaultReasoningLevel: (m && m.defaultReasoningLevel) || null,
+      reasoningNote: (m && typeof m.reasoningNote === 'string' && m.reasoningNote) || null,
+      runWindow: (m && +m.runWindow) || 0
     };
   }
 
@@ -611,6 +1058,9 @@ const Harness = (() => {
         if (p === 'openrouter') list = await fetchModelCatalog(OR + '/models', 'data');
         else list = [];
       }
+      // OpenRouter's catalog (and the managed one, which passes it through) lists batch-only '<id>:batch' rows that
+      // chat/completions refuses with a 404: never offer one (the sidecar route drops them too; the direct fallback above does not)
+      if (p === 'openrouter' || p === 'starnet') list = list.filter(m => !/:batch$/i.test(m.id));
       list.sort((a, b) => a.id.localeCompare(b.id));
       // scope the catalog to the provider it was fetched FOR — never to a shared map another
       // provider's warm can overwrite (see modelsByProv above).
@@ -632,7 +1082,7 @@ const Harness = (() => {
     const p = normalizeProviderId(provider || getProv());
     const baseUrl = getBaseUrl(p) || '';
     const credentialSaved = hasStoredCredential(p);
-    const endpointConfigured = p === 'ollama' || p === 'claudecode' || (p === 'custom' && !!baseUrl);
+    const endpointConfigured = p === 'ollama' || p === 'claude-cli' || (p === 'custom' && !!baseUrl);
     const selected = p === getProv();
     const fallback = { provider: p, credentialSaved, endpointConfigured, reachable: false, catalogAvailable: false, credentialVerified: false, selected, error: 'station unreachable' };
     if (p === 'custom' && !endpointConfigured) return Object.assign({}, fallback, { error: 'endpoint not configured' });
@@ -641,32 +1091,34 @@ const Harness = (() => {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ provider: p, key: getKey(p) || '', baseUrl })
       });
-      const j = await r.json().catch(() => ({}));
+      const text = await r.text().catch(() => '');
+      let j = {}; try { j = JSON.parse(text) || {}; } catch (_) { j = {}; }
       return {
         provider: p, credentialSaved, endpointConfigured,
         reachable: !!(r.ok && j.reachable), catalogAvailable: !!(j && j.catalogAvailable),
         credentialVerified: !!(j && j.credentialVerified), selected,
-        error: String((j && j.error) || '')
+        // a refused probe (403 origin/host/token) names the refusal, never a blank "check failed" (#62)
+        error: r.ok ? String((j && j.error) || '') : keyCheckFailure(r.status, j, text).replace('key check', 'provider check')
       };
     } catch (_) { return fallback; }
   }
 
   // Replace a credential as one user-visible operation: prove the candidate first, then commit it. Validation
   // never mutates provider state, so a rejection/timeout leaves the previous working key untouched.
-  async function validateAndSetKey(key, provider) {
+  // `model`: the model the caller is about to run. Onboarding checks the key BEFORE it stores its pick, so the stored
+  // pick was the wrong one there (#126: a CUSTOM key was tested on the endpoint's first-listed model and refused).
+  async function validateAndSetKey(key, provider, model) {
     const p = normalizeProviderId(provider || getProv());
-    const candidate = String(key || '').trim();
+    const candidate = cleanKey(key);
     if (!candidate) return setKey('', p);
-    const r = await fetch('/api/providers/validate', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider: p, key: candidate, baseUrl: getBaseUrl(p) || '', model: p === getProv() ? getModel() : '' })
-    });
-    const j = await r.json().catch(() => ({}));
+    const hadKey = hasStoredCredential(p);   // a first-time WAKE has no previous key to keep — never claim one
+    const checkModel = String(model || '').trim() || (p === getProv() ? getModel() : '');
+    const { r, j, text } = await postKeyCheck('/api/providers/validate', { provider: p, key: candidate, baseUrl: getBaseUrl(p) || '', model: checkModel });
     if (!r.ok || !j.credentialVerified) {
-      throw new Error(String(j.error || 'the provider did not verify this key') + ' — your previous key is unchanged');
+      throw new Error(keyCheckLine(keyCheckFailure(r.status, j, text)) + (hadKey ? ' — your previous key is unchanged' : ' — nothing was saved'));
     }
-    await Promise.resolve(setKey(candidate, p));
-    return Object.assign({}, j, { stored: true });
+    const stored = await Promise.resolve(setKey(candidate, p));
+    return Object.assign({}, j, { stored: true }, (stored && stored.engine) ? { engine: stored.engine } : {});
   }
 
   // PURE (test-locked in harness-internal.test.js): fold a sidecar error-response body into the human tail of
@@ -687,19 +1139,268 @@ const Harness = (() => {
     return t;
   }
 
+  /* ONE STREAM FOR EVERY RUN THIS PAGE WATCHES (2026-10-21; sidecar/run-streams.js is the station half).
+     A browser opens at most six HTTP/1.1 connections to one host — Chromium, WebView2 (the Windows app) and WebKit (the
+     Mac app) alike — and every run used to hold one for its whole life: POST /api/run answered with the run's own
+     stream, held open through each approval pause. Five paused conversations plus the station's SSE bridge filled the
+     pool, and everything else the page asked for queued behind them: the next conversation never started, Approve/Deny
+     never left the page, the NEEDS YOU feeds never loaded, and each paused run waited on an answer that was waiting on
+     it until the ask timed out to a denial.
+     Now the page holds ONE stream (GET /api/run/stream) for all of its runs, opened when a run starts and closed a few
+     seconds after the last one ends (an idle page holds no extra connection). A run names it on its POST
+     ({ stream: { id, key } }), the POST is answered at once, and the run's lines arrive on the stream tagged with the
+     key this page chose for it; chat() reads them through the same reader it always used. Leaving means what it meant:
+     the stream closing (a reload, a closed tab, a lost connection) stops every run on it, and a run whose fetch is
+     aborted is withdrawn, the station's half of closing that run's own response. A station without the route (404), a
+     stream that cannot open, or one held back before its first line (a buffering proxy) leaves runs on their own
+     response, as before. */
+  const runStream = (() => {
+    const IDLE_MS = 4000;     // the stream outlives its last run by this much, so back-to-back runs reuse it
+    const READY_MS = 10000;   // a stream whose first line has not arrived by then is being held back (a buffering proxy)
+    const SKIP_MS = 120000;   // …and runs keep their own response this long before the page tries a stream again
+    const END = ',"end":true}';   // a run's last line is exactly {"k":"<key>","end":true}
+    const enc = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
+    let cur = null;           // the open (or opening) stream: { id, ready, sinks: Map(key -> sink), ac, dead }
+    let idleTimer = null;
+    let unsupported = false;  // the station answered 404: runs keep their own response
+    let skipUntil = 0;        // a stream that never said ready: runs keep their own response until then
+    function newKey() {
+      const b = new Uint8Array(16);
+      try { crypto.getRandomValues(b); } catch (_) { for (let i = 0; i < b.length; i++) b[i] = Math.floor(Math.random() * 256); }
+      return Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+    }
+    function abortReason(signal) {
+      if (signal && signal.reason !== undefined) return signal.reason;   // what fetch() rejects with for this signal
+      try { return new DOMException('The operation was aborted.', 'AbortError'); }
+      catch (_) { const e = new Error('The operation was aborted.'); e.name = 'AbortError'; return e; }
+    }
+    function clearIdle() { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } }
+    function idleCheck() {
+      if (idleTimer || !cur || cur.sinks.size) return;
+      const s = cur;
+      idleTimer = setTimeout(() => { idleTimer = null; if (cur === s && !s.sinks.size) lost(s, null); }, IDLE_MS);
+    }
+    // the stream is over: a loss errors every run on it (each chat() reads it as its own stream breaking), a clean end
+    // (or the idle close) ends them (a run without its own end line then reads as a reply cut short, as before)
+    function lost(s, err) {
+      if (s.dead) return;
+      s.dead = true;
+      if (s.readyTimer) { clearTimeout(s.readyTimer); s.readyTimer = null; }
+      if (cur === s) { cur = null; clearIdle(); }
+      try { s.reject(err || new Error('the station closed the run stream')); } catch (_) {}
+      const sinks = [...s.sinks.values()];
+      s.sinks.clear();
+      for (const sink of sinks) { if (err) sink.fail(err); else sink.close(); }
+      try { s.ac.abort(); } catch (_) {}
+    }
+    function route(s, line) {
+      if (line.charCodeAt(0) !== 123) return;   // not '{': the keepalive's blank line
+      if (line.startsWith('{"k":"')) {
+        const q = line.indexOf('"', 6);
+        const sink = q > 6 ? s.sinks.get(line.slice(6, q)) : null;
+        if (!sink) return;   // a run this page no longer reads: its lines go nowhere, as an unread response's did
+        if (line.length === q + 1 + END.length && line.endsWith(END)) { s.sinks.delete(sink.key); sink.close(); idleCheck(); }
+        else sink.push(line);
+        return;
+      }
+      let j = null;
+      try { j = JSON.parse(line); } catch (_) { return; }
+      if (j && j.stream === 'ready' && j.id && !s.id) {
+        s.id = String(j.id);
+        if (s.readyTimer) { clearTimeout(s.readyTimer); s.readyTimer = null; }
+        s.resolve(s.id);
+      }
+    }
+    async function pump(s, reader) {
+      const dec = new TextDecoder();
+      let buf = '';
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          buf += done ? dec.decode() : dec.decode(value, { stream: true });
+          let nl;
+          while ((nl = buf.indexOf('\n')) >= 0) {
+            const line = buf.slice(0, nl);
+            buf = buf.slice(nl + 1);
+            if (line) route(s, line);
+          }
+          if (done) break;
+        }
+        lost(s, null);
+      } catch (e) { lost(s, e); }
+      try { reader.releaseLock(); } catch (_) {}
+    }
+    function open() {
+      const s = { id: '', sinks: new Map(), ac: new AbortController(), dead: false, resolve: null, reject: null, readyTimer: null };
+      s.ready = new Promise((resolve, reject) => { s.resolve = resolve; s.reject = reject; });
+      s.ready.catch(() => {});   // each run that joins reads it; a stream nobody waits on must not log an unhandled rejection
+      // a stream held back before its first line (a proxy that buffers it) must never hold the runs waiting on it
+      s.readyTimer = setTimeout(() => {
+        s.readyTimer = null;
+        if (s.id || s.dead) return;
+        skipUntil = Date.now() + SKIP_MS;
+        lost(s, new Error('the station\'s run stream did not open in time'));
+      }, READY_MS);
+      (async () => {
+        let res;
+        try { res = await fetch('/api/run/stream', { cache: 'no-store', signal: s.ac.signal }); }
+        catch (e) { return lost(s, e); }
+        if (res.status === 404) unsupported = true;
+        if (!res.ok || !res.body) return lost(s, new Error('sidecar HTTP ' + res.status));
+        pump(s, res.body.getReader());
+      })();
+      return s;
+    }
+    /* A run joins the page's stream: { key, ready: Promise<stream id>, stream: the run's own ReadableStream, release(),
+       drop(), abandon() }. null where the page cannot hold one (no ReadableStream, or a station without the route).
+       Aborting `signal` errors the run's stream with what fetch() rejects with and withdraws the run on the station.
+       release(): done reading — a run that ended already left; one this page stopped reading early stays (its lines go
+       nowhere) until its own end line, so the stream outlives it as that run's unread response would have.
+       drop(): the station never took this run (its POST was refused or answered on its own response).
+       abandon(): its POST failed on the way, so the station may hold it — withdraw it, as the lost connection did. */
+    function join(signal) {
+      if (unsupported || Date.now() < skipUntil || !enc || typeof ReadableStream === 'undefined' || typeof AbortController === 'undefined') return null;
+      clearIdle();
+      if (!cur || cur.dead) cur = open();
+      const s = cur, key = newKey();
+      let ctrl = null, state = 'open';
+      const stream = new ReadableStream({ start(c) { ctrl = c; } });
+      const sink = {
+        key,
+        push(line) { if (state === 'open') { try { ctrl.enqueue(enc.encode(line + '\n')); } catch (_) {} } },
+        close() { if (state === 'open') { state = 'closed'; try { ctrl.close(); } catch (_) {} } },
+        fail(e) { if (state === 'open') { state = 'failed'; try { ctrl.error(e); } catch (_) {} } },
+        detach() { if (state === 'open') state = 'detached'; }
+      };
+      s.sinks.set(key, sink);
+      let withdrawn = false;
+      const withdraw = () => {
+        if (withdrawn || !s.id || s.dead) return;   // no id yet: its POST was never sent, so nothing waits on the station
+        withdrawn = true;
+        fetch('/api/run/stream/withdraw', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stream: s.id, key }) })
+          .catch(e => console.warn('[run-stream] could not withdraw a stopped run:', (e && e.message) || e));
+      };
+      const onAbort = () => { sink.fail(abortReason(signal)); if (s.sinks.get(key) === sink) s.sinks.delete(key); withdraw(); idleCheck(); };
+      const off = () => { if (signal) { try { signal.removeEventListener('abort', onAbort); } catch (_) {} } };
+      if (signal) { if (signal.aborted) onAbort(); else signal.addEventListener('abort', onAbort, { once: true }); }
+      const drop = () => { off(); if (s.sinks.get(key) === sink) s.sinks.delete(key); sink.close(); idleCheck(); };
+      return {
+        key, stream, ready: s.ready, drop,
+        release() { off(); if (s.sinks.get(key) === sink) sink.detach(); idleCheck(); },
+        abandon() { drop(); withdraw(); }
+      };
+    }
+    // what the page holds right now (diagnostics and the live proof): one stream at most, and how many runs ride it
+    function state() { return { open: !!(cur && !cur.dead), id: (cur && cur.id) || '', runs: cur ? cur.sinks.size : 0, unsupported, heldBack: Date.now() < skipUntil }; }
+    return { join, state };
+  })();
+
+  /* A RUN A BUTTON STARTS — a routine's Run now / Retry, an app's refresh, a workshop build — rides the same ONE stream:
+     the POST names it and is answered at once, and the run's lines arrive on the stream (a station that answers with the
+     run's own NDJSON stream is read from that response instead). Resolves { ok, status, j, done }:
+       ok/status/j  the station's answer to the POST (j: its receipt, or the refusal it answered with)
+       done         settles when the run's last line arrives, with that last { name, payload } (a route's *.result line);
+                    rejects when the stream breaks first. Read to the end either way, so nothing piles up unread.
+     onEvent(name, payload) sees every line as it arrives. Never throws: an unreachable station is { ok:false, status:0 }. */
+  async function streamPost(path, body, opts) {
+    const o = opts || {}, signal = o.signal;
+    const payload = Object.assign({}, body || {});
+    let shared = runStream.join(signal);
+    if (shared) {
+      try { payload.stream = { id: await shared.ready, key: shared.key }; }
+      catch (_) { shared.drop(); shared = null; }
+    }
+    const post = () => fetch(path, { method: 'POST', signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    let res;
+    try {
+      res = await post();
+      if (shared && res.status === 409) {   // the stream closed under this POST: refused before any work, so once more on its own response
+        let gone = false;
+        try { gone = /run_stream_gone/.test(await res.clone().text()); } catch (_) {}
+        if (gone) { shared.drop(); shared = null; delete payload.stream; res = await post(); }
+      }
+    } catch (e) {
+      if (shared) shared.abandon();   // the POST may have reached the station: withdraw it (an abort already did)
+      const failed = Promise.reject(e); failed.catch(() => {});
+      return { ok: false, status: 0, j: { error: 'the station could not be reached: ' + ((e && e.message) || e) }, done: failed };
+    }
+    if (!res.ok) {
+      if (shared) shared.drop();
+      let j = {};
+      try { j = (await res.json()) || {}; } catch (_) { j = {}; }
+      return { ok: false, status: res.status, j, done: Promise.resolve(null) };
+    }
+    let j = {}, source = res.body || null;
+    const type = String((res.headers && typeof res.headers.get === 'function' && res.headers.get('content-type')) || '');
+    if (shared && /json/i.test(type)) { try { j = (await res.json()) || {}; } catch (_) { j = {}; } source = shared.stream; }
+    else if (shared) { shared.drop(); shared = null; }
+    const done = (async () => {
+      if (!source) return null;
+      const reader = source.getReader(), dec = new TextDecoder();
+      let buf = '', last = null;
+      try {
+        for (;;) {
+          const { value, done: end } = await reader.read();
+          buf += end ? dec.decode() + '\n' : dec.decode(value, { stream: true });
+          let nl;
+          while ((nl = buf.indexOf('\n')) >= 0) {
+            const s = buf.slice(0, nl).trim();
+            buf = buf.slice(nl + 1);
+            if (!s) continue;
+            let ev; try { ev = JSON.parse(s); } catch (_) { continue; }
+            if (!ev || typeof ev.name !== 'string') continue;
+            last = { name: ev.name, payload: ev.payload || {} };
+            if (o.onEvent) { try { o.onEvent(last.name, last.payload); } catch (e) { console.warn('[run-stream] a line handler failed:', (e && e.message) || e); } }
+          }
+          if (end) break;
+        }
+      } finally {
+        try { reader.releaseLock(); } catch (_) {}
+        if (shared) shared.release();
+      }
+      return last;
+    })();
+    done.catch(() => {});   // a caller that never awaits it (a fire-and-forget Retry) must not log an unhandled rejection
+    return { ok: true, status: res.status, j, done };
+  }
+
   /* Run an agent turn/task through the LOCAL SIDECAR (node sidecar/index.js), which holds the
      real agent loop + tools (web, files). We POST the request and read the response body as a
      stream of newline-delimited JSON events — the FROZEN agent.* U.bus events the harness emits.
      Each event is re-emitted on U.bus (for telemetry) and mapped to the caller's callbacks.
      onToken(delta) per text delta · onToolCall/onToolResult per tool step · onUsage per turn. */
-  async function chat({ system, messages, onToken, onTerminalReset, onUsage, onToolCall, onToolResult, onRunId, onDeliverable, onPermission, onSummon, agentId, isTask, recurring, signal, streamId, recipeId, workbench, placed, stationPlaced, internal, evidence, projectRoot, taskAction, postconditions, recovery, connectorContinuationOf, retryUserRunId }) {
+  async function chat({ system, messages, onToken, onTerminalReset, onUsage, onToolCall, onToolResult, onRunId, onDeliverable, onPermission, onSummon, agentId, isTask, recurring, signal, streamId, recipeId, workbench, placed, stationPlaced, internal, evidence, keepEffort, projectRoot, taskAction, postconditions, recovery, connectorContinuationOf, retryUserRunId, voiceTurn }) {
     const model = getModel(), provider = getProv(), key = getKey(provider), reasoningEffort = getReasoningEffort(provider);
     // Codex authenticates by an OAuth token (server-side); the desktop build keeps the key in the
     // sidecar's env (keychain). Neither needs a key sent from here.
     if (providerNeedsKey(provider) && !DESKTOP && !DEVMODE && !key) throw new Error('no API key set');
     if (!model) throw new Error('no model selected');
 
-    let res;
+    /* TRANSPORT PROVENANCE (night N2, 2026-10-15 — found by the GH#116 lane). A transport loss is known by WHERE an
+       error was thrown, never by its words. Browsers do not agree on those words: when the sidecar dies mid-stream,
+       Chromium/WebView2 (the Windows desktop app) rejects the body read with a bare "network error" (its console says
+       net::ERR_INCOMPLETE_CHUNKED_ENCODING), which friendlyerror's word list never knew — the drop read as `unknown`
+       and the reconnect watch never started. Widening that list is the trap: text the SIDECAR streamed (a provider's
+       own "network error") flows through the same classifier, and would arm a probe that then announces "connection
+       restored" about a connection that never dropped. So chat() marks the errors raised by its OWN transport — the
+       fetch() rejection, the body read rejection, the body ending before the lead's completion — and friendlyError
+       reads only that mark (verdict.transport). In-band text arrives as a string and can never carry it. The browser's
+       own error object is kept (callers check identity and name); only a value that cannot hold the mark is wrapped.
+       (Nested so the tests that execute chat() on its own run it whole.) */
+    function transportLoss(e, site) {
+      if (e != null && (typeof e === 'object' || typeof e === 'function') && Object.isExtensible(e)) {
+        e.starnetTransport = site;
+        if (e.starnetTransport === site) return e;
+      }
+      const wrapped = new Error(String((e && e.message) || e || 'the connection was lost'));
+      wrapped.starnetTransport = site;
+      wrapped.cause = e;
+      return wrapped;
+    }
+    // a Stop (AbortController) is the Commander's own act, never a transport loss
+    function isAbortError(e) { return !!e && e.name === 'AbortError'; }
+
+    let res, shared = null;   // shared: this run's place on the page's ONE run stream (runStream above), when it has one
     try {
       const reqBody = { model, provider, reasoningEffort, system, messages, agentId: agentId || 'agent', isTask: !!isTask, recurring: !!recurring };
       if (recovery && recovery.sourceRunId && recovery.continuationId && recovery.continuationToken) {
@@ -715,6 +1416,10 @@ const Harness = (() => {
       // reason-only self-talk (retitle / goal-judge / pitch / autopilot): the sidecar keeps the caller's system
       // prompt VERBATIM (no manual/capability/skill/memory dressing) and never stamps the away clock for it.
       if (internal) reqBody.internal = true;
+      // self-talk runs on the cheap aux reasoning effort; keepEffort (work they read, the goal judge, the preflight) keeps theirs
+      if (internal && keepEffort) reqBody.keepEffort = true;
+      // a SPOKEN reply: the sidecar may answer it on SETTINGS › Models › VOICE CHAT MODEL (this turn only)
+      if (voiceTurn && !internal) reqBody.voiceTurn = true;
       /* THE EVIDENCE PACK, for the runs that must GUESS (rec perfection W2). An internal run gets a verbatim
          system prompt — which is right for a strict-format parse, and wrong for the three RECOMMENDATION
          generators, which were asked "what should this Commander do next?" while being handed strictly less
@@ -743,13 +1448,33 @@ const Harness = (() => {
       if (!DESKTOP && !DEVMODE) {
         try { const pool = JSON.parse(readScoped(LS.keyPool, provider) || '[]'); if (Array.isArray(pool) && pool.length) reqBody.keyPool = pool; } catch (_) {}
       }
-      res = await fetch('/api/run', {
+      // ONE STREAM PER PAGE: the run's lines ride the page's shared stream, so this POST does not hold a connection for the
+      // run's life. A stream that cannot open leaves this run on its own response, exactly as before.
+      shared = (typeof runStream !== 'undefined' && runStream) ? runStream.join(signal) : null;
+      if (shared) {
+        try { reqBody.stream = { id: await shared.ready, key: shared.key }; }
+        catch (_) { shared.drop(); shared = null; }
+      }
+      const post = () => fetch('/api/run', {
         method: 'POST', signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(reqBody)
       });
+      res = await post();
+      // the stream closed between opening and this POST (a station restart, a dropped connection): the station refused the
+      // run before doing any work, so it goes once more on its own response
+      if (shared && res.status === 409) {
+        let gone = false;
+        try { gone = /run_stream_gone/.test(await res.clone().text()); } catch (_) {}
+        if (gone) { shared.drop(); shared = null; delete reqBody.stream; res = await post(); }
+      }
     } catch (e) {
-      throw new Error('cannot reach the STARNET sidecar — start it with `npm start` (node sidecar/index.js)');
+      // the POST may have reached the station before it failed: withdraw the run, as the lost connection used to stop it
+      // (an abort already withdrew it)
+      if (shared) { shared.abandon(); shared = null; }
+      // a Stop while connecting keeps today's message, but only a real refused/failed fetch is a transport loss
+      const refused = new Error('cannot reach the STARNET sidecar — start it with `npm start` (node sidecar/index.js)');
+      throw isAbortError(e) ? refused : transportLoss(refused, 'fetch');
     }
     // A pre-stream failure's TRUE reason lives in the response body — runRouteFailure's {"error":"sidecar
     // failure: Not signed in to ChatGPT …"} JSON, handleRun's "missing key/model", the token gate's "forbidden
@@ -757,22 +1482,41 @@ const Harness = (() => {
     // and the RECONNECT CHATGPT / reload doors were lost on this whole path (EL-10/EL-11). Read it (bounded)
     // and carry it in the thrown message.
     if (!res.ok || !res.body) {
+      if (shared) { shared.drop(); shared = null; }
       let detail = '';
       try { detail = sidecarErrorDetail(await res.text()); } catch (_) {}
       throw new Error('sidecar HTTP ' + res.status + (detail ? ' — ' + detail : ''));
     }
+    // the station took the run onto the page's stream (its answer is a small JSON receipt); a station that answered with
+    // the run's own NDJSON stream keeps it on this response
+    let source = res.body;
+    if (shared) {
+      const type = String((res.headers && typeof res.headers.get === 'function' && res.headers.get('content-type')) || '');
+      if (/json/i.test(type)) { try { await res.json(); } catch (_) {} source = shared.stream; }
+      else { shared.drop(); shared = null; }
+    }
 
-    const reader = res.body.getReader();
+    const reader = source.getReader();
     const dec = new TextDecoder();
     let buf = '', full = '', lastUsage = null, runId = null, errMsg = null, endReason = null, finishReason = null, completionVerdict = 'not_assessed', effectVerdict = 'no_observed_effects';
     let budgetScope = null, budgetCapUsd = null;   // additive: WHICH spend cap ended a 'budget' run (+ its $ cap)
+    let budgetCapIsBalance = false;   // additive: that per-run ceiling was the StarNet balance (sidecar admission clamp)
+    let budgetProjected = false;   // additive: the run stopped BEFORE that cap (its family's calls in flight took what was left)
+    // additive: a 'budget' stop at the per-run TOKEN ceiling for a model with no known price (loop.js maxUnpricedTokens).
+    // The $ cap never governed it, so COMMS must name the real limit instead of "raise your spend cap".
+    let unpricedModel = null, unpricedCapTokens = 0;
+    // additive: a 'budget' stop at the per-run SUBSCRIPTION-token ceiling (loop.js maxSubscriptionTokens) — a Claude Code
+    // sign-in books $0 per turn, so this is the only ceiling it has; COMMS names it instead of a $ cap.
+    let subscriptionModel = null, subscriptionCapTokens = 0;
     let sawLeadEnd = false;
 
     try {
     for (;;) {
       let chunk;
       try { chunk = await reader.read(); }
-      catch (e) { if (sawLeadEnd) break; throw e; } // a lost trailing connection cannot undo a confirmed end
+      // a lost trailing connection cannot undo a confirmed end. Otherwise the browser's own rejection is rethrown
+      // (identity kept) carrying its provenance: Chromium/WebView2 says only "network error" here (night N2).
+      catch (e) { if (sawLeadEnd) break; throw isAbortError(e) ? e : transportLoss(e, 'read'); }
       const { value, done } = chunk;
       // EOF is a transport boundary, never proof the run completed. Flush the decoder and
       // process a final complete JSON record even when the transport omitted its newline.
@@ -806,13 +1550,29 @@ const Harness = (() => {
             // bus fold below always finds the registration.
             if (payload.runId && !internal) registerRun(payload.runId, agentId || 'agent', streamId, messages);
             if (!runId) { runId = payload.runId; onRunId && onRunId(runId); }
+            else if (payload.runId && payload.runId !== runId) { delegatedRuns.add(payload.runId); if (delegatedRuns.size > 400) delegatedRuns.delete(delegatedRuns.values().next().value); }
             break;
           case 'agent.token': full += payload.delta; onToken && onToken(payload.delta); break;
           // Any prose before a tool call was an in-progress narration segment, not the terminal answer. Keep it
           // visible in the chronological live transcript, but reset every final-output accumulator at this
           // authoritative boundary so returned/persisted/delivered text contains exactly the last assistant turn.
-          case 'agent.tool_call': full = ''; onTerminalReset && onTerminalReset(); onToolCall && onToolCall(payload); break;
-          case 'agent.tool_result': onToolResult && onToolResult(payload); break;
+          // a delegated WORKER's tool steps ride this stream too (orchestration FORWARD) for the floor + CREW + DELEGATED
+          // readers on U.bus above; they are not the lead's steps, so they never reset its answer or render as its rows.
+          /* a delegated WORKER's tool step arrives under its own name (crew.tool_step, see orchestration makeChildEmit): it is
+             never the lead's step, so it never touches this run's answer or rows. The page is the one place it turns back into
+             agent.tool_call / agent.tool_result — on U.bus only — for the floor tag, the CREW card and the DELEGATED row, which
+             key on the WORKER's agentId/runId. The run is recorded as delegated FIRST, so the room-gap quest guard sees it. */
+          case 'crew.tool_step': {
+            if (payload.runId) { delegatedRuns.add(String(payload.runId)); if (delegatedRuns.size > 400) delegatedRuns.delete(delegatedRuns.values().next().value); }
+            if (typeof U === 'undefined' || !U.bus) break;
+            const step = { agentId: payload.agentId, runId: payload.runId, callId: payload.callId };
+            if (payload.phase === 'call') { step.name = payload.name; if (payload.argsSummary != null) step.argsSummary = payload.argsSummary; }
+            else { step.ok = payload.ok !== false; step.isError = payload.isError === true; if (payload.ms != null) step.ms = payload.ms; }
+            try { U.bus.emit(payload.phase === 'call' ? 'agent.tool_call' : 'agent.tool_result', step); } catch (e) { console.warn('[harness] crew.tool_step', e); }
+            break;
+          }
+          case 'agent.tool_call': if (runId && payload.runId && payload.runId !== runId) break; full = ''; onTerminalReset && onTerminalReset(); onToolCall && onToolCall(payload); break;
+          case 'agent.tool_result': if (runId && payload.runId && payload.runId !== runId) break; onToolResult && onToolResult(payload); break;
           case 'deliverable': onDeliverable && onDeliverable(payload); break;
           // the run is PAUSED on the sidecar awaiting this; the UI shows approve/always/full/deny and answers
           // via Harness.consent(). No more events arrive on this stream until the answer is POSTed.
@@ -845,6 +1605,12 @@ const Harness = (() => {
               // additive budget-stop detail: which cap fired + the effective $ cap (absent on non-budget stops)
               budgetScope = payload.budgetScope || null;
               budgetCapUsd = (typeof payload.budgetCapUsd === 'number' && isFinite(payload.budgetCapUsd)) ? payload.budgetCapUsd : null;
+              budgetCapIsBalance = payload.budgetCapIsBalance === true;
+              budgetProjected = payload.budgetProjected === true;
+              unpricedModel = payload.unpricedModel ? String(payload.unpricedModel) : null;
+              unpricedCapTokens = Number(payload.unpricedCapTokens) || 0;
+              subscriptionModel = payload.subscriptionModel ? String(payload.subscriptionModel) : null;
+              subscriptionCapTokens = Number(payload.subscriptionCapTokens) || 0;
             }
             break;   // the lead's own end, not a forwarded worker's
         }
@@ -853,17 +1619,18 @@ const Harness = (() => {
     }
     } finally {
       reader.releaseLock();
+      if (shared) shared.release();
       if (runId) { delete runModels[runId]; internalRuns.delete(runId); }
     }
     totals.calls++;
     // Preserve explicit in-band errors, including setup failures before run.start. Otherwise
     // let COMMS keep the partial reply and reconcile with the durable journal; never retry
     // inference here, since tools may already have executed before the stream was lost.
-    if (!sawLeadEnd && !errMsg) throw new Error('Reply stream disconnected before completion was confirmed.');
+    if (!sawLeadEnd && !errMsg) throw transportLoss(new Error('Reply stream disconnected before completion was confirmed.'), 'eof');
     // surface the error to the caller (do NOT swallow it just because some text streamed first) —
     // a network/fetch failure still throws below; this is for in-band run errors / capdenied.
-    if (errMsg) return { text: full, usage: lastUsage, runId, error: errMsg, endReason, finishReason, completionVerdict, effectVerdict, budgetScope, budgetCapUsd };
-    return { text: full, usage: lastUsage, runId, endReason, finishReason, completionVerdict, effectVerdict, budgetScope, budgetCapUsd };
+    if (errMsg) return { text: full, usage: lastUsage, runId, error: errMsg, endReason, finishReason, completionVerdict, effectVerdict, budgetScope, budgetCapUsd, budgetCapIsBalance, unpricedModel, unpricedCapTokens, subscriptionModel, subscriptionCapTokens, budgetProjected };
+    return { text: full, usage: lastUsage, runId, endReason, finishReason, completionVerdict, effectVerdict, budgetScope, budgetCapUsd, budgetCapIsBalance, unpricedModel, unpricedCapTokens, subscriptionModel, subscriptionCapTokens, budgetProjected };
   }
 
   /* Read-only fetch of an agent's notebook (its memory.md) from the sidecar. The agent writes these notes
@@ -885,7 +1652,11 @@ const Harness = (() => {
     try {
       const r = await fetch('/api/cancel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ runId }) });
       if (!r.ok) return { ok: false, error: 'the station refused the stop (http ' + r.status + ')', status: r.status };
-      return { ok: true };
+      // ADDITIVE (2026-10-14): the station says whether a live run was there to stop. Passed on only when it says so —
+      // a body that is not JSON is still a confirmed stop, it just proves nothing more.
+      let said = null;
+      try { said = typeof r.json === 'function' ? await r.json() : null; } catch (e) { said = null; }
+      return said && typeof said.stopped === 'boolean' ? { ok: true, stopped: said.stopped } : { ok: true };
     } catch (e) { return { ok: false, error: (e && e.message) || String(e), transport: true }; }
   }
 
@@ -917,6 +1688,19 @@ const Harness = (() => {
       const j = await r.json().catch(() => null);
       return (j && typeof j === 'object') ? j : { ok: false, decision: 'deny' };
     } catch (_) { return { ok: false, decision: 'deny' }; }
+  }
+
+  // the WHOLE (redacted) request behind a live consent card — the event only carries the short argsSummary line.
+  // { ok:true, tool, args, truncated } while the prompt waits; { ok:false, gone:true, error } once it was answered/expired;
+  // { ok:false, error } when the station could not be reached. Never cached: the text exists only while the prompt does.
+  async function consentArgs(runId, promptId) {
+    if (!runId || !promptId) return { ok: false, gone: true, error: 'This approval is no longer tied to a live run.' };
+    try {
+      const r = await fetch('/api/consent/args?runId=' + encodeURIComponent(runId) + '&promptId=' + encodeURIComponent(promptId), { cache: 'no-store' });
+      const j = await r.json().catch(() => null);
+      if (r.ok && j && j.ok && typeof j.args === 'string') return j;
+      return { ok: false, gone: r.status === 404, error: (j && j.error) || ('the station refused the request (http ' + r.status + ')') };
+    } catch (e) { return { ok: false, error: 'The station could not be reached: ' + ((e && e.message) || String(e)) }; }
   }
 
   // EL-11 FIX 1c: attest to the sidecar that a live permission.prompt is now RENDERED to a human (the active
@@ -979,6 +1763,16 @@ const Harness = (() => {
       if (!r.ok) return [];
       const j = await r.json();
       return Array.isArray(j.proposals) ? j.proposals : [];
+    } catch (e) { return []; }
+  }
+  // USER-STUDY LOOP: the index of every undecided study batch (runs that ended while this window was closed
+  // included) — [{ agentId, runId, createdAt, count }], oldest first. [] on any failure.
+  async function studyPending() {
+    try {
+      const r = await fetch('/api/study/pending', { cache: 'no-store' });
+      if (!r.ok) return [];
+      const j = await r.json();
+      return Array.isArray(j.batches) ? j.batches : [];
     } catch (e) { return []; }
   }
   // NS-6: after a salient task run the sidecar MINES threads (ideas the Commander floated but never acted on) into
@@ -1219,11 +2013,59 @@ const Harness = (() => {
       .catch(() => done(timedOut ? null : false));
   }
 
+  /* ENGINE RECOVERY (link-down 2026-10-07): the in-game LINK DOWN chip and the boot SAVE-UNKNOWN screen share ONE
+     reading of why the station service is gone and ONE restart door. Before this the reason probe and the restart
+     lived only on the boot screen, so a crash-loop hold after the game loaded showed a red LINK DOWN with no reason
+     and no way out ("I could not find where I could quit/restart").
+     engineState(timeoutMs) -> { state, reason }, never throws:
+       'ok'       /api/health answered 200 — the service is up (a dead link is this window's, not the engine's)
+       'degraded' it answered 503 'degraded: …' (crash-loop breaker / workspace-owner hold) — reason is that text VERBATIM
+       'silent'   nothing answered inside the budget (a hung service)      'down' the request was refused outright
+     For silent/down the desktop guardian's halt (starnet_sidecar_status) is the reason when it has one. Same 4s budget
+     as pingEngine and for the same measured reason: a hung service must not leave the probe pending forever.
+     restartEngine() -> Promise<bool>: the desktop shell kills and respawns the sidecar (same port, same per-launch
+     token — the World bridge reconnects on its own). false in a browser (nothing to restart) or on any failure.
+     Single-flight: a double click never fires two restarts. */
+  function tauriCoreNow() { return (typeof window !== 'undefined' && window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) ? window.__TAURI__.core : null; }
+  async function engineState(timeoutMs) {
+    const budget = (typeof timeoutMs === 'number' && timeoutMs > 0) ? timeoutMs : 4000;
+    let ac = null, timer = null, timedOut = false, state = 'down', reason = '';
+    try { ac = new AbortController(); } catch (_) { ac = null; }
+    try {
+      const answer = fetch('/api/health', Object.assign({ cache: 'no-store' }, ac ? { signal: ac.signal } : {})).then(async r => {
+        if (r && r.status === 503) { const t = String(await r.text() || '').trim(); if (/^degraded/i.test(t)) return { state: 'degraded', reason: t }; }
+        return { state: 'ok', reason: '' };
+      });
+      const deadline = new Promise((_, reject) => { timer = setTimeout(() => { timedOut = true; try { if (ac) ac.abort(); } catch (_) {} reject(new Error('timeout')); }, budget); });
+      ({ state, reason } = await Promise.race([answer, deadline]));
+    } catch (_) { state = timedOut ? 'silent' : 'down'; reason = ''; }
+    finally { if (timer) clearTimeout(timer); }
+    const core = tauriCoreNow();
+    if (!reason && state !== 'ok' && core) {
+      try { const g = await core.invoke('starnet_sidecar_status'); if (g && g.halted && g.reason) reason = 'station service halted: ' + String(g.reason); } catch (_) {}
+    }
+    return { state, reason };
+  }
+  let restartInflight = null;
+  function restartEngine() {
+    const core = tauriCoreNow();
+    if (!core) return Promise.resolve(false);
+    if (restartInflight) return restartInflight;
+    restartInflight = Promise.resolve().then(() => core.invoke('starnet_restart_sidecar')).then(up => up === true, () => false)
+      .then(up => { if (up) pushDesktopEndpoints(); return up; })   // #137: re-sync the endpoints with the restarted station
+      .finally(() => { restartInflight = null; });
+    return restartInflight;
+  }
+
   // Durable interrupted-run recovery. Listing is read-only; preparation is accepted only when the sidecar's
   // journal proves there is no uncertain dispatched mutation. The returned token is one-shot and consumed by
   // the ordinary /api/run path, so recovery does not create a privileged second execution route.
-  async function runRecoveries() {
-    const r = await fetch('/api/run-recoveries?limit=100', { cache: 'no-store' });
+  // filter (optional): { streamId, agentId } — the sidecar then lists only that conversation's journals, so its
+  // interrupted run is found even behind hundreds of others (a plain first page of 100 missed it, perf 10-19)
+  async function runRecoveries(filter) {
+    let qs = 'limit=100';
+    for (const k of ['streamId', 'agentId']) if (filter && filter[k] != null) qs += '&' + k + '=' + encodeURIComponent(String(filter[k]));
+    const r = await fetch('/api/run-recoveries?' + qs, { cache: 'no-store' });
     if (!r.ok) throw new Error('recovery list unavailable');
     const j = await r.json();
     return Array.isArray(j && j.recoveries) ? j.recoveries : [];
@@ -1281,25 +2123,36 @@ const Harness = (() => {
   }
 
   return {
-    pingEngine,
+    isDelegatedRun: (id) => delegatedRuns.has(String(id || '')),
+    pingEngine, engineState, restartEngine,
+    canRestartEngine: () => !!tauriCoreNow(),
     isDesktop: () => DESKTOP,   // lets the UI tell a desktop keychain-store failure (token saved locally) from a browser no-op
-    getSelectionRevision, getKey, setKey, setKeyPool, validateAndSetKeyPool, keyPoolSize, storeChannelToken, getModel, setModel, getProv, setProv, getBaseUrl, setBaseUrl, getReasoningEffort, setReasoningEffort, normalizeReasoningEffort, init, configured, refreshCreditsConfigured, hasStoredCredential, setDesktopConfigured,
-    listModels, probeProvider, validateAndSetKey, priceOf, contextLimitOf, contextState, chat, cancel, haltAll, consent, consentAck, consentAnswer, summonAck, notebook,
+    getSelectionRevision, getKey, setKey, setKeyPool, validateAndSetKeyPool, keyPoolSize, storeChannelToken, getModel, setModel, getProv, setProv, getBaseUrl, setBaseUrl, getReasoningEffort, setReasoningEffort, clearLegacyReasoningOff, normalizeReasoningEffort, init, configured, refreshCreditsConfigured, creditsEpoch: () => creditsEpoch, hasStoredCredential, setDesktopConfigured,
+    listModels, probeProvider, validateAndSetKey, priceOf, contextLimitOf, runWindowOf, contextState, contextRevision: () => contextRev, chat, cancel, haltAll, consent, consentAck, consentArgs, consentAnswer, summonAck, notebook,
+    runStreamState: () => runStream.state(),   // the page's ONE run stream: { open, id, runs, unsupported, heldBack }
+    streamPost,   // a run a button starts (Run now / Retry / an app refresh / a workshop build), on the page's ONE run stream
     runRecoveries, prepareAutomaticRecovery, resolveRunRecovery, prepareReviewedRecovery,
     memoryProposals, memoryTurnin, memoryVeto, memoryReset, memoryRecords, memoryDeclined, memoryRestore, memoryPending, memoryPin, memoryEdit, memoryForget,
-    studyProposals,
+    studyProposals, studyPending,
     threadProposals, threadTurnin,
     agentSkills, agentSkillsRead, agentSkillManage, agentSkillAllow,
     skillExchangeInspect, skillExchangeRegistry, skillExchangeDiscover, skillExchangeRegistries, skillExchangeImport, skillExchangeInstall, skillExchangeCheck,
     skillExchangeExport, skillExchangePublishHandoff, skillExchangeGenerations, skillExchangeRollback,
     api,
     apiToken: ensureApiToken,
+    sessionStale: () => sessionStale,   // a stale-token 403 that could not be recovered in place — the answer is "reload this page" (#39)
+    tokenWithheld: () => tokenWithheld,   // the station kept its key from this page (peerowner reason) — never "restarted"; '' = it has its key
+    tokenWithheldNotice: () => tokenWithheldNotice(tokenWithheld),   // the full withheld sentence ('' = not withheld)
+    tokenWithheldRetryable: () => withheldRetryable(tokenWithheld),   // a transient reason: a reload re-runs the check and may pass
+    // the ONE reading of a refused /api/* reply (voice synthesis, push-to-talk, the Live Voice probe): a 403 is a restart only when
+    // the stale-token recovery proved it (sessionStale), never for a withheld page, else the route's own refusal
+    classifyApiFailure: response => classifyApiFailure(response, { sessionStale, tokenWithheld, withheldNotice: tokenWithheldNotice(tokenWithheld) }),
     apiFetch: (u, init) => ensureApiToken().then(t => fetch(u, withApiToken(init, t))),
     totals: () => totals,
     setTotals: t => { totals = { tokens: t.tokens || 0, cost: t.cost || 0, calls: t.calls || 0 }; },
     resetTotals: () => {
       totals = { tokens: 0, cost: 0, calls: 0 }; contextByKey = {}; runModels = {}; runConv = {};
-      overheadByModel = Object.create(null);
+      overheadByModel = Object.create(null); contextRev++;
       try { localStorage.removeItem(LS_OVERHEAD); } catch (_) {}   // a wipe must clear the persisted calibration too
     }
   };

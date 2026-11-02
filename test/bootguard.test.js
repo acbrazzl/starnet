@@ -232,6 +232,37 @@ function retryable(t, opts) {
   A.eq(t.guard._internals.reasonText('plain'), 'plain', 'reasonText passes strings through');
 }
 
+/* ---- 6b. the copied diagnostics NAME where an uncaught error happened (#136, 2026-10-18) ----
+   A pre-16.4 Mac WebKit hit a SyntaxError parsing app/workflowline.js; WorkflowLine never existed, no critical probe failed
+   (no banner), and the report a user can paste said only "page errors: 1 uncaught error(s)". The summary line now carries
+   file:line + the error's TYPE name — never the message, which can carry data. */
+{
+  const t = boot(allGlobals());
+  t.fire('error', { message: 'SyntaxError: Invalid regular expression: invalid group specifier name', filename: 'tauri://localhost/app/workflowline.js?v=1', lineno: 797, error: { name: 'SyntaxError' } });
+  t.ready();
+  A.eq(t.banner(), null, 'a non-critical module failing to parse is not the fatal banner');
+  A.eq(t.guard.summaryLine(), '1 uncaught error(s) at app/workflowline.js:797 (SyntaxError)', 'the summary names the file, line and error type: ' + t.guard.summaryLine());
+  const Diag = require('../frontend/app/diagnostics.js');
+  A.eq(Diag.withPageErrors('REPORT', t.guard), 'REPORT\npage errors:   1 uncaught error(s) at app/workflowline.js:797 (SyntaxError)', 'COPY DIAGNOSTICS carries the location');
+}
+{
+  const t = boot(allGlobals());
+  t.fire('error', { message: 'TypeError: bad token sk-live-SECRET in https://x/?key=SECRET', filename: 'http://127.0.0.1:8787/app/chat.js?ticket=SECRET', lineno: 5 });
+  t.fire('error', { message: 'Uncaught TypeError: x', filename: 'http://127.0.0.1:8787/app/chat.js', lineno: 5 });
+  t.fire('error', { message: 'Script error.', filename: '', lineno: 0 });
+  for (let i = 0; i < 6; i++) t.fire('error', { message: 'ReferenceError: y', filename: 'http://127.0.0.1:8787/app/m' + i + '.js', lineno: 1, error: { name: 'Error with spaces' } });
+  const line = t.guard.summaryLine();
+  A.ok(!/SECRET/.test(line), 'the summary never carries an error message, query or ticket: ' + line);
+  A.ok(line.startsWith('9 uncaught error(s) at app/chat.js:5 (TypeError), (inline), app/m0.js:1 (ReferenceError), app/m1.js:1 (ReferenceError) +4 more'), 'locations are de-duplicated, bounded, typed from the message when the error object is absent: ' + line);
+  A.eq(t.guard._internals.errorKind({ error: { name: 'x\nSyntaxError' }, message: '' }), '', 'a type name that is not a bare identifier is dropped');
+}
+{
+  const t = boot(allGlobals());
+  t.fire('error', { message: 'SyntaxError: bad', filename: 'http://127.0.0.1:8787/app/workflowline.js', lineno: 797 });
+  for (let i = 0; i < 60; i++) t.fire('error', { message: 'TypeError: loop', filename: 'http://127.0.0.1:8787/app/world.js', lineno: 9 });
+  A.eq(t.guard.summaryLine(), '61 uncaught error(s) at app/workflowline.js:797 (SyntaxError), app/world.js:9 (TypeError)', 'the first (boot-time) place is kept while a later error loops: ' + t.guard.summaryLine());
+}
+
 /* ---- 7. COPY DIAGNOSTICS rides Diag when present (page report + sidecar report), falls back to the clipboard ---- */
 (async () => {
   {
@@ -275,6 +306,23 @@ function retryable(t, opts) {
     A.eq(t.guard.PROBES.map(p => p.name), CRITICAL, 'the critical probe list is exactly the documented set');
     t.guard.PROBES.forEach(p => A.ok(fs.existsSync(path.join(ROOT, 'frontend', p.file)), 'probe file exists: ' + p.file));
     A.ok(!/new Function\s*\(|[^\w.'"]eval\s*\(/.test(SRC), 'no eval() / new Function() — the desktop CSP forbids it, probes are literal typeofs');
+  }
+  /* ---- 10. an OUTDATED web engine (macOS 10.15 / Safari 13, 2026-10-08 report) is named, not called a broken file ---- */
+  {
+    const OldRegExp = function (src, flags) { if (/\(\?<[=!]/.test(String(src))) throw new SyntaxError('Invalid regular expression: invalid group specifier name'); return new RegExp(src, flags); };
+    const g = allGlobals(); delete g[CRITICAL[0]];
+    const t = boot(Object.assign(g, { RegExp: OldRegExp }));
+    t.sandbox.navigator = { userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)' };
+    t.ready();
+    const b = t.banner();
+    A.ok(!!b, 'a missing module on an outdated engine still renders the banner');
+    const txt = b ? textOf(b) : '';
+    A.ok(txt.includes('NEEDS A NEWER macOS') && /macOS 11 Big Sur/.test(txt) && /Safari 16\.4/.test(txt), 'the banner names the real cause: a newer macOS / Safari');
+    A.ok(!txt.includes('broken or blocked file'), 'an outdated engine is never called a broken or blocked file');
+    A.ok(!txt.includes('RELOAD'), 'no RELOAD (it can never update a web engine)');
+    A.ok(/web engine:\s+TOO OLD/.test(t.guard.report()), 'the copied report says the web engine is too old');
+    A.ok(b && !/inset:/.test(b.style.cssText) && /top:0;left:0;right:0;bottom:0/.test(b.style.cssText), 'the overlay avoids inset (Safari 14.1+) so it covers an old window');
+    const modern = boot(allGlobals()); A.eq(modern.guard._internals.webviewTooOld(), false, 'a modern engine is not flagged');
   }
   A.report('bootguard');
 })();

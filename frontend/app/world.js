@@ -4,7 +4,7 @@
    procedural bake (stationbake.js), under a pan/zoom camera. The agent has a
    workstation in its spawn room and ACTUALLY WALKS the rooms + corridors — pathing
    through doors via the model's BFS path() — to reach its seat when given a task,
-   then wanders the whole reachable station when idle. Edits made in REFIT build mode
+   then wanders the whole reachable station when idle. Edits made in BUILD MODE build mode
    re-bake the world live (the agent re-homes if the floor under it is reclaimed).
 
    Coordinate frame: everything here is in the bake's LOCAL tile frame (tile*TILE px);
@@ -21,6 +21,7 @@ const World = (() => {
 
   /* ---------- station + bake cache ---------- */
   let station = null, geo = null, cache = null, geoDirty = true, bakeDirty = true, unsub = null;
+  let bakeEditPending = true;   // STATIC BAKE: a station edit since the last derive changed what the bake draws
   let desk = null, seat = null, blocked = new Set();   // desk footprint (local tiles) blocks pathing
   let deskPropId = null, deskFace = 'north';           // set when the hero's desk is a PLACED workstation prop assigned to it (its id + the seat's facing)
   let convey = null;   // live conveyor transport sim (boxes riding the belts)
@@ -32,8 +33,12 @@ const World = (() => {
   let routeTagCache = null;                      // tileKey -> {text, ok} composed hover route tag (invalidated on recompile)
   let hoverBeltTile = null;                      // belt tile under the cursor (hover-glance route tag), or null
   let hoverOutbox = null;                        // stacked OUTBOX under the cursor (hover-glance "N TO REVIEW" tag), or null
+  let hoverCap = null;                           // ORG P33: a capability prop under the cursor ({ p, text }) — its GLANCE nameplate, or null
   let routingNags = null;                        // [{x,y,w,h,label,warn}] in-world callouts mirroring the compiler's errors
+  let nagLabelBoxes = [];                        // where drawRoutingNags laid its labels last frame (world px) — WOULD-captions yield to them
+  let firstShipPulse = null;
   let feedState = { known: false, fed: true };   // server-proven "something feeds the intake" truth (channels/cron); fed=true until proven otherwise
+  let startFacts = null;                         // …and the server's own answers it was read from ({ chans, cron, lt }) — what starts ONE line (WorkflowLine.lineStarts)
   let feedNagOn = false;                         // a NO FEED nag is showing → the intake becomes clickable (→ CHANNELS)
   let selectedRoutingTile = null;                // explicit canvas selection; full routing instructions never open on hover
 
@@ -72,11 +77,26 @@ const World = (() => {
     _glFailed = true; _glReady = false;
     return false;
   }
-  // whole-frame per-channel means via a 16×16 GPU downscale (~1KB readback) — the probe's sampler
+  // whole-frame per-channel means via a 16×16 GPU downscale (~1KB readback) — the probe's sampler.
+  // The downscale is a chain of exact 2:1 bilinear halvings (each one a true 2×2 box average on every
+  // backend), never one big drawImage: a single ~45:1 step POINT-samples, so scanlines, grain and fine
+  // material texture alias into a biased reading that differs between the raw and the warped frame.
+  // (2026-09-23: that alias read a healthy warp as +27% brighter — true means moved +3% — tripped the
+  // "implausible magnitude" check and pinned whole sessions to the CPU warp at half frame rate.)
   function probeMeans(src) {
-    if (!_glProbeCv) { _glProbeCv = document.createElement('canvas'); _glProbeCv.width = 16; _glProbeCv.height = 16; }
-    const pctx = _glProbeCv.getContext('2d', { willReadFrequently: true });
-    pctx.clearRect(0, 0, 16, 16); pctx.drawImage(src, 0, 0, src.width, src.height, 0, 0, 16, 16);
+    if (!_glProbeCv) _glProbeCv = [];
+    const fit = n => { let s = 16; while (s * 2 <= n) s *= 2; return s; };
+    let w = fit(src.width), h = fit(src.height), from = src, fw = src.width, fh = src.height, level = 0, pctx = null;
+    for (;;) {
+      let c = _glProbeCv[level];
+      if (!c) { c = _glProbeCv[level] = document.createElement('canvas'); }
+      if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+      pctx = c.getContext('2d', w === 16 && h === 16 ? { willReadFrequently: true } : undefined);
+      pctx.imageSmoothingEnabled = true;
+      pctx.clearRect(0, 0, w, h); pctx.drawImage(from, 0, 0, fw, fh, 0, 0, w, h);
+      if (w === 16 && h === 16) break;
+      from = c; fw = w; fh = h; w = Math.max(16, w / 2); h = Math.max(16, h / 2); level++;
+    }
     const d = pctx.getImageData(0, 0, 16, 16).data;
     let r = 0, g = 0, b = 0;
     for (let i = 0; i < d.length; i += 4) { r += d[i]; g += d[i + 1]; b += d[i + 2]; }
@@ -89,7 +109,7 @@ const World = (() => {
   let fitW = 0, fitH = 0;   // canvas size the last fitCamera() framed against — a fit on a hidden/degenerate stage doesn't count as a real view
   const MINZ = 0.5, MAXZ = 6;
   const clampz = (v, a, b) => v < a ? a : v > b ? b : v;
-  let drag = null, hoverAgent = null, onClick = null, onArcade = null, onOutbox = null, onMissionBoard = null, onTrophyCase = null, onBayAssign = null, onIntakeFeed = null, onIntakeSample = null, wakeAt = 0;
+  let drag = null, hoverAgent = null, onClick = null, onArcade = null, onOutbox = null, onMissionBoard = null, onTrophyCase = null, onPluginTerminal = null, onBayAssign = null, onIntakeFeed = null, onIntakeSample = null, onDesk = null, wakeAt = 0;
   let camLerp = null;   // {scale,panX,panY} target — a gentle one-on-one framing for voice conversations
   let arrivalScene = null;
   let wakeDark = 0, wakeDarkTarget = 0, awakeFrozen = false;   // the AWAKENING: a darkness veil that lifts to first light, + a freeze so the newborn holds still during its first meeting
@@ -102,6 +122,7 @@ const World = (() => {
   let camLock = null;                  // {id, sc, source:'session'|'cine'} — the followed body + its target zoom
   let camUserAt = 0;                   // last USER camera act (performance.now clock) — the cinecam idle clock
   const CINE_IDLE_MS = 120000;         // hands-off threshold before the auto-director may take the camera (2 min)
+  const CAM_SETTLE_PX = 0.25;          // a follow-lock axis this close to its target (device px) lands ON it — see CAMERA SETTLE in frameBody
   let cineIdleMs = CINE_IDLE_MS;       // live threshold (setCinecamIdle lets DEV/verify shrink it — never shipped-UI-tunable)
   let cineHoldUntil = 0;               // director: when the current shot may be re-cast
   let cineWalkAt = 0;                  // last time the director's subject was actually WALKING (movement grace before a cut)
@@ -111,7 +132,7 @@ const World = (() => {
   let floorLiveAt = 0;                                         // when this page's world started running — the boot-quiet window the spawn WELCOME waits out (a roster replay spawns every body at once)
   let kindleArmed = false, kindleP = 0, kindleHolding = false, kindlePeak = 0, kindleDone = null;   // THE KINDLING: the user HOLDS to wake the dormant mind; their attention fills kindleP (0..1) → ignition
   // THE VOID backdrop (dense parallax starfield + nebulas) lives in spacebg.js (SpaceBG.draw),
-  // shared with REFIT (build.js) so entering/exiting build mode never jumps the sky.
+  // shared with BUILD MODE (build.js) so entering/exiting build mode never jumps the sky.
 
   /* reduced-motion (the warroom honesty floor): heavy motion — pulses/blinks — goes steady when the OS
      asks for less motion. Live-read so a runtime setting change is honored without a reload. */
@@ -135,6 +156,16 @@ const World = (() => {
   // body when the lead delegates. delegateLead/delegateCall track the open team.dispatch window (tool_call→result)
   // so a worker run that starts inside it animates; both are driven purely by existing agent.* bus events.
   const handoffBoxes = [];
+  // SUMMON LINES: a delegation stays visible for as long as the worker's run lives — a floor link from the lead
+  // body to the worker body (who started whom), a pulse down it on start, the result riding it home on end.
+  // Driven only by the same handoff() calls (team.dispatch window + agent.run.start/end), so it can't outlive a run.
+  const summonLinks = [];
+  // ACTIVITY TAGS: what each live run is doing, read off the bus — its task in words (the lead's settled Task Brief /
+  // a worker's dispatch thread), the tool in flight and its target (agent.tool_call argsSummary), and the cost the
+  // sidecar REPORTED (cost.estimate / agent.cost; nothing shown until one arrives — an unreported cost is unknown,
+  // never $0). One per run, right above the body; it carries the run clock, so the RUN / ▸ TOOL tags stand down for it.
+  const PLATES_ON = true;
+  const plateByAgent = new Map();
   let delegateLead = null, delegateCall = null;
   // G4 feature 1 — APPROVAL WALK-AND-WAIT. When a HERO run blocks on a permission.prompt the body stops
   // working, stands, and walks to a wait anchor (airlock → mission board → own desk, resolved honestly from
@@ -446,6 +477,9 @@ const World = (() => {
   const DIR_HYST = 0.13;     // rad (~7.5°) a bucket holds PAST its own boundary before handing over
   const ACCEL = 150;         // world units/s² — spools up to hero pace in ~0.23s, and brakes at the same rate
   const CORNER_LOOK = 2.5;   // world units: hand over to the next waypoint this early (see the walk blocks)
+  const CORNER_PLANT = 1.95; // rad (~112°): past this a body plants and pivots; below it, it arcs (stepGait)
+  const CORNER_ARC = 1.75;   // rad (~100°): the widest heading error still travelled along the facing
+  const ARC_MIN_D = 1.5;     // world units: inside this (+ turn radius) of its target a body takes the chord
   const angNorm = a => Math.atan2(Math.sin(a), Math.cos(a));   // wrap to (-π, π]
   function bucketDir(a, cur) {
     if (cur && DIR_A[cur] != null && Math.abs(angNorm(a - DIR_A[cur])) < Math.PI / 4 + DIR_HYST) return cur;
@@ -460,11 +494,15 @@ const World = (() => {
      spools up and settles instead of skating off at full tilt, for free.
      `lastLeg` brakes into the FINAL stop only; intermediate waypoints are taken at pace so the body doesn't
      stutter at every corner. dx,dy = the vector it is stepping along, d = its length. */
-  function stepGait(b, dx, dy, d, top, lastLeg, dt) {
+  function stepGait(b, dx, dy, d, top, lastLeg, dt, plant) {
     // Art height controls rendering, not travel speed: 19 px skins share the normal station pace.
     const seconds=Math.max(0,Math.min(100,dt))/1000;
     const accel=ACCEL;
-    if(b.faceA==null||b.dir!==b.faceDir)b.faceA=DIR_A[b.dir]??Math.PI/2;
+    // Another system set b.dir (intent tell, glance, seat). Start from the facing the viewer actually SEES
+    // (assets.js eases the standing pose into _rA) rather than snapping to the new cardinal: that snap was
+    // the 90° pop at the first step of every walk. The slew below then turns the body onto its heading.
+    if(b.faceA==null||b.dir!==b.faceDir){const seen=b._rA,want=DIR_A[b.dir]??Math.PI/2;
+      b.faceA=seen!=null&&Math.abs(angNorm(seen-want))<Math.PI/2?seen:want;b.angW=0;}
     const t=typeof performance!=='undefined'?performance.now():Date.now();
     if(b.odo==null)b.odo=0;
     if(t-(b.odoAt||0)>150)b.spd=0;
@@ -476,18 +514,43 @@ const World = (() => {
     const curW=b.angW||0;
     b.angW=curW<target?Math.min(target,curW+TURN_ACCEL_A*seconds):Math.max(target,curW-TURN_ACCEL_A*seconds);
     b.faceA=angNorm(b.faceA+Math.sign(turn)*Math.min(remain,b.angW*seconds));
-    // Turn before travelling backwards. Gentle corners retain momentum; sharp turns plant first.
-    const error=Math.abs(angNorm(heading-b.faceA));
-    const alignment=error>=Math.PI/4?0:Math.cos(error*2)**2;
+    // WALK THROUGH CORNERS (2026-09-22, Andrew: "you can see the frames when they turn"). Any turn of 45°+
+    // used to halt the body dead, swap it to its single standing frame and pivot it on the spot — every
+    // path corner was stop · frozen pose · snap · go. Now the body keeps walking and ARCS: it travels
+    // along its eased facing, slowing through the bend (radius ≈ spd/TURN_RATE, ~1-3 units), so the
+    // walk cycle keeps running while the 8-way facing sweeps through the diagonal between the legs.
+    // Only a genuine about-face (past CORNER_PLANT) still plants and pivots.
+    // `plant`: traffic sidesteps keep the old plant-first rule — a yielder that arcs straight back reaches
+    // the passer's final tile before the passer does and the two deadlock (hallway-traffic 2-tile hall).
+    const error=Math.abs(angNorm(heading-b.faceA)),limit=plant?Math.PI/4:CORNER_PLANT;
+    const alignment=error>=limit?0:plant?Math.cos(error*2)**2:Math.cos(error*0.8)**1.5;
     const want=(lastLeg?Math.min(top,Math.sqrt(Math.max(0,d)*2*accel)):top)*alignment;
     const cur=b.spd||0,rate=accel*seconds;
     b.spd=cur<want?Math.min(want,cur+rate):Math.max(want,cur-rate);
     // Speed already eases with alignment. Applying it twice makes every corner drag.
-    const step=error>=Math.PI/4?0:Math.min(d,b.spd*seconds);
+    const step=error>=limit?0:Math.min(d,b.spd*seconds);
+    // Arc along the facing only while the leg is long enough to converge on its target; close to a
+    // waypoint (or badly misaligned) the chord wins so a body can never orbit what it is walking to.
+    const arc=!plant&&step>0&&error<CORNER_ARC&&d>ARC_MIN_D+(b.spd||0)/TURN_RATE;
+    b._stepDir=arc?{x:Math.cos(b.faceA),y:Math.sin(b.faceA)}:null;
     // Only translation advances the stride. Rotation used to add almost an entire fake cycle.
-    b.odo+=step;b._travelHeading=heading;b._travelStep=step;
+    b.odo+=step;b._travelHeading=arc?b.faceA:heading;b._travelStep=step;
     b.dir=b.faceDir=bucketDir(b.faceA,b.dir);
     return step;
+  }
+
+  /* Apply stepGait's step. The arc (along the eased facing) is taken only when BOTH the step and the
+     remaining leg from where it lands are clear; otherwise the validated chord, exactly as before —
+     so a curve can round a corner but never clip a jamb or leave a leg that is no longer walkable. */
+  function gaitMove(b, dx, dy, d, step) {
+    const u = b._stepDir;
+    if (u && step > 0 && geo && geo.clearFootSegment) {
+      const nx = b.px + u.x * step, ny = b.py + u.y * step;
+      if (geo.clearFootSegment(b.px, b.py, nx, ny, blocked) &&
+          geo.clearFootSegment(nx, ny, b.px + dx, b.py + dy, blocked)) { b.px = nx; b.py = ny; return; }
+    }
+    b._travelHeading = Math.atan2(dy, dx);
+    b.px += dx / d * step; b.py += dy / d * step;
   }
 
   function finishGait(b){
@@ -588,13 +651,28 @@ const World = (() => {
     novelty = []; seenProps = null; seenBelts = null;   // re-learn the scene from scratch (no cross-station novelty)
     beltWatch = null;                                   // ...and the belt-watch claim: this floor's belts are gone, so a claim on them is a ghost holding the slot
     clearDeferredShips();                               // a crate waiting on the OLD floor's handoff must never land on this one
-    dockLineWork.clear();
+    clearSendCrates();                                  // ...nor a SEND TO hand-off held or flying on the old floor
+    dockLineWork.clear(); activeDock.clear();          // ...and the dock glow it feeds (written together in intakeMessage)
+    // LINE WATCH state is keyed by prop id, and a fresh doc reissues low ids — the old floor's lamps/plates would
+    // light this floor's colliding bays. Drop the watch (lazily rebuilt; acks re-read from localStorage) and the
+    // stats (re-asked by rederive's lineStatsSoon) so every lamp re-earns its state from THIS floor's events.
+    watch = null; lineStats = { known: false, byLine: {}, since: 0 }; firstShipPulse=null; hoverBay = null; hoverCrate = null;
+    // …and FIRST SHIP's shipment counts belong to the old floor's lines too: unknown until THIS floor's are read (an older read
+    // still in flight can no longer land — shipApplied moves past it)
+    shipBase = { known: false, byLine: {} }; shipBaseHash = null; shipApplied = shipSeq; firstShipPending.clear();
     propFoot = new Map(); pendingMourn = null;          // forget where things stood (no cross-station grief)
     agentDecor.length = 0; ownPlaced.clear(); placeCd = 0;   // forget which decor it placed (the new floor is a clean slate)
     if (agent && agent.fond) agent.fond.clear();        // forget the old floor's haunts — the new floor earns its own
     for (const b of crew) if (!b.summoned) seizeFromIdle(b);
     crew = crew.filter(b => b.summoned);                // drop plan-derived crew (rebuilt from the new floor's bays); KEEP summoned crew (app-level, not floor-bound)
-    if (station && station.onChange) unsub = station.onChange(() => { geoDirty = true; });
+    /* STATIC BAKE (2026-10-10, "slower since the new textures"): the deck/wall/light bake reads rooms, walls and doors —
+       never props or belts — and on a large industrial station it costs ~2.5 s of frozen main thread. Every edit used to
+       re-bake it: placing, moving or turning a prop, giving a desk an agent, labelling a line, each step the station
+       builder lays. WorldModel already marks the edits that leave the bake alone (staticBakeUnchanged; airlocks never
+       are), exactly as BUILD mode reads them, so the floor now re-bakes only for an edit that changes the bake — or when
+       the derived floor's size or origin moved (the bake is drawn in that frame). */
+    // STILL: a layout edit (often after an await: a builder step, a restyle, an undo) wakes a still floor — drawn on the next vsync
+    if (station && station.onChange) unsub = station.onChange(p => { geoDirty = true; if (!p || !p.staticBakeUnchanged || p.global) bakeEditPending = true; motionWake(); });
     rederive();
   }
 
@@ -634,6 +712,7 @@ const World = (() => {
         if (b.state === 'walk') { b.state = 'idle'; b.idleUntil = 0; }
       }
     }
+    reframeSendCrates();           // a held/flying SEND TO crate re-reads its OUTBOX + INBOX in the new frame (after the plan + belts moved)
     syncCrewFromPlan();            // reconcile the light crew bodies with the plan's bound bays
     if (agent) {
       if (agent.unplaced) placeAgent();
@@ -649,13 +728,46 @@ const World = (() => {
       }
     }
     scanNovelty();   // diff props/belts vs last frame — anything new becomes a "go check it out" target
-    geoDirty = false; bakeDirty = true;
+    const frameMoved = !cache || cache.W !== geo.W || cache.H !== geo.H || !cache.origin || !geo.origin
+      || cache.origin.tx !== geo.origin.tx || cache.origin.ty !== geo.origin.ty;
+    if (bakeEditPending || frameMoved || fixtureAnchorKey(geo) !== bakedAnchorKey) bakeDirty = true;   // STATIC BAKE: a props-only edit keeps the deck it already has
+    geoDirty = false; bakeEditPending = false;
   }
 
+  /* STATIC BAKE guard: furniture reaches the bake in exactly one place — WorldSurface.planFixtures puts a wall lamp's light
+     sample on clear deck in the 3 rows below its north wall face, skipping past furniture. A props-only edit that changes
+     walkability on any of those tiles could move a lamp's light, so it re-bakes; any other props-only edit cannot. */
+  let bakedAnchorKey = null;
+  function fixtureAnchorKey(g) {
+    if (!g || !g.zoneGrid || typeof g.walkable !== 'function') return '';
+    const C = g.COLS, R = g.ROWS, zg = g.zoneGrid; let k = '';
+    for (let y = 0; y < R; y++) for (let x = 0; x < C; x++) {
+      if (zg[y * C + x] == null || (y > 0 && zg[(y - 1) * C + x] != null)) continue;   // a tile with a north wall face
+      for (let dy = 1; dy <= 3 && y + dy < R; dy++) k += g.walkable(x, y + dy) ? '1' : '0';
+    }
+    return k;
+  }
+  // Build holds unpublished geometry. Render-only work (late art, lighting or a still) must not
+  // rederive it: that also posts routing and clears the pending-edit truth. Explicit syncPlan and
+  // closing Build still publish through their existing paths.
+  function buildHoldsFloor() {
+    return !!(station && (geoDirty || !geo) && typeof Build !== 'undefined' && Build.isOpen());
+  }
+  /* BUILD MODE HANDS ITS FLOOR BACK (2026-10-13, Andrew: "a huge delay in build mode"). SAVE & EXIT after a room edit
+     re-baked the whole station here (~2.3 s on the demo station) right after BUILD MODE had painted every chunk of it.
+     Build.close() now offers its chunks stitched into one whole-station bake (StationBake.stitchWhole — refused unless
+     they cover this exact floor); the rebake that start() runs takes it only for THIS station at THIS edit revision, and
+     the offer dies with that first frame either way. */
+  let handedBake = null;
   function rebake() {
+    if (buildHoldsFloor()) { bakeDirty = true; return; }
     if (geoDirty || !geo) rederive();
     if (!geo) return;
-    cache = StationBake.bake(geo);
+    const handed = handedBake; handedBake = null;
+    cache = handed && handed.station === station && handed.seq === station.getSeq() && handed.bake.W === geo.W && handed.bake.H === geo.H &&
+      handed.bake.origin && geo.origin && handed.bake.origin.tx === geo.origin.tx && handed.bake.origin.ty === geo.origin.ty
+      ? handed.bake : StationBake.bake(geo);
+    bakedAnchorKey = fixtureAnchorKey(geo);
     for (const d of cache.doorOccluders || []) {
       if (d.image.addEventListener) d.image.addEventListener('contextlost', () => { bakeDirty = true; });
     }
@@ -688,6 +800,9 @@ const World = (() => {
           without an event (and any future regression that blanks the bake).
      The probe costs one 1x1 readback a second, against a frame it saves entirely. */
   let bakeProbe = null;        // {x,y} a pixel buildBase painted opaque — the loss sentinel
+  let bakeProbePending = false; // transient read failure or an empty rebuild of a known occupied floor
+  let bakeExpected = false;
+  let bakeProbeSource = null;
   let detailProbes = new WeakMap(); // discarded on rebake; never retain obsolete LOD plates
   let lostDetailLayer = null;
   let probeOff = false;        // getImageData refused (tainted canvas): never retry, never spam
@@ -695,7 +810,7 @@ const World = (() => {
   let lastRecoverAt = 0;       // when the last recovery ran (only consulted while backing off)
   let futileRecoveries = 0;    // consecutive recoveries that did NOT restore an opaque bake
   let recoveries = 0;
-  const PROBE_MS = 250, RECOVER_COOLDOWN_MS = 3000;
+  const PROBE_MS = 250, RECOVER_COOLDOWN_MS = 3000, RECOVER_MAX_COOLDOWN_MS = 60000;
 
   /* Find one pixel the fresh bake painted OPAQUE. Centre first (on any real station the middle
      of the footprint is deck), then a coarse ring outward — so the common case is a single
@@ -704,6 +819,14 @@ const World = (() => {
      watchdog simply stays inert rather than rebaking a legitimately empty frame forever. */
   function recordBakeProbe() {
     bakeProbe = null;
+    bakeProbePending = false;
+    const g = typeof geo !== 'undefined' && geo;
+    const tile = g && g.TILE, cols = g && g.COLS;
+    const occupied = g && g.zoneGrid && tile > 0 && cols > 0 ? g.zoneGrid.findIndex(z => z != null) : -1;
+    const floorPoint = occupied >= 0 ? { x: Math.floor((occupied % cols + .5) * tile), y: Math.floor((Math.floor(occupied / cols) + .5) * tile) } : null;
+    if (g && g.zoneGrid && tile > 0 && cols > 0) bakeExpected = !!floorPoint;
+    else bakeExpected = !!cache && cache.baseCv === bakeProbeSource && bakeExpected;
+    bakeProbeSource = cache && cache.baseCv;
     probeBatch = null; // a newly painted bake must never inherit pre-recovery samples
     probeEpoch++; completedProbeBatch = null; pendingProbe = null;
     detailProbes = new WeakMap();
@@ -712,13 +835,20 @@ const World = (() => {
     if (W < 2 || H < 2) return;
     const pts = [[0.5, 0.5], [0.5, 0.32], [0.5, 0.68], [0.3, 0.5], [0.7, 0.5],
                  [0.3, 0.3], [0.7, 0.3], [0.3, 0.7], [0.7, 0.7]];
+    // Thin or disconnected stations can miss every coarse sample. An actual
+    // occupied tile supplies a floor witness; nine misses alone prove nothing.
+    if (floorPoint && floorPoint.x < W && floorPoint.y < H) pts.unshift([floorPoint.x / W, floorPoint.y / H]);
     try {
       for (const [fx, fy] of pts) {
         const x = Math.min(W - 1, Math.max(0, Math.round(W * fx)));
         const y = Math.min(H - 1, Math.max(0, Math.round(H * fy)));
-        if (readAlpha1(c, x, y) > 0) { bakeProbe = { x, y }; detailWentBlank(); return; }   // via the probe canvas — see THE READBACK LAW below
+        if (readAlpha1(c, x, y) > 0) { bakeProbe = { x, y }; bakeExpected = true; detailWentBlank(); return; }   // via the probe canvas — see THE READBACK LAW below
       }
-    } catch (e) { probeOff = true; }
+      bakeProbePending = bakeExpected;
+    } catch (e) {
+      if (e && e.name === 'SecurityError') probeOff = true;
+      else { resetLossProbe(); bakeProbePending = true; }
+    }
   }
 
   /* THE READBACK LAW (2026-08-26, lag escape shipped in v0.10.10): NEVER getImageData a canvas
@@ -731,6 +861,10 @@ const World = (() => {
   let sentinelCv = null, sentinelCtx = null;
   let probeAtlas = null, probeAtlasCtx = null, probeBatch = null;
   let probeEpoch = 0, pendingProbe = null, completedProbeBatch = null, probeAsyncFailed = false, timedOutProbe = null;
+  function resetLossProbe() {
+    sentinelCv = sentinelCtx = probeAtlas = probeAtlasCtx = probeBatch = null;
+    probeEpoch++; pendingProbe = completedProbeBatch = null;
+  }
   function prepareProbeBatch() {
     if(completedProbeBatch){probeBatch=completedProbeBatch;completedProbeBatch=null;return;}
     const now=performance.now(),timedOut=pendingProbe&&now-pendingProbe.started>1000;
@@ -790,6 +924,7 @@ const World = (() => {
   function readAlpha1(src, x, y) {   // alpha 0-255 of src's (x,y); throws propagate to the caller's existing taint/loss handling
     const batch=probeBatch&&probeBatch.get(src),key=x+','+y;
     if(batch&&batch.has(key))return batch.get(key);
+    if (sentinelCtx && sentinelCtx.isContextLost?.()) resetLossProbe();
     if (!sentinelCtx) {
       sentinelCv = document.createElement('canvas'); sentinelCv.width = 1; sentinelCv.height = 1;
       sentinelCtx = sentinelCv.getContext('2d', { willReadFrequently: true });
@@ -823,10 +958,15 @@ const World = (() => {
   }
   function bakeWentBlank() {
     lostDetailLayer = null;
-    if (!bakeProbe || probeOff || !cache || !cache.baseCv) return false;
+    if (probeOff || !cache || !cache.baseCv) return false;
+    if (bakeProbePending) return true;
+    if (!bakeProbe) return false;
     try {
       return readAlpha1(cache.baseCv, bakeProbe.x, bakeProbe.y) === 0 || detailWentBlank();
-    } catch (e) { probeOff = true; return false; }
+    } catch (e) {
+      if (e && e.name === 'SecurityError') { probeOff = true; return false; }
+      resetLossProbe(); return true;
+    }
   }
 
   /* Rebuild everything that lives in an offscreen canvas. Only `bakeDirty` is set (never
@@ -838,17 +978,28 @@ const World = (() => {
        by the FIRST loss made the station sit black through the next one. A recovery that
        restored an opaque bake is proof the GPU is healthy, so the next loss must heal on the
        spot; only a recovery that changed nothing (futile) is evidence of a broken GPU worth
-       rate-limiting. Recovering is cheap. Sitting in a black station is not. */
-    if (futileRecoveries > 0 && now - lastRecoverAt < RECOVER_COOLDOWN_MS) return false;
+       rate-limiting. Recovering is cheap. Sitting in a black station is not.
+       A futile streak waits longer each time (3 s, 6 s, 12 s ... capped at a minute): every retry is a full station bake (~2.5 s
+       on a big industrial floor) into a GPU that is not giving canvases back, and a flat 3 s kept the main thread ~80% busy for
+       as long as it stayed broken. A restored context or the page coming back starts the streak over. */
+    const cooldown = Math.min(RECOVER_MAX_COOLDOWN_MS, RECOVER_COOLDOWN_MS * 2 ** Math.max(0, futileRecoveries - 1));
+    if (futileRecoveries > 0 && now - lastRecoverAt < cooldown) return false;
     lastRecoverAt = now; recoveries++;
     try {
       console.warn('[world] cached canvases lost (' + why + ') — rebuilding station + sky + ground (recovery #' + recoveries + ')');
     } catch (_) {}
     bakeDirty = true; bakeProbe = null;
+    resetLossProbe();
     try { if (typeof IndustrialTextures !== 'undefined' && IndustrialTextures.restoreMaterials) IndustrialTextures.restoreMaterials(); } catch (_) {}
+    // the prop catalog is re-prepared once per loss, not per futile retry: PropRemaster retries its own failed entries, and
+    // watchCanvasLoss re-prepares it again once the GPU gives an opaque bake back
+    if (!futileRecoveries) restorePropArt();
     try { if (typeof SpaceBG !== 'undefined' && SpaceBG.invalidate) SpaceBG.invalidate(); } catch (_) {}
     try { if (typeof Terrain !== 'undefined' && Terrain.invalidate) Terrain.invalidate(); } catch (_) {}
     return true;
+  }
+  function restorePropArt() {
+    try { if (typeof PropRemaster !== 'undefined' && PropRemaster.restore) PropRemaster.restore(); } catch (_) {}
   }
 
   /* per-frame (throttled) sentinel read — called from frameBody. Heals in THIS frame: rebake()
@@ -864,9 +1015,11 @@ const World = (() => {
       recoveries++; futileRecoveries = 0;
       return; // native bake is intact; do not stall the frame rebaking the entire station
     }
+    const streak = futileRecoveries;
     if (!recoverLostCanvases(now, 'bake sentinel went transparent')) return;
     rebake();
     futileRecoveries = bakeProbe ? 0 : futileRecoveries + 1;
+    if (streak && bakeProbe) restorePropArt();   // the GPU is back after a broken spell: prop art prepared during it may be blank too
   }
 
   /* ---------- STAGE CONTEXT LOSS — the OTHER way the station goes black ----------
@@ -949,7 +1102,7 @@ const World = (() => {
       if (!g) return false;
       if (old.parentNode) old.parentNode.replaceChild(fresh, old);
       cv = fresh; ctx = g;
-      drag = null; hoverAgent = null; hoverBeltTile = null; hoverOutbox = null;   // pointer state died with the old node
+      drag = null; hoverAgent = null; hoverBeltTile = null; hoverOutbox = null; hoverCrate = null; hoverBay = null; hoverPlate = null; hoverCap = null;   // pointer state died with the old node
       wireStageInput();
       try { if (ro) { ro.disconnect(); ro.observe(cv.parentElement || cv); } } catch (_) {}
       resize();
@@ -970,7 +1123,8 @@ const World = (() => {
     if (!station || !aid || (agent && aid === agent.id)) return true;
     if (typeof station.agentRoomId !== 'function' || typeof station.bayObjects !== 'function') return true;
     if (!station.agentRoomId(aid)) return true;   // no bay -> not room-resolved -> can't honestly call it dark
-    return station.bayObjects(aid).some(o => (o && typeof o === 'object' ? o.objectType : o) === 'computer');
+    const hb = homeBayOf(aid);   // (multi-bay) the room of the agent's HOME bay (its desk room when it has a desk)
+    return station.bayObjects(aid, hb ? hb.id : undefined).some(o => (o && typeof o === 'object' ? o.objectType : o) === 'computer');
   }
   function computeOkFor(aid) {
     if (!computeOkCache.has(aid)) computeOkCache.set(aid, agentComputeOK(aid));
@@ -1103,7 +1257,7 @@ const World = (() => {
     if (!b.pendingApprovals) b.pendingApprovals = new Map();
     const now = performance.now();
     if (!crewIsAwaiting(b)) b.awaitResumeWork = !!b.working;
-    b.pendingApprovals.set(p.promptId, { at: now, runId: p.runId || null });
+    b.pendingApprovals.set(p.promptId, { at: now, runId: p.runId || null, question: p.tool === 'brief.ask' });
     seizeFromIdle(b);
     b.working = false; b.sitting = false; b.goal = 'awaiting'; b.state = 'idle';
     b.target = null; b.pathPts = null;
@@ -1163,7 +1317,8 @@ const World = (() => {
   // proposal). Gated to a free, idle hero (never interrupts a task/talk/await/leisure walk) — the pin is a
   // projection, not a gate: if the agent is busy the card still shows on the board; the WALK just plays later.
   function maybePinProposal(now, count) {
-    if (now - pinCheckAt < 400) return; pinCheckAt = now;
+    if (now - pinCheckAt < 400) { if ((count | 0) > pinnedCount) noteDue(pinCheckAt + 400, now); return; }   // STILL: a waiting pin walk re-checks on its own vsync
+    pinCheckAt = now;
     if (!agent || agent.unplaced) return;
     if ((count | 0) <= pinnedCount) { if ((count | 0) < pinnedCount) pinnedCount = count | 0; return; }   // count dropped (accepted/declined) → lower the mark so a later re-propose re-pins
     // only launch the walk when the hero is genuinely free (idle, not seized, not already pinning)
@@ -1205,9 +1360,22 @@ const World = (() => {
   }
   // the hero's ASSIGNED conveyor: a walkable tile beside the BAY bound to this agent (agentId match, so it never
   // reacts to another agent's bay). null = this agent has no conveyor → no fetch leg (straight to work).
+  /* THE HOME DOCK (multi-bay agents, 2026-09-22 — Andrew's ruling: one body, anchored at its home dock, no
+     walking between docks). An agent crewing several bays lives at its ENTRY dock (the compiled plan's
+     entryDock: the oldest bay an INBOX reaches, else its oldest); its other bays light up when work lands
+     there, but the body never walks to them. One bay = that bay, exactly as before. */
+  function homeBayOf(aid) {
+    if (!geo || !geo.props || !aid) return null;
+    const home = routingPlan && routingPlan.entryDock ? routingPlan.entryDock[aid] : null;
+    const bays = geo.props.filter(p => p.t === 'bay' && p.agentId === aid);
+    if (!bays.length) return null;
+    return (home && bays.find(p => p.id === home)) || bays[0];
+  }
+  // does this agent crew MORE than one bay? (the nameplate + dock-glow rules only change when it does)
+  function multiDock(aid) { const ds = routingPlan && routingPlan.docksOfAgent && routingPlan.docksOfAgent[aid]; return !!(ds && ds.length > 1); }
   function assignedConveyorTile(aid) {
     if (!geo || !geo.props || !aid) return null;
-    const bay = geo.props.find(p => p.t === 'bay' && p.agentId === aid);
+    const bay = homeBayOf(aid);
     if (!bay) return null;
     const bw = bay.w || 1, bh = bay.h || 1;
     for (let yy = bay.y - 1; yy <= bay.y + bh; yy++)
@@ -1270,7 +1438,7 @@ const World = (() => {
                              // couch reads "full" over a physically EMPTY cushion. spawn()-only, same rationale as below.
     beltWatch = null;        // the belt-watch claim is the same shape of module-level claim, held by a body we just dropped
     // …and with it every other scrap of the PREVIOUS agent's session that lives on this page. These reset
-    // here (the per-agent hero (re)spawn), NOT in loadStation — loadStation also runs on a same-agent REFIT,
+    // here (the per-agent hero (re)spawn), NOT in loadStation — loadStation also runs on a same-agent BUILD MODE,
     // where the running economy/belts MUST persist. spawn() runs only on wake/resume, so a refit is untouched.
     if (floor) floor.reset();           // W1: factory-floor economy (spend/slag/yield) — no inherited numbers on a new HUD
     if (slaglog) slaglog.reset();       // W1: wasted-spend post-mortems
@@ -1308,7 +1476,7 @@ const World = (() => {
       pauseUntil: 0, pauseLook: null, pauseCd: 0, yieldCd: 0, lookBackCd: 0,   // CONSIDERED MOVEMENT: brief mid-stroll holds, belt-yield to cargo, the rare double-take
       attn: null, drive: null, driveUntil: 0,   // CONTINUITY OF ATTENTION: the neighbourhood it is currently occupied with (attn) + the drive it is mid-way through satisfying (drive/driveUntil) — see the CONTINUITY block above decideIdle
       stilling: false,   // STILLNESS: true during a real CONTENT=STILL quiet hold (suppresses the ambient swivel + cargo body-track)
-      wakePhase: 0,   // FIRST LIGHT: the wake-ritual sub-beat sequencer (driven by studyUntil; reset on exit + on a REFIT drop)
+      wakePhase: 0,   // FIRST LIGHT: the wake-ritual sub-beat sequencer (driven by studyUntil; reset on exit + on a BUILD MODE drop)
       quirkCd: 0, offbeatCd: 0   // J2: per-body quirk/off-beat gates (read/written via self in maybeQuirk/offbeat) — uniform with the crew init shape; self===agent keeps the hero byte-identical
     };
     self = agent;   // B1: track the hero from birth so engine helpers called BEFORE the first tick (awakening / mouse handlers via setGlance/releaseSeat) act on the hero — self is restored to agent every tick anyway
@@ -1374,8 +1542,12 @@ const World = (() => {
        block), NOT in wireStageInput(): that function re-runs on every stage rebuild, and these
        two target document/window — the only listeners in it that would survive the old canvas
        and stack forever (every other handler is cv-scoped and dies with the replaced node). */
-    document.addEventListener('visibilitychange', () => { if (!document.hidden) lastProbeAt = 0; });
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) { lastProbeAt = 0; futileRecoveries = 0; } });   // (a sleep/wake GPU reset heals on THIS frame, not after the broken spell's back-off)
     window.addEventListener('focus', () => { lastProbeAt = 0; });
+    // RENDER PACING wake-ups (#69): focus, a visible page, or any hand on the window resumes full pace NOW
+    window.addEventListener('focus', paceWake);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) paceWake(); });
+    for (const ev of ['pointermove', 'pointerdown', 'wheel', 'keydown']) window.addEventListener(ev, userActive, { passive: true, capture: true });
     /* STUCK CAMERA DRAG: a press dragged past the canvas edge and released elsewhere never delivers
        cv's mouseup, so `drag` survived — the bare cursor then panned the camera on every crossing and
        the next real click was swallowed as a "drag" (drag.moved was already true). Same class build.js
@@ -1389,9 +1561,12 @@ const World = (() => {
     pollFeedState();          // feed truth (channels/cron) for the NO FEED intake nag — server-proven, refreshed slowly
     pollShipStats();          // SHIPPED TODAY truth (completed runs since local midnight) — reload-proof
     pollAffinity();           // the PROVEN social graph — who the run log says works together (biases idle social beats)
-    setInterval(pollFeedState, 60000);   // listenersBound guards init's one-time block, so these arm exactly once
-    setInterval(pollShipStats, 60000);
-    setInterval(pollAffinity, 300000);   // the graph moves on the timescale of DAYS — a 5min refresh is already generous
+    // through PollGate (idle CPU piece 3, 2026-10-20): the same cadence on screen, a 30 s floor while away (never slower
+    // than these already are), a catch-up on return; setInterval when PollGate is absent (node tests)
+    const gatedPoll = (fn, ms) => (typeof PollGate !== 'undefined' && PollGate.every) ? PollGate.every(fn, { ms, immediate: false }) : setInterval(fn, ms);
+    gatedPoll(pollFeedState, 60000);   // listenersBound guards init's one-time block, so these arm exactly once
+    gatedPoll(pollShipStats, 60000);
+    gatedPoll(pollAffinity, 300000);   // the graph moves on the timescale of DAYS — a 5min refresh is already generous
   }
 
   /* Every handler the stage canvas owns, bound to the CURRENT `cv`. Called once from init
@@ -1409,7 +1584,7 @@ const World = (() => {
         try { console.warn('[world] canvas 2d context lost — awaiting restore'); } catch (_) {}
       }, false);
       cv.addEventListener('contextrestored', () => {
-        lastRecoverAt = 0;   // an explicit restore always wins the cooldown
+        lastRecoverAt = 0; futileRecoveries = 0;   // an explicit restore always wins the cooldown (and re-prepares the props)
         recoverLostCanvases(performance.now(), 'contextrestored');
         redrawNow();
       }, false);
@@ -1423,6 +1598,7 @@ const World = (() => {
       scale = clampz(scale * Math.exp(-ev.deltaY * 0.0015), MINZ, MAXZ);
       panX = c.x - wx * scale; panY = c.y - wy * scale;
       camLerp = null; camLock = null; camUserAt = performance.now();   // the user is driving the camera — stop any focus ease, release any follow-lock, reset the cinecam idle clock
+      cameraMoved();
     }, { passive: false });
     cv.addEventListener('mousedown', ev => { if (kindleArmed) { kindleHolding = true; return; } camLerp = null; camLock = null; camUserAt = performance.now(); const c = toCanvas(ev); drag = { sx: c.x, sy: c.y, moved: false }; });
     cv.addEventListener('mousemove', ev => {
@@ -1438,10 +1614,11 @@ const World = (() => {
           drag.moved = true;
         }
         panX += c.x - drag.sx; panY += c.y - drag.sy; drag.sx = c.x; drag.sy = c.y;
+        cameraMoved();
         cv.style.cursor = 'grabbing'; return;
       }
       const wp = toWorld(ev);
-      if (!wp) { hoverAgent = null; hoverBeltTile = null; hoverOutbox = null; cv.style.cursor = 'default'; return; }
+      if (!wp) { hoverAgent = null; hoverBeltTile = null; hoverOutbox = null; hoverCrate = null; hoverBay = null; hoverPlate = null; hoverCap = null; cv.style.cursor = 'default'; return; }
       const nowMs = performance.now();
       // D4: stamp cursorMoveT only on a REAL displacement (> ~half a tile) — a parked-but-jittering cursor is
       // presence (feeds gaze), not "moving" (which lures THE CHASE). Compared against the PREVIOUS lastCursor.
@@ -1456,7 +1633,12 @@ const World = (() => {
       hoverBeltTile = null;
       if (!hit && beltTileSet) { const bt = tileOf(wp.x, wp.y); if (beltTileSet.has(bt.x + ',' + bt.y)) hoverBeltTile = bt; }
       hoverOutbox = hit ? null : outboxAt(wp);   // arm the hover-glance crate tag (a glance, never a window)
-      cv.style.cursor = (hit || hoverOutbox || arcadeAt(wp) || missionBoardAt(wp) || trophyCaseAt(wp) || unboundBayAt(wp) || intakeSampleAt(wp) || intakeFeedAt(wp)) ? 'pointer' : 'default';   // arcade cabinets + a stacked OUTBOX + the MISSION BOARD + the TROPHY CASE + an unbound BAY + a complete-line INBOX + a starved INTAKE are clickable too
+      hoverCrate = (hit || hoverOutbox) ? null : crateAt(wp);                  // LINE WATCH: a riding crate is inspectable
+      hoverBay = (hit || hoverOutbox || hoverCrate) ? null : boundBayAt(wp);   // LINE WATCH: a bound bay's lamp glance
+      if (hoverCrate) hoverBeltTile = null;   // one voice: the crate's glance replaces the belt's route tag under it
+      hoverPlate = (hit || hoverOutbox || hoverCrate || hoverBay) ? null : lwPlateAt(wp);   // LINE WATCH: an INBOX's whole reading
+      hoverCap = (hit || hoverOutbox || hoverCrate || hoverBay || hoverPlate) ? null : capPropAt(wp);   // ORG P33: a capability prop's GLANCE nameplate — no pointer: its click does nothing until Andrew picks one, and a pointer would promise it
+      cv.style.cursor = (hit || hoverOutbox || hoverCrate || (hoverBay && failedBayAt(wp)) || arcadeAt(wp) || missionBoardAt(wp) || trophyCaseAt(wp) || pluginTerminalAt(wp) || unboundBayAt(wp) || intakeSampleAt(wp) || intakeFeedAt(wp) || (onDesk && deskAt(wp))) ? 'pointer' : 'default';   // arcade cabinets + a stacked OUTBOX + the MISSION BOARD + the TROPHY CASE + an unbound BAY + a complete-line INBOX + a starved INTAKE are clickable too
     });
     cv.addEventListener('mouseup', ev => {
       if (kindleArmed) { kindleHolding = false; return; }   // releasing during the kindle lets the spark ebb
@@ -1475,30 +1657,43 @@ const World = (() => {
         if (onClick) onClick(hit.agentId || hit.id);
         return;
       }
-      const arc = arcadeAt(wp);
-      if (arc && onArcade) { onArcade(arc); return; }
+      // CLICK PRIORITY MIRRORS HOVER PRIORITY (mousemove above: body > OUTBOX > crate > bay): whatever tag the
+      // cursor is showing is what the click acts on — a crate riding past an OUTBOX must not steal its click.
       // G2.3: a stacked OUTBOX is the collect tap — clicking it opens the oldest pending run's review
       const ob = outboxAt(wp);
       if (ob && onOutbox) { onOutbox(ob); return; }
+      // LINE WATCH: a crate riding a belt opens its station card; a FAILED bay's red lamp is acked by a click
+      const crate = crateAt(wp);
+      if (crate && openCrate(crate, ev)) return;
+      const fb = failedBayAt(wp);
+      if (fb && ackBay(fb)) return;
+      const arc = arcadeAt(wp);
+      if (arc && onArcade) { onArcade(arc); return; }
       // G1b: the MISSION BOARD is the quest log's body — clicking it opens the log (never gated, never dead)
       const mb = missionBoardAt(wp);
       if (mb && onMissionBoard) { onMissionBoard(mb); return; }
       // G3b: the TROPHY CASE opens the trophy surface (honest even when empty — it shows dust, never a dead click)
       const tc = trophyCaseAt(wp);
       if (tc && onTrophyCase) { onTrophyCase(tc); return; }
-      // an UNBOUND bay's nag says CLICK — the click opens the assign flow (REFIT bay picker), closing the loop
+      // a PLUGIN TERMINAL opens its plugin's window (or, unbound, the place to bind/install one)
+      const pt = pluginTerminalAt(wp);
+      if (pt && onPluginTerminal) { onPluginTerminal(pt); return; }
+      // DESK SCREEN: an agent's workstation opens THAT agent's work — live steps while it runs, its last job at rest
+      const dk = onDesk ? deskAt(wp) : null;
+      if (dk) { onDesk({ agentId: dk.agentId, propId: dk.propId, clientX: ev.clientX, clientY: ev.clientY }); return; }
+      // an UNBOUND bay's nag says CLICK — the click opens the assign flow (BUILD MODE bay picker), closing the loop
       const ub = unboundBayAt(wp);
       if (ub && onBayAssign) { onBayAssign(ub.id); return; }
       // an INBOX on a COMPLETE line offers the sample-job card (PROOF: run one real job through the line).
       // Checked first: when the NO-FEED nag is also up (which needs the same live line), the card carries the
       // CHANNELS door itself, so the nag's promised click-through is never lost — see intakeSampleAt.
       const ismp = intakeSampleAt(wp);
-      if (ismp && onIntakeSample) { onIntakeSample({ propId: ismp.id, fed: feedState.known ? !!feedState.fed : null }); return; }
+      if (ismp && onIntakeSample) { onIntakeSample({ propId: ismp.id, fed: feedState.known ? !!feedState.fed : null, schedOff: !!(feedState.known && !feedState.fed && schedOffFor(ismp.id)) }); return; }
       // a NO-FEED intake's nag says CLICK — the click opens the CHANNELS panel (the fix is wiring a feed)
       const inf = intakeFeedAt(wp);
       if (inf && onIntakeFeed) onIntakeFeed(inf.id);
     });
-    cv.addEventListener('mouseleave', () => { if (kindleArmed) kindleHolding = false; hoverAgent = null; hoverBeltTile = null; hoverOutbox = null; if (!drag) cv.style.cursor = 'default'; });
+    cv.addEventListener('mouseleave', () => { if (kindleArmed) kindleHolding = false; hoverAgent = null; hoverBeltTile = null; hoverOutbox = null; hoverCrate = null; hoverBay = null; hoverPlate = null; hoverCap = null; if (!drag) cv.style.cursor = 'default'; });
   }
 
   function resize() {
@@ -1530,12 +1725,458 @@ const World = (() => {
   // the queued rAF first so frame()'s own re-schedule doesn't leave two loops running.
   function redrawNow() {
     if (!running || !cache) return;
-    if (raf) { cancelAnimationFrame(raf); raf = 0; }
-    frame(performance.now());
+    cancelScheduled();
+    frame(performance.now(), true);   // forced: a resize blanked the bitmap, so the pacer may not skip this one
   }
 
-  function start() { if (running) return; running = true; last = performance.now(); if (!floorLiveAt) floorLiveAt = last; frame(last); }
-  function stop() { cancelArrival(); running = false; if (raf) { cancelAnimationFrame(raf); raf = 0; } }
+  function start() {
+    if (running) return;
+    running = true; last = performance.now(); if (!floorLiveAt) floorLiveAt = last;
+    // a floor coming back to life (BUILD MODE exit) re-asks its line numbers NOW — a step test run while the editor held the
+    // floor otherwise waited up to a minute before the INBOX plate counted it (2026-09-28 retest)
+    try { if (typeof LineWatch !== 'undefined' && typeof fetch !== 'undefined') lineStatsSoon(); } catch (_) {}
+    frame(last);
+    handedBake = null;   // BUILD MODE's floor is taken by this first frame's rebake or not at all
+  }
+  function stop() { cancelArrival(); running = false; cancelScheduled(); }
+  /* FRAME CAP (HUD widget, 2026-09-29): an opt-in ceiling on how often the floor is DRAWN. Frames in between are
+     skipped whole; the simulation still reads the real clock, so bodies move at their true speed, just drawn fewer
+     times a second. 0 = no caller cap (the station's own RENDER PACING below then decides). */
+  let frameCapMs = 0, lastDrawnAt = 0;
+  function setFrameCap(ms) { frameCapMs = ms > 0 ? +ms : 0; paceWake(); }
+  /* RENDER PACING (#69, 2026-10-06): StarNet stays open all day so routines run, and an uncapped rAF loop drew the
+     whole station at the monitor's refresh rate the entire time — 240 draws/s on a 240 Hz panel, a visible-but-
+     unfocused window included (rAF only pauses when the page is HIDDEN). Measured on the seeded station: the GPU
+     process alone burned ~1.1 cores, the renderer another ~0.7. Only the DRAWING is paced; every event handler and
+     the harness state they write keep running in real time, and a throttled draw advances the simulation in real-
+     time slices (see simSlices) so nothing walks or rides slower.
+       visible, focused or not → at most 60 draws/s (PACE_VISIBLE_MS), rounded to the nearest vsync
+       YOU moving the camera (drag, wheel) → up to 144 draws/s (PACE_MOTION_MS) for PACE_MOTION_HOLD_MS after the hand
+       hidden/minimized → the browser stops rAF outright (the desktop shell sets the webview not-visible on minimize/tray)
+     (Andrew, 2026-10-13, on 0.13.5: "when you're not clicked into StarNet it goes at less than 5 FPS … if it's open on
+     screen this should not happen", and the 30 fps cap made every camera move judder on his 239 Hz panel next to
+     0.13.1's ~200 draws/s. The 5 fps unfocused tier is gone and the visible pace is 60: still ~4x under the uncapped
+     240 Hz loop #69 measured, and the FRAME BUDGET below keeps a slow machine's UI alive either way.) A caller cap
+     (setFrameCap — the HUD widget's 48 ms) is that caller's stated intent and wins over the visible pace.
+     STILL (Andrew, 2026-10-21, approved: "draw 30/s while nothing on screen moves, snap back to 60 the instant anything
+     moves (144 while panning)"). What he was asked: a tier that applies only when nothing but background effects changed —
+     no body moved, no camera, crate, hover, input or run event — so the starfield drift, twinkle and light flicker step
+     half as often. The installed 0.13.5 idled at 178% of a core and 96% of it was DRAWING an unchanged station 60 times a
+     second. A frame whose verdict (stillVerdict, below renderPace) finds nothing on screen changed but those ambient
+     effects is redrawn at PACE_STILL_MS (30/s), waiting in a TIMER (no per-vsync rAF spin). It is only how often a still
+     scene is REDRAWN: nothing drawn changes, nothing that moves is slowed, a caller cap and a hidden page are untouched.
+     The verdict's own rule is "unsure is motion": a prop whose art moves on its clock, a bobbing body, a meteor all keep
+     the normal pace (its MOTION / AMBIENT lists name every source). Motion never waits on it:
+       · every source that starts motion from outside the frame wakes it (motionWake → paceWake): any input on the
+         window, a camera move, a harness event on U.bus, a World API call that changes a body, a bubble or the camera,
+         the hero's voice starting or stopping (voice.js → World.voiceChanged), and every async answer that rewrites what
+         the floor draws (the line plates and pallets, FIRST SHIP, the snapshot reconcile, feed truth, portals, a crate
+         the hand-off grace releases, the link going down or up);
+       · a change the frame can see coming lands on its own vsync: stillDue is the earliest one (an idle body's next
+         decision, a blink, the next frame of a clock-driven pose or prop, a talk turn, the next meteor, a cinecam cut);
+     and the frame that shows any motion is followed at the normal pace (60, or 144 while the hand moves the camera).
+     The 10-21 review of the tier found what it still slowed or delayed, all fixed the same evening: ANDROMEDA's meteor and
+     bolide had no sky readout (drawn at 30/s); a bubble or nameplate over a body walking OFF screen slides along the canvas
+     edge (now motion); an off-screen body's decision clocks were never due, though an initiator past the edge decides for
+     an on-screen partner (now due for every placed body); the voice and the async answers above never woke a still floor;
+     the SHIPPED pallet pop was not motion; NIGHT CITY's cars were classed as ambient, so a city floor drew them at 30/s
+     (they are motion now: a city sky with traffic driving never goes still). And the planted breath was counted as
+     motion, so a scene with a standing body never went still — the breath is now drift (see AMBIENT in the STILL VERDICT: sub-pixel, drawn at its true phase).
+     The final fixes (10-21): frameReviewRoom's camera cut (and init's resize) wake the floor, and every camera-writing export
+     is locked to the wrapper; a due change is met by rAF, never by a timer that can fire a Windows tick late (DUE LEAD); a
+     layout edit (station.onChange) wakes; animation start stamps set between frames read the wall clock; the ocean's plate
+     steps are due; a body napping in a bunk is rest and one boxing the heavy bag is motion; a dormant focus ease under a lock
+     is not camera motion; PropSprites.pulsing reads one stamp. */
+  const PACE_VISIBLE_MS = 1000 / 60, PACE_MOTION_MS = 1000 / 144, PACE_MOTION_HOLD_MS = 1200;
+  const PACE_STILL_MS = 1000 / 30, INPUT_HOLD_MS = 1200;   // still: 30 draws/s · input: a hand on the window holds the normal pace this long (hover tags, glances)
+  const PACE_TIMER_MIN_MS = 100;   // pace intervals at/above this wait in a timer instead of spinning rAF (the still pace does too)
+  const SIM_SLICE_MS = 48, SIM_CATCHUP_MAX_MS = 1000;   // a slice stays under frameBody's 64 ms step clamp; past 1 s (a hidden page) the old freeze stands
+  let paceTimer = 0, paceLowRate = false, motionUntil = 0, pacedDraws = 0, simMs = 0;   // simMs: total simulated time advanced (renderPace readout)
+  let vsyncMs = 0, lastRafAt = 0;   // the display's own frame interval, learned from back-to-back rAF callbacks (rounds the pace to whole vsyncs)
+  // STILL state: the last verdict (still?), why not (the first motion source it found), the next known change, input stamp,
+  // and when a booked still timer fires (a verdict that finds an earlier change re-books)
+  let stillNow = false, stillWhy = 'boot', stillDue = Infinity, inputAt = -Infinity, paceTimerAt = 0, stillKick = false;
+  /* DUE LEAD (2026-10-21 final fixes): a timer is never trusted to hit a vsync. Windows (WebView2) timers can fire a whole
+     ~15.6 ms system tick late, so a timer booked 2 ms before a due change missed its vsync and the change drew a frame late.
+     The last vsync + 4 ms before a due change rides requestAnimationFrame (a skipped callback is cheap); the timer only
+     covers the long still wait before it. dueWatch is the change the last still verdict was waiting on: the draw that lands
+     it records how late it came (renderPace: dueDraws, dueLate — later than a vsync + 1 ms — dueLatMaxMs, dueLatAvgMs). */
+  const DUE_LEAD_SLACK_MS = 4;
+  let dueWatch = Infinity, dueDraws = 0, dueLate = 0, dueLatSum = 0, dueLatMax = 0;
+  function dueLeadMs() { return (vsyncMs || 17) + DUE_LEAD_SLACK_MS; }
+  function noteDueDraw(now) {
+    const l = now - dueWatch; dueWatch = Infinity;
+    dueDraws++; dueLatSum += l; if (l > dueLatMax) dueLatMax = l;
+    if (l > (vsyncMs || 17) + 1) dueLate++;
+  }
+  /* THE STILL TICK'S TIMER (Andrew: exactly 30/s while still). A still frame is drawn on the vsync frame()'s own rule picks
+     (the first one at least pace - half a vsync after the last draw). The timer wakes a hair after the vsync BEFORE that one
+     and rAF lands the draw, so a timer up to a vsync late (a Windows tick, ~15.6 ms at 60 Hz) still makes it, and an on-time
+     one books one rAF callback per still draw, as before. It used to aim 2 ms before the draw: a timer over 2 ms late missed
+     the vsync and the still pace fell to 20/s. */
+  const TICK_AFTER_VSYNC_MS = 0.5;
+  function drawSlackMs() { return Math.max(1, Math.min(vsyncMs || 2, 17) / 2); }   // frame()'s own slack: it draws on the vsync NEAREST the pace
+  function stillTickTimerAt(pace) {
+    const P = vsyncMs || 17, k = Math.max(1, Math.ceil((pace - drawSlackMs()) / P - 1e-9));
+    return lastDrawnAt + (k - 1) * P + TICK_AFTER_VSYNC_MS;
+  }
+  function pageFocused() {
+    try { return typeof document === 'undefined' || typeof document.hasFocus !== 'function' || document.hasFocus(); } catch (_) { return true; }
+  }
+  /* FRAME BUDGET (2026-10-07, "laggy" reports on 0.13): the floor may hold at most BUDGET_SHARE of the main thread.
+     The pace above is only a CEILING on the draw rate. A big station draws slowly (a 26-agent, 200-light station
+     took ~22ms a draw on a fast desktop, and a laptop is 2-3x that), so at 30 draws/s the world owned the thread and
+     every click, keystroke and COMMS token queued behind it. The interval stretches to drawCost / BUDGET_SHARE
+     (never below BUDGET_MIN_FPS) so the UI always keeps the rest; a cheap station never notices (drawCost 10ms ->
+     14ms, under the 33ms pace). The simulation reads the real clock and is sliced (simSlices), so nothing moves
+     slower. Replaces the 10-04 per-vsync budget (agent/restore-lag), which predates this time-based pacer.
+     The floor is LOW on purpose (2026-10-08, CPU throttled 4x on that station: one draw ~140ms): a 12 fps floor could
+     not be met anyway (4-6 draws/s) and only kept the thread 100% busy — click waits p50 ~270ms; at 5 fps the same
+     4 draws/s leave the UI a third of the thread (65-73% busy, p50 56-103ms). At 2x nothing changes (21 draws/s). */
+  const BUDGET_SHARE = 0.7, BUDGET_MIN_FPS = 5, BUDGET_SAMPLE_MAX_MS = 250;
+  let drawCostMs = 0;
+  function noteDrawCost(ms) {
+    if (!(ms >= 0)) return;
+    ms = Math.min(BUDGET_SAMPLE_MAX_MS, ms);   // one page-in stall (a restore from minimized) must not park the loop
+    drawCostMs = drawCostMs ? drawCostMs * 0.9 + ms * 0.1 : ms;
+  }
+  function budgetMs() { return Math.min(drawCostMs / BUDGET_SHARE, 1000 / BUDGET_MIN_FPS); }
+  /* STRAINED DETAIL (2026-10-10, "1 frame per hour — can't navigate"; see SPRITES.setStrained). The budget above keeps
+     the UI alive but cannot make a slow draw fast: a weak machine sat at 5 draws/s and every pan landed 5 times a second.
+     While the floor's draw would hold the budget under ~25 fps the crew drops its extra passes (walk in-between, pose
+     dissolve, local light). Entering needs a slow floor, not one hitch: the budget over STRAIN_ENTER_MS AND 3 of the last
+     5 draws over it (a GC pause, a page-in after a restore or a props-only rederive holds a 22 ms floor's EMA over the
+     line ~13 draws, yet it is one slow draw). Leaving needs proof, not a prediction: every STRAIN_PROBE_DRAWS strained
+     draws, one draw is made at full detail and timed, and full detail returns after STRAIN_EXIT_PROBES probes in a row
+     come in under STRAIN_EXIT_MS. That line sits 10% under the entry line: a 22-25 ms floor (fine at 30 fps) that a long
+     stall pushed in must earn its way back (under the old 70% line it stayed strained for the session); three probes in
+     a row and the 3-of-5 entry keep a borderline floor from flapping. A healthy station never enters. */
+  const STRAIN_ENTER_MS = (1000 / 30) * BUDGET_SHARE * 1.2, STRAIN_EXIT_MS = STRAIN_ENTER_MS * 0.9;   // anchored on 30 fps on purpose: the visible pace is not the strain line
+  const STRAIN_SETTLE_DRAWS = 10, STRAIN_PROBE_DRAWS = 45, STRAIN_EXIT_PROBES = 3;   // settle: a boot-time false start is harmless (the probes undo it); a slow one is 15 s of slideshow at 2 draws/s
+  let strained = false, strainProbe = false, strainProbeMs = 0, strainPasses = 0, strainDraws = 0, strainSlow = 0, strainForce = null;
+  function noteStrain(ms) {
+    strainDraws++;
+    if (strainForce != null) { strained = strainForce; strainProbe = false; return; }
+    if (!strained) {
+      strainSlow = ((strainSlow << 1) | (ms > STRAIN_ENTER_MS ? 1 : 0)) & 31;   // the last 5 draws, one bit each: over the line
+      let slow = 0; for (let b = strainSlow; b; b &= b - 1) slow++;
+      if (strainDraws > STRAIN_SETTLE_DRAWS && drawCostMs > STRAIN_ENTER_MS && slow >= 3) { strained = true; strainDraws = 0; strainPasses = 0; strainSlow = 0; }
+      return;
+    }
+    if (strainProbe) {   // the draw that just finished was the full-detail probe
+      strainProbe = false; strainProbeMs = ms;
+      strainPasses = ms < STRAIN_EXIT_MS ? strainPasses + 1 : 0;
+      if (strainPasses >= STRAIN_EXIT_PROBES) { strained = false; strainDraws = 0; }
+      return;
+    }
+    if (strainDraws % STRAIN_PROBE_DRAWS === 0) strainProbe = true;   // the next draw measures full detail again
+  }
+  // the still pace applies: the last verdict was still, no caller cap, no hand on the camera, and no known change is due yet
+  function stillPaced(now) { return stillNow && !frameCapMs && now >= motionUntil && now < stillDue; }
+  function paceMs(now) {
+    const base = frameCapMs ? Math.max(frameCapMs, PACE_VISIBLE_MS) : now < motionUntil ? PACE_MOTION_MS : stillPaced(now) ? PACE_STILL_MS : PACE_VISIBLE_MS;
+    return Math.max(base, budgetMs());
+  }
+  function cancelScheduled() {
+    if (raf) { cancelAnimationFrame(raf); raf = 0; }
+    if (paceTimer) { clearTimeout(paceTimer); paceTimer = 0; }
+  }
+  // the ONE place the next frame is booked: rAF at a draw-rate pace, a timer then rAF at a low one or the still pace. The
+  // still wait is a timer to just past the vsync before the still frame (THE STILL TICK'S TIMER) or a DUE LEAD before stillDue,
+  // then rAF (see DUE LEAD). A timer-booked callback is not a vsync sample: lastRafAt is cleared so a 33 ms gap can never be
+  // learned as the display's frame interval.
+  // UI FIRST (2026-10-26): a window opening holds the floor's draws for a moment — see the note in frame()
+  const YIELD_MAX_MS = 250;
+  let yieldUntil = 0;
+  function yieldToUi(ms) {
+    const until = performance.now() + Math.max(0, Math.min(YIELD_MAX_MS, ms > 0 ? ms : YIELD_MAX_MS));
+    if (until > yieldUntil) yieldUntil = until;
+  }
+  function yieldWait(now, force) { return force === true || !(now < yieldUntil) ? 0 : yieldUntil - now; }
+  function scheduleFrame(pace) {
+    if (!running) return;
+    const now = performance.now(), still = pace < PACE_TIMER_MIN_MS && stillPaced(now), lead = dueLeadMs();
+    const wait = now < yieldUntil ? yieldUntil - now : pace >= PACE_TIMER_MIN_MS ? lastDrawnAt + pace - now - 2
+      : still && stillDue - now > lead ? Math.min(stillTickTimerAt(pace), stillDue - lead) - now : 0;
+    if (wait > 0) { lastRafAt = 0; paceTimerAt = still ? now + wait : 0; paceTimer = setTimeout(() => { paceTimer = 0; if (running && !raf) raf = requestAnimationFrame(frame); }, wait); }
+    else raf = requestAnimationFrame(frame);
+  }
+  // focus / input / visible again: drop a pending low-rate wait and draw on the very next vsync
+  function paceWake() {
+    if (!running || !paceTimer) return;
+    clearTimeout(paceTimer); paceTimer = 0;
+    if (!raf) raf = requestAnimationFrame(frame);
+  }
+  // something started moving between frames: the scene is no longer known still, and a pending still wait is dropped, so the
+  // next vsync is drawn at the normal pace (that frame then judges itself). Called inside a frame it marks that frame moving.
+  function motionWake() { stillNow = false; stillKick = true; if (stillWhy === '') stillWhy = 'wake'; paceWake(); }
+  // any hand on the window: you are here, so the idle auto-director stands down (it is for when you are AWAY, not while you
+  // type in COMMS), a still or budget-throttled floor redraws now, and INPUT_HOLD_MS of normal pace follows (hover glances)
+  function userActive() { camUserAt = inputAt = performance.now(); motionWake(); }
+  // you are moving the camera: draw up to PACE_MOTION_MS for a moment so a pan or zoom tracks the hand
+  function cameraMoved() { motionUntil = performance.now() + PACE_MOTION_HOLD_MS; motionWake(); }
+  /* The simulation's step list for one drawn frame. At draw rate it is the old single step (dt clamped to 64 ms, so a
+     long stall never teleports anyone). While the pacer holds a low rate it is the real elapsed time cut into
+     <= SIM_SLICE_MS slices, so bodies and crates cover the same ground per wall-second as at 30 fps. */
+  function simSlices(gap, now) {
+    if (!((paceLowRate || budgetMs() > 64) && gap > 64 && gap <= SIM_CATCHUP_MAX_MS)) return [[Math.min(64, gap), now]];
+    const n = Math.ceil(gap / SIM_SLICE_MS), step = gap / n, out = [];
+    for (let i = n - 1; i >= 0; i--) out.push([step, now - i * step]);
+    return out;
+  }
+  // a per-frame ease tuned at 60 Hz, held to the same WALL-CLOCK speed at any draw rate (the 30 fps pace, a 240 Hz panel)
+  function easeK(k60, dt) { return dt > 0 ? 1 - Math.pow(1 - k60, dt / (1000 / 60)) : 0; }
+  function renderPace() {
+    const now = performance.now(), pace = running ? paceMs(now) : 0, still = running && stillPaced(now);
+    return { running, focused: pageFocused(), motion: now < motionUntil, paceMs: +pace.toFixed(1), vsyncMs: +vsyncMs.toFixed(2),
+      mode: !running ? 'stopped' : frameCapMs ? 'capped' : pace < PACE_VISIBLE_MS - 0.5 ? 'motion' : still && pace < PACE_STILL_MS + 0.5 ? 'still'
+        : pace > PACE_VISIBLE_MS + 0.5 ? 'budget' : 'visible',
+      still: stillNow, stillWhy: stillWhy || null, stillDueMs: stillDue < Infinity ? Math.max(0, Math.round(stillDue - now)) : null,
+      stillFrames, stillWhyCounts: Object.assign({}, stillWhyN),   // cumulative: a bench window's still share and what kept it moving
+      // cumulative: the due changes a still floor waited on, how many drew later than a vsync (+1 ms), and how late (DUE LEAD)
+      dueDraws, dueLate, dueLatMaxMs: +dueLatMax.toFixed(1), dueLatAvgMs: dueDraws ? +(dueLatSum / dueDraws).toFixed(1) : null,
+      drawCostMs: +drawCostMs.toFixed(2), budgetMs: +budgetMs().toFixed(1), strained, strainProbeMs: +strainProbeMs.toFixed(1),
+      draws: pacedDraws, simMs: Math.round(simMs), timerWait: !!paceTimer, yieldMs: Math.max(0, Math.round(yieldUntil - now)) };
+  }
+  /* STILL VERDICT (the tier Andrew approved 2026-10-21 — see RENDER PACING). Runs once at the end of every drawn frame
+     (frameBody), on state that frame already computed — no extra scene pass, no allocation. A frame is STILL only when
+     nothing on screen changed but ambient effects; the first motion source found is kept as stillWhy (the renderPace
+     readout the bench proves it by). The rule it is written to: never slow or delay anything that moves — unsure is motion.
+       MOTION — the next frame keeps the normal pace:
+         wake   — motionWake ran during the frame (a harness event on U.bus, a World API call)
+         camera — pan or zoom moved since the last frame, a scripted move or a focus ease is running, the hand hold
+         input  — a hand on the window within INPUT_HOLD_MS (hover tags, nameplates, the gaze that follows the cursor),
+                  the hero's mic listening
+         body   — an on-screen body moved, turned, or changed pose, drawn frame, goal or state; is walking, holds a walk
+                  target, pivots or dissolves a pose; is working, speaking or talking; wears a wake ripple, level-up or
+                  working glow; or its drawn geometry moves on the clock (SPRITES.drawBody's _renderLive: the idle bob, the
+                  speech accent while it shows). Also a decision the very next tick acts on: a social or gather plan still
+                  to walk, a chase due to repath, the hero's glance roll pending (maybeGlance rolls every tick)
+         speech — a peer-chatter line is up (it rides a talking mouth and fades), or the hero's voice is speaking; or a
+                  canvas overlay that follows a body (its speech bubble, the hovered body's nameplate) while that body moves
+                  or its drawn head-top does — on screen or off, the overlay is clamped to the canvas edge (a bubble over a
+                  body that holds still is static while it is up: its vanishing is a due change, below)
+         crate  — a real or ghost crate riding or sinking, a queue jam bobbing, a hand-off or SEND TO crate in flight
+         prop   — an on-screen prop with live content (a worked or lit prop: run output, a progress strip, heat; a filter
+                  scanning; the OUTBOX flare; a lit bay; an arcade/TV/jukebox in use — a body resting on a couch is not);
+                  a drawn prop whose art moves on its own clock (PropSprites.clockNext: every native draw, an occupied
+                  screen's sweep, fish, wax, steam, plasma, a ripple, a wall screen's scan line); a harness pulse decaying
+                  (a tool-fire surge, a connector packet, a workbench flash: PropSprites.pulsing)
+         sky    — a meteor or the bolide crossing, the belt's ember shower or fireball, a city's cars driving (review 10-21:
+                  separate objects crossing the screen, never drift), the sky still baking (SpaceBG)
+         fx     — a canvas overlay animating: desk and dock flashes, the pin flourish, the FIRST SHIP pulse, a SHIPPED
+                  pallet's newest crate popping in, the hero's wake ripple and level surge, the awakening, arrival, kindling
+                  and flood, the dawn veil easing, a truth flare, the CRT roll bar sweeping
+         belt   — an ENERGIZED belt tile in frame (its rollers march; a cold line's rollers are parked)
+       AMBIENT — never motion, redrawn whole at the still pace: the sky's slow layers (star drift and twinkle, the gas
+         breathing, ocean swell, a city's clouds and beacons), light flicker (fixture and prop light modulation,
+         and the dust motes drifting in the light pools, under a device px per still frame), and alpha-only glow pulses
+         (the await tag and its caret, LINK DOWN, bay lamps, routing nags, a prop's lamp/heat/band/hologram/indicator
+         glow). Andrew's words named the starfield drift and twinkle, light flicker and glow pulses; the other skies'
+         slow layers and the light-pool dust motes are classed with them HERE, by this code, as the same kind of drift.
+         A planted body's breath is not motion either (review 10-21, the reviewer's option b): SPRITES.drawBody publishes it
+         as _renderDrift, not _renderLive. It is a 0.12 world px swell of the drawn height on a 6.6 s sine, smooth-sampled,
+         never snapped — its head-top moves under 0.004 x zoom device px between two still frames (0.023 px at MAXZ), and
+         every still frame draws it at its true phase, so 30 or 60 draws/s put the same picture on screen. Counting it
+         kept every scene with a standing body (the hero, in the default view) at 60/s: the tier never engaged. What
+         rounds to whole px on top of it — the bubble or nameplate over its head — stays motion (speech, above).
+     stillDue = the earliest change the frame can see coming: a placed body's inner-life decision clock (BODY_CLOCKS — every
+     body's, on screen or off: an off-screen initiator decides for an on-screen partner too); an on-screen body's glance,
+     meeting, talk turn, hold, chase or mimic beat ending, its next drawn-frame edge; a speech bubble vanishing, a prop's
+     next stepped frame, the next meteor or fireball, the CRT grain's next step, a cinecam cut, an encounter or assembly
+     beat (its hold, the overseer's next line, the next gathering roll), a ghost spawn: the pacer draws that vsync instead
+     of waiting out the tick. Draw passes add to it too (noteDue); stillBegin clears it at the top of the frame. */
+  const STILL_BODY_PAD = 48;      // world px past the canvas edge a body still counts as on screen (a walker is caught well before it shows)
+  const STILL_MOVE_EPS = 0.01;    // world px: a body nudged less than this has not moved (float dust from the separation pass)
+  // every timestamp the inner life re-decides at (the tick ladder's `now >= x` gates, *Until and *Cd): the earliest future one is due
+  const BODY_CLOCKS = Object.freeze(['idleUntil', 'thinkUntil', 'settleUntil', 'useUntil', 'studyUntil', 'pauseUntil', 'trackUntil',
+    'workUntil', 'workRetryAt', 'spokeUntil', 'chatTrackUntil', 'driveUntil', 'barJoinUntil', 'lastFunUntil', 'hardUntil', 'convergeUntil',
+    'glanceCd', 'lookCd', 'noticeCd', 'chatTrackCd', 'neighborGlanceCd', 'mimicCd', 'exploreCd', 'quirkCd', 'offbeatCd', 'ackCd',
+    'revisitCd', 'pauseCd', 'beltWatchCd', 'yieldCd', 'summonGlanceCd', 'roundsCd', 'napCd', 'lookBackCd', 'deskVisitCd',
+    'cursorGazeCd', 'barJoinCd', 'nextFidget']);
+  // a body resting on these leaves the prop's art as it was: a couch, a stool or chair, the bench press (static art), a
+  // beanbag, a bunk (the sleeper's quilt breath is the prop's own clock: PropSprites.clockNext). NOT the heavy bag ('bag'):
+  // a body boxing it is active punching, and the bag swings
+  const REST_USE = Object.freeze({ couch: 1, seat: 1, bench: 1, beanbag: 1, bed: 1 });
+  // the hero's maybeGlance, by goal (see heroGlanceAt): the idle TAIL re-rolls its glance on every tick until one fires; a
+  // BRANCH goal rolls once and re-arms glanceCd either way; NONE never glances
+  const GLANCE_TAIL = Object.freeze({ inspect: 1, tend: 1, gaze: 1, rounds: 1 });
+  const GLANCE_BRANCH = Object.freeze({ lounge: 1, stare: 1, mourn: 1, quirk: 1 });
+  const GLANCE_NONE = Object.freeze({ sleep: 1, firstwake: 1, mimic: 1, chase: 1 });
+  let stillMark = '', stillCamS = NaN, stillCamX = NaN, stillCamY = NaN, stillDueAcc = Infinity;
+  let stillFrames = 0;                         // drawn frames judged still (renderPace readout: a bench window's still share)
+  const stillWhyN = {};                        // drawn frames judged moving, by stillWhy (a dozen fixed keys: no growth)
+  let liveBeltOf = null, liveBeltFor = null, liveBeltBox = null;   // the energized tiles' bounding box (tile units), re-measured on a new layout or plan
+  // frameBody's first act: this frame judges itself, and its draw passes may add due changes (noteDue) from here on
+  function stillBegin() { stillNow = false; stillKick = false; stillMark = ''; stillDueAcc = Infinity; }
+  function stillMove(why) { if (!stillMark) stillMark = why; }                     // an in-draw motion source (the prop pass, the queue jam, the roll bar)
+  function noteDue(t, now) { if (t > now && t < stillDueAcc) stillDueAcc = t; }
+  function restingOn(p) { const u = propUse(p); return !u || !!REST_USE[u.kind]; }
+  function bodyOnScreen(b) {
+    if (!cv) return true;
+    const m = STILL_BODY_PAD * scale, x = bodyPosX(b) * scale + panX, y = bodyPosY(b) * scale + panY;
+    return x > -m && y > -m && x < cv.width + m && y < cv.height + m;
+  }
+  /* when the hero's maybeGlance (run every tick) next acts. <= now: it rolls on this very tick — and the idle tail rolls
+     again on every tick until a glance fires — so the next frame must come at the tick rate, or every failed roll would
+     wait out a still interval. Mirrors maybeGlance's own gates, in its order. */
+  function heroGlanceAt(b, now) {
+    if (activity === 'talk' || b.state === 'walk' || GLANCE_NONE[b.goal]) return Infinity;   // talk: listening glances ride the mic (input)
+    const t = Math.max(b.glance ? b.glance.until : 0, b.glanceCd || 0);
+    if (b.goal === 'use' || b.working) return Math.max(t, b.nextFidget || 0);
+    if (b.goal == null || GLANCE_TAIL[b.goal] || GLANCE_BRANCH[b.goal] || b.stilling) return t;
+    // any other goal: only THE LOOK-UP can act (revisit / watch, off task); a box to track is a crate, motion already
+    if ((b.goal === 'revisit' || b.goal === 'watch') && activity !== 'task' && !b.working) return Math.max(t, b.lookCd || 0);
+    return Infinity;
+  }
+  // drawBubble's own test: a line to say, up until its time — or past it while the hero's voice is still speaking it
+  function bubbleShown(b, now) {
+    if (!b.say || !b.say.text) return false;
+    if (now <= b.say.until) return true;
+    return b === agent && typeof Voice !== 'undefined' && !!Voice.isSpeaking && !!Voice.isSpeaking();
+  }
+  // '' or why this body is motion; its baseline (position, facing, pose, drawn frame, goal, state) is refreshed whenever it changed
+  function bodyStillWhy(b, now) {
+    if (!b || b.unplaced) return '';
+    const moved = !(Math.abs(b.px - b._stillX) <= STILL_MOVE_EPS && Math.abs(b.py - b._stillY) <= STILL_MOVE_EPS)
+      || b.dir !== b._stillDir || b._pose !== b._stillPose || b._renderFrame !== b._stillFrame
+      || b.goal !== b._stillGoal || b.state !== b._stillState;   // a decision: what it starts shows on the very next tick
+    if (moved) {
+      b._stillX = b.px; b._stillY = b.py; b._stillDir = b.dir; b._stillPose = b._pose; b._stillFrame = b._renderFrame;
+      b._stillGoal = b.goal; b._stillState = b.state;
+    }
+    // the inner life's decision clocks are due for EVERY placed body, on screen or off (review 10-21): an initiator just past
+    // the edge decides for its partner too — a huddle or watch within SOCIAL_NEAR_RADIUS (wider than the pad), a border meeting
+    // in the next room, a mutual glance — and what it starts on screen must land on the vsync it is decided on
+    for (let i = 0; i < BODY_CLOCKS.length; i++) noteDue(b[BODY_CLOCKS[i]], now);
+    // bubbles are clamped to the canvas, so they count even for a body off screen: a speech bubble on a body that holds still is
+    // static while up (its vanishing is a due change); a peer-chatter line rides a talking mouth and fades in and out
+    if (b.say && b.say.text) noteDue(b.say.until, now);
+    if (b.chatter && now <= b.chatter.until) return 'speech';
+    // a canvas overlay that follows its body — its speech bubble (held up while the hero's voice speaks) or the hovered body's
+    // nameplate — is anchored to the drawn head-top and clamped to the canvas: a body that moves, or whose drawn geometry moves
+    // (_renderLive; _renderDrift, the sub-pixel breath — the overlay rounds to whole px, so it can step), slides it, on screen
+    // or along the canvas edge from a body off screen (review 10-21: "a bubble that is visible and moving is motion")
+    if (overlaysOn && (moved || b._renderLive || b._renderDrift) && (b === hoverAgent || bubbleShown(b, now))) return 'speech';
+    if (!bodyOnScreen(b)) return '';   // off screen it changes nothing you can see; a walker re-enters through the pad
+    if (b.glance) noteDue(b.glance.until, now);
+    if (b.meet) noteDue(b.meet.until, now);
+    noteDue(b._renderNextAt, now);   // the next blink edge / clock-driven pose frame (SPRITES.drawBody)
+    if (moved || b.state === 'walk' || b.target || b.working || b.speaking || b.talking || b._renderLive
+      || (b._rW || 0) > 0.05 || b._renderPoseFade != null) return 'body';
+    if ((b.wakeAt && now - b.wakeAt < 1500) || (b.levelUpAt && now - b.levelUpAt < 1200) || (b.workUntil && now < b.workUntil)) return 'body';
+    // the inner life's beats: one the next tick acts on is motion now; one that holds is due at its next edge
+    const pl = b.social;
+    if (pl) {
+      if (pl.phase === 'walk') return 'body';                    // stepSocial paths it (or settles it) on the next tick
+      if (pl.phase === 'hold') {
+        noteDue(((socialBeat && socialBeat.lastArrivalAt) || pl.holdAt || 0) + (pl.holdLen || 0), now);   // the hold ends
+        if (isTalkKind(pl.kind) && socialBeat && socialBeat.startedAt) {   // a talk turn opens or closes (talkTurn's slots)
+          const s0 = socialBeat.startedAt, k = Math.floor((now - s0) / TALK_SLOT_MS);
+          noteDue(s0 + k * TALK_SLOT_MS + TALK_SPEAK_MS, now); noteDue(s0 + (k + 1) * TALK_SLOT_MS, now);
+        }
+      }
+    }
+    if (b.gather && !b.gather.arrived) return 'body';           // stepGather paths it to its assembly tile on the next tick
+    const ch = b.chase;
+    if (ch) {
+      if (ch.phase === 'pursue' && !(ch.repathAt > now)) return 'body';   // stepChase repaths toward the cursor on this tick
+      noteDue(ch.until, now); noteDue(ch.endAt, now); noteDue(ch.hardUntil, now); noteDue(ch.repathAt, now);
+      noteDue(lastCursor.t + CURSOR_FRESH_MS, now);              // the cursor goes stale: stop and stare
+    }
+    if (b.mimic) { noteDue(b.mimic.until, now); noteDue(lastCursor.t + CURSOR_FRESH_MS, now); }
+    if (b === agent) { const g = heroGlanceAt(b, now); if (g <= now) return 'body'; noteDue(g, now); }
+    return '';
+  }
+  // an energized belt in frame: its rollers march. No plan = every tile draws live (Conveyor's legacy default)
+  function liveBeltsInFrame() {
+    const belts = geo && geo.belts;
+    if (!belts || !belts.length || !cv) return false;
+    if (belts !== liveBeltOf || beltLiveSet !== liveBeltFor) {
+      liveBeltOf = belts; liveBeltFor = beltLiveSet;
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const b of belts) if (!beltLiveSet || beltLiveSet[b.x + ',' + b.y]) { x0 = Math.min(x0, b.x); y0 = Math.min(y0, b.y); x1 = Math.max(x1, b.x); y1 = Math.max(y1, b.y); }
+      liveBeltBox = x0 <= x1 ? [x0, y0, x1 + 1, y1 + 1] : null;
+    }
+    const bb = liveBeltBox, k = T * scale;
+    return !!bb && bb[2] * k + panX >= 0 && bb[0] * k + panX <= cv.width && bb[3] * k + panY >= 0 && bb[1] * k + panY <= cv.height;
+  }
+  // the floor's own movers and canvas overlays (module state, no per-prop walk). Each is judged on its OWN clock, never on
+  // whether its draw pass has pruned it yet (a pass the overlays toggle skips would otherwise read as motion forever).
+  function fxStillWhy(now) {
+    if ((convey && convey.boxCount() > 0) || handoffBoxes.length) return 'crate';
+    for (let i = 0; i < sendCrates.length; i++) {   // a SEND TO crate flies once released; a held one waits (static) for its grace
+      const c = sendCrates[i];
+      if (c.t0) return 'crate';
+      noteDue(c.born + HANDOFF_GRACE_MS, now);
+    }
+    if (ghost && ghost.nextChange && geo && geo.belts) { const g = ghost.nextChange(now); if (g <= now) return 'crate'; noteDue(g, now); }   // ticked only where belts are (drawScene)
+    if (typeof PropSprites !== 'undefined') {
+      if (PropSprites.pulsing && PropSprites.pulsing(now)) return 'prop';   // a tool-fire surge / connector packet / workbench flash decaying
+      if (PropSprites.clockNext) { const c = PropSprites.clockNext(); if (c <= now) return 'prop'; noteDue(c, now); }   // this frame's drawn props
+    }
+    // the sky this frame drew (a landed station draws ground, a still render none): a meteor, the bolide, the belt's shower
+    if (!stillPass && typeof SpaceBG !== 'undefined' && SpaceBG.nextChange && !(typeof Terrain !== 'undefined' && Terrain.active())) {
+      const s = SpaceBG.nextChange(now); if (s <= now) return 'sky'; noteDue(s, now);
+    }
+    if (deskFlash.size) for (const f of deskFlash.values()) if (now - f.at < FLASH_MS) return 'fx';
+    if (dockFlashes.size) for (const t0 of dockFlashes.values()) if (now - t0 < 1100) return 'fx';
+    if (now - pinFlourishAt <= 900 || (firstShipPulse && now - firstShipPulse.at < 1500)) return 'fx';
+    // a SHIPPED pallet's newest crate pops in for 900 ms when its line's count rises (drawPallet: the lift steps down, the glint fades)
+    if (now - palletPopAt < 900) return 'fx';
+    if (camAnim || awakeFrozen || arrivalScene || kindleArmed || kindleP > 0 || floodAt || wakeDark !== wakeDarkTarget) return 'fx';
+    if ((dawnAt && now - dawnAt < 1300) || (sparkAt && now - sparkAt < 1200) || (bornAt && now - bornAt < 1000)
+      || (truthPulseAt && now - truthPulseAt < 360) || (wakeAt && now - wakeAt < 1500) || (levelUpAt && now - levelUpAt < 1200)) return 'fx';
+    return '';
+  }
+  function stillVerdict(now) {
+    let why = stillKick ? 'wake' : stillMark;
+    const camMoved = scale !== stillCamS || panX !== stillCamX || panY !== stillCamY;
+    stillCamS = scale; stillCamX = panX; stillCamY = panY;
+    // a focus ease counts only while it runs — under the ease's own gate: a camLerp left dormant under a follow-lock (or the
+    // scripted camera) moves nothing, and holding the tier off for it would draw a still floor at 60
+    if (!why && (camMoved || camAnim || (camLerp && !camAnim && !camLock) || now < motionUntil)) why = 'camera';
+    if (!why && now - inputAt < INPUT_HOLD_MS) why = 'input';
+    if (!why && typeof Voice !== 'undefined') {
+      if (Voice.isListening && Voice.isListening()) why = 'input';
+      else if (Voice.isSpeaking && Voice.isSpeaking()) why = 'speech';
+    }
+    // every body every frame, even once a source has decided: a baseline left stale reads as motion later (never as stillness)
+    if (agent) { const w = bodyStillWhy(agent, now); if (!why) why = w; }
+    for (let i = 0; i < crew.length; i++) { const w = bodyStillWhy(crew[i], now); if (!why) why = w; }
+    if (!why) why = fxStillWhy(now);
+    if (!why && liveBeltsInFrame()) why = 'belt';
+    // the cinecam's next cut (a hold ending, a still subject's 3 s grace, the hands-off takeover), an encounter or assembly beat
+    if (camLock && camLock.source === 'cine') noteDue(cineHoldUntil, now);
+    noteDue(cineWalkAt + 3000, now); noteDue(camUserAt + cineIdleMs, now);
+    if (socialBeat) noteDue(socialBeat.until, now);
+    if (gathering) {
+      noteDue(gathering.until, now);
+      if (gathering.phase === 'converge') noteDue(gathering.convergeUntil, now);
+      else if (gathering.phase === 'hold') {
+        const h0 = gathering.holdFrom, cyc = GATHER_SPEAK_MS + GATHER_GAP_MS, k = Math.floor((now - h0) / cyc);
+        noteDue(h0 + (gathering.holdLen || 0), now);                              // the assembly breaks
+        noteDue(h0 + k * cyc + GATHER_SPEAK_MS, now); noteDue(h0 + (k + 1) * cyc, now);   // the overseer's line ends / the next begins
+      } else if (gathering.phase === 'breaking') noteDue(gathering.scatterAt + OVERSEER_BREAK_MS, now);
+    } else if (!reduceMotion()) {   // maybeGather runs every tick: the roll comes the tick its last gate lapses
+      noteDue(gatherGateUntil, now); noteDue(stationBusyAt + GATHER_QUIET_MS, now); noteDue(gatherRollAt, now);
+    }
+    if (chatFocusId != null) noteDue(chatWarmUntil, now);   // the COMMS stare goes cold (chatStareHold)
+    if (!linkStaleDim && lastSseEventAt) noteDue(lastSseEventAt + LINK_STALE_MS, now);   // the link goes stale: LINK DOWN, telemetry dims
+    stillWhy = why; stillNow = !why; stillDue = stillDueAcc;
+    dueWatch = stillNow ? stillDue : Infinity;   // DUE LEAD: the draw that lands this change records how late it came
+    if (stillNow) stillFrames++; else stillWhyN[why] = (stillWhyN[why] || 0) + 1;
+    // the next frame was booked before this one ran: a STILL wait that must not stand (motion, or an earlier change: its
+    // timer must fire a DUE LEAD before it) re-books
+    if (paceTimer && paceTimerAt && (!stillNow || stillDue - dueLeadMs() < paceTimerAt - 0.5)) paceWake();   // (a budget-floor timer is left to the budget)
+  }
+  // ---- end STILL VERDICT
+  /* OVERLAYS (HUD widget, 2026-09-30): the station's in-world readouts — run clocks, tool tickers, await tags,
+     routing callouts, bay names/lamps/plates, hover glances, dock flashes, speech bubbles, nameplates and the
+     working pulse at a worker's feet. A surface that says all of that itself (the HUD widget's rows) turns
+     them off to show only the world. true = the station's normal frame, byte-identical. */
+  let overlaysOn = true;
+  function setOverlays(on) { overlaysOn = on !== false; }
   function wakeIn() { wakeAt = performance.now(); }
 
   /* ---------- THE AWAKENING — a witnessed birth (cinematic camera + spark + dark->dawn) ----------
@@ -1625,13 +2266,19 @@ const World = (() => {
     if (!agent) return;
     const side = (cache && agent.px > cache.W / 2) ? 'west' : 'east';
     setGlance(side, 650, performance.now());
-    setTimeout(() => { if (agent) agent.dir = side; }, 240);
-    setTimeout(() => { if (agent) setGlance('south', 700, performance.now()); }, 760);
-    setTimeout(() => { if (agent) agent.dir = 'south'; }, 1000);
+    setTimeout(() => { if (agent) agent.dir = side; motionWake(); }, 240);   // STILL: each beat of the Turn lands on the next vsync
+    setTimeout(() => { if (agent) setGlance('south', 700, performance.now()); motionWake(); }, 760);
+    setTimeout(() => { if (agent) agent.dir = 'south'; motionWake(); }, 1000);
   }
   function truthPulse() { truthPulseAt = performance.now(); }
   function endAwakening() { wakeDarkTarget = 0; dawnAt = performance.now(); wakeIn(); }   // DAWN: light floods + ripple fires (agent stays frozen/facing-you for the final line)
-  function releaseAwakening() { cancelArrival(); awakeFrozen = false; sparkAt = 0; floodAt = 0; floodEndAt = 0; floodStreams = null; kindleArmed = false; kindleP = 0; kindleHolding = false; armFirstWake(); }   // hand the newborn back to its own autonomous life — and let it have its FIRST LIGHT
+  function releaseAwakening() {
+    cancelArrival(); awakeFrozen = false; sparkAt = 0; floodAt = 0; floodEndAt = 0; floodStreams = null; kindleArmed = false; kindleP = 0; kindleHolding = false; armFirstWake();   // hand the newborn back to its own autonomous life — and let it have its FIRST LIGHT
+    // first-run chrome that must not talk over the arrival (navdock's nav coach, org P31) waits for this beat
+    if (typeof document !== 'undefined' && typeof CustomEvent === 'function') document.dispatchEvent(new CustomEvent('starnet:awakening-released'));
+  }
+  // true while a birth's awakening owns the room (beginAwakening → releaseAwakening)
+  function awakeningHeld() { return awakeFrozen; }
   // FIRST LIGHT: arm the once-per-life wake ritual the instant the newborn owns itself. The activity!=='task'
   // guard makes a summon racing the release win cleanly (the ritual simply never arms).
   function armFirstWake() {
@@ -1662,14 +2309,23 @@ const World = (() => {
   }
   function collapseFlood() { if (floodAt && !floodEndAt) floodEndAt = performance.now(); }   // pull the cascade inward into the mind
   function refit() { fitNeeded = true; }
+  /* The bubble shows a line's first 160 characters, whitespace runs folded. chat.js says the WHOLE reply so far on every
+     streamed token, so folding all of it was O(reply) per token — O(n²) per answer (perf p5, 2026-10-20). Only a head that
+     already reaches past 160 folded characters decides them; a whitespace-heavy head falls back to folding everything. */
+  function bubbleText(text) {
+    const s = String(text || '');
+    if (s.length > 2048) { const head = s.slice(0, 2048).replace(/\s+/g, ' ').trimStart(); if (head.length > 160) return head.slice(0, 160); }
+    return s.replace(/\s+/g, ' ').trim().slice(0, 160);
+  }
   function say(text, opts) {
     if (!agent) return;
-    const t = String(text || '').replace(/\s+/g, ' ').trim();
+    const ambient = !!(opts && opts.ambient);
+    const t = ambient ? String(text || '').replace(/\s+/g, ' ').trim() : bubbleText(text);
     agent.say = { text: t.slice(0, 160), until: performance.now() + 4200 };
     // ambient station-life remarks are muttered ALOUD too (when the agent has a voice and isn't
     // mid-conversation) so the station feels lived-in. Real replies are spoken by chat.js, not here,
     // so only {ambient:true} lines speak — and pure filler ("...", "hmm") stays a silent bubble.
-    if (opts && opts.ambient && typeof Voice !== 'undefined' && Voice.mutter
+    if (ambient && typeof Voice !== 'undefined' && Voice.mutter
         && /[a-z]/i.test(t) && !/^h+m+[.…]?$/i.test(t)) {
       Voice.mutter(t);
     }
@@ -1736,11 +2392,34 @@ const World = (() => {
   // agent locks the feed onto that agent immediately (no idle wait) and TRAILS it as it moves, until the
   // Commander grabs the camera (wheel/drag/click → the input handlers release the lock). One-shot focusBody
   // stays for programmatic reframes (boot restore, delete-fallback) — lockBody is only armed by a USER selection.
-  function lockBody(id) {
+  // zoom (optional, 2026-09-30): the lock's scale for a surface that frames one agent closer (the HUD widget);
+  // omitted = the station's own rule (at least 3, never zooming out), byte-identical.
+  // opts.seatAt (optional): where a SEATED body's feet sit in the frame (0..1 of its height). A seated worker
+  // faces its desk, which stands ABOVE it on screen; a small frame that keeps the default 0.56 cuts the desk
+  // and its screen off. Omitted = 0.56 for every body, byte-identical.
+  /* A BORROWED CAMERA, HANDED BACK (HUD mode, 2026-09-30): cameraState() is what drives the view right now — a
+     session lock (whom, at what zoom) or a free transform, kept as the zoom and the WORLD point at the canvas centre
+     (a canvas resize re-anchors on its centre, so that point survives the window changing size in between);
+     restoreCamera(state) puts exactly that back: the lock, or the free view (the cinecam re-casts on its own). */
+  function cameraState() {
+    const w = cv ? cv.width : 0, h = cv ? cv.height : 0;
+    return { lockId: camLock && camLock.source === 'session' ? camLock.id : null, lockSc: camLock ? camLock.sc : 0, seatAt: camLock && camLock.seatAt ? camLock.seatAt : 0,
+      scale, cx: scale > 0 ? (w / 2 - panX) / scale : 0, cy: scale > 0 ? (h / 2 - panY) / scale : 0 };
+  }
+  function restoreCamera(st) {
+    if (!st || !(st.scale > 0) || camAnim || awakeFrozen) return false;   // the scripted awakening camera owns the transform
+    camLerp = null; camLock = null;
+    if (st.lockId) { lockBody(st.lockId, st.lockSc, st.seatAt ? { seatAt: st.seatAt } : null); if (camLock) return true; }
+    scale = clampz(st.scale, MINZ, MAXZ);
+    if (cv) { panX = cv.width / 2 - st.cx * scale; panY = cv.height / 2 - st.cy * scale; }
+    return true;
+  }
+  function lockBody(id, zoom, opts) {
     const b = bodyForAgent(id) || agent;
     if (!b || b.unplaced || !cache || camAnim || awakeFrozen) return;   // nothing to frame yet / the scripted awakening camera owns the transform
     camLerp = null;
-    camLock = { id: (b.agentId || b.id), sc: clampz(Math.max(scale, 3), MINZ, MAXZ), source: 'session' };
+    camLock = { id: (b.agentId || b.id), sc: clampz(zoom > 0 ? zoom : Math.max(scale, 3), MINZ, MAXZ), source: 'session' };
+    if (opts && opts.seatAt > 0 && opts.seatAt < 1) camLock.seatAt = +opts.seatAt;
   }
   /* ---------- IDLE CINECAM — the security-feed auto-director ----------
      After cineIdleMs of true hands-off the camera starts hunting the floor's own life: it follow-locks a
@@ -1808,7 +2487,7 @@ const World = (() => {
     return true;
   }
   function toCanvas(ev) {
-    const r = cv.getBoundingClientRect();
+    const r = U.pointerRect(cv);   // clientX's px, also on WebKit under TEXT SIZE (U.pointerRect)
     return { x: (ev.clientX - r.left) * (cv.width / r.width), y: (ev.clientY - r.top) * (cv.height / r.height) };
   }
   // Output pixel -> pre-CRT scene pixel. Match the renderer's six-step inverse,
@@ -2170,7 +2849,7 @@ const World = (() => {
     const aid = body && body.id;
     const dp = aid && deskPropFor(aid);
     if (dp) return { x: dp.x, y: dp.y, assigned: true };
-    if (aid && geo.props) { const bay = geo.props.find(p => p.t === 'bay' && p.agentId === aid); if (bay) return { x: bay.x, y: bay.y, assigned: true }; }
+    if (aid && geo.props) { const bay = homeBayOf(aid); if (bay) return { x: bay.x, y: bay.y, assigned: true }; }
     if (body === agent && seat) return { x: seat.tx, y: seat.ty, assigned: true };   // hero on the synthetic auto-desk
     // A2 leash fallback: a PLACED crew body with no workstation/bay (the common freshly-summoned worker
     // before the user assigns it a PC) anchors on its OWN foot tile, so zoneFor yields a bounded leash
@@ -2289,6 +2968,17 @@ const World = (() => {
   // A passing agreement belongs to these bodies, targets and geometry only. It
   // never replaces their work/social goals or survives a refit or a new command.
   const trafficPlans = new WeakMap(), trafficRetry = new WeakMap();
+  // who each body is holding behind this frame; a stale entry (its body stopped stepping) is ignored
+  const followOf = new WeakMap();
+  function followLeadsTo(from, target, now) {
+    for (let cur = from, hops = 0; cur && hops < 32; hops++) {
+      const f = followOf.get(cur);
+      if (!f || now - f.at > 100) return false;
+      if (f.leader === target) return true;
+      cur = f.leader;
+    }
+    return false;
+  }
   function trafficDistance(p, a, b) {
     const dx=b.x-a.x,dy=b.y-a.y,n=dx*dx+dy*dy;
     const t=n ? Math.max(0,Math.min(1,((p.x-a.x)*dx+(p.y-a.y)*dy)/n)) : 0;
@@ -2351,6 +3041,10 @@ const World = (() => {
     }
     // Match a slower walker instead of repeatedly shoving its back. This check
     // runs every frame; the more expensive refuge search below is throttled.
+    // FOLLOW RINGS (2026-10-03, Andrew: three crew frozen in a hall "for minutes"): two walkers crossing
+    // at an X each see the other "ahead and going my way", so each holds for the other forever — and
+    // a holder is 'idle', which jam release never touches. Never wait on a body whose own wait chain
+    // leads back to us; the body that closes the ring walks on and the ring is gone next frame.
     if(!plan&&b.target){
       const dx=b.target.x-b.px,dy=b.target.y-b.py,d=Math.hypot(dx,dy),R=PERSONAL_TILES*T;
       if(d>1)for(const other of allBodies()){
@@ -2358,11 +3052,13 @@ const World = (() => {
         const ox=other.px-b.px,oy=other.py-b.py,ahead=(ox*dx+oy*dy)/d;
         if(ahead>0&&ahead<R+3&&Math.abs(ox*dy-oy*dx)/d<R&&
           (other.target.x-other.px)*dx+(other.target.y-other.py)*dy>0&&
-          geo.clearFootSegment(b.px,b.py,other.px,other.py,blocked)){
+          geo.clearFootSegment(b.px,b.py,other.px,other.py,blocked)&&!followLeadsTo(other,b,now)){
+          followOf.set(b,{leader:other,at:now});
           b.state='idle';b.spd=0;return true;
         }
       }
     }
+    followOf.delete(b);
     if(!plan&&b.target&&now>=(trafficRetry.get(b)||0)){
       trafficRetry.set(b,now+250);
       const dx=b.target.x-b.px,dy=b.target.y-b.py,d=Math.hypot(dx,dy),R=PERSONAL_TILES*T;
@@ -2402,7 +3098,11 @@ const World = (() => {
     }
     if(plan.phase==='hold'){
       const vx=plan.passTarget.x-plan.origin.x,vy=plan.passTarget.y-plan.origin.y,d=Math.hypot(vx,vy)||1;
-      const passed=!plan.passer.target||plan.passer.target!==plan.passTarget||((plan.passer.px-plan.origin.x)*vx+(plan.passer.py-plan.origin.y)*vy)/d>PERSONAL_TILES*T;
+      // Past the origin is not enough: a passer whose next waypoint lies beside the pocket cannot reach it
+      // while the yielder steps back out (personal space holds them apart and both stall until jam recovery
+      // drops both routes). Hold the pocket until the passer has ARRIVED or is clear of it by two radii.
+      const clearOfPocket=Math.hypot(plan.passer.px-b.px,plan.passer.py-b.py)>2*PERSONAL_TILES*T;
+      const passed=!plan.passer.target||clearOfPocket&&(plan.passer.target!==plan.passTarget||((plan.passer.px-plan.origin.x)*vx+(plan.passer.py-plan.origin.y)*vy)/d>PERSONAL_TILES*T);
       if(!passed){b.state='idle';b.spd=0;b.dir=dirToward(b.px,b.py,plan.passer.px,plan.passer.py);return true;}
       // Resume from the shoulder directly where safe; otherwise retrace the
       // validated refuge route before continuing the original waypoint.
@@ -2415,7 +3115,7 @@ const World = (() => {
       if(plan.idx>=plan.points.length){if(plan.phase==='back')clearTraffic(plan);else plan.phase='hold';}
       b.state='idle';return true;
     }
-    const step=stepGait(b,dx,dy,d,28,plan.idx===plan.points.length-1,dt);
+    const step=stepGait(b,dx,dy,d,28,plan.idx===plan.points.length-1,dt,true);
     const nx=b.px+dx/d*step,ny=b.py+dy/d*step;
     if(!geo.clearFootSegment(b.px,b.py,nx,ny,blocked)){clearTraffic(plan);return true;}
     b.px=nx;b.py=ny;b.state='walk';return true;
@@ -2449,6 +3149,8 @@ const World = (() => {
   const PERSONAL_TILES = 0.8;      // min centre-to-centre spacing, in tiles. < 1 so adjacent-tile beats never fight it.
   const SEP_JAM_MS = 2500;         // continuously shoved while walking for this long → give up on the leg and re-decide
   const SEP_PASSES = 4;            // relaxation sweeps per frame — a pile of three needs more than one pass to settle
+  const STALL_MS = 12000;          // a body with somewhere to go that has not moved STALL_PX in this long is stuck → re-plan
+  const STALL_PX = 3;
   function nudgeBody(b, dx, dy) {
     const nx = b.px + dx, ny = b.py + dy;
     const t = tileOf(nx, ny);
@@ -2477,6 +3179,7 @@ const World = (() => {
     const list = [];
     if (agent && !agent.unplaced) list.push(agent);
     for (const b of crew) if (b && !b.unplaced) list.push(b);
+    releaseStalled(list, now);   // every body, even a lone one — see STALL WATCHDOG below
     if (list.length < 2) return;
     const R = PERSONAL_TILES * T, R2 = R * R;
     const anchored = b => !!(b.sitting || b.seated);   // seated only — see the note above: a walk-in is exactly when they cross
@@ -2535,6 +3238,25 @@ const World = (() => {
     }
   }
 
+  /* STALL WATCHDOG (2026-10-03, Andrew: three crew stood in a hall for 30+ minutes). The backstop for
+     every hold above and any we have not found yet: a body that WANTS to go somewhere (has a target) but
+     has not covered STALL_PX in STALL_MS is not waiting, it is stuck. Every deliberate hold is shorter —
+     belt-yield and stroll pauses < 2s, a traffic agreement expires at 10s — and seated, social, gather and
+     approval-waiting bodies own their own timers. Drop the leg and re-plan: work re-paths to its seat
+     (tick / stepCrewToSeat re-plot a null target, around the bodies standing there now), idle re-decides. */
+  function releaseStalled(list, now) {
+    for (const b of list) {
+      if (!b.target || b.sitting || b.seated || b.goal === 'social' || b.goal === 'gather' || b.goal === 'awaiting') { b.stallAt = 0; continue; }
+      if (!b.stallAt || Math.hypot(b.px - b.stallX, b.py - b.stallY) > STALL_PX) { b.stallAt = now; b.stallX = b.px; b.stallY = b.py; continue; }
+      if (now - b.stallAt < STALL_MS) continue;
+      b.stallAt = 0;
+      const plan = trafficPlans.get(b); if (plan) clearTraffic(plan);
+      followOf.delete(b);
+      if (!(b.working || b.goal === 'work' || b.goal === 'summon' || b.goal === 'fetch')) seizeFromIdle(b);
+      b.pathPts = null; b.target = null; b.state = 'idle'; b.idleUntil = now + U.irnd(300, 900);
+    }
+  }
+
   /* ---------- crew movement helper ----------
      A crew body walks to its assigned chair when working (stepCrewToSeat below). When NOT working it now runs the
      HERO's full sentience engine per-body (crewEngineStep, Tier B2) instead of the old light crewWander stepper —
@@ -2585,7 +3307,7 @@ const World = (() => {
         else { b.px = b.target.x; b.py = b.target.y; b.target = null; }
       } else {
         const sp = stepGait(b, dx, dy, d, 28, !more, dt);
-        b.px += dx / d * sp; b.py += dy / d * sp; b.state = 'walk'; b.sitting = false;
+        gaitMove(b, dx, dy, d, sp); b.state = 'walk'; b.sitting = false;
       }
     }
   }
@@ -2650,7 +3372,7 @@ const World = (() => {
           else { self.px = self.target.x; self.py = self.target.y; arrive(now); }
         } else {
           const s = stepGait(self, dx, dy, d, SPEED, !more, dt);
-          self.px += dx / d * s; self.py += dy / d * s; self.state = 'walk';
+          gaitMove(self, dx, dy, d, s); self.state = 'walk';
         }
       }
     } else if (self.goal === 'social') {
@@ -5544,8 +6266,36 @@ const World = (() => {
      so a bed reclaimed mid-nap can never leave a body posed on a mattress that is no longer there. */
   function lyingBed(b) {
     if (!b || !b.lying || b.goal !== 'sleep' || !b.usingProp || !geo || !geo.props) return null;
-    const p = geo.props.find(q => q.id === b.usingProp);
+    const p = propById(b.usingProp);
     return (p && (propUse(p) || {}).kind === 'bed') ? p : null;
+  }
+  /* ONE WALK, NOT ONE PER PROP (perf, 2026-10-20). The prop pass asked, for EVERY prop, which body sleeps in it and which
+     sits on it — a crew.find per prop, each lyingBed a geo.props.find — O(props² × bodies) per frame: ~1.5 ms on a
+     furnished 300-prop station with sleepers, 12 ms at 600. propById reads the floor's props through an id index (the
+     FIRST prop with an id, as props.find answered), rebuilt whenever the projected prop list is replaced or resized —
+     rederive hands over a fresh array on every edit and nothing mutates it in place. bodyPropIndex() walks [agent,
+     ...crew] once per frame and keeps the FIRST body per bed and per seat: the hero, then the crew in order — exactly
+     what `(agent && … === p) ? agent : crew.find(…)` picked. */
+  let propIndexOf = null, propIndexLen = -1, propIndex = null;
+  function propById(id) {
+    const props = geo && geo.props;
+    if (!props) return undefined;
+    if (props !== propIndexOf || props.length !== propIndexLen) {
+      propIndex = new Map();
+      for (const q of props) if (!propIndex.has(q.id)) propIndex.set(q.id, q);
+      propIndexOf = props; propIndexLen = props.length;
+    }
+    return propIndex.get(id);
+  }
+  function bodyPropIndex() {
+    const sleeper = new Map(), sitter = new Map();   // bed prop -> the body dormant in it · prop id -> the body seated on it
+    for (const b of [agent, ...crew]) {
+      if (!b) continue;
+      const bed = lyingBed(b);
+      if (bed && !sleeper.has(bed)) sleeper.set(bed, b);
+      if (b.seated && !b.lying && !sitter.has(b.usingProp)) sitter.set(b.usingProp, b);
+    }
+    return { sleeper, sitter };
   }
   function planBedSleep(now, reviewBedId = null, reviewZone = null) {
     if (!geo || !geo.props || !geo.props.length) return false;
@@ -5964,7 +6714,7 @@ const World = (() => {
     // body-track: keep the torso turned to a tracked box for a beat after the glance (whole-body attention, eased by glanceCd)
     if (agent.goal == null && agent.state !== 'walk' && agent.trackUntil > now) { const box = nearestBox(); if (box && box.d < 90) agent.dir = dirToward(agent.px, agent.py, box.x, box.y); }
     // self-heal a stuck walker: the walk pose with nowhere to go (target + path both gone —
-    // e.g. a REFIT re-bake cleared the in-flight path, or a path came back empty). The idle
+    // e.g. a BUILD MODE re-bake cleared the in-flight path, or a path came back empty). The idle
     // re-decision below is gated on state !== 'walk', so without this the legs cycle in place
     // forever (moonwalk). Drop to idle and let this same tick re-path / re-summon.
     if (agent.state === 'walk' && !agent.target && (!agent.pathPts || agent.pathIdx >= agent.pathPts.length)) {
@@ -6063,7 +6813,7 @@ const World = (() => {
           else { agent.px = agent.target.x; agent.py = agent.target.y; arrive(now); }
         } else {
           const s = stepGait(agent, dx, dy, d, SPEED, !more, dt);
-          agent.px += dx / d * s; agent.py += dy / d * s; agent.state = 'walk';
+          gaitMove(agent, dx, dy, d, s); agent.state = 'walk';
         }
       }
     } else if (agent.goal === 'use') {
@@ -6141,9 +6891,27 @@ const World = (() => {
     if (!reviewParts) return;
     const t=performance.now();reviewParts[name]=(reviewParts[name]||0)+t-reviewStamp;reviewStamp=t;
   }
-  function frame(now) {
-    if (running) raf = requestAnimationFrame(frame);   // schedule next frame FIRST — a throw below can't kill the loop
-    const reviewStart=reviewPerformance.enabled?performance.now():0;
+  function frame(now, force) {
+    raf = 0;
+    if (paceTimer) { clearTimeout(paceTimer); paceTimer = 0; }   // exactly one booking alive (redrawNow / start call in directly)
+    const pace = paceMs(now);
+    { const d = now - lastRafAt; if (lastRafAt && d > 2 && d < 50) vsyncMs = !vsyncMs || d < vsyncMs ? d : vsyncMs + (d - vsyncMs) * 0.02; lastRafAt = now; }
+    /* UI FIRST (2026-10-26, Andrew: "laggy … especially when opening windows … it should never lag"). Opening a window is
+       the heaviest thing the page does in one go — build its content, style and lay it out, seat it on the dock — and on a big
+       station a floor draw is ~30 ms, so a draw landing in the same frames pushed the window's first paint out by a frame or
+       more (measured on a copy of his station, 11 windows: click → window on screen, median 168 ms → 102 ms with the floor held
+       while the window opens; the worst, SETTINGS, 631 → 431). A window opening asks the floor to stand aside for a moment:
+       no draw until the hold ends (at most YIELD_MAX_MS — the sheet's rise is ~220 ms), then the normal pace. The simulation
+       reads the real clock, so nothing is lost but those frames; a forced draw (a resize blanked the bitmap) still draws. */
+    if (yieldWait(now, force) > 0) { scheduleFrame(pace); return; }   // scheduleFrame books the first vsync after the hold
+    paceLowRate = pace >= PACE_TIMER_MIN_MS;
+    // RENDER PACING: not this vsync. Half a vsync of slack draws on the vsync NEAREST the pace (never a whole one late)
+    if (force !== true && now - lastDrawnAt < pace - Math.max(1, Math.min(vsyncMs || 2, 17) / 2)) { scheduleFrame(pace); return; }
+    lastDrawnAt = now; pacedDraws++;
+    if (dueWatch <= now) noteDueDraw(now);   // STILL: this draw lands the change the still floor waited on (DUE LEAD readout)
+    scheduleFrame(pace);   // schedule next frame FIRST — a throw below can't kill the loop
+    const drawStart = performance.now(), bakedBefore = cache;   // only rebake() (and loadStation) replace the bake
+    const reviewStart=reviewPerformance.enabled?drawStart:0;
     reviewParts=reviewPerformance.enabled?{}:null;reviewStamp=reviewStart;
     try {
       frameBody(now);
@@ -6154,6 +6922,12 @@ const World = (() => {
       if (msg !== lastFaultMsg) { lastFaultMsg = msg; try { console.error('[world] render frame threw (x' + renderFaults + '):', e); } catch (_) {} }
       if (renderFaults >= RENDER_FAULT_LIMIT) { try { drawRenderFault(); } catch (_) {} }
     } finally {
+      // a frame that baked the station paid a one-off cost (~2.5 s on a big floor), not the floor's steady draw: it must neither
+      // seed the budget nor tip a healthy floor into STRAINED DETAIL, which only full-detail probes under the exit line undo
+      if (cache === bakedBefore) {
+        noteDrawCost(performance.now() - drawStart);   // FRAME BUDGET: what this draw really cost the main thread
+        noteStrain(performance.now() - drawStart);     // STRAINED DETAIL: the same cost, raw (a probe is judged on its own draw)
+      }
       if(reviewPerformance.enabled && reviewPerformance.samples.length<3600)reviewPerformance.samples.push({t:now,ms:performance.now()-reviewStart,parts:reviewParts});
       reviewParts=null;
     }
@@ -6193,6 +6967,15 @@ const World = (() => {
     if (!(typeof IndustrialTextures !== 'undefined' && typeof IndustrialTextures.drawBase === 'function'
       && IndustrialTextures.drawBase(ctx, d.image, d.x, d.y))) ctx.drawImage(d.image, d.x, d.y);
   }
+  const TAGGED_PROPS = { outbox: 1, missionboard: 1, trophycase: 1, airlock: 1 };   // the props propremaster.js approvedState tags
+  /* a tagged prop's room, side walls included: the tag stays centred under its prop while it overhangs no further than the
+     wall's own thickness, and is nudged in only where it would run past the hull's outer face. (Clamped to the floor itself,
+     the walker's OUTBOX-by-the-wall tag slid under the next bay's name plate, which hid its count.) */
+  function tagRoomOf(p) {
+    const r = lwRoomBox(p.x, p.y); if (!r) return null;
+    const side = ((typeof StationBake !== 'undefined' && StationBake.WALL && StationBake.WALL.side) || 0) + 2;   // + lwRoomBox's 2px inset
+    return { x: r.x - side, y: r.y, w: r.w + side * 2, h: r.h };
+  }
   function drawLitProp(p, work, live) {
     PropSprites.draw(p, work, live);
     if (!sceneRenderer || !PropSprites.canLightResponse || !PropSprites.canLightResponse(p)) return;
@@ -6224,6 +7007,10 @@ const World = (() => {
     } finally {g.restore();PropSprites.setCtx(ctx);}
   }
 
+  // Prop ART changed (a remaster repair batch, a user prop decoded): only the screen-space shadow layer holds prop
+  // pixels, so clear its stamp and the next frame repaints it. StationBake never reads prop art — a full rebake here
+  // was a ~2.5 s freeze per repair batch on a large station (review finding world-render-03).
+  function invalidatePropShadows() { if (propShadowLayer) propShadowLayer.stamp = null; }
   function drawPropShadows() {
     if(typeof PropSprites==='undefined'||!PropSprites.drawShadow)return;
     if(!propShadowLayer){
@@ -6264,7 +7051,9 @@ const World = (() => {
     if(n.root.getAttribute('data-feed')!==readout.state)n.root.setAttribute('data-feed',readout.state);
   }
   function frameBody(now) {
-    const dt = Math.min(64, now - last); last = now; fnow = now;
+    stillBegin();   // STILL: this frame judges itself (stillVerdict, after the scene) — a throw below leaves it not-still
+    const gap = now - last, dt = Math.min(64, gap); last = now; fnow = now;
+    const slices = simSlices(gap, now);   // RENDER PACING: one step at draw rate; real-time slices while the pacer holds a low rate
     linkStaleDim = linkDown(now);   // recompute the honest link state before any telemetry is drawn this frame
     if (now - lastTtlSweepAt >= 1000) { lastTtlSweepAt = now; try { sweepStaleStates(now); } catch (_) {} }   // E2: degrade any paired state whose end-event was lost
     if (wakeDark !== wakeDarkTarget) { wakeDark += (wakeDarkTarget - wakeDark) * Math.min(1, dt / 260); if (Math.abs(wakeDark - wakeDarkTarget) < 0.002) wakeDark = wakeDarkTarget; }
@@ -6289,7 +7078,9 @@ const World = (() => {
       watchStageLoss(now);    // a DEAD stage context heals here too — the rest of this frame draws onto the replacement
     } finally {probeBatch=null;}
     reviewMark('recovery');
-    tick(dt, now);
+    for (const [d] of slices) simMs += d;
+    if (slices.length === 1) tick(dt, now);
+    else { for (const [d, t] of slices) { fnow = t; tick(d, t); } fnow = now; }
     reviewMark('simulation');
 
     ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.imageSmoothingEnabled = false;
@@ -6305,13 +7096,25 @@ const World = (() => {
       const lb = bodyForAgent(camLock.id);
       if (!lb || lb.unplaced) camLock = null;   // subject despawned / off-floor → release (the director re-casts next frame if it owns the camera)
       else {
-        const ts = camLock.sc, lx = cv.width / 2 - bodyPosX(lb) * ts, ly = cv.height * 0.56 - bodyPosY(lb) * ts;
-        const k = 0.08;   // softer than the one-shot focus ease (0.16): a trailing, cinematic follow of a moving body
+        const fy = (camLock.seatAt && (lb.seated || lb.sitting)) ? camLock.seatAt : 0.56;   // desk = `sitting`, couch/bench = `seated`
+        const ts = camLock.sc, lx = cv.width / 2 - bodyPosX(lb) * ts, ly = cv.height * fy - bodyPosY(lb) * ts;
+        const k = easeK(0.08, dt);   // softer than the one-shot focus ease (0.16): a trailing, cinematic follow of a moving body
         scale += (ts - scale) * k; panX += (lx - panX) * k; panY += (ly - panY) * k;
+        /* CAMERA SETTLE (perf, 2026-10-20 — "it eats my PC's resources"). A geometric ease never reaches its target: in
+           float64 each cine shot's zoom crept for ~400 frames (6.6 s; a pan near 0 for 150 s), and every cache keyed on the
+           camera — the belt atlas, the prop shadow layer — was dropped and rebuilt on each of them, all day while idle.
+           Each axis lands on its own once its remaining motion is under CAM_SETTLE_PX device px — the zoom measured at
+           the on-screen pixel it would move farthest, (sx - panX) * Δscale / scale at a screen edge: a walking subject
+           keeps panning, but its zoom still lands. Not camLerp's joint rule — that waits for scale AND pan, which never
+           happens on a walking body, and its 1px/0.01 snap can pop ~4px at the edge. */
+        const reach = Math.max(Math.abs(panX), Math.abs(cv.width - panX), Math.abs(panY), Math.abs(cv.height - panY));
+        if (Math.abs(ts - scale) / scale * reach < CAM_SETTLE_PX) scale = ts;
+        if (Math.abs(lx - panX) < CAM_SETTLE_PX) panX = lx;
+        if (Math.abs(ly - panY) < CAM_SETTLE_PX) panY = ly;
       }
     }
     if (camLerp && !camAnim && !camLock) {   // gently ease toward a conversation framing (set by focusAgent); the awakening camera + a follow-lock win
-      const k = 0.16;
+      const k = easeK(0.16, dt);
       scale += (camLerp.scale - scale) * k; panX += (camLerp.panX - panX) * k; panY += (camLerp.panY - panY) * k;
       if (Math.abs(camLerp.scale - scale) < 0.01 && Math.abs(camLerp.panX - panX) < 1 && Math.abs(camLerp.panY - panY) < 1) {
         scale = camLerp.scale; panX = camLerp.panX; panY = camLerp.panY; camLerp = null;
@@ -6322,7 +7125,19 @@ const World = (() => {
        camLerp ran would leave every finite-distance layer a frame behind the station, which is
        exactly the "picture behind a picture" tell the parallax exists to kill. Still screen
        space, still under the identity transform, still first — nothing has drawn yet. */
-    drawBackdrop(now, { panX, panY, scale });
+    drawScene(now, dt, slices);
+    stillVerdict(now);   // STILL: did anything but ambient effects change? (sets the next frame's pace — see RENDER PACING)
+  }
+
+  /* THE SCENE PASS — the station drawn once onto whatever {cv, ctx, scale, panX, panY} currently are. The frame
+     loop runs it on the stage every frame; renderStill() runs it once on an offscreen canvas. Everything that
+     belongs to the live stage alone (the backdrop, bloom, the curve, scanlines, the heartbeat pixel, the camera
+     readout) is skipped for a still. */
+  function drawScene(now, dt, slices) {
+    if (!slices) slices = [[dt, now]];
+    if (typeof PropSprites !== 'undefined' && PropSprites.clockBegin) PropSprites.clockBegin();   // STILL: this pass's props report their clocks afresh
+    if (stillPass) { ctx.fillStyle = stillPass.fill; ctx.fillRect(0, 0, cv.width, cv.height); }
+    else drawBackdrop(now, { panX, panY, scale });
 
     ctx.setTransform(scale, 0, 0, scale, panX, panY); ctx.imageSmoothingEnabled = false;
 
@@ -6347,16 +7162,24 @@ const World = (() => {
       if (!convey) convey = Conveyor.create({ onDeliver: onWorkitemDeliver });
       // stops = bound-bay hookup tiles (crate-physics truth: an inbound crate is CONSUMED at its dock,
       // never riding past it toward the outbox — an addressed crate stops only at its OWNER's dock)
-      convey.tick(dt, now, geo.belts, junctions, routingPlan ? routingPlan.bayTileToAgent : null);
+      // (multi-bay) stops name the DOCK too: a crate addressed to bay C rides past the same agent's bay A
+      const stops = routingPlan ? dockStops() : null;
+      for (const [d, t] of slices) convey.tick(d, t, geo.belts, junctions, stops);
       /* GHOST PROJECTION (Phase 3): stands down while the tutorial coaches and the INSTANT any
          real crate rides (real telemetry owns the belt); resumes when the line goes incomplete
          again. Same belts + junction decisions as the real sim, on its own dedicated engine. */
       if (ghost) {
         const coaching = !!(typeof Tutorial !== 'undefined' && Tutorial.isCoaching && Tutorial.isCoaching());
-        ghost.tick(dt, now, geo.belts, junctions, { blocked: coaching || convey.boxCount() > 0,
-          feed: { known: feedState.known, fed: feedState.fed } });
+        for (const [d, t] of slices) ghost.tick(d, t, geo.belts, junctions, { blocked: coaching || convey.boxCount() > 0,
+          feed: { known: feedState.known, fed: feedState.fed }, fedLines: knownFedLines() });
       }
       convey.drawBelts(ctx, now, T, geo.belts, beltLiveSet);
+      if(firstShipPulse) {
+        const age=now-firstShipPulse.at;
+        if(age>=1500)firstShipPulse=null;
+        else { ctx.save();ctx.strokeStyle='#fff0bf';ctx.lineWidth=1/scale;ctx.globalAlpha=reduceMotion()?0.55:0.75*(1-age/1500);
+          for(const key of Object.keys(firstShipPulse.tiles||{})){const [x,y]=key.split(',').map(Number);ctx.strokeRect(x*T+1,y*T+1,T-2,T-2);}ctx.restore(); }
+      }
     }
 
     const items = [], decals = [], propLights = [], bayLabels = [];   // decals = the flat floor pass, painted under every item (see isFlatProp) · propLights = this frame's emissive sources
@@ -6372,7 +7195,7 @@ const World = (() => {
       if (convey && convey.peekBoxes && typeof PropRemaster !== 'undefined' && PropRemaster.enabled('filter')) {
         for (const box of convey.peekBoxes()) if (!(box.sink > 0)) scanningTiles.add(box.x + ':' + box.y);
       }
-      if (PropSprites.setOutboxCrates) PropSprites.setOutboxCrates(returnCrates());   // G2.3: uncollected while-away work stacks on the chute
+      if (PropSprites.setOutboxCrates) PropSprites.setOutboxCrates(outboxCrateMap());   // G2.3: each chute stacks only ITS line's uncollected results (10-03)
       if (PropSprites.setMissionPins) { const mp = missionPinCounts(now); PropSprites.setMissionPins(mp[0], mp[1], mp[2], mp[3]); maybePinProposal(now, mp[3]); }   // G1b/G1c: open quests pin to the MISSION BOARD; a station-gap keeps it breathing; a jammed routine flags an amber JAM stub; G4: pending proposals + the walk-and-pin body
       if (PropSprites.setTrophyCount) PropSprites.setTrophyCount(trophyCount(now));   // G3b: earned trophies stand behind glass in the TROPHY CASE
       if (PropSprites.setJourneyStage) {
@@ -6384,6 +7207,7 @@ const World = (() => {
         PropSprites.setJourneyStage(journeyStage);   // one proven goal = one physical beacon on the TROPHY CASE crown
       }
       const outboxLit = now - lastOutboxFlash < 600;   // the OUTBOX flares for 600ms after a reply dispatches
+      const occupants = bodyPropIndex();   // who lies in / sits on each prop, one walk for the whole pass (ONE WALK, NOT ONE PER PROP)
       for (const p of geo.props) {
         // FLOOR DECALS never enter the y-sort: they are paint on the deck, so they go in the floor pass
         // and everything else — props, crates, bodies — is drawn ON them. Decals carry no seat/mount/live
@@ -6398,16 +7222,19 @@ const World = (() => {
           occupied: workstationOccupied(p), still: reduceMotion()
         });
         if (p.t === 'filter') live = Object.assign({}, live, { scanning: scanningTiles.has(p.x + ':' + p.y), still: reduceMotion() });
+        // STILL: live content on screen — run output, a progress strip, heat, a scan, a flare, a cabinet in use — is motion
+        // (a body resting on a couch leaves the couch as drawn)
+        if (!stillMark && ((work && !(leisureProps.has(p.id) && restingOn(p))) || (live && (live.heat > 0 || live.prog != null || live.scanning)))
+          && propOnScreen(p)) stillMove('prop');
         // A stool/chair sorts just BEHIND its sitter; a couch sorts just IN FRONT so the tall sofa back
         // occludes the sitter's lower body. Beds/beanbags never set `seated` and never enter this branch.
         // A BODY IS IN THIS BED (lyingBed): the bed paints in TWO passes around it — frame + pillow under
         // the sleeper, quilt over it — so the head shows on the pillow and the rest is under the covers.
-        const sleeper = ((agent && lyingBed(agent) === p) ? agent : crew.find(b => lyingBed(b) === p)) || null;
+        const sleeper = occupants.sleeper.get(p) || null;
         // a sleeper is `seated` (it holds a mattress claim with a render anchor) but it is NOT a sitter:
         // the sitter branch pulls the prop's sort key onto the body, which is right for a stool and wrong
         // for a bed, whose frame must keep its own footprint key with the body sorted INSIDE it.
-        const sitter = (agent && agent.seated && !agent.lying && agent.usingProp === p.id) ? agent
-          : crew.find(b => b.seated && !b.lying && b.usingProp === p.id);
+        const sitter = occupants.sitter.get(p.id);
         const sitterUse = sitter ? propUse(p) : null;
         // a SIDE SEAT sorts BEHIND its sitter like a stool, not in front like a sofa: its near arm
         // comes back over the body as the seat-front overlay below, so the sitter shows through the
@@ -6428,9 +7255,14 @@ const World = (() => {
         // frame (never persisted — the doc keeps only agentId, so renames and reassignment stay truthful)
         if (p.t === 'bay' && p.agentId) {
           const db = bodyForAgent(p.agentId);
-          if (db && db.name) dp = Object.assign(dp === p ? Object.assign({}, p) : dp, { dockName: db.name });
+          // (multi-bay) the agent's OTHER bays say where its body lives: "NAME ↔ home"
+          const away = multiDock(p.agentId) && routingPlan.entryDock && routingPlan.entryDock[p.agentId] !== p.id;
+          if (db && db.name) dp = Object.assign(dp === p ? Object.assign({}, p) : dp, { dockName: db.name + (away ? ' ↔ home' : '') });
           if (propOnScreen(dp)) bayLabels.push(dp);
         }
+        // a prop that wears a small state tag under it ("1 pending", "3 quests") is told its room's extent, so the tag never runs
+        // past the hull into space (review 10-14)
+        if (TAGGED_PROPS[p.t]) dp = Object.assign(dp === p ? Object.assign({}, p) : dp, { tagRoom: tagRoomOf(p) });
         // OCCUPIED BED: the base pass holds the quilt back so the sleeper can be drawn between the
         // frame and the covers (drawOver, below). Same copy-on-write idiom as the nameplate above.
         if (sleeper) dp = Object.assign(dp === p ? Object.assign({}, p) : dp, { sleeper: true });
@@ -6502,8 +7334,9 @@ const World = (() => {
       return bed ? { y: (bed.y + (bed.h || 1)) * T + 0.5, draw: () => drawSleeper(now, b, bed) }
                  : { y: fallbackY, draw: () => drawAgent(now, b) };
     };
-    if (agent && !agent.unplaced) items.push(bodyItem(agent, rposY()));
-    for (const b of crew) items.push(bodyItem(b, (b.seated ? b.seatPy : b.py)));   // the other agents, at their bays (seated → sort by the cushion pos like the hero's rposY, so a couch-lounging crew body tucks just behind the back-facing couch panel, head over the cap)
+    const crewInScene = !(stillPass && stillPass.noBodies);   // a crew-free still: the phone draws the crew itself, live
+    if (crewInScene && agent && !agent.unplaced) items.push(bodyItem(agent, rposY()));
+    if (crewInScene) for (const b of crew) items.push(bodyItem(b, (b.seated ? b.seatPy : b.py)));   // the other agents, at their bays (seated → sort by the cushion pos like the hero's rposY, so a couch-lounging crew body tucks just behind the back-facing couch panel, head over the cap)
     // A raised doorway stands in front of a body until its feet clear the wall.
     // Use the baked surfaces in the same depth order as props and agents; leaving
     // them only in baseCv made every body paint through the solid jambs.
@@ -6524,20 +7357,40 @@ const World = (() => {
     reviewMark('sceneSetup');
     if (sceneRenderer) sceneRenderer.prepareLight(propLights, { ambient: StationBake.LIGHT.ambient, emission: CRT.emit });
     drawPropShadows();
-    if (sceneRenderer) sceneRenderer.drawGrounding(ctx, [agent, ...crew].filter(b => b && !b.unplaced && !b.seated && !b.lying)
+    if (sceneRenderer && crewInScene) sceneRenderer.drawGrounding(ctx, [agent, ...crew].filter(b => b && !b.unplaced && !b.seated && !b.lying)
       .map(b => ({ x: bodyPosX(b), y: bodyPosY(b), width: 7, height: 20, opacity: .16 })));
     reviewMark('shadows');
-    if (sceneRenderer) {
-      sceneRenderer.drawEntities(ctx, items);
-    } else {
-      items.sort((a, b) => a.y - b.y);
-      for (const it of items) it.draw();
+    const strainBodies = strained && !strainProbe && !stillPass && typeof SPRITES !== 'undefined' && SPRITES.setStrained;   // a still (phone, renderStill) always draws full detail
+    if (strainBodies) SPRITES.setStrained(true);
+    try {
+      if (sceneRenderer) {
+        sceneRenderer.drawEntities(ctx, items);
+      } else {
+        items.sort((a, b) => a.y - b.y);
+        for (const it of items) it.draw();
+      }
+    } finally { if (strainBodies) SPRITES.setStrained(false); }
+    // a LAYOUT-ONLY still (a community map's picture) shows the station as built: none of this station's live work
+    const liveWork = !(stillPass && stillPass.layoutOnly);
+    if (convey && liveWork) convey.drawBoxes(ctx, now, T);   // boxes ride on top of the belts
+    if (ghost && liveWork) {
+      // the projection + its WOULD-captions (NAG_FONT size). A caption never prints over a line's plate (2026-09-28 retest:
+      // the dock caption moved UNDER its tile — the plates own the space above docks — where an INBOX plate can sit). The
+      // plate is the resting truth and the caption only a projection, so a caption that would collide sits that pass out.
+      const plates = lwDrawOff ? [] : lwPlateBoxes();
+      const onPlate = bx => plates.some(p => p.box && bx.x < p.box.x + p.box.w && bx.x + bx.w > p.box.x && bx.y < p.box.y + p.box.h && bx.y + bx.h > p.box.y);
+      // (2026-09-30) the caption plate is set at a reading size ON SCREEN — 14px, by pixel ratio and TEXT SIZE — whatever the camera
+      // zoom: at the shared 8 world px a plate grew to twice the NO FEED nag at a close zoom and covered the machines it spoke of
+      const capPx = 14 * (window.devicePixelRatio || 1) * ((typeof U !== 'undefined' && U.uiZoom && U.uiZoom()) || 1) / (scale || 1);
+      ghost.draw(ctx, now, T, capPx, plates.length ? (bx, paint) => { if (onPlate(bx)) return false; paint(); return true; } : null, (bx, n) => captionInStation(bx, n, plates));
     }
-    if (convey) convey.drawBoxes(ctx, now, T);   // boxes ride on top of the belts
-    if (ghost) ghost.draw(ctx, now, T, 8);       // the projection + its WOULD-captions (NAG_FONT size)
+    if (liveWork) {
+    drawSummonLinks(now);    // SUMMON LINES: lead→worker floor links for as long as each delegated run lives
     drawHandoffBoxes(now);   // Stage 2: lead→worker delegation boxes fly over the entities
+    drawSendCrates();        // SEND TO: a line's product crate flies from its OUTBOX to the next line's INBOX
     drawQueueJam(now);   // the live backlog as a physical jam of waiting crates at the INTAKE (world-space, under the lightmap)
     drawShippedPallet(now);   // SHIPPED TODAY: completed jobs stack as product crates at the OUTBOX (server-truth count)
+    }
 
     reviewMark('entities');
     const nextLight = sceneRenderer && sceneRenderer.drawLight(ctx, propLights, { ambient: StationBake.LIGHT.ambient, emission: CRT.emit });
@@ -6553,7 +7406,7 @@ const World = (() => {
     reviewMark('lighting');
     drawNavLights(now);   // small running lights on validated exterior armour mounts
     if (!(sceneRenderer && sceneRenderer.drawAtmosphere(ctx, { dust: CRT.dust }))) drawDust(now);
-    drawDeskFlashes(now);   // G0.4/G0.8: red distress strobe over a desk whose run just died (additive, with the glows)
+    if (liveWork) drawDeskFlashes(now);   // G0.4/G0.8: red distress strobe over a desk whose run just died (additive, with the glows)
     drawAwakenLight(now);   // the soul kindling: ignition spark + a growing halo + motes (world-space additive, awakening only)
     // the AWAKENING veil — now a SPOTLIGHT on the newborn (center light, corners dark) that warms cold->dawn,
     // drawn UNDER the speech bubble so its first words still glow while the room is dark.
@@ -6579,8 +7432,10 @@ const World = (() => {
     if (floodAt) drawFlood(now);   // THE FLOOD — the cascade of knowledge streaming in, over the dark room
     if (dawnAt && now - dawnAt < 1300) drawDawnBloom(now);   // the room takes its first breath of light
     // (the context-window gauge now lives engraved in the bottom bar — StationUI.ctxTick, not the desk)
+    if (overlaysOn) {
     drawRunClocks(now);   // G0.2: the honest elapsed-time tag at every desk with a live run (world-space, over the lightmap)
     drawWorkGlyphs(now);  // stage-ticker STRETCH: the "▸ TOOL" tag at a desk with a real tool in flight (one line below the run clock)
+    if (PLATES_ON) drawActivityPlates(now);   // ACTIVITY TAGS: a one-line tag over every working agent (name + its task); the full card for the agent in COMMS / under the pointer
     drawAwaitTag(now);    // the existing lead wait anchor
     for (const b of crew) if (crewIsAwaiting(b)) drawAwaitTag(now, b);
     drawRoutingNags(now); // BELT LEGIBILITY: the compiled plan's errors as in-world callouts on the broken piece
@@ -6588,16 +7443,27 @@ const World = (() => {
       PropSprites.setCtx(ctx);
       PropSprites.drawBayNames(bayLabels, scale, window.devicePixelRatio || 1);
     }
+    reviewMark('overlays');
+    drawBayLamps(now);    // LINE WATCH: every bound bay's status lamp, on its name plate
+    drawLinePlates(now);  // LINE WATCH: each line's numbers at its INBOX (server truth)
+    drawSendPlates();     // SEND TO: an OUTBOX that hands its line's work on says where (the compiled plan's sendTo)
+    drawBayGlance(now);   // LINE WATCH: hover a bay → one tiny glance plate (never a window)
+    drawCrateGlance(now); // LINE WATCH: hover a crate → what it is + CLICK
+    drawPlateGlance(now); // LINE WATCH: hover an INBOX → the line's whole reading today
+    reviewMark('lineWatch');
     drawBeltHoverTag(now);// BELT LEGIBILITY: hover a belt tile → where does this line flow (a glance, never a window)
     drawOutboxHoverTag(now);// OUTBOX LEGIBILITY: hover the stacked chute → what the crates are + what a click does
+    drawCapHoverTag(now);   // ORG P33: hover a capability prop → 'INTEL CAB · FILES' (a glance, never a window)
     drawDockFlashes(now); // LONE-BAY dock arrival: the bay visibly catches work when no belt line exists
     drawPinFlourish(now); // G4.2: the amber pin-burst at the board the instant a proposal is pinned
     if (agent && !agent.unplaced) drawBubble(now);
     for (const b of crew) drawBubble(now, b);   // crew speech and useful status messages
     if (hoverAgent && !hoverAgent.unplaced) drawNameplate(now, hoverAgent);
+    }   // overlaysOn
     // FLOOR-STATS OVERLAY REMOVED (2026-07-09 decision): the YIELD/RUNS/CACHE/SLAG/THRU/DWELL box no
     // longer floats over the world sim. The FloorStats engine stays live (event-fed) so any panel or
     // widget consumer keeps honest numbers — only the floating canvas readout is gone.
+    if (stillPass) { if (sceneRenderer) sceneRenderer.finish(); return; }   // a still ends here: no stage chrome, no post-processing
     if (linkStaleDim) drawLinkDown(now);   // E1: honest "the live telemetry is not live" marker in the chrome
     // (station growth headline now lives in the top bar's STATION chip — see xpstore.pushTopbar)
     drawBloom(now); // phosphor bloom: the bright things in the frame haze outward (screen-space, before the warp so it bows with the picture)
@@ -6609,6 +7475,92 @@ const World = (() => {
     updateCameraHud(now);
     if (sceneRenderer) sceneRenderer.finish();
     // NOTE: the next rAF is scheduled by the frame() crash-guard wrapper, BEFORE this body runs — never here.
+  }
+
+  /* A STILL OF THE WHOLE STATION, for a surface that is not this window (StarNet Remote's phone view).
+     It is the same scene pass the stage gets — floor, walls, props, crew where they really stand, light — aimed
+     at an offscreen canvas framed on the full station. It never reads the live stage canvas. Returns
+     { canvas, width, height, bodies:[{ agentId, name, x, y, working }] } with bodies in still pixels, or null
+     when there is no honest picture to give (no bake yet, the awakening is still playing). */
+  let stillPass = null;
+  function renderStill(maxPx, opts) {
+    if (buildHoldsFloor()) return null;
+    // A window that has not drawn a frame yet (opened behind other tabs: the browser runs no frames there) has not
+    // built its station either. Build it here, exactly as the first frame would, so the phone still gets a picture.
+    if (!stillPass && station && geo !== undefined) {
+      try { if (geoDirty) rederive(); if (bakeDirty || !cache) rebake(); } catch (e) { try { console.error('[world] still could not build the station:', e); } catch (_) {} }
+    }
+    if (stillPass || !cache || !cv || !ctx || !geo || camAnim || kindleArmed || arrivalScene || wakeDark > 0.002) return null;
+    const W = cache.baseCv.width, H = cache.baseCv.height;
+    if (!(W > 1 && H > 1)) return null;
+    // opts.crop { x, y, w, h } in station pixels draws only that part (the lead builder's close look at a room); absent = the whole station
+    const cr = (opts && opts.crop) ? (() => { const c = opts.crop, x = Math.max(0, Math.floor(c.x)), y = Math.max(0, Math.floor(c.y));
+      const w = Math.min(W, Math.ceil(c.x + c.w)) - x, h = Math.min(H, Math.ceil(c.y + c.h)) - y; return w > 1 && h > 1 ? { x, y, w, h } : null; })() : null;
+    if (opts && opts.crop && !cr) return null;
+    const CW = cr ? cr.w : W, CH = cr ? cr.h : H;
+    const cap = Math.max(320, Math.min(2400, Number(maxPx) || 1600));
+    const s = Math.max(1, Math.min(6, cap / Math.max(CW, CH)));   // never draw the pixel art below 1:1 (that crushes it); a big station is shrunk smoothly afterwards
+    const off = document.createElement('canvas');
+    off.width = Math.max(1, Math.round(CW * s)); off.height = Math.max(1, Math.round(CH * s));
+    const g = off.getContext('2d');
+    if (!g) return null;
+    const keep = { cv, ctx, scale, panX, panY, overlaysOn };
+    const landed = typeof Terrain !== 'undefined' && Terrain.active();
+    let drawn = false;
+    cv = off; ctx = g; scale = s; panX = cr ? -cr.x * s : 0; panY = cr ? -cr.y * s : 0; overlaysOn = false;
+    stillPass = { fill: landed ? Terrain.baseColor() : '#040302', noBodies: !!(opts && opts.noBodies), layoutOnly: !!(opts && opts.layoutOnly) };
+    // the wall clock, never the last frame's time: a hidden or minimized window stops its frames, and a stale
+    // clock froze every timed effect (a failed run's red desk flash stayed lit in every still)
+    try { drawScene(performance.now(), 0); drawn = true; }
+    catch (e) { try { console.error('[world] station still failed:', e); } catch (_) {} }
+    finally {
+      stillPass = null;
+      cv = keep.cv; ctx = keep.ctx; scale = keep.scale; panX = keep.panX; panY = keep.panY; overlaysOn = keep.overlaysOn;
+      if (typeof PropSprites !== 'undefined') PropSprites.setCtx(ctx);
+    }
+    if (!drawn) return null;
+    let out = off, k = 1;
+    if (Math.max(off.width, off.height) > cap) {
+      k = cap / Math.max(off.width, off.height);
+      out = document.createElement('canvas');
+      out.width = Math.max(1, Math.round(off.width * k)); out.height = Math.max(1, Math.round(off.height * k));
+      const og = out.getContext('2d');
+      if (!og) return null;
+      og.imageSmoothingEnabled = true; og.imageSmoothingQuality = 'high';
+      og.drawImage(off, 0, 0, out.width, out.height);
+    }
+    const ox = cr ? cr.x : 0, oy = cr ? cr.y : 0;
+    const bodies = [agent, ...crew].filter(b => b && !b.unplaced).map(b => ({
+      agentId: String(b.agentId || b.id || ''), name: String(b.name || ''),
+      x: Math.round((bodyPosX(b) - ox) * s * k), y: Math.round((bodyPosY(b) - oy) * s * k), working: !!b.working
+    }));
+    return { canvas: out, width: out.width, height: out.height, bodies, scale: s * k };
+  }
+
+  /* A STILL OF SOME OF THE STATION'S OWN TILES (the lead builder's station.map { look: a room }): renderStill cropped to
+     world tiles x1..x2, y1..y2, one tile of margin round them and the wall faces above the top row. Null when no still. */
+  function renderStillOfTiles(t, maxPx, opts) {
+    if (buildHoldsFloor()) return null;
+    if (!t || !station) return null;
+    try { if (geoDirty) rederive(); if (bakeDirty || !cache) rebake(); } catch (_) { return null; }
+    if (!geo || !geo.origin) return null;
+    const up = (typeof StationBake !== 'undefined' && StationBake.WALL && StationBake.WALL.up) || T;
+    const x = (t.x1 - geo.origin.tx - 1) * T, y = (t.y1 - geo.origin.ty - 1) * T - up;
+    return renderStill(maxPx, Object.assign({}, opts, { crop: { x, y, w: (t.x2 - t.x1 + 3) * T, h: (t.y2 - t.y1 + 3) * T + up } }));
+  }
+
+  /* THE CREW AS THE STAGE LAST DREW THEM, for a surface that draws them itself (the phone's live station view):
+     each body's sprite track + frame and the exact rectangle drawBody put it in, in world pixels. Read-only:
+     it reports what was drawn and decides nothing. A body not drawn yet is left out. */
+  function crewFrames() {
+    const out = [];
+    for (const b of [agent, ...crew]) {
+      const p = b && !b.unplaced ? b._poseLast : null;
+      if (!p || !p.key) continue;
+      out.push({ agentId: String(b.agentId || b.id || ''), key: p.key, idx: b._renderFrame | 0,
+        x: p.x, y: p.y, w: p.w, h: p.h, at: p.at || 0, walking: b.state === 'walk', working: !!b.working });
+    }
+    return out;
   }
 
   // ---- CRT SCANLINES + FADE (screen-space, drawn last, OVER the curved feed) --------
@@ -6674,6 +7626,7 @@ const World = (() => {
        phase is derived from the clock so it needs no state. Steady under reduced motion. CRT.roll = strength. */
     if (CRT.roll > 0.001 && !reduceMotion()) {
       const PER = 16800, SWEEP = 2600, t = now % PER;
+      if (t < SWEEP) stillMove('fx'); else noteDue(now - t + PER, now);   // STILL: a sweeping band is motion; the next sweep is due
       if (t < SWEEP) {
         const y = (t / SWEEP) * (H + 80) - 40, hh = 34 * dpr;
         const g = ctx.createLinearGradient(0, y - hh, 0, y + hh);
@@ -6705,6 +7658,7 @@ const World = (() => {
       // almost nothing on this dark feed. Keep speckles at one CSS pixel so a
       // high-DPI display does not average them away into an invisible finish.
       const fi = reduceMotion() ? 0 : Math.floor(now / 66);
+      if (!reduceMotion()) noteDue((fi + 1) * 66, now);   // STILL: the static steps every 66 ms — each step lands on its own vsync
       const jx = (fi * 53) % GRAIN_S, jy = (fi * 97) % GRAIN_S;
       ctx.globalCompositeOperation = 'overlay';
       ctx.globalAlpha = Math.min(.65, grain);
@@ -6863,7 +7817,12 @@ const World = (() => {
       if (!initGL(W, H)) return false;
       const gl = _gl;
       if (glContextLost(gl)) return abandonCurveGL('WebGL context lost before draw');
-      if (_glc.width !== W || _glc.height !== H) { _glc.width = W; _glc.height = H; }
+      // GROW-ONLY drawing buffer (10-02): resizing a WebGL canvas makes Chrome wait on the GPU, and a seam drag
+      // resized it every frame (~5ms of a 16ms frame, a stuttering drag). The warp draws into the W×H BOTTOM-LEFT
+      // corner (GL's viewport origin) of a buffer rounded up to 256px, and only that corner is blitted back —
+      // the same pixels, without a reallocation per frame.
+      const bw = Math.max(_glc.width, Math.ceil(W / 256) * 256), bh = Math.max(_glc.height, Math.ceil(H / 256) * 256);
+      if (_glc.width !== bw || _glc.height !== bh) { _glc.width = bw; _glc.height = bh; }
       if (glContextLost(gl)) return abandonCurveGL('WebGL context lost during resize');
       // OUTPUT SANITY PROBE (2026-07-20, the mac theme-wash report): the warp only MOVES pixels and
       // applies a channel-NEUTRAL vignette, so the frame's global per-channel ratios must survive it.
@@ -6891,7 +7850,7 @@ const World = (() => {
       // dead offscreen canvas is copied over a healthy 2D frame and the camera feed goes permanently black.
       if (glContextLost(gl)) return abandonCurveGL('WebGL context lost during draw');
       ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalCompositeOperation = 'source-over';
-      ctx.clearRect(0, 0, W, H); ctx.drawImage(_glc, 0, 0);   // blit the warped result back onto the visible feed
+      ctx.clearRect(0, 0, W, H); ctx.drawImage(_glc, 0, _glc.height - H, W, H, 0, 0, W, H);   // blit the warped W×H corner back onto the visible feed
       if (pre) {
         const post = probeMeans(cv);   // cv now holds the blitted GL output
         const preSum = pre[0] + pre[1] + pre[2], postSum = post[0] + post[1] + post[2];
@@ -7299,6 +8258,7 @@ const World = (() => {
       // Do not flash the cyan procedural body while the real default skin is actively loading.
       // A genuine load failure still clears `loading` and gets the honest fallback on the next frame.
       if (!geom && !(typeof SPRITES !== 'undefined' && SPRITES.loading)) drawFallback(now, who);
+      if (!geom) who._renderLive = !who.sitting;   // STILL: the procedural fallback body bobs while it stands (drawFallback)
       // remember the visible head-top (world px) so overlays (nameplate, speech bubble) anchor
       // above the ACTUAL drawn sprite — skins are taller than the old 15px assumption, which
       // parked bubbles over the face. Fallback bodies keep the legacy 15px estimate (null).
@@ -7320,7 +8280,7 @@ const World = (() => {
       // SUMMONED-WORKER "working" glow — a soft sustained pulse at the feet of a crew body while ITS real run
       // is in flight (workUntil set by setActivityFor). The honest "this agent is actually working" cue for a
       // deskless summoned worker; hero-exempt (the hero shows work at its desk).
-      if (who !== agent && !crewIsAwaiting(who) && who.workUntil && now < who.workUntil) {
+      if (overlaysOn && who !== agent && !crewIsAwaiting(who) && who.workUntil && now < who.workUntil) {
         const wp = 0.35 + 0.25 * Math.sin(now / 360);
         ctx.save(); ctx.globalAlpha = wp * 0.7; ctx.strokeStyle = who.color; ctx.lineWidth = 1;
         ctx.beginPath(); ctx.ellipse(who.px, who.py, 7 + 1.5 * Math.sin(now / 360), 3, 0, 0, Math.PI * 2); ctx.stroke(); ctx.restore();
@@ -7462,17 +8422,37 @@ const World = (() => {
      how long the run has actually been going (agent.run.start -> .end, runStartByAgent). World-space,
      the station's VT323 terminal face with a faint phosphor bloom — a glance, never a window. */
   const RUN_FONT = "7px 'VT323','Courier New',monospace";
+  /* NEIGHBOURING CLOCKS NEVER RUN TOGETHER (live walk 2026-10-14: two crew at side-by-side desks read "RUN 2:54 RUN 2:14" as
+     one string — each tag starts at its desk's right edge, so it spans the next desk's crown up to that desk's own tag). A tag
+     that would touch one already drawn this frame steps up a line until it stands clear. */
+  function clearOfTags(placed, x, y, w) {
+    const GAP = 4, LINE = 9;   // world px: the space a tag keeps from its neighbour, and one 7px line of VT323 plus air
+    for (let step = 0; step < 6; step++) {
+      if (!placed.some(t => Math.abs(t.y - y) < LINE && x < t.x + t.w + GAP && t.x < x + w + GAP)) break;
+      y -= LINE;
+    }
+    return y;
+  }
   function drawRunClocks(now) {
     if (!runStartByAgent.size) return;
     ctx.save();
     if (linkStaleDim) ctx.globalAlpha = 0.3;   // E1: link down → these clocks are last-known, not live; dim them
+    const placed = [];   // this frame's tags, for clearOfTags
     for (const [aid, t0] of runStartByAgent) {
       const b = bodyForAgent(aid);
       if (!b || b.unplaced || crewIsAwaiting(b)) continue;
+      if (typeof PLATES_ON !== 'undefined' && PLATES_ON && plateByAgent.has(aid)) continue;   // its ACTIVITY PLATE carries this clock
       // only at a desk that is honestly in the working pose — a talk-only run never grows a clock
       const working = (b === agent) ? !!agent.working : !!(b.working || (b.workUntil && now < b.workUntil));
       if (!working) continue;
-      const sec = Math.max(0, Math.floor((now - t0) / 1000));
+      /* ONE CLOCK PER RUN (rc walk #21 #27): CREW and the DELEGATED row read CrewClock — the same run with every wait on the
+         Commander excluded — while this tag counted wall time from run start, so a run that waited 2 min on an approval read
+         RUN 6:05 here and 3:43 in CREW. It reads the same clock; the run's own start is the fallback when CREW has no live run. */
+      // (CrewClock is wall-clock ms; this frame's `now` is the rAF timestamp: CrewClock.frameNow turns it into the frame's one wall
+      // instant — the instant CREW paints its turn from in this same frame, so the two never straddle a second)
+      const wallNow = (typeof CrewClock !== 'undefined' && CrewClock && typeof CrewClock.frameNow === 'function') ? CrewClock.frameNow(now) : Date.now();
+      const crewMs = (typeof CrewClock !== 'undefined' && CrewClock && typeof CrewClock.elapsedOf === 'function') ? CrewClock.elapsedOf(aid, wallNow) : null;
+      const sec = Math.max(0, Math.floor((typeof crewMs === 'number' && isFinite(crewMs) ? crewMs : (now - t0)) / 1000));
       const mm = Math.floor(sec / 60), ss = String(sec % 60).padStart(2, '0');
       const label = 'RUN ' + (mm >= 60 ? Math.floor(mm / 60) + ':' + String(mm % 60).padStart(2, '0') + ':' + ss : mm + ':' + ss);
       // anchor beside the desk's crown (placed workstation, or the hero's synthetic desk), else above the body
@@ -7483,12 +8463,175 @@ const World = (() => {
       else { ax = b.px + 7; ay = b.py - 16; }
       ctx.save();
       ctx.font = RUN_FONT; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      const tw = ctx.measureText(label).width;
+      ay = clearOfTags(placed, ax, ay, tw);
+      placed.push({ x: ax, y: ay, w: tw });
       ctx.shadowBlur = 3; ctx.shadowColor = '#62ff9e';
       ctx.fillStyle = '#9adcb0';
       ctx.fillText(label, ax, ay);
       ctx.restore();
     }
     ctx.restore();   // E1: close the link-stale dim wrapper
+  }
+
+  /* ---------- ACTIVITY TAGS (Andrew 10-26, "fantastic, perfect"): right above each working agent, in WORLD px so they
+     zoom with the station and never grow when the camera pulls back; inked in the user's own theme phosphor with each
+     agent's suit colour as its name and edge. Plain VT323 glyphs only (▸ and "…" are fallback faces / a flat bar: a
+     long line FADES instead). The clock is the RUN clock's own (CrewClock first), so the two can never disagree. */
+  const ACT_PLATE_FONT = "5px 'VT323','Courier New',monospace";   // WORLD px: it zooms with the station, never grows on zoom-out
+  const ACT_TAG_W = 22;     // characters in a one-line tag (name + the task, faded at the edge)
+  const ACT_PLATE_W = 30;   // characters per line (the task line needs the room)
+  function plateTarget(raw) {
+    const s = String(raw || '');
+    const m = /"(?:url|path|file_path|filePath|file|query|q|command|cmd|pattern|title|name|to|id)"\s*:\s*"([^"]{1,200})/.exec(s);
+    let v = m ? m[1] : '';
+    v = v.replace(/^https?:\/\/(www\.)?/, '').replace(/\\\\/g, '/');
+    if (/[\/]/.test(v) && !/\s/.test(v) && !/^[a-z0-9-]+\.[a-z]{2,}/i.test(v)) v = v.split('/').filter(Boolean).pop() || v;   // a file path → its basename
+    return v.replace(/\s+/g, ' ').trim();
+  }
+  function plateClock(aid, t0, now) {
+    const wallNow = (typeof CrewClock !== 'undefined' && CrewClock && typeof CrewClock.frameNow === 'function') ? CrewClock.frameNow(now) : Date.now();
+    const crewMs = (typeof CrewClock !== 'undefined' && CrewClock && typeof CrewClock.elapsedOf === 'function') ? CrewClock.elapsedOf(aid, wallNow) : null;
+    const sec = Math.max(0, Math.floor((typeof crewMs === 'number' && isFinite(crewMs) ? crewMs : (now - t0)) / 1000));
+    const mm = Math.floor(sec / 60), ss = String(sec % 60).padStart(2, '0');
+    return mm >= 60 ? Math.floor(mm / 60) + ':' + String(mm % 60).padStart(2, '0') + ':' + ss : mm + ':' + ss;
+  }
+  // a delegated worker's task in words: the title of the thread its lead filed it under (the DELEGATED row's own line),
+  // only a thread filed for THIS run (made no earlier than a minute before it started). Looked up at most once a second.
+  function workerTaskFor(aid, wallStart) {
+    if (typeof Workstreams === 'undefined' || !Workstreams.list) return '';
+    let best = null;
+    for (const w of Workstreams.list({ includeArchived: true, includeWorkers: true })) {
+      if (!w || w.worker !== true || w.agentId !== aid || !w.title) continue;
+      if ((+w.createdAt || 0) < wallStart - 60000) continue;
+      if (!best || (+w.createdAt || 0) > (+best.createdAt || 0)) best = w;
+    }
+    return best ? String(best.title) : '';
+  }
+  // the plate speaks in the STATION's phosphor (Andrew's hue 216 = the same blue as every desk screen), not a fixed
+  // green/amber that belongs to no theme. Read off <body> (stationui writes --ph-rgb / --ph-bright-rgb there).
+  let plateInk = null, plateInkAt = -1e9;
+  function plateTheme(now) {
+    if (plateInk && now - plateInkAt < 1000) return plateInk;
+    plateInkAt = now;
+    let ph = [154, 220, 176], br = [214, 245, 226];
+    try {
+      const cs = getComputedStyle(document.body);
+      const p = String(cs.getPropertyValue('--ph-rgb') || '').split(',').map(Number), q = String(cs.getPropertyValue('--ph-bright-rgb') || '').split(',').map(Number);
+      if (p.length >= 3 && p.every(isFinite)) ph = p.slice(0, 3);
+      if (q.length >= 3 && q.every(isFinite)) br = q.slice(0, 3);
+    } catch (e) { plateInk = plateInk || null; }
+    const rgba = (c, a) => 'rgba(' + c.join(',') + ',' + a + ')';
+    plateInk = { ph: rgba(ph, 1), dim: rgba(ph, 0.62), faint: rgba(ph, 0.35), bright: rgba(br, 0.95), glow: rgba(ph, 0.9) };
+    return plateInk;
+  }
+  // word-wrap to at most n lines of w monospace chars; the last line keeps the overflow (fadeText fades it)
+  function wrapChars(t, w, n) {
+    const out = []; let line = '';
+    for (const word of String(t).split(' ')) {
+      if (out.length === n - 1) { line = line ? line + ' ' + word : word; continue; }
+      if ((line ? line.length + 1 : 0) + word.length > w && line) { out.push(line); line = word; } else line = line ? line + ' ' + word : word;
+    }
+    if (line) out.push(line);
+    return out.slice(0, n);
+  }
+  // VT323's "…" is a flat bar: a line that runs out of room FADES its last glyphs instead (one VT323 advance each)
+  function fadeText(t, x, y, maxW, cw) {
+    const n = Math.floor(maxW / cw);
+    if (t.length <= n) { ctx.fillText(t, x, y); return; }
+    const keep = t.slice(0, Math.max(0, n - 3)), a0 = ctx.globalAlpha;
+    ctx.fillText(keep, x, y);
+    for (let i = 0; i < 3; i++) { ctx.globalAlpha = a0 * (0.62 - i * 0.22); ctx.fillText(t.charAt(keep.length + i), x + (keep.length + i) * cw, y); }
+    ctx.globalAlpha = a0;
+  }
+  function drawActivityPlates(now) {
+    if (!plateByAgent.size) return;
+    // TWO SIZES (Andrew 10-26, "it all clusters together"): every working agent wears a ONE-LINE tag — its name and, in
+    // words, what it was asked to do — and ONE agent at a time gets the full card (task on two lines, the live tool, the
+    // clock and the reported cost): the agent you are talking to in COMMS, or the one under your pointer. The full card
+    // is placed first so it gets the best spot, and drawn last so it sits on top.
+    const live = [];
+    for (const [aid, k] of plateByAgent) {
+      const t0 = runStartByAgent.get(aid);
+      const b = bodyForAgent(aid);
+      if (t0 == null || !b || b.unplaced || crewIsAwaiting(b)) continue;
+      const working = (b === agent) ? !!agent.working : !!(b.working || (b.workUntil && now < b.workUntil));
+      if (!working) continue;
+      // only a DELEGATED worker's run reads its dispatch thread's title — any other run of a crew agent (its own chat, a
+      // routine) has no such thread, and a recent worker thread of that agent must never be passed off as this run's task
+      if (!k.task && aid !== 'agent' && k.runId && typeof Harness !== 'undefined' && Harness.isDelegatedRun && Harness.isDelegatedRun(k.runId) && now - (k.taskTry || 0) > 1000) { k.taskTry = now; k.task = workerTaskFor(aid, k.wallStart || 0); }
+      live.push({ aid, k, b, t0, full: b === hoverAgent || (chatFocusId != null && aid === chatFocusId) });
+    }
+    if (!live.length) return;
+    live.sort((p, q) => Number(q.full) - Number(p.full));
+    const placed = [], drawn = [];
+    ctx.save();
+    ctx.font = ACT_PLATE_FONT; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    const cw = ctx.measureText('M').width, PAD = 1.5, LH = 5, ink = plateTheme(now);
+    for (const p of live) {
+      const { aid, k, b, t0, full } = p;
+      const nm = String(b.name || aid).toUpperCase();
+      const task = String(k.task || '').replace(/\s+/g, ' ').trim().replace(/\s*(…|\.\.\.)$/, '');
+      const what = k.name ? tickerTool(k.name).toLowerCase() + (k.target ? ' ' + k.target : '') : 'thinking';
+      // the full card: NAME · clock · cost / the task (two lines) / the live tool. The tag: NAME + the task (or, before
+      // a task is known, what it is doing), one line, sized to its words.
+      const taskLines = full ? (task ? wrapChars(task, ACT_PLATE_W, 2) : []) : [];
+      const rows = full ? 1 + taskLines.length + 1 : 1;
+      const tagText = task || what;
+      const chars = full ? ACT_PLATE_W : Math.min(ACT_TAG_W, nm.length + 2 + tagText.length + 1);
+      const w = cw * chars + PAD * 2 + (full ? 0 : 4), H = LH * rows + 2, hx = bodyPosX(b);
+      const top = (b.visTopPy != null ? b.visTopPy : bodyPosY(b) - 18) - 3;
+      const sw = cache ? cache.W : Infinity, vx0 = Math.max(-panX / scale + 2, T * 2), vx1 = Math.min((cv.width - panX) / scale - w - 2, sw - T * 2 - w), vy0 = -panY / scale + 2, vy1 = (cv.height - panY) / scale - H - 2;   // inside the view AND the station hull
+      const clampX = v => Math.round(Math.max(vx0, Math.min(vx1, v)));
+      const hits = (x, y) => placed.some(q => x < q.x + q.w + 2 && q.x < x + w + 2 && y < q.y + q.h + 1 && q.y < y + H + 1);
+      // RIGHT ABOVE THE HEAD (Andrew 10-26): centred over the agent; when a neighbour's tag is already there it steps up
+      // one row (twice at most), never sideways — so every tag stays over its own agent.
+      let x = clampX(hx - w / 2), y = Math.max(vy0, top - H);
+      for (let step = 0; step < 3 && hits(x, y); step++) y -= H + 1;
+      y = Math.round(Math.max(vy0, Math.min(vy1, y)));   // never off the top or bottom of the view
+      placed.push({ x, y, w, h: H });
+      drawn.push({ p, nm, task, taskLines, what, w, H, x, y, hx, top });
+    }
+    if (linkStaleDim) ctx.globalAlpha = 0.3;   // link down → last-known, not live
+    const a0 = ctx.globalAlpha;
+    // tags first, the full card last (on top)
+    for (const d of drawn.slice().reverse()) {
+      const { p, nm, task, taskLines, what, w, H, x, y, hx, top } = d;
+      const { aid, k, b, t0, full } = p;
+      const suit = b.color || ink.ph;
+      ctx.globalAlpha = a0 * 0.55; ctx.fillStyle = ink.ph;
+      const sx = Math.round(Math.max(x + 2, Math.min(x + w - 2, hx)));
+      ctx.fillRect(sx, y + H - 1, 0.6, Math.max(0, top + 2 - (y + H - 1)));   // a stem down to its own head
+      // IDENTITY: a dark, slightly see-through plate (the deck shows through), the suit colour as its edge and its name
+      ctx.globalAlpha = a0 * (full ? 0.78 : 0.66); ctx.fillStyle = '#04070b'; ctx.fillRect(x - 1, y - 1, w + 2, H);
+      ctx.globalAlpha = a0 * 0.9; ctx.fillStyle = suit; ctx.fillRect(x - 1, y - 1, 0.75, H);
+      ctx.globalAlpha = a0;
+      const base = y + LH - 1, tx = x + PAD + 4;
+      ctx.fillStyle = k.live ? ink.bright : suit; ctx.fillRect(x + PAD, base - 3.5, 2, 2);   // the run lamp: lit on a live tool
+      ctx.shadowBlur = 2;
+      if (!full) {
+        ctx.shadowColor = suit; ctx.fillStyle = suit; ctx.fillText(nm, tx, base);
+        const nx = tx + ctx.measureText(nm).width + cw;
+        ctx.shadowColor = ink.glow; ctx.fillStyle = task ? ink.bright : (k.live ? ink.ph : ink.faint);
+        fadeText(task || what, nx, base, x + w - PAD - nx, cw);
+        continue;
+      }
+      const clock = plateClock(aid, t0, now);
+      // a cost only when it is REAL: priced and above zero. An unpriced, subscription or local-model run shows no $ at all —
+      // never a bare "$0.000" (truthful telemetry: an unreported cost is unknown, never $0)
+      const usd = (k.usd == null || k.unpriced || !(k.usd > 0)) ? '' : (k.est ? '~$' : '$') + (k.usd < 0.01 ? k.usd.toFixed(3) : k.usd.toFixed(2));
+      const right = clock + (usd ? ' · ' + usd : '');
+      ctx.globalAlpha = a0 * 0.3; ctx.fillStyle = ink.ph; ctx.fillRect(x + PAD, y + LH + 0.25, w - PAD * 2, 0.4); ctx.globalAlpha = a0;
+      ctx.shadowColor = ink.glow; ctx.fillStyle = ink.dim; ctx.textAlign = 'right'; ctx.fillText(right, x + w - PAD, base);
+      ctx.textAlign = 'left'; ctx.shadowColor = suit; ctx.fillStyle = suit;
+      fadeText(nm, tx, base, w - PAD * 2 - 4 - ctx.measureText(right).width - cw, cw);
+      let ly = base + LH;
+      ctx.shadowColor = ink.glow;
+      for (const tl of taskLines) { ctx.fillStyle = ink.bright; fadeText(tl, x + PAD, ly, w - PAD * 2, cw); ly += LH; }
+      const caret = k.live && Math.floor(now / 420) % 2 ? '_' : '';
+      ctx.fillStyle = k.live ? ink.ph : ink.faint; fadeText((k.live ? '> ' : '. ') + what + caret, x + PAD, ly, w - PAD * 2, cw);
+    }
+    ctx.restore();
   }
 
   /* ---------- the DESK WORK-GLYPH (stage ticker STRETCH): a tiny "▸ TOOL" tag at a desk while that agent has
@@ -7503,6 +8646,7 @@ const World = (() => {
       if (!b || b.unplaced || crewIsAwaiting(b)) continue;
       const working = (b === agent) ? !!agent.working : !!(b.working || (b.workUntil && now < b.workUntil));
       if (!working) continue;
+      if (typeof PLATES_ON !== 'undefined' && PLATES_ON && plateByAgent.has(aid)) continue;   // its ACTIVITY PLATE names the tool
       const label = '▸ ' + tickerTool(g && g.name);
       // anchor beside the same desk the run clock uses, but one line lower (RUN clock is at dp.y*T+3).
       let ax, ay;
@@ -7527,7 +8671,10 @@ const World = (() => {
     if (body ? (!crewIsAwaiting(body) || body.unplaced) : (!awaitPrompt || !agent || agent.unplaced)) return;
     const x = body ? bodyPosX(body) : rposX(), y = body ? bodyPosY(body) : rposY();
     const pulse = 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(now / 380));   // slow breathing so it never looks frozen
-    const label = 'AWAITING APPROVAL';
+    // a QUESTION (brief.ask) waits on your answer, never on an approval (live walk 2026-10-14: a question read AWAITING
+    // APPROVAL) — the words COMMS uses. A crew body says answer only while every one of its waits is a question.
+    const question = body ? ![...body.pendingApprovals.values()].some(p => !(p && p.question)) : !!awaitPrompt.question;
+    const label = question ? 'AWAITING YOUR ANSWER' : 'AWAITING APPROVAL';
     ctx.save();
     ctx.font = AWAIT_FONT; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
     const tw = ctx.measureText(label).width, ty = y - 22, pad = 3;
@@ -7760,7 +8907,7 @@ const World = (() => {
   function setOnClick(fn) { onClick = fn; }
   function setOnArcade(fn) { onArcade = fn; }
   function setOnOutbox(fn) { onOutbox = fn; }
-  function setOnBayAssign(fn) { onBayAssign = fn; }   // click an UNBOUND bay → open the assign flow (app wires to REFIT's picker)
+  function setOnBayAssign(fn) { onBayAssign = fn; }   // click an UNBOUND bay → open the assign flow (app wires to BUILD MODE's picker)
   function setOnIntakeFeed(fn) { onIntakeFeed = fn; } // click a NO-FEED intake → open the CHANNELS panel (app wires it)
   function setOnIntakeSample(fn) { onIntakeSample = fn; } // click an INBOX on a COMPLETE line → the sample-job card (guided workflow Phase 4)
 
@@ -7779,20 +8926,28 @@ const World = (() => {
   // a bay->OUTBOX ship-out lane is valid and GLOWS instead of nagging (the 2026-07-05 playtest bug class).
   /* PARITY IS A LAW, NOT A HABIT (2026-08-07 conveyor audit). buildRoutingNags does `if (!label) continue`,
      so a compiler code missing from this table is a finding the live world SILENTLY DROPS — the Commander
-     sees a dead line and no reason anywhere on the floor. ORPHAN_JUNCTION was exactly that: REFIT's
+     sees a dead line and no reason anywhere on the floor. ORPHAN_JUNCTION was exactly that: BUILD MODE's
      VAL_LABEL named it, the world said nothing. Every VAL_LABEL key must have an entry here (the wording
-     may differ — REFIT can spell out a gesture the world has no room for); locked by
+     may differ — BUILD MODE can spell out a gesture the world has no room for); locked by
      test/routing-nag-parity.test.js, which reads both tables out of the two source files. */
   const NAG_LABEL = {
-    UNBOUND_BAY: 'NO AGENT — CLICK', ORPHAN_BAY: 'NOT ON THE LINE', ORPHAN_SOURCE: 'NO BELT OUT',
-    BAY_NOT_FED: 'NOT FED — BELT THROUGH THE JUNCTION', CYCLE: 'LOOP!', FILTER_NO_DEFAULT: 'NO DEFAULT LANE', DUP_AGENT: 'DUP AGENT',
+    UNBOUND_BAY: 'NO AGENT — CLICK', ORPHAN_BAY: 'NOT ON A LINE — BELT INTO IT', ORPHAN_SOURCE: 'NO BELT OUT',
+    BAY_NOT_FED: 'NOT FED — BELT THROUGH THE JUNCTION', BAY_TOO_CLOSE: 'TOO CLOSE — MOVE 1 TILE', CYCLE: 'LOOP!', FILTER_NO_DEFAULT: 'NO DEFAULT LANE', SPLIT_CREW: 'PLACE A DESK — TOOLS FOLLOW THE DOCK',
     SPLIT_ONE_LANE: 'SPLITTER — BELT THROUGH IT, 2 OUT', CHAIN_CYCLE: 'WORK LINE LOOPS',
     JOIN_ONE_LANE: 'JOINER — NEEDS 2 BELTS IN', LOOP_NO_DONE: 'LOOP — NO DONE LANE OUT', LOOP_NO_BACK: 'LOOP — NO BACK LANE',
     BELT_BURIED: 'PROP ON THE LINE — MOVE IT',
-    ORPHAN_JUNCTION: 'NOT ON A BELT — MOVE IT'
+    ORPHAN_JUNCTION: 'NOT ON A BELT — BELT INTO IT',
+    LINE_TOO_LONG: 'TOO LONG — RAISE THE LINE BUDGET',
+    LINE_BUDGET_SHADOWED: 'BUDGET NOT USED — SEE FIRST INBOX',
+    SEND_TO_MISSING: 'SENDS NOWHERE — PICK A LINE', SEND_TO_SELF: 'SENDS TO ITSELF — PICK ANOTHER LINE',
+    SEND_TO_LOOP: 'SENDS IN A CIRCLE — CUT ONE SEND TO'
   };
   // project the compiled plan's error list onto floor rectangles once per recompile (zero per-frame walk)
+  // a line another line SENDS TO is fed; its own run count never is (a SEND IT A JOB / a test starts nothing — 2026-10-12)
+  const knownFedLines = plan => typeof Pipeline !== 'undefined' && Pipeline.fedLineIds ? Pipeline.fedLineIds(plan || routingPlan) : {};
+  let feedNagIds = new Set();
   function buildRoutingNags() {
+    feedNagIds = new Set();
     const out = [];
     feedNagOn = false;
     if (!routingPlan || !routingPlan.errors || !geo || !geo.props) return out;
@@ -7802,7 +8957,7 @@ const World = (() => {
       let label = NAG_LABEL[e.code];
       if (!label) continue;
       // a ROLE-carrying unbound dock names WHO it wants ("RESEARCHER — DIGS SOURCES… — CLICK") instead
-      // of the bare NO AGENT (guided workflows Phase 1; same WorldModel.BAY_ROLES source REFIT reads).
+      // of the bare NO AGENT (guided workflows Phase 1; same WorldModel.BAY_ROLES source BUILD MODE reads).
       if (e.code === 'UNBOUND_BAY' && e.propId) {
         const rp = byId[e.propId];
         const ri = (rp && rp.role && !rp.agentId && typeof WorldModel !== 'undefined' && WorldModel.bayRoleInfo) ? WorldModel.bayRoleInfo(rp.role) : null;
@@ -7813,12 +8968,12 @@ const World = (() => {
     }
     // beyond the compiler — two silent failure modes the floor must also confess:
     // (a) a BOUND bay whose room grants no computer: routed work arrives and the run can't act (the compute
-    //     gate stays shut). Same bayObjects check as REFIT's NO COMPUTE ghost, now visible in the live world.
+    //     gate stays shut). Same bayObjects check as BUILD MODE's NO COMPUTE ghost, now visible in the live world.
     //     Walks dockBays (EVERY bound bay, belt-hooked or standalone) — a lone dock deserves the same truth.
     if (routingPlan.dockBays && station && typeof station.bayObjects === 'function') {
       for (const b of routingPlan.dockBays) {
         let objs = [];
-        try { objs = station.bayObjects(b.agentId) || []; } catch (_) {}
+        try { objs = station.bayObjects(b.agentId, b.propId) || []; } catch (_) {}   // THIS dock's room (multi-bay)
         if (objs.indexOf('computer') >= 0) continue;
         out.push({ x: b.x, y: b.y, w: b.w || 1, h: b.h || 1, label: 'NO COMPUTE — ADD A PC', warn: true });
       }
@@ -7828,8 +8983,9 @@ const World = (() => {
     //     never a nag on ignorance. The click-through opens the CHANNELS panel (onIntakeFeed).
     if (feedState.known && !feedState.fed && beltLiveSet && Object.keys(beltLiveSet).length) {
       for (const p of geo.props) {
-        if (p.t !== 'intake') continue;
-        out.push({ x: p.x, y: p.y, w: p.w || 1, h: p.h || 1, label: 'NO FEED — CLICK', warn: true });
+        if (p.t !== 'intake' || knownFedLines()[routingPlan.lineOfProp[p.id]]) continue;
+        feedNagIds.add(p.id);
+        out.push({ x: p.x, y: p.y, w: p.w || 1, h: p.h || 1, label: schedOffFor(p.id) ? 'SCHEDULE OFF — CLICK' : 'NO FEED — CLICK', warn: true });
         feedNagOn = true;
       }
     }
@@ -7838,20 +8994,45 @@ const World = (() => {
   /* FEED TRUTH: is anything actually wired to drop work onto this floor? ANY registry channel configured
      (the bulk /api/channels/status covers telegram/discord/slack/matrix/signal — polling only the first two
      falsely nagged a slack/matrix/signal-only floor), or the cron scheduler armed with at least one enabled
-     routine. Server-proven only — `fed` stays true until a real response says otherwise, so a fetch hiccup
-     can never fire the nag. */
+     routine, or an armed LINE TRIGGER (a watched folder / a webhook the server reports enabled with nothing
+     blocking it — GET /api/routing/triggers blockedBy). Server-proven only — `fed` stays true until a real
+     response says otherwise, so a fetch hiccup can never fire the nag. */
+  /* SCHEDULE OFF is a fact about ONE line (2026-09-28 retest): the floor-wide flag labelled every INBOX "SCHEDULE OFF",
+     even a line that has no schedule at all (that one is simply unfed). A waiting routine belongs to the line its dock
+     sits on — or, for a routine addressed to an agent, the dock work addressed to that agent enters at. */
+  function schedOffFor(intakeId, plan) {
+    const pl = plan || routingPlan;   // BUILD MODE passes ITS plan: a line stamped this session is not in the frozen world's yet
+    if (!feedState.schedOff || !intakeId || !pl || !pl.lineOfProp) return false;
+    const line = pl.lineOfProp[intakeId]; if (!line) return false;
+    const entry = pl.entryDock || {};
+    return (feedState.offJobs || []).some(j => { const d = j.dockId || (j.agentId && entry[j.agentId]) || null; return !!d && pl.lineOfProp[d] === line; });
+  }
   function pollFeedState() {
     if (typeof fetch === 'undefined') return;
-    const get = u => { try { return fetch(apiUrl(u)).then(r => (r.ok ? r.json() : null)).catch(() => null); } catch (_) { return Promise.resolve(null); } };
-    return Promise.all([get('/api/channels/status'), get('/api/cron')]).then(([chans, cron]) => {
-      if (!chans && !cron) return;   // nothing answered — keep the last known truth
+    // each read has a 15 s deadline like every other bounded poll: one the sidecar accepts and never answers must not hold
+    // this beat (PollGate awaits it) or a connection slot to the sidecar for good; a timed-out read is "no answer"
+    const deadline = () => ((typeof U !== 'undefined' && U.timeoutSignal) ? U.timeoutSignal(15000) : undefined);
+    const get = u => { try { return fetch(apiUrl(u), { signal: deadline() }).then(r => (r.ok ? r.json() : null)).catch(() => null); } catch (_) { return Promise.resolve(null); } };
+    return Promise.all([get('/api/channels/status'), get('/api/cron'), get('/api/routing/triggers')]).then(([chans, cron, trg]) => {
+      if (!chans && !cron && !trg) return;   // nothing answered — keep the last known truth
       const chan = !!(chans && typeof chans === 'object' && Object.keys(chans).some(id => chans[id] && chans[id].configured));
       const jobs = (cron && Array.isArray(cron.jobs)) ? cron.jobs : [];
       const cronFeeds = !!(cron && cron.enabled && jobs.some(j => j && j.enabled !== false));
-      const next = { known: true, fed: chan || cronFeeds };
-      const changed = next.known !== feedState.known || next.fed !== feedState.fed;
+      const trgFeeds = !!(trg && Array.isArray(trg.triggers) && trg.triggers.some(t => t && t.enabled && !t.blockedBy));
+      // a schedule is SAVED but scheduling is off (2026-09-27 audit R3): the INBOX of THAT line says so instead of
+      // "NO FEED" (offJobs names where each waiting routine lands — see schedOffFor)
+      const offJobs = (cron && !cron.enabled) ? jobs.filter(j => j && j.enabled !== false).map(j => ({ dockId: j.dockId || null, agentId: j.agentId || null })) : [];
+      const schedOff = offJobs.length > 0;
+      const next = { known: true, fed: chan || cronFeeds || trgFeeds, schedOff, offJobs };
+      // the answers themselves, per fact (one that did not answer keeps its last answer — a hiccup never unsays a start): BUILD MODE's
+      // FINISH THE LINE reads what starts ONE line from these, never the station-wide `fed` (wave 2 repair, build-12)
+      const was = startFacts || {};
+      startFacts = { chans: (chans && typeof chans === 'object') ? chans : (was.chans || null), cron: (cron && Array.isArray(cron.jobs)) ? cron : (was.cron || null),
+        lt: (trg && Array.isArray(trg.triggers)) ? trg : (was.lt || null) };
+      const offSig = s => (s.offJobs || []).map(j => j.dockId + '|' + j.agentId).join(',');
+      const changed = next.known !== feedState.known || next.fed !== feedState.fed || next.schedOff !== feedState.schedOff || offSig(next) !== offSig(feedState);
       feedState = next;
-      if (changed) routingNags = buildRoutingNags();   // feed truth changed → refresh the callouts
+      if (changed) { routingNags = buildRoutingNags(); motionWake(); }   // feed truth changed → refresh the callouts (STILL: drawn on the next vsync)
     });
   }
   /* hit-test: an INBOX (intake) on a floor with a COMPLETE line — an energized intake→bound-bay route exists
@@ -7872,7 +9053,7 @@ const World = (() => {
   function intakeFeedAt(wp) {
     if (!feedNagOn || !geo || !geo.props) return null;
     for (const p of geo.props) {
-      if (p.t !== 'intake') continue;
+      if (p.t !== 'intake' || !feedNagIds.has(p.id)) continue;
       const x0 = p.x * T, y0 = p.y * T - 10, x1 = (p.x + (p.w || 1)) * T, y1 = (p.y + (p.h || 1)) * T + 2;
       if (wp.x >= x0 && wp.x < x1 && wp.y >= y0 && wp.y < y1) return p;
     }
@@ -7964,9 +9145,9 @@ const World = (() => {
         lines = [fitText(text, maxWidth)];
       }
       const capacity = Math.max(1, Math.floor((bounds.h - padding * 2) / rowHeight));
-      // Extreme authored descriptions keep their full text in the existing REFIT
+      // Extreme authored descriptions keep their full text in the existing BUILD MODE
       // selection card. The on-canvas detail explicitly indicates truncation.
-      if (lines.length > capacity) lines = lines.slice(0, capacity - 1).concat([fitText('… SELECT IN REFIT', maxWidth / unit)]);
+      if (lines.length > capacity) lines = lines.slice(0, capacity - 1).concat([fitText('… SELECT IN BUILD MODE', maxWidth / unit)]);
       const w = Math.min(bounds.w, Math.max(...lines.map(widthOf)) + padding * 2), h = lines.length * rowHeight + padding * 2;
       const x = Math.max(bounds.x, Math.min(bounds.x + bounds.w - w, g.prop.x + g.prop.w / 2 - w / 2));
       let y = Math.max(bounds.y, Math.min(bounds.y + bounds.h - h, g.prop.y - h - 2));
@@ -7984,7 +9165,7 @@ const World = (() => {
     return result;
   }
   function drawRoutingNags(now) {
-    if (!routingNags || !routingNags.length) return;
+    if (!routingNags || !routingNags.length) { nagLabelBoxes = []; return; }
     const pulse = 0.55 + 0.35 * Math.sin(now / 280);
     for (const n of routingNags) {
       const X = n.x * T, Y = n.y * T, Wd = n.w * T, Hd = n.h * T;
@@ -8016,6 +9197,7 @@ const World = (() => {
           w: (r.x2 - r.x1 + 1) * T - 4, h: (r.y2 - r.y1 + 1) * T - 4 } : null;
       }
     });
+    nagLabelBoxes = labels.map(b => ({ x: b.x, y: b.y, w: b.w, h: b.h }));
     for (const box of labels) {
       ctx.shadowBlur = 0; ctx.fillStyle = '#111812'; ctx.fillRect(box.x, box.y, box.w, box.h);
       ctx.fillStyle = box.warn ? '#ffbe3c' : '#ff5046'; ctx.shadowColor = ctx.fillStyle; ctx.shadowBlur = 2;
@@ -8024,18 +9206,55 @@ const World = (() => {
     }
     ctx.restore();
   }
-  // the hover-glance tag over a clickable OUTBOX: crates pending → "N TO REVIEW — CLICK"; pallet only →
-  // the LOGBOOK click-through. Names what the stacked boxes ARE and what the click does (the 2026-07-16
-  // confusion: "boxes showing output but I can't see it"). A glance, never a window (hover law).
+  // the hover-glance tag over a clickable OUTBOX: names what the stacked boxes ARE and what the click does (the
+  // 2026-07-16 confusion: "boxes showing output but I can't see it"). THIS chute's line only (10-03): its own waiting
+  // results, else its line's results; a chute on no line says so. A glance, never a window (hover law).
   function drawOutboxHoverTag(now) {
     if (!hoverOutbox) return;
-    const n = returnCrates();
-    const text = n > 0 ? (n + ' TO REVIEW — CLICK') : 'FINISHED WORK — CLICK';
+    const onLine = !!(routingPlan && routingPlan.lineOfProp && routingPlan.lineOfProp[hoverOutbox.id]);
+    const n = onLine ? (outboxCrateMap()[hoverOutbox.id] | 0) : 0;
+    const text = !onLine ? 'NOT ON A WORKFLOW' : n > 0 ? (n + ' TO REVIEW — CLICK') : 'THIS LINE’S RESULTS — CLICK';
     ctx.save();
     ctx.font = NAG_FONT; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
     ctx.shadowBlur = 3; ctx.shadowColor = n > 0 ? '#ffd88a' : '#62ff9e';
     ctx.fillStyle = n > 0 ? '#ffe9bd' : '#9adcb0';
     ctx.fillText(text, (hoverOutbox.x + (hoverOutbox.w || 1) / 2) * T, hoverOutbox.y * T - 40);
+    ctx.restore();
+  }
+  /* ORG P33 — STARTER-ROOM MACHINES SHOW WHAT THEY ARE. On a station where every object is a capability, the first room's
+     INTEL CAB / SERVER CART / DISH / WORKBENCH / STUDIO were silent to the cursor. Hovering any capability prop now raises a
+     GLANCE nameplate — its catalog label and the one power word it grants (WorldModel.grantLabelForProp, the same owned
+     source the BUILD palette and placement toast read), e.g. 'INTEL CAB · FILES'. A glance only: no window, no new click
+     (what a click does is Andrew's open pick). Workstations and plugin terminals keep their own click + glance. */
+  function capPropAt(wp) {
+    if (!geo || !geo.props || typeof WorldModel === 'undefined' || !WorldModel.grantLabelForProp) return null;
+    for (const p of geo.props) {
+      const cap = station && station.capForProp ? station.capForProp(p.t) : null;
+      if (!cap || cap === 'computer' || cap === 'plugin') continue;   // a desk opens its DESK SCREEN; a plugin terminal its window
+      const x0 = p.x * T, y0 = p.y * T - 6;
+      const x1 = (p.x + (p.w || 1)) * T, y1 = (p.y + (p.h || 1)) * T + 4;
+      if (!(wp.x >= x0 && wp.x < x1 && wp.y >= y0 && wp.y < y1)) continue;
+      const spec = (typeof PropSprites !== 'undefined' && PropSprites.spec) ? PropSprites.spec(p.t) : null;
+      const label = spec && spec.label ? String(spec.label) : '';
+      const grant = WorldModel.grantLabelForProp(p.t);
+      if (!label || !grant) continue;   // never a hardcoded name: no catalog label = no plate
+      return { p, text: label.toUpperCase() + ' · ' + String(grant).toUpperCase() };
+    }
+    return null;
+  }
+  function drawCapHoverTag(now) {
+    if (!hoverCap || hoverAgent) return;
+    const p = hoverCap.p;
+    ctx.save();
+    ctx.font = NAG_FONT; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+    const cx = (p.x + (p.w || 1) / 2) * T, ty = p.y * T - 8, tw = ctx.measureText(hoverCap.text).width, pad = 3;
+    // a small dark plate behind the letters (the AWAITING tag's idiom) so the name never crosses busy sprite pixels
+    ctx.globalAlpha = 0.78; ctx.fillStyle = '#04100a';
+    ctx.fillRect(Math.round(cx - tw / 2 - pad), Math.round(ty - 7), Math.round(tw + pad * 2), 9);
+    ctx.globalAlpha = 1;
+    ctx.shadowBlur = 3; ctx.shadowColor = '#62ff9e';
+    ctx.fillStyle = '#9adcb0';
+    ctx.fillText(hoverCap.text, cx, ty);
     ctx.restore();
   }
   // the hover-glance route tag over the belt tile under the cursor (green = flows to a bound bay, amber = doesn't)
@@ -8052,15 +9271,56 @@ const World = (() => {
   }
   function setOnMissionBoard(fn) { onMissionBoard = fn; }   // G1b: click a placed MISSION BOARD → open the quest log
   function setOnTrophyCase(fn) { onTrophyCase = fn; }   // G3b: click a placed TROPHY CASE → open the trophy surface
-  // G2.3 — the live uncollected-crate count (ReturnStore's pending ledger). Read per-frame for the
-  // OUTBOX sprite stack and by the hit-test below; 0 when the store isn't loaded (headless tests).
+  function setOnPluginTerminal(fn) { onPluginTerminal = fn; }   // click a placed PLUGIN TERMINAL → that plugin's window (or why not)
+  function setOnDesk(fn) { onDesk = fn; }   // DESK SCREEN: click an agent's workstation → that agent's live work (deskscreen.js)
+  // G2.3 — the live uncollected-crate count (ReturnStore's pending ledger); 0 when the store isn't loaded (headless tests).
   function returnCrates() {
     try { return (typeof ReturnStore !== 'undefined' && ReturnStore.pendingCount) ? (ReturnStore.pendingCount() | 0) : 0; } catch (_) { return 0; }
   }
-  // hit-test: the OUTBOX chute under a world-space point — ALWAYS clickable while placed (2026-07-16:
-  // the click opens the OUTBOX window, which has honest content in every state — pending crates,
-  // or the "finished work lands here" empty state — so the affordance is never dead, mirroring the
-  // MISSION BOARD). The stacks spill above AND below the footprint, so the box extends both ways.
+  /* PER-OUTBOX CRATES (Andrew 10-03: an OUTBOX shows only ITS conveyor's output). A pending row belongs to a line only
+     when a line-job record PROVES it: the row's run stream is a job sent down that line (/api/line-jobs streamId → line).
+     Routines, chats and while-away runs are no conveyor's output — they wait in DELIVERABLES › TO REVIEW, never on a
+     chute. Memoized on (ledger revision, stream join, plan) so the per-frame read stays cheap: the revision moves on every
+     ReturnStore write (perf, 2026-10-20 — the pending COUNT it used to key on cost a ledger hydrate per frame, and a
+     resolve plus a fold between two frames kept the count and left a crate on the old line's chute). A store without
+     revision() keys on the count, as before. */
+  function returnRevision() {
+    try { return (typeof ReturnStore !== 'undefined' && ReturnStore.revision) ? ReturnStore.revision() : undefined; } catch (_) { return undefined; }
+  }
+  let lineJobStream = {};   // job streamId -> line key, from the server's line-job records (refreshed with the line plates)
+  let crateMemo = null, crateKey = null;
+  function outboxCrateMap() {
+    const n = returnCrates(), rev = returnRevision(), key = [rev, rev === undefined ? n : 0, lineJobStream, routingPlan];
+    if (crateKey && crateKey.every((v, i) => v === key[i])) return crateMemo;
+    const by = {}, outOf = {};
+    try {
+      if (n > 0 && routingPlan && routingPlan.lineOfProp && geo && geo.props) {
+        for (const p of geo.props) if (p.t === 'outbox') { const l = routingPlan.lineOfProp[p.id]; if (l && !outOf[l]) outOf[l] = p.id; }
+        for (const r of ReturnStore.pendingRows()) {
+          const l = r && r.streamId ? lineJobStream[r.streamId] : null, ob = l ? outOf[l] : null;
+          if (ob) by[ob] = (by[ob] | 0) + 1;
+        }
+      }
+    } catch (_) {}
+    crateMemo = by; crateKey = key;
+    return by;
+  }
+  function pollLineJobStreams() {
+    try {
+      fetch(apiUrl('/api/line-jobs?limit=100'), { cache: 'no-store' })
+        .then(r => (r.ok ? r.json() : null))
+        .then(j => {
+          if (!j || !Array.isArray(j.jobs)) return;   // no answer — keep the last known join
+          const m = {};
+          for (const x of j.jobs) if (x && x.streamId && x.line) m[x.streamId] = x.line;
+          lineJobStream = m;
+          motionWake();   // STILL: a crate joined to its chute is drawn there on the next vsync
+        }).catch(() => {});
+    } catch (_) {}
+  }
+  // hit-test: the OUTBOX chute under a world-space point — ALWAYS clickable while placed: the click opens THIS
+  // OUTBOX's own line in WORKFLOWS (its newest result, its last jobs — 10-03), and an OUTBOX on no line says so,
+  // so the affordance is never dead, mirroring the MISSION BOARD. The stacks spill above AND below the footprint, so the box extends both ways.
   function outboxAt(wp) {
     if (!geo || !geo.props) return null;
     for (const p of geo.props) {
@@ -8133,6 +9393,16 @@ const World = (() => {
   // hit-test: a placed TROPHY CASE under a world-space point. Always clickable while placed — the click opens
   // the TROPHY CASE surface (honest even when empty: it shows dust, never a dead affordance). The glass casing
   // sits within its 2×2 footprint; a small down-spill for the base shadow keeps the bottom row clickable.
+  function pluginTerminalAt(wp) {
+    if (!geo || !geo.props) return null;
+    for (const p of geo.props) {
+      if (p.t !== 'plugin_terminal') continue;
+      const x0 = p.x * T, y0 = p.y * T - 2;
+      const x1 = (p.x + (p.w || 1)) * T, y1 = (p.y + (p.h || 2)) * T + 4;
+      if (wp.x >= x0 && wp.x < x1 && wp.y >= y0 && wp.y < y1) return p;
+    }
+    return null;
+  }
   function trophyCaseAt(wp) {
     if (!geo || !geo.props) return null;
     for (const p of geo.props) {
@@ -8140,6 +9410,25 @@ const World = (() => {
       const x0 = p.x * T, y0 = p.y * T - 2;
       const x1 = (p.x + (p.w || 1)) * T, y1 = (p.y + (p.h || 1)) * T + 4;
       if (wp.x >= x0 && wp.x < x1 && wp.y >= y0 && wp.y < y1) return p;
+    }
+    return null;
+  }
+  // hit-test: an agent's WORKSTATION under a world-space point → { agentId } (null if none). A placed computer prop
+  // counts only while it is assigned to an agent that has a body on this floor (an unassigned desk has no one's work
+  // to show); the hero's synthetic fallback desk counts for the hero. The screen art sits inside the footprint; a
+  // small spill up/down keeps the monitor top and the desk front clickable.
+  function deskAt(wp) {
+    if (!geo || !geo.props) return null;
+    for (const p of geo.props) {
+      if (!p.agentId || !isWorkstationProp(p.t) || !bodyForAgent(p.agentId)) continue;
+      const s = specOf(p.t) || {};
+      const x0 = p.x * T, y0 = p.y * T - 6;
+      const x1 = (p.x + (p.w || s.w || 1)) * T, y1 = (p.y + (p.h || s.h || 1)) * T + 2;
+      if (wp.x >= x0 && wp.x < x1 && wp.y >= y0 && wp.y < y1) return { agentId: p.agentId, propId: p.id };
+    }
+    if (agent && desk && !deskPropId) {
+      const x0 = desk.tx * T, y0 = desk.ty * T - 6, x1 = (desk.tx + desk.w) * T, y1 = (desk.ty + desk.h) * T + 2;
+      if (wp.x >= x0 && wp.x < x1 && wp.y >= y0 && wp.y < y1) return { agentId: agent.id, propId: null };
     }
     return null;
   }
@@ -8242,7 +9531,29 @@ const World = (() => {
     const s = aid ? liveRunsByAgent.get(aid) : null; if (!s) return 0;
     if (rid) s.delete(rid); else s.clear();   // a runId-less end can't be matched — treat it as agent-terminal (old behavior)
     if (!s.size) liveRunsByAgent.delete(aid);
+    // the hero's LAST live run ended: no run of it can still be waiting on you, so its AWAITING plate goes now — a STOPPED
+    // stream loses its run.end and the station's response, and the plate used to stand over an idle hero until the TTL
+    if (!s.size && agent && aid === agent.id && awaitPrompt) clearAwait();
     return s.size;
+  }
+  // the floor just forgot aid's run (a sweep, a reconcile, a STOP, the last run.end): its activity tag goes, and every summon
+  // link to or from it ends (fades home) — so neither can outlive the run it stood for
+  function releaseActivity(aid, now) {
+    if (!aid) return;
+    plateByAgent.delete(aid);
+    const t = now || ((typeof performance !== 'undefined') ? performance.now() : fnow);
+    for (const L of summonLinks) if (!L.tEnd && (L.toId === aid || (L.fromId || (agent && agent.id)) === aid)) L.tEnd = t;
+  }
+  // chat.js retires a run whose stream ENDED here (a finished turn, or a STOP whose run.end was lost with the stream)
+  function dropRunFromPage(aid, rid) {
+    const left = noteRunEnd(aid, rid);
+    const leading = summonLinks.some(L => !L.tEnd && (L.fromId || (agent && agent.id)) === aid);
+    if (!left && aid) {
+      if (leading) for (const L of summonLinks) if (!L.tEnd && (L.fromId || (agent && agent.id)) === aid) L.tEnd = (typeof performance !== 'undefined') ? performance.now() : fnow;
+      // the workers it led: the SERVER says whether they still run — ask now (and once more as the cancel cascade lands)
+      if (leading && typeof setTimeout === 'function') { setTimeout(fetchSnapshot, 1500); setTimeout(fetchSnapshot, 5000); }
+    }
+    return left;
   }
   function agentRunsLive(aid) { const s = aid ? liveRunsByAgent.get(aid) : null; return s ? s.size : 0; }
   /* the once-per-second TTL sweep (E2). Degrades paired states whose reinforcing event was lost:
@@ -8256,7 +9567,7 @@ const World = (() => {
       for (const aid of Array.from(runStartByAgent.keys())) {
         const seen = runLastSeenByAgent.get(aid) || runStartByAgent.get(aid) || 0;
         if (now - seen > RUN_TTL_MS) {
-          runStartByAgent.delete(aid); runLastSeenByAgent.delete(aid);
+          runStartByAgent.delete(aid); runLastSeenByAgent.delete(aid); releaseActivity(aid, now);
           liveRunsByAgent.delete(aid);                    // a leaked refcount (lost run.end) degrades with the clock
           glyphByAgent.delete(aid);                       // the in-flight tool glyph is just as stale
           if (serverLit.has(aid)) { serverLit.delete(aid); setActivityFor(aid, 'idle'); }   // drop an autonomous body out of the working pose
@@ -8272,7 +9583,7 @@ const World = (() => {
       for (const [rid, seen] of Array.from(s)) if (now - seen > RUN_TTL_MS) s.delete(rid);
       if (!s.size) {
         liveRunsByAgent.delete(aid);
-        runStartByAgent.delete(aid); runLastSeenByAgent.delete(aid); glyphByAgent.delete(aid);
+        runStartByAgent.delete(aid); runLastSeenByAgent.delete(aid); glyphByAgent.delete(aid); releaseActivity(aid);
         if (serverLit.has(aid)) { serverLit.delete(aid); setActivityFor(aid, 'idle'); }
         const b = bodyForAgent(aid); if (b && b !== agent && b.workUntil) b.workUntil = 0;
       }
@@ -8291,13 +9602,20 @@ const World = (() => {
        { ts, runs:[{runId, agentId, startedAt, source}], prompts:[{runId, agentId, promptId}], summons:[], queues:[] }
      with startedAt in epoch ms — normalizeSnapshot() maps it onto the internal shape below (all fields optional):
        { activeRuns:[{agentId, startedMsAgo?}], pendingPrompts:[{promptId, agentId}], inflightTools:[{agentId, name, callId}],
-         serverLitAgents:[agentId] }  */
+         serverLitAgents:[agentId] }
+     A row the sidecar marks `internal` is the harness's own self-talk (session ideas, a title, a goal plan): live, its
+     run.start/run.end never reach the bus, so it never lights the floor — and the snapshot must not either. Read as an
+     active run it lit NOVA's CREW card WORKING with a RUN clock after a reload (live walk 10-13); it is not the agent
+     working for the Commander (test/internal-run-not-working.test.js). */
   function normalizeSnapshot(snap) {
     if (!snap || typeof snap !== 'object' || snap.activeRuns) return snap;   // already internal-shaped (dbg/test paths)
     if (!Array.isArray(snap.runs) && !Array.isArray(snap.prompts)) return snap;
     const ts = +snap.ts || 0;
     const out = Object.assign({}, snap);
-    if (Array.isArray(snap.runs)) out.activeRuns = snap.runs.map(r => r && r.agentId ? {
+    // the harness's own SELF-TALK (a title, a session recommendation, a judge — row.internal) is never the agent at work:
+    // read as an orphan live run it sat NOVA at its desk WORKING with a RUN clock, and its leaked refcount kept NOVA working
+    // past a STOP of its real run until the next reconcile (live walk 2026-10-14). HUD mode skips these rows the same way.
+    if (Array.isArray(snap.runs)) out.activeRuns = snap.runs.map(r => r && r.agentId && !r.internal ? {
       agentId: r.agentId,
       runId: r.runId || null,
       startedMsAgo: (ts && +r.startedAt) ? Math.max(0, ts - (+r.startedAt)) : 0
@@ -8337,10 +9655,13 @@ const World = (() => {
         if (orphan && !serverLit.has(r.agentId)) { serverLit.add(r.agentId); setActivityFor(r.agentId, 'task'); }
       }
       for (const aid of Array.from(runStartByAgent.keys())) if (!live.has(aid)) {   // ended during the outage
-        runStartByAgent.delete(aid); runLastSeenByAgent.delete(aid); glyphByAgent.delete(aid); liveRunsByAgent.delete(aid);
+        runStartByAgent.delete(aid); runLastSeenByAgent.delete(aid); glyphByAgent.delete(aid); liveRunsByAgent.delete(aid); releaseActivity(aid);
         if (serverLit.has(aid)) { serverLit.delete(aid); setActivityFor(aid, 'idle'); }
         const b = bodyForAgent(aid); if (b && b !== agent && b.workUntil) b.workUntil = 0;
       }
+    }
+    if (Array.isArray(snap.activeRuns) && !snap.activeRuns.some(r => r && r.agentId && !r.runId)) {
+      const w = lineWatch(); if (w) w.reconcileLive(snap.activeRuns.map(r => r && r.runId).filter(Boolean), now, 15000);   // LINE WATCH
     }
     // ---- inflight tool glyphs: authoritative rebuild ----
     if (Array.isArray(snap.inflightTools)) {
@@ -8359,7 +9680,7 @@ const World = (() => {
       const prompts = Array.isArray(snap.pendingPrompts) ? snap.pendingPrompts : [];
       reconcileCrewAwaits(prompts);
       const mine = prompts.find(p => p && (!p.agentId || (agent && p.agentId === agent.id)));
-      if (mine) enterAwait({ promptId: mine.promptId || '', agentId: mine.agentId || (agent && agent.id) });
+      if (mine) enterAwait({ promptId: mine.promptId || '', agentId: mine.agentId || (agent && agent.id), question: mine.tool === 'brief.ask' });
       else if (awaitPrompt) clearAwait();   // the prompt was answered during the outage
     }
     // ---- delegation window: the server no longer reports an open dispatch we tracked ----
@@ -8409,7 +9730,7 @@ const World = (() => {
   // origin) so it resolves in the desktop build, where the page origin is the Tauri asset host, NOT the sidecar.
   // Bare /api/* fetches (routing POST, connectors poll) skipped that prefix and would hit the wrong origin there.
   // apiUrl() is the single source of truth so all three use the same base. (Auth token is attached by harness.js's
-  // window.fetch monkey-patch for /api/ URLs; the SSE path can't send a header so it appends ?token= separately.)
+  // window.fetch monkey-patch for /api/ URLs; the SSE path can't send a header so it presents a single-use ApiTicket.sseUrl ticket.)
   function apiBase() { return (typeof window !== 'undefined' && window.__STARNET_API__) ? window.__STARNET_API__ : ''; }
   function apiUrl(path) { return apiBase() + path; }
   let chanES = null, connPollTimer = null, connPollFn = null, connOpenFn = null, bridgePaused = false;
@@ -8439,8 +9760,8 @@ const World = (() => {
   }
   function pauseBridge() {
     bridgePaused = true;
-    if (connPollTimer) { clearInterval(connPollTimer); connPollTimer = null; }
-    if (spotifyPollTimer) { clearInterval(spotifyPollTimer); spotifyPollTimer = null; }
+    if (connPollTimer) { if (connPollTimer.stop) connPollTimer.stop(); else clearInterval(connPollTimer); connPollTimer = null; }   // a PollGate loop or a bare interval
+    if (spotifyPollTimer) { if (spotifyPollTimer.stop) spotifyPollTimer.stop(); else clearInterval(spotifyPollTimer); spotifyPollTimer = null; }
     if (chanES) { try { chanES.close(); } catch (_) {} chanES = null; }
   }
   // E1: the ONE public read of the SSE bridge health — the SAME predicate the canvas dims its live
@@ -8456,12 +9777,14 @@ const World = (() => {
   function resumeBridge() {
     if (!bridged) return;                 // never set up yet (no agent has entered) — connectChannelBridge will open it
     bridgePaused = false;
-    if (!connPollTimer && connPollFn) { connPollFn(); connPollTimer = setInterval(connPollFn, 5000); }
-    if (!spotifyPollTimer && spotifyPollFn) { spotifyPollFn(); spotifyPollTimer = setInterval(spotifyPollFn, 5000); }
+    const gated = typeof PollGate !== 'undefined' && PollGate.every;   // idle CPU piece 3: 5 s on screen, 30 s floor while away
+    if (!connPollTimer && connPollFn) { connPollFn(); connPollTimer = gated ? PollGate.every(connPollFn, { ms: 5000, immediate: false }) : setInterval(connPollFn, 5000); }
+    if (!spotifyPollTimer && spotifyPollFn) { spotifyPollFn(); spotifyPollTimer = gated ? PollGate.every(spotifyPollFn, { ms: 5000, immediate: false }) : setInterval(spotifyPollFn, 5000); }
     if (!chanES && connOpenFn) connOpenFn();
   }
   let floor = null, lastSlagAt = -1e9;   // FloorStats: the factory-floor economy fold + a fresh-slag pulse clock
   let slaglog = null, lastCacheFrac = null;   // SlagLog: wasted-spend post-mortems + the last reconciled cache ratio (for the diagnosis)
+  const slagErrText = new Map();              // runId -> its agent.run.error message, read (and dropped) at that run's end
 
   // a belt tile on/adjacent to a footprint (its tiles + a 1-tile ring), used as a box spawn point (local frame)
   function beltTileNear(tx, ty, tw, th) {
@@ -8473,6 +9796,10 @@ const World = (() => {
     return null;
   }
   function intakeTile() {
+    // the compiled plan's first feed mouth — on a linked floor an INBOX feeds only down its own links, so a loose belt
+    // beside it is never a spawn point (conveyor-links phase B); a floor with no compiled source keeps the old reading
+    const src = routingPlan && routingPlan.sources && routingPlan.sources[0];
+    if (src && src.tile) return { x: src.tile.x, y: src.tile.y };
     const intake = geo && geo.props && geo.props.find(p => p.t === 'intake');
     return intake ? beltTileNear(intake.x, intake.y, intake.w || 1, intake.h || 1) : null;
   }
@@ -8489,7 +9816,7 @@ const World = (() => {
     routeTagCache = null; hoverBeltTile = null; selectedRoutingTile = null;   // the floor changed — cached positions and answers are stale
     routingNags = buildRoutingNags();
     /* GHOST PROJECTION (Phase 3): re-derive its route data from the SAME plan + geometry this
-       recompile produced. The live world runs it too (not just REFIT): between REFIT sessions this
+       recompile produced. The live world runs it too (not just BUILD MODE): between BUILD MODE sessions this
        is the view the user stares at their half-built line in, and the existing nags say what's
        broken while the ghost shows what the line WOULD do — same local frame, offset {0,0}. */
     if (typeof GhostLine !== 'undefined' && typeof Pipeline !== 'undefined' && Pipeline.lineComponents && geo) {
@@ -8500,10 +9827,14 @@ const World = (() => {
     // tools to exactly what the floor placed there (the bay->agent binding decides WHO; the room decides WHAT).
     // dockBays too — a LONE bay (no belt) is a complete dock and isolates identically (sense pass 2026-07-05).
     if (routingPlan && station && typeof station.bayObjects === 'function') {
-      for (const b of (routingPlan.bays || [])) b.objects = station.bayObjects(b.agentId);
-      for (const b of (routingPlan.dockBays || [])) b.objects = station.bayObjects(b.agentId);
+      // PER DOCK (multi-bay, 2026-09-22): each bay record carries ITS room's objects (a deskful agent's desk room
+      // on every one of its bays — worldmodel.bayObjects prefers the desk), so a hop runs with the room of the
+      // bay it is AT, never the union of the agent's bays.
+      for (const b of (routingPlan.bays || [])) b.objects = station.bayObjects(b.agentId, b.propId);
+      for (const b of (routingPlan.dockBays || [])) b.objects = station.bayObjects(b.agentId, b.propId);
     }
     postRoutingPlan(routingPlan);
+    lineStatsSoon();   // LINE WATCH: the floor's lines changed — re-ask their numbers once the plan has landed
   }
   /* PLAN-POSTER-BEGIN (extraction marker — test/plan-poster.test.js evals this block with injected deps;
      keep it PURE: params + locals only, no module state, no direct fetch/console/setTimeout).
@@ -8526,6 +9857,8 @@ const World = (() => {
     let refusedHash = null;   // the hash of the last 422-refused plan (refusal state, inspectable)
     let pendingHash = null;   // the hash currently being delivered (in flight or awaiting a retry tick)
     let inflight = false, timer = null, seq = 0;
+    let sendingHash = null;   // the hash of the POST on the wire right now
+    let queued = null;        // the NEWEST floor offered while a POST was on the wire — sent the moment it settles
     let stale = false;        // honest flag: the sidecar may still route by an older floor than the one drawn
     let waiters = [];         // flush() callers awaiting the NEXT server answer (run-now ordering, 2026-08-22)
     function state() { return { lastHash: lastHash, refusedHash: refusedHash, pendingHash: pendingHash, inflight: inflight, retryPending: timer != null, stale: stale }; }
@@ -8535,7 +9868,15 @@ const World = (() => {
        routes the line the user just drew, not the last one it heard about. A failed attempt resolves too
        (stale=true, retries continue in the background): the caller refuses rather than running a stale floor. */
     function flush() { return new Promise(resolve => { if (!inflight && timer == null) resolve(state()); else waiters.push(resolve); }); }
+    /* ONE POST AT A TIME, IN ORDER (2026-10-08). Two POSTs on separate connections can ARRIVE out of order: the
+       sidecar then kept the OLDER floor while this page committed the newer hash and believed it delivered — a
+       built line read READY TO RUN while the router said "no armed work line" (station-builder e2e, intermittent
+       under load). While a POST is on the wire, the newest offer waits in `queued` and goes out when it settles. */
     function offer(plan, hash) {
+      if (inflight) {
+        if (hash === sendingHash) { queued = null; return false; }           // the floor on the wire IS the newest again
+        queued = { plan: plan, hash: hash }; pendingHash = hash; stale = true; return true;
+      }
       if (hash === lastHash) return false;                                   // server already answered this exact floor
       if (hash === pendingHash && (inflight || timer != null)) return false; // same floor already being delivered
       if (timer != null) { deps.cancel(timer); timer = null; }               // a different floor supersedes the pending retry
@@ -8546,7 +9887,8 @@ const World = (() => {
     function send(plan, hash, attempt, mySeq) {
       const fail = why => {
         if (mySeq !== seq) return;   // superseded — the newer offer owns delivery (and the flags) now
-        inflight = false;
+        inflight = false; sendingHash = null;
+        if (drainQueued()) return;   // a NEWER floor was offered meanwhile: deliver it instead of retrying this one
         stale = true;
         deps.warn('[routing] plan post failed (' + why + ') — sidecar routing may be stale' +
           (attempt < MAX_RETRIES ? '; retrying in ' + RETRY_MS + 'ms' : '; will retry on the next floor change'));
@@ -8554,15 +9896,25 @@ const World = (() => {
         settle();
       };
       let p = null;
-      inflight = true;
+      inflight = true; sendingHash = hash;
       try { p = deps.post(plan); } catch (_) { fail('exception'); return; }
       Promise.resolve(p).then(res => {
         if (mySeq !== seq) return;   // superseded — never let a stale response commit or clear flags
-        inflight = false;
-        if (res && res.ok) { lastHash = hash; refusedHash = null; pendingHash = null; stale = false; settle(); return; }
-        if (res && res.status === 422) { lastHash = hash; refusedHash = hash; pendingHash = null; stale = false; settle(); return; }
+        inflight = false; sendingHash = null;
+        if (res && res.ok) { lastHash = hash; refusedHash = null; if (drainQueued()) return; pendingHash = null; stale = false; settle(); return; }
+        if (res && res.status === 422) { lastHash = hash; refusedHash = hash; if (drainQueued()) return; pendingHash = null; stale = false; settle(); return; }
         fail('http ' + (res ? res.status : '?'));
       }, () => fail('network'));
+    }
+    // the wire is free: send the newest floor offered while it was busy (unless the server already holds it)
+    function drainQueued() {
+      const q = queued; queued = null;
+      if (!q) return false;
+      if (q.hash === lastHash) { pendingHash = null; return false; }
+      if (timer != null) { deps.cancel(timer); timer = null; }
+      pendingHash = q.hash; stale = true;
+      send(q.plan, q.hash, 0, ++seq);
+      return true;
     }
     return { offer: offer, state: state, flush: flush };
   }
@@ -8590,7 +9942,10 @@ const World = (() => {
       + '|' + (plan.dockBays || []).map(b => b.propId + ':' + (b.brief || '')).join(';')
       // LINE BUDGET rides the key too (2026-08-21): limits live on `lines`, outside plan.hash (policy, not
       // topology — splitter balance must survive a cap edit), but the sidecar's copy must re-read them.
-      + '|' + JSON.stringify(plan.lineLimits || {}) + '|' + JSON.stringify((plan.lines || []).map(l => [l.lineId, l.projectRoot || '']))) : '';
+      + '|' + JSON.stringify(plan.lineLimits || {}) + '|' + JSON.stringify((plan.lines || []).map(l => [l.lineId, l.projectRoot || '', l.name || '']))
+      // SEND TO rides the key too (2026-10-10): plan.sendTo is outside plan.hash (a hand-off is not dispatch topology), but the
+      // sidecar's handoff runner reads the posted copy — an edited SEND TO that never re-posted would hand work to the old line
+      + '|' + JSON.stringify(plan.sendTo || {})) : '';
     planPoster.offer(plan, hash);
   }
   // junction props (splitter/filter/merger) keyed by tile — derived from the compiled plan so the VISUAL engine
@@ -8601,7 +9956,14 @@ const World = (() => {
       // enrich each junction with its lanes' reachable OWNERS so addressed crates ride home (a shallow
       // copy — never mutate the plan object itself; the sidecar-posted plan/hash stays untouched)
       const owners = (typeof Pipeline !== 'undefined' && Pipeline.junctionLaneOwners) ? Pipeline.junctionLaneOwners(routingPlan) : {};
-      for (const k in routingPlan.junctions) (j = j || new Map()).set(k, owners[k] ? Object.assign({}, routingPlan.junctions[k], { owners: owners[k] }) : routingPlan.junctions[k]);
+      // …and by DOCK (multi-bay): a crate addressed to ONE bay of a multi-dock agent steers to THAT bay
+      const docks = (typeof Pipeline !== 'undefined' && Pipeline.junctionLaneDocks) ? Pipeline.junctionLaneDocks(routingPlan) : {};
+      for (const k in routingPlan.junctions) {
+        const extra = {};
+        if (owners[k]) extra.owners = owners[k];
+        if (docks[k]) extra.ownerDocks = docks[k];
+        (j = j || new Map()).set(k, Object.keys(extra).length ? Object.assign({}, routingPlan.junctions[k], extra) : routingPlan.junctions[k]);
+      }
       return j;
     }
     // fallback (Pipeline unavailable): the original splitter-only scan keeps belts animating
@@ -8624,13 +9986,44 @@ const World = (() => {
      overwrote whose-line-is-this for a run that started earlier. Each dock now keeps a bounded FIFO
      of placed work-items' line identity; the ship decision consumes the OLDEST entry (runs end in
      roughly placement order — the same pairing basis the queue gauge runs on). */
-  const dockLineWork = new Map();   // agentId -> [lineId|null, ...] per placed work-item, oldest first
+  /* (multi-bay, 2026-09-22) each entry also remembers WHICH bay the work-item landed at (the crate's additive
+     dockId), so the run it pairs with ships its product from THAT bay — quill's run at bay C leaves bay C,
+     not quill's first bay. */
+  const dockLineWork = new Map();   // agentId -> [{ workitemId|null, lineId|null, dockId|null }, ...] per placed work-item
   function dockLineTake(aid) {
     const q = dockLineWork.get(aid);
     if (!q || !q.length) return null;
     const v = q.shift();
     if (!q.length) dockLineWork.delete(aid);
     return v;
+  }
+  const lineOfWork = w => (w && w.lineId) || null;
+  function dockWorkPeek(aid) { const q = dockLineWork.get(aid); return (q && q.length) ? q[0] : null; }
+  function dockWorkForRun(p) {
+    const rec = p && p.runId && typeof watch !== 'undefined' && watch && watch.run(p.runId);
+    return rec && rec.agentId === p.agentId ? rec : dockWorkPeek(p && p.agentId);
+  }
+  function dockLineTakeMatching(aid, work) {
+    const q = dockLineWork.get(aid);
+    if (!q || !work) return;
+    const i = work.workitemId ? q.findIndex(w => w.workitemId === work.workitemId)
+      : q.findIndex(w => w === work || (w.dockId === work.dockId && lineOfWork(w) === lineOfWork(work)));
+    if (i < 0) return;   // an exact observed run must never consume an unrelated placement
+    q.splice(i, 1);
+    if (!q.length) dockLineWork.delete(aid);
+  }
+  // the bay an agent's CURRENT work is at (its newest placed item), for the dock glow — null = no dock named
+  const activeDock = new Map();     // agentId -> dockId
+  /* conveyor stops by DOCK: { "x,y": { agentId, dockId } } — rebuilt only when the plan object changes */
+  let stopsFor = null, stopsMap = null;
+  function dockStops() {
+    if (!routingPlan) return null;
+    if (stopsFor === routingPlan) return stopsMap;
+    const byTile = routingPlan.bayTileToAgent || {}, dockAt = routingPlan.bayTileToDock || {};
+    const m = {};
+    for (const k in byTile) m[k] = dockAt[k] ? { agentId: byTile[k], dockId: dockAt[k] } : byTile[k];
+    stopsFor = routingPlan; stopsMap = m;
+    return m;
   }
   function intakeMessage(payload) {
     const p = payload || {};
@@ -8639,13 +10032,19 @@ const World = (() => {
        return below: cancelling is bookkeeping about a run that already happened, and it must not depend
        on whether this floor currently has a conveyor to draw the arriving crate on. */
     if (p.kind === 'chain' && p.from) cancelDeferredShip(String(p.from));
+    // SEND TO: the hand-off crate is titled by the line it came FROM, as the floor names that line — the sidecar knows only a name
+    // typed on it, so an unnamed line's work rode in as 'FROM ANOTHER LINE' while its plate said LINE C. Re-worded here, before
+    // LINE WATCH (registered after this) keeps the crate's title; a line no longer on the floor keeps the sidecar's words.
+    if (p.kind === 'handoff' && p.fromLine) { const nm = lineNameOf(p.fromLine); if (nm) p.preview = ('FROM ' + nm).slice(0, 40); }
     if (!convey) return;
     // tag the box with its content kind (the same getTag the sidecar routes by) so a FILTER sorts it visibly
     if (p.agentId) {
       const q = dockLineWork.get(p.agentId) || [];
-      q.push(p.lineId ? String(p.lineId) : null);          // a direct order queues NULL — "this one is nobody's line"
+      // a direct order queues lineId NULL — "this one is nobody's line"; dockId = the bay it landed at (or null)
+      q.push({ workitemId: p.workitemId ? String(p.workitemId) : null, lineId: p.lineId ? String(p.lineId) : null, dockId: p.dockId ? String(p.dockId) : null });
       if (q.length > 8) q.shift();                          // bounded like every floor latch
       dockLineWork.set(p.agentId, q);
+      if (p.dockId) activeDock.set(p.agentId, String(p.dockId)); else activeDock.delete(p.agentId);
     }
     if (!p.tag && typeof Classify !== 'undefined' && Classify.getTag) p.tag = Classify.getTag(p.preview || p.text || '');
     // ride inbound work as ORE — a UNIFORM raw chunk: every incoming request is one identical piece of raw
@@ -8653,6 +10052,8 @@ const World = (() => {
     // bound to real outcomes, never to this inbound request. (WIRING_AUDIT P4: lie #5.)
     p.box = 'ore';
     if (p.weight == null) p.weight = 0.3;
+    // SEND TO: the next line's work arrives as the sending line's product, carried over from that line's OUTBOX (drawSendCrates)
+    if (p.kind === 'handoff' && placeSendCrate(p)) return;
     // WHERE does this work ENTER the floor? (multi-network law, 2026-07-05 — Andrew's two-room bug):
     //  • a COMMS directive is a DIRECT order to a specific agent — it skips the station doors entirely and
     //    lands at that agent's BAY (the model sentence: "COMMS orders skip the ride in");
@@ -8670,17 +10071,22 @@ const World = (() => {
        produced — see conveyor.js tick / pipeline.js chain layer). */
     if (p.kind === 'chain' && routingPlan && routingPlan.chains) {
       p.box = 'product';
+      // (multi-bay) the producing BAY rides the event (additive fromDock): the crate leaves THAT bay's ship
+      // tile and carries fromDockId so the conveyor never feeds it back into the bay that made it
+      const dChains = routingPlan.dockChains || {};
+      const fromDockRec = (p.fromDock && dChains[p.fromDock]) ? dChains[p.fromDock] : null;
       const upAid = (p.from && routingPlan.chains[p.from]) ? p.from
         : Object.keys(routingPlan.chains).filter(a => (routingPlan.chains[a].next || []).indexOf(p.agentId) >= 0).sort()[0];
-      const from = upAid ? routingPlan.chains[upAid] : null;
+      const from = fromDockRec || (upAid ? routingPlan.chains[upAid] : null);
       if (upAid) p.fromAgentId = upAid;
+      if (fromDockRec) p.fromDockId = String(p.fromDock);
       if (from && from.tile) { convey.enqueueAt(from.tile.x, from.tile.y, p); return; }
       dockArrival(p); return;                                       // no drawn lane between them — land it at the dock
     }
     let t = null;
     if (p.kind !== 'directive') {
       t = (p.agentId && routingPlan && typeof Pipeline !== 'undefined' && Pipeline.sourceFor)
-        ? Pipeline.sourceFor(routingPlan, p.agentId)
+        ? Pipeline.sourceFor(routingPlan, p.agentId, p.dockId || undefined)   // the door that leads to THIS bay
         : intakeTile();
     }
     if (t) convey.enqueueAt(t.x, t.y, p);
@@ -8704,11 +10110,15 @@ const World = (() => {
     const docks = (routingPlan && routingPlan.dockBays) || [];
     // ADDRESSED work flashes ONLY its own agent's dock — never another agent's (that's a wrong-agent
     // reaction, the exact confusion this lane kills). Only UNADDRESSED work falls back to the first dock.
-    const dock = aid ? docks.find(d => d.agentId === aid) : docks[0];
+    // (multi-bay) the crate names its bay: flash THAT one, never the agent's other bay
+    const dock = aid ? ((p.dockId && docks.find(d => d.propId === p.dockId && d.agentId === aid)) || docks.find(d => d.agentId === aid)) : docks[0];
     if (!dock) return;                                             // no (matching) bay → nothing to show (today's behavior)
-    dockFlashes.set(dock.propId, fnow);
+    // STILL: the wall clock, never the last frame's fnow (the deskFlash.set pattern): work lands between frames, and a still
+    // floor's fnow is up to 33 ms old — the flash and the ripple would start part-way through
+    const t0 = (typeof performance !== 'undefined') ? performance.now() : fnow;
+    dockFlashes.set(dock.propId, t0);
     const body = bodyForAgent(aid);
-    if (body && body !== agent) { body.wakeAt = fnow; if (!(body.workUntil > fnow + 5000)) body.workUntil = fnow + 4000; }
+    if (body && body !== agent) { body.wakeAt = t0; if (!(body.workUntil > fnow + 5000)) body.workUntil = fnow + 4000; }
     else if (agent && !agent.unplaced) { wakeIn(); }
   }
   // the dock catching a delivery: a bright ring + rim flash over the bay, ~1.1s, additive (with the glows)
@@ -8731,15 +10141,493 @@ const World = (() => {
       ctx.restore();
     }
   }
+  /* ---------- LINE WATCH (2026-09-23, owner-approved): "watch your factory work" ----------
+     Three read-outs on the LIVE floor, every one a fold of real harness state (linewatch.js holds the rules):
+       • a status LAMP on every bound bay — IDLE / WORKING (only once agent.run.start confirms a run AT that dock) /
+         WAITING (a crate queued there) / FAILED (last run there died; until the next success or a click) /
+         PAUSED (a step-through test is paused after this dock). Hover = a tiny glance plate; never a window.
+       • CRATE INSPECT — click a crate riding a belt: a small station card (cratecard.js) with what the harness
+         proved about it (job, line, route, the run working it, its outcome), plus the logbook / Workflow doors.
+       • a per-line PLATE at each line's INBOX — today's runs / shipped / failed, $ today vs the line's daily cap,
+         median time per run — straight from GET /api/routing/lines/stats, reconciled on the SHIPPED counter's
+         60 s cadence and re-asked (never ticked) shortly after a line run ends.
+     The lamp is a DRAWN lens in a housing on the bay's name plate (a glow is not an edge): the halo is secondary. */
+  let watch = null;
+  let lineStats = { known: false, byLine: {}, since: 0 };
+  let lineStatsTimer = 0, stepPollTimer = 0;
+  let hoverBay = null, hoverCrate = null;
+  let lwDrawOff = false;   // verify-only A/B switch (_dbgLineWatch().setDraw) for the frame-cost measurement — never user-facing
+  const LW_ACK_KEY = 'starnet.linewatch.acked';
+  function lineWatch() {
+    if (!watch && typeof LineWatch !== 'undefined') {
+      watch = LineWatch.create({ entryDock: aid => (routingPlan && routingPlan.entryDock) ? (routingPlan.entryDock[aid] || null) : null });
+      try { const a = JSON.parse(localStorage.getItem(LW_ACK_KEY) || '[]'); if (Array.isArray(a)) watch.setAcked(a); } catch (_) { /* per-viewer convenience only */ }
+    }
+    return watch;
+  }
+  const lwNow = () => ((typeof performance !== 'undefined') ? performance.now() : fnow);
+  function watchEvent(name, p) {
+    const w = lineWatch(); if (!w) return;
+    w.onEvent(name, p, lwNow());
+    // a LINE run just ended: re-ask the server for the line's numbers (a reconcile, never an optimistic tick)
+    if (name === 'agent.run.end' && p && p.runId) {
+      const r = w.run(p.runId);
+      if (r && r.lineId) lineStatsSoon();
+      if (r && r.steptest) setTimeout(pollStepTest, 600);   // a step-test hop ended: the session is paused/done NOW — ask once
+    }
+    if (name === 'workitem.placed' && p && p.steptest) pollStepTest();   // a step-test crate: learn the session (its 4 s poll runs only while live)
+    // FIRST SHIP: a job is starting on a line with no shipment count yet (a line built a moment ago) — read it NOW, before the job can ship
+    if ((name === 'workitem.placed' || name === 'agent.run.start') && p) {
+      const lid = name === 'workitem.placed' ? p.lineId : ((w.run(p.runId) || {}).lineId);
+      if (lid && !hasCount(String(lid))) refreshShipBase();
+    }
+  }
+  function pollLineStats() {
+    if (typeof fetch === 'undefined' || typeof LineWatch === 'undefined') return;
+    pollLineJobStreams();   // the per-OUTBOX crate join rides the line plates' cadence (60 s + shortly after a line run)
+    if (shipBaseStale()) refreshShipBase();   // FIRST SHIP's counts: a reload or a new line on the posted floor reads them (once per plan)
+    const since = LineWatch.localMidnight(Date.now());
+    try {
+      fetch(apiUrl('/api/routing/lines/stats?since=' + since), { cache: 'no-store' })
+        .then(r => {
+          if (r.ok) return r.json();
+          /* the server ANSWERED and said it cannot read the numbers (runtime audit 2026-10-12): the plates, the pallets and the
+             panel's TODAY row stop showing the last ones — jobs and spend go on, so a kept number would freeze into a lie */
+          lineStats = { known: false, byLine: {}, since: 0 };
+          routingNags = buildRoutingNags();
+          motionWake();   // STILL: the plates and pallets go — drawn on the next vsync, never a still tick later
+          return null;
+        })
+        .then(j => {
+          if (!j || !Array.isArray(j.lines)) return;   // no answer (a network drop) — keep the last server answer: the link-down dim marks it last-known
+          const by = {};
+          for (const l of j.lines) if (l && l.lineId) by[l.lineId] = l;
+          lineStats = { known: true, byLine: by, since };
+          routingNags = buildRoutingNags();
+          const w = lineWatch(); if (w) w.seedOutcomes(j.docks);
+          motionWake();   // STILL: a risen SHIPPED count pops its pallet's newest crate on the frame that draws it — the next vsync
+        }).catch(() => {});
+    } catch (_) { /* offline: the plate keeps its last server answer */ }
+  }
+  function lineStatsSoon() {
+    if (lineStatsTimer) return;
+    lineStatsTimer = setTimeout(() => { lineStatsTimer = 0; pollLineStats(); }, 1500);
+  }
+  /* the step-through session: asked on the SHIPPED counter's 60 s cadence (piggyback) and pushed by the Workflow
+     panel's own poll while it shows a session; polled faster ONLY while a session is live (running/paused). */
+  function pollStepTest() {
+    if (typeof fetch === 'undefined') return;
+    try {
+      fetch(apiUrl('/api/routing/steptest'), { cache: 'no-store' })
+        .then(r => (r.ok ? r.json() : null))
+        .then(j => { if (j && j.ok === true) { noteStepTest(j.session || null); motionWake(); } })   // STILL: the PAUSED lamp, on the next vsync
+        .catch(() => {});
+    } catch (_) { /* the seam may be absent on an older sidecar — no lamp claims PAUSED then */ }
+  }
+  function noteStepTest(s) {
+    const w = lineWatch(); if (w) w.setStepTest(s);
+    const live = !!(s && (s.state === 'running' || s.state === 'paused'));
+    if (live && !stepPollTimer) stepPollTimer = setInterval(() => { if (!bridgePaused) pollStepTest(); }, 4000);
+    else if (!live && stepPollTimer) { clearInterval(stepPollTimer); stepPollTimer = 0; }
+  }
+  // the name plate drawBayNames paints over a bound bay: centred on the bay's crown, 11 tall
+  function bayPlateBox(d) {
+    const width = Math.max(12, (d.w || 1) * T - 1), cx = (d.x + (d.w || 1) / 2) * T;
+    return { left: cx - width / 2, top: d.y * T + 1 - 5.5, width, h: 11, cx };
+  }
+  const LAMP = { idle: '#2e443b', working: '#ffb23e', waiting: '#cdb46a', failed: '#ff4a3d', paused: '#62d6e3' };
+  function drawBayLamps(now) {
+    if (lwDrawOff) return;
+    const w = lineWatch();
+    if (!w || !routingPlan || !routingPlan.dockBays || !routingPlan.dockBays.length) return;
+    const rm = reduceMotion(), t = lwNow();
+    ctx.save();
+    ctx.shadowBlur = 0;
+    for (const d of routingPlan.dockBays) {
+      if (!d.agentId || !propOnScreen(d)) continue;
+      const s = w.status(d.propId, t);
+      const b = bayPlateBox(d);
+      const hx = b.left + b.width - 7.5, hy = b.top - 2.4;   // the housing sits on the plate's top rail, right end
+      ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+      ctx.fillStyle = '#070a0b'; ctx.fillRect(hx, hy, 5.5, 3);
+      ctx.strokeStyle = '#56626a'; ctx.lineWidth = 0.35; ctx.strokeRect(hx, hy, 5.5, 3);
+      // WORKING pulses; FAILED snaps on the caret cadence but never to zero (a flashing control never flashes out)
+      let k = 1;
+      if (s.state === 'working' && !rm) k = 0.5 + 0.5 * (0.5 + 0.5 * Math.sin(now / 240));
+      else if (s.state === 'failed' && !rm) k = (Math.floor(now / 700) % 2) ? 0.5 : 1;
+      ctx.globalAlpha = k; ctx.fillStyle = LAMP[s.state] || LAMP.idle;
+      ctx.fillRect(hx + 1, hy + 0.8, 3.5, 1.4);
+      if (s.state !== 'idle') {
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.globalAlpha = 0.16 * k; ctx.fillRect(hx - 0.6, hy - 0.8, 6.7, 4.6);
+      }
+    }
+    ctx.restore();
+  }
+  // hit-test: a BOUND bay (footprint + its name plate) under a world point
+  function boundBayAt(wp) {
+    if (!routingPlan || !routingPlan.dockBays) return null;
+    for (const d of routingPlan.dockBays) {
+      if (!d.agentId) continue;
+      const x0 = d.x * T, y0 = d.y * T - 8, x1 = (d.x + (d.w || 1)) * T, y1 = (d.y + (d.h || 1)) * T;
+      if (wp.x >= x0 && wp.x < x1 && wp.y >= y0 && wp.y < y1) return d;
+    }
+    return null;
+  }
+  function failedBayAt(wp) {
+    const d = boundBayAt(wp), w = lineWatch();
+    return (d && w && w.status(d.propId, lwNow()).state === 'failed') ? d : null;
+  }
+  function ackBay(d) {
+    const w = lineWatch(); if (!w || !w.ack(d.propId)) return false;
+    try { localStorage.setItem(LW_ACK_KEY, JSON.stringify(w.ackedIds())); } catch (_) { /* per-viewer convenience only */ }
+    return true;
+  }
+  const lwSecs = ms => { const s = Math.max(0, Math.round(ms / 1000)); return s < 60 ? s + 's' : Math.floor(s / 60) + 'm' + String(s % 60).padStart(2, '0') + 's'; };
+  function bayGlanceText(d) {
+    const w = lineWatch(); if (!w) return null;
+    const s = w.status(d.propId, lwNow());
+    if (s.state === 'working') return { text: 'WORKING · ' + lwSecs(lwNow() - s.since) + (s.usd > 0 ? ' · ' + U.usd(s.usd) : ''), col: LAMP.working };
+    if (s.state === 'waiting') return { text: 'WAITING · ' + s.queued + (s.queued === 1 ? ' CRATE' : ' CRATES') + ' QUEUED', col: LAMP.waiting };
+    if (s.state === 'failed') return { text: 'FAILED · ' + String(s.reason || 'error').toUpperCase().replace(/_/g, ' ') + ' — CLICK TO CLEAR', col: LAMP.failed };
+    if (s.state === 'paused') return { text: 'PAUSED · STEP TEST WAITS HERE', col: LAMP.paused };
+    return { text: 'IDLE', col: '#9fb0a8' };
+  }
+  // the hover glance: ONE tiny screen-space plate over the bay (the agent nameplate's language, smaller)
+  function drawBayGlance(now) {
+    if (lwDrawOff || !hoverBay || hoverAgent) return;
+    // one voice per anchor: a bay already carrying a routing callout keeps that voice
+    if (routingNags && routingNags.some(n => n.x === hoverBay.x && n.y === hoverBay.y)) return;
+    const g = bayGlanceText(hoverBay); if (!g) return;
+    const b = bayPlateBox(hoverBay);
+    screenTag(g.text, g.col, b.cx, b.top + b.h + 1, true);   // BELOW the plate: the space above belongs to nags + the INBOX plate
+  }
+  function screenTag(text, col, wx, wy, below) {
+    const dpr = window.devicePixelRatio || 1;
+    ctx.save();
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.imageSmoothingEnabled = false;
+    ctx.font = '15px ' + PLATE_FONT;
+    const tw = ctx.measureText(text).width, h = 17, w = Math.round(tw + 12);
+    const Wc = cv.width / dpr, Hc = cv.height / dpr;
+    const ax = (wx * scale + panX) / dpr, ay = (wy * scale + panY) / dpr;
+    const x = Math.round(Math.max(4, Math.min(Wc - w - 4, ax - w / 2))), y = Math.round(Math.max(4, Math.min(Hc - h - 4, below ? ay + 2 : ay - h)));
+    ctx.fillStyle = 'rgba(6,5,4,0.92)'; ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = '#6b5a33'; ctx.lineWidth = 1; ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+    ctx.globalAlpha = 0.7; ctx.fillStyle = col; ctx.fillRect(x + 1, y, w - 2, 1); ctx.globalAlpha = 1;
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.shadowBlur = 3; ctx.shadowColor = col; ctx.fillStyle = col;
+    ctx.fillText(text, x + 6, y + h / 2 + 1);
+    ctx.restore();
+  }
+  // hit-test: a real crate (a payload-carrying box, never the ghost engine's) riding a belt under a world point
+  const CRATE_DIRV = { E: [1, 0], W: [-1, 0], S: [0, 1], N: [0, -1] };
+  function crateAt(wp) {
+    if (!convey || !convey.peekBoxes) return null;
+    let best = null, bd = 7.5;
+    for (const bx of convey.peekBoxes()) {
+      if (!bx.payload || bx.payload.ghost || bx.sink > 0) continue;
+      const v = CRATE_DIRV[bx.dir] || [0, 0];
+      const cx = (bx.x + 0.5) * T + (bx.prog - 0.5) * T * v[0], cy = (bx.y + 0.5) * T + (bx.prog - 0.5) * T * v[1] - 1;
+      const dd = Math.hypot(wp.x - cx, wp.y - cy);
+      if (dd < bd) { bd = dd; best = Object.assign({ cx, cy }, bx); }
+    }
+    return best;
+  }
+  function drawCrateGlance(now) {
+    if (lwDrawOff || !hoverCrate || hoverAgent || typeof LineWatch === 'undefined') return;
+    const card = LineWatch.crateCard(hoverCrate.payload, crateCtx(hoverCrate.payload));
+    screenTag(card.kind + ' — CLICK TO INSPECT', '#e8c860', hoverCrate.cx, hoverCrate.cy - 7);
+  }
+  // names the card may print: live roster names, the bay's ROLE + crew, the line's INBOX label
+  function lwDockName(dockId) {
+    const p = geo && geo.props ? geo.props.find(q => q.id === dockId) : null;
+    const aid = p && p.agentId;
+    const b = aid ? bodyForAgent(aid) : null;
+    const who = (b && b.name) ? String(b.name).toUpperCase() : (aid ? String(aid).toUpperCase() : 'NO AGENT');
+    return (p && (p.label || p.role) ? String(p.label || p.role).toUpperCase() : 'BAY') + ' · ' + who;
+  }
+  // a line as every surface names it — the ONE naming rule (worldmodel.lineName: its first named INBOX, else LINE <its first
+  // INBOX's letter>), never the label of whichever prop keys the line (final floor lane M17/M23). A lineId is a KEY: read the
+  // compiled line record (a key an edit retired resolves through that prop's current line; one whose prop is gone says so),
+  // then name that record by the station's rule — the record's own name + INBOX letter only where no station rule is loaded.
+  function lwLineName(lineId) {
+    const ls = routingPlan && Array.isArray(routingPlan.lines) ? routingPlan.lines : [];
+    const moved = routingPlan && routingPlan.lineOfProp ? routingPlan.lineOfProp[lineId] : null;
+    const rec = ls.find(l => l && l.lineId === lineId) || (moved ? ls.find(l => l && l.lineId === moved) : null);
+    if (!rec) return 'a line since edited';
+    const ruled = station && station.lineName ? station.lineName(rec.lineId) : null;
+    if (ruled) return ruled;
+    const iid = rec.intakes && rec.intakes[0], letter = iid && station && station.lineLetter ? station.lineLetter(iid) : null;
+    return Pipeline.lineWord(rec.name, letter ? 'LINE ' + letter : 'UNNAMED LINE');
+  }
+  function lwAgentName(aid) { const b = bodyForAgent(aid); return (b && b.name) ? String(b.name).toUpperCase() : String(aid || '?').toUpperCase(); }
+  function crateCtx(payload) {
+    const w = lineWatch(), p = payload || {};
+    const run = w ? (p.runId ? w.run(p.runId) : (p.workitemId ? w.runOfWorkitem(p.workitemId) : null)) : null;
+    return { run, row: null, nowMs: lwNow(), agentName: lwAgentName, dockName: lwDockName, lineName: lwLineName, usd: n => U.usd(n) };
+  }
+  function openCrate(bx, ev) {
+    if (typeof CrateCard === 'undefined' || typeof LineWatch === 'undefined') return false;
+    const payload = bx.payload;
+    CrateCard.open({
+      clientX: ev ? ev.clientX : 0, clientY: ev ? ev.clientY : 0,
+      payload, api: apiUrl,
+      agentOf: aid => bodyForAgent(aid),   // the RUN row's skin thumb draws this body's own skin
+      // the card re-resolves on every refresh: the run record grows (start, cost, end) while the card is open
+      resolve: row => { const c = crateCtx(payload); c.row = row || null; return LineWatch.crateCard(payload, c); },
+      runIdOf: () => { const c = crateCtx(payload); return (c.run && c.run.runId) || payload.runId || null; },
+      runEnded: () => { const c = crateCtx(payload); return !!((c.run && c.run.ended) || payload.outbound); },
+      openRun: a => { if (!a || !a.agentId) return; if (onClick) onClick(a.agentId); if (typeof StationUI !== 'undefined' && StationUI.openTerm) StationUI.openTerm('logbook'); },
+      openWorkflow: f => { if (!f || typeof Build === 'undefined') return; try { if (!Build.isOpen()) Build.open(); if (f.dockId && Build.openAssign) Build.openAssign(f.dockId); } catch (_) { /* BUILD MODE absent: nothing to open */ } }
+    });
+    return true;
+  }
+  /* A WOULD-caption stays ON the station (walk 10-14 #13: "THE RESULT WOULD SHIP OUT HERE" crossed the hull into space and
+     past the stage frame, "NO FEED — CLICK" sat on "A MESSAGE WOULD ARRIVE HERE"). GhostLine.onStation holds the law BUILD
+     MODE shares: in its own room, every part over the station, beside the machine its "HERE" names. Here it also stays on
+     the visible stage (a spot above or below the stage is refused, never slid onto a machine it is not about), and a spot
+     on a routing callout, a line plate or a bay's name plate answers null, so ghostline.js tries the caption's next spot —
+     with none clear, the projection sits that pass out. */
+  function captionInStation(b, n, plates) {
+    const v = { x: (4 - panX) / scale, y: (4 - panY) / scale, w: Math.max(0, (cv.width - 8) / scale), h: Math.max(0, (cv.height - 8) / scale) };
+    const onStage = bx => {
+      if (bx.w <= v.w) bx.x = Math.max(v.x, Math.min(v.x + v.w - bx.w, bx.x));
+      return !(bx.h <= v.h && (bx.y < v.y || bx.y + bx.h > v.y + v.h));
+    };
+    if (!GhostLine.onStation(b, n, stationRoomBoxes(), T, onStage)) return null;
+    const hit = o => !!o && b.x < o.x + o.w && b.x + b.w > o.x && b.y < o.y + o.h && b.y + b.h > o.y;
+    if (nagLabelBoxes.some(hit) || (plates || []).some(p => hit(p.box))) return null;
+    // a bay's name plate is its agent's name: a caption never covers it either
+    for (const d of (routingPlan && routingPlan.dockBays) || []) { if (!d.agentId) continue; const q = bayPlateBox(d); if (hit({ x: q.left, y: q.top, w: q.width, h: q.h })) return null; }
+    return b;
+  }
+  // the station's rooms in local px (GhostLine.roomBoxes): what "on the station" means for a world caption
+  let roomBoxMemo = [], roomBoxGeo = null;
+  function stationRoomBoxes() {
+    if (!geo || !geo.allRects || !geo.allRects.length || typeof GhostLine === 'undefined') return [];
+    if (roomBoxGeo !== geo) { roomBoxGeo = geo; roomBoxMemo = GhostLine.roomBoxes(geo.allRects, T, 0, 0, (typeof StationBake !== 'undefined' && StationBake.WALL && StationBake.WALL.up) || 0); }
+    return roomBoxMemo;
+  }
+  // the floor rectangle of the room a local tile sits in (the nag layout's containerFor, reused)
+  function lwRoomBox(tx, ty) {
+    if (!station || !station.roomById || !geo || !geo.origin) return null;
+    const id = roomOfLocalTile(tx, ty), room = id && station.roomById(id);
+    const ox = geo.origin.tx, oy = geo.origin.ty;
+    const rr = room && room.rects.find(q => tx + ox >= q.x1 && tx + ox <= q.x2 && ty + oy >= q.y1 && ty + oy <= q.y2);
+    return rr ? { x: (rr.x1 - ox) * T + 2, y: (rr.y1 - oy) * T + 2, w: (rr.x2 - rr.x1 + 1) * T - 4, h: (rr.y2 - rr.y1 + 1) * T - 4 } : null;
+  }
+  // the INBOX plate: ONE short line of the line's counts at rest (hover the INBOX for the whole reading), only once the
+  // server has answered for this line. Laid out so it never covers a bay's name plate/lamp, a routing callout or
+  // another line's plate (one voice per anchor) — a plate with no clear spot is not drawn; the hover glance still is.
+  const lwPlateW = new Map();
+  let lwPlateMemo = null, lwPlateKey = null;
+  function lwPlateBoxes() {
+    if (!lineStats.known || !routingPlan || !Array.isArray(routingPlan.lines) || !geo || !geo.props || typeof LineWatch === 'undefined') return [];
+    const key = [routingPlan, lineStats, routingNags, geo];
+    if (lwPlateKey && lwPlateKey.every((v, i) => v === key[i])) return lwPlateMemo;
+    const out = [], taken = [];
+    const hit = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+    for (const d of (routingPlan.dockBays || [])) { if (!d.agentId) continue; const b = bayPlateBox(d); taken.push({ x: b.left, y: b.top - 3, w: b.width, h: b.h + 3 }); }
+    for (const n of (routingNags || [])) taken.push({ x: n.x * T - 24, y: n.y * T - 16, w: n.w * T + 48, h: 15 });
+    for (const bt of (geo.belts || [])) taken.push({ x: bt.x * T, y: bt.y * T + 2, w: T, h: T - 4 });   // never over a belt: crates ride there
+    ctx.save();
+    ctx.font = "5.5px 'VT323','Courier New',monospace";
+    for (const l of routingPlan.lines) {
+      const s = lineStats.byLine[l.lineId]; if (!s) continue;
+      const ip = geo.props.find(q => q.id === (l.intakes && l.intakes[0])); if (!ip) continue;
+      const lines = LineWatch.plateLines(s); if (!lines) continue;
+      let tw = lwPlateW.get(lines[0]);
+      if (tw == null) { tw = ctx.measureText(lines[0]).width; if (lwPlateW.size > 64) lwPlateW.clear(); lwPlateW.set(lines[0], tw); }
+      const w = tw + 6, h = 8, cx = (ip.x + (ip.w || 1) / 2) * T;
+      const room = lwRoomBox(ip.x, ip.y);
+      const clampX = x => room ? Math.max(room.x, Math.min(room.x + room.w - w, x)) : x;   // an INBOX at a wall must not hang into the void
+      // only spots that stay ON the INBOX's column: a plate drifting across the floor would read as another line's
+      // numbers. Above it, above its callout, one row higher; else right under it — centred, or flush to either side.
+      const ys = [ip.y * T - 2 - h, ip.y * T - 17 - h, ip.y * T - 26 - h, (ip.y + (ip.h || 1)) * T + 1];
+      const xs = [clampX(cx - w / 2), clampX(ip.x * T), clampX((ip.x + (ip.w || 1)) * T - w)];
+      let box = null;
+      for (const y of ys) {
+        if (room && (y < room.y || y + h > room.y + room.h)) continue;
+        for (const x of xs) { const b = { x, y, w, h }; if (!taken.some(t => hit(t, b))) { box = b; break; } }
+        if (box) break;
+      }
+      const entry = { lineId: l.lineId, ip, s, lines, box };
+      if (box) taken.push(box);
+      out.push(entry);
+    }
+    ctx.restore();
+    lwPlateMemo = out; lwPlateKey = key;
+    return out;
+  }
+  function drawLinePlates(now) {
+    if (lwDrawOff) return;
+    const plates = lwPlateBoxes(); if (!plates.length) return;
+    ctx.save();
+    ctx.font = "5.5px 'VT323','Courier New',monospace"; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.shadowBlur = 0;
+    ctx.globalAlpha = linkStaleDim ? 0.35 : 1;   // link down → last-known numbers, dimmed like the SHIPPED pallet
+    for (const p of plates) {
+      const b = p.box; if (!b || !propOnScreen(p.ip)) continue;
+      if (hoverPlate && !hoverAgent && hoverPlate.lineId === p.lineId) continue;   // the glance says it all while hovered — never two plates
+      ctx.fillStyle = '#0d1311'; ctx.fillRect(b.x, b.y, b.w, b.h);
+      ctx.strokeStyle = '#3f4c47'; ctx.lineWidth = 0.35; ctx.strokeRect(b.x, b.y, b.w, b.h);
+      ctx.strokeStyle = '#4f7f6c'; ctx.lineWidth = 0.5; ctx.beginPath(); ctx.moveTo(b.x + 2, b.y + b.h - 0.8); ctx.lineTo(b.x + b.w - 2, b.y + b.h - 0.8); ctx.stroke();
+      ctx.fillStyle = (p.s.failed | 0) > 0 ? '#e7b3a6' : '#b9cfc4';
+      ctx.fillText(p.lines[0], b.x + b.w / 2, b.y + b.h / 2 - 0.3);
+    }
+    ctx.restore();
+  }
+  /* SEND TO PLATES (2026-10-10) — an OUTBOX whose line hands its finished work on says where, at rest: "SENDS TO LINE B". Read
+     from the COMPILED plan's sendTo (the very map the sidecar's handoff runner reads), so a SEND TO the compiler turned off — a
+     circle, an INBOX that is gone — shows no plate (its nag says why). Placed in the line plates' own pass: never over a stat
+     plate, a nag, a bay plate or a belt; above the OUTBOX first (the SHIPPED pallet owns the floor in front of it). */
+  let sendPlateKey = null, sendPlateMemo = [];
+  function sendPlateBoxes() {
+    if (!routingPlan || !routingPlan.sendTo || !Array.isArray(routingPlan.lines) || !geo || !geo.props) return [];
+    const stat = lwPlateBoxes();
+    // (an empty stat list is a FRESH [] each call until the server's numbers are known — keyed as null, or this pass re-ran per frame)
+    const key = [routingPlan, routingNags, geo, stat.length ? stat : null];
+    if (sendPlateKey && sendPlateKey.every((v, i) => v === key[i])) return sendPlateMemo;
+    const out = [], taken = [];
+    const hit = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+    for (const d of (routingPlan.dockBays || [])) { if (!d.agentId) continue; const b = bayPlateBox(d); taken.push({ x: b.left, y: b.top - 3, w: b.width, h: b.h + 3 }); }
+    for (const n of (routingNags || [])) taken.push({ x: n.x * T - 24, y: n.y * T - 16, w: n.w * T + 48, h: 15 });
+    for (const bt of (geo.belts || [])) taken.push({ x: bt.x * T, y: bt.y * T + 2, w: T, h: T - 4 });
+    for (const s of stat) if (s.box) taken.push(s.box);
+    ctx.save();
+    ctx.font = "5.5px 'VT323','Courier New',monospace";
+    for (const obId of Object.keys(routingPlan.sendTo)) {
+      const st = routingPlan.sendTo[obId], ob = geo.props.find(q => q.id === obId);
+      if (!st || !ob) continue;
+      const text = 'SENDS TO ' + ((station && station.lineName ? station.lineName(st.toLine) || station.lineName(st.intakeId) : null) || 'ANOTHER LINE');   // (the one line name)
+      const w = ctx.measureText(text).width + 6, h = 8, cx = (ob.x + (ob.w || 1) / 2) * T;
+      const room = lwRoomBox(ob.x, ob.y);
+      const clampX = x => room ? Math.max(room.x, Math.min(room.x + room.w - w, x)) : x;
+      const ys = [ob.y * T - 2 - h, ob.y * T - 17 - h, ob.y * T - 26 - h, (ob.y + (ob.h || 1)) * T + 9];
+      const xs = [clampX(cx - w / 2), clampX(ob.x * T), clampX((ob.x + (ob.w || 1)) * T - w)];
+      let box = null;
+      for (const y of ys) {
+        if (room && (y < room.y || y + h > room.y + room.h)) continue;
+        for (const x of xs) { const b = { x, y, w, h }; if (!taken.some(t => hit(t, b))) { box = b; break; } }
+        if (box) break;
+      }
+      if (box) taken.push(box);
+      out.push({ obId, ob, text, box, toIntake: st.intakeId, toLine: st.toLine });
+    }
+    ctx.restore();
+    sendPlateMemo = out; sendPlateKey = key;
+    return out;
+  }
+  function drawSendPlates() {
+    if (lwDrawOff) return;
+    const plates = sendPlateBoxes(); if (!plates.length) return;
+    ctx.save();
+    ctx.font = "5.5px 'VT323','Courier New',monospace"; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.shadowBlur = 0;
+    ctx.globalAlpha = linkStaleDim ? 0.35 : 1;
+    for (const p of plates) {
+      const b = p.box; if (!b || !propOnScreen(p.ob)) continue;
+      ctx.fillStyle = '#0d1311'; ctx.fillRect(b.x, b.y, b.w, b.h);
+      ctx.strokeStyle = '#3f4c47'; ctx.lineWidth = 0.35; ctx.strokeRect(b.x, b.y, b.w, b.h);
+      ctx.strokeStyle = '#57bd8b'; ctx.lineWidth = 0.5; ctx.beginPath(); ctx.moveTo(b.x + 2, b.y + b.h - 0.8); ctx.lineTo(b.x + b.w - 2, b.y + b.h - 0.8); ctx.stroke();
+      ctx.fillStyle = '#9adcb0';
+      ctx.fillText(p.text, b.x + b.w / 2, b.y + b.h / 2 - 0.3);
+    }
+    ctx.restore();
+  }
+  /* THE HAND-OFF CRATE (SEND TO, 2026-10-10). The sidecar places the NEXT line's work as workitem.placed kind:'handoff'
+     { fromOutbox, toIntake } once the sending line's job left its line clean. Drawn as what it is: that line's PRODUCT, lifted out
+     of its OUTBOX and carried over to the next line's INBOX on an arc, where it drops in and rides the line as work (ore). Never
+     before the sending line's own crate has sunk into that OUTBOX — the placement usually arrives while that crate is still on
+     the belt — and never NEITHER: if that crate never comes (no lane drawn, a reload mid-run) the hand-off flies after the same
+     grace the dock hand-offs use. Exactly one crate either way; nothing here touches the doc or the plan. */
+  const SEND_FLY_MS = 1300;
+  const sendCrates = [];             // { p, ob, ib, born, t0 } — t0 = 0 while held
+  const outboxSunk = new Map();      // outbox propId -> fnow its last product crate sank
+  function placeSendCrate(p) {
+    if (!geo || !geo.props || !p.fromOutbox || !p.toIntake) return false;
+    const ob = geo.props.find(q => q.id === p.fromOutbox), ib = geo.props.find(q => q.id === p.toIntake);
+    if (!ob || !ib) return false;
+    p.box = 'product';
+    sendCrates.push({ p, ob, ib, born: fnow, t0: 0 });
+    if (sendCrates.length > 12) sendCrates.shift();
+    return true;
+  }
+  function clearSendCrates() { sendCrates.length = 0; outboxSunk.clear(); }   // loadStation: the old floor's crates and (recycled) ids
+  /* Props live in the local tile frame and each edit derives new prop objects: a crate re-reads its OUTBOX and INBOX by id, so an
+     origin shift (a room added at the north/west edge) or a moved prop carries the arc with it. A crate whose OUTBOX or INBOX is
+     gone is not dropped — the sidecar really placed that work — it lands now, the way any work the floor cannot arc in does. */
+  function reframeSendCrates() {
+    if (!sendCrates.length || !geo || !geo.props) return;
+    const gone = [];
+    for (let i = 0; i < sendCrates.length; i++) {
+      const c = sendCrates[i], ob = geo.props.find(q => q.id === c.ob.id), ib = geo.props.find(q => q.id === c.ib.id);
+      if (ob && ib) { c.ob = ob; c.ib = ib; } else gone.push(c);
+    }
+    for (const c of gone) { sendCrates.splice(sendCrates.indexOf(c), 1); landSendCrate(c); }
+  }
+  function noteOutboxSink(x, y) {
+    if (!geo || !geo.props) return;
+    for (const q of geo.props) if (q.t === 'outbox' && x >= q.x - 1 && x <= q.x + (q.w || 1) && y >= q.y - 1 && y <= q.y + (q.h || 1)) outboxSunk.set(q.id, fnow);
+  }
+  const sendArcPts = (c) => {
+    const ax = (c.ob.x + (c.ob.w || 1) / 2) * T, ay = (c.ob.y + (c.ob.h || 1) / 2) * T, bx = (c.ib.x + (c.ib.w || 1) / 2) * T, by = (c.ib.y + (c.ib.h || 1) / 2) * T;
+    return { ax, ay, bx, by, mx: (ax + bx) / 2, my: Math.max(ay, by) + 1.6 * T };
+  };
+  function landSendCrate(c) {
+    const p = c.p;
+    p.box = 'ore';
+    const t = (p.agentId && routingPlan && typeof Pipeline !== 'undefined' && Pipeline.sourceFor) ? Pipeline.sourceFor(routingPlan, p.agentId, p.dockId || undefined) : null;
+    if (t && convey) convey.enqueueAt(t.x, t.y, p); else dockArrival(p);
+    if (typeof SFX !== 'undefined' && SFX.ship) { try { SFX.ship(); } catch (_) { /* a sound never breaks the floor */ } }
+  }
+  function drawSendCrates() {
+    if (!sendCrates.length) return;
+    for (let i = sendCrates.length - 1; i >= 0; i--) {
+      const c = sendCrates[i];
+      if (!c.t0) {   // held until the sending line's own crate sinks at that OUTBOX (or the grace runs out)
+        const sunk = outboxSunk.get(c.ob.id);
+        if ((sunk != null && sunk >= c.born - 3000) || fnow - c.born >= HANDOFF_GRACE_MS) c.t0 = fnow;
+        else continue;
+      }
+      const k = (fnow - c.t0) / SEND_FLY_MS;
+      if (k >= 1) { sendCrates.splice(i, 1); landSendCrate(c); continue; }
+      const e = k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2, u = 1 - e, a = sendArcPts(c);
+      const x = u * u * a.ax + 2 * u * e * a.mx + e * e * a.bx, y = u * u * a.ay + 2 * u * e * a.my + e * e * a.by;
+      ctx.save();
+      ctx.globalAlpha = 0.45; ctx.strokeStyle = '#57bd8b'; ctx.lineWidth = 0.6; ctx.setLineDash([2, 2]);
+      ctx.beginPath(); ctx.moveTo(a.ax, a.ay); ctx.quadraticCurveTo(a.mx, a.my, a.bx, a.by); ctx.stroke();
+      ctx.setLineDash([]); ctx.globalAlpha = 1;
+      if (typeof Conveyor !== 'undefined' && Conveyor.drawCrate) Conveyor.drawCrate(ctx, Math.round(x), Math.round(y), 'product');
+      else { ctx.fillStyle = '#57bd8b'; ctx.fillRect(Math.round(x) - 2, Math.round(y) - 2, 4, 4); }
+      ctx.restore();
+    }
+  }
+  // hover: an INBOX (or its plate) with a server reading → the whole reading as one glance line
+  function lwPlateAt(wp) {
+    for (const p of lwPlateBoxes()) {
+      const ip = p.ip, b = p.box;
+      if (wp.x >= ip.x * T && wp.x < (ip.x + (ip.w || 1)) * T && wp.y >= ip.y * T && wp.y < (ip.y + (ip.h || 1)) * T) return p;
+      if (b && wp.x >= b.x && wp.x < b.x + b.w && wp.y >= b.y && wp.y < b.y + b.h) return p;
+    }
+    return null;
+  }
+  let hoverPlate = null;
+  function drawPlateGlance(now) {
+    if (lwDrawOff || !hoverPlate || hoverAgent) return;
+    const p = hoverPlate, b = p.box;
+    screenTag(p.lines[2], (p.s.failed | 0) > 0 ? '#e7b3a6' : '#b9cfc4', b ? b.x + b.w / 2 : (p.ip.x + 0.5) * T, b ? b.y - 1 : p.ip.y * T - 2);
+  }
   // a belt tile to ship an outbound box from — beside the PRODUCING agent's own bay, not always the hero's.
   // The hero ships from its desk (byte-identical); a crew/summoned agent ships from a belt tile beside ITS
   // body; an unknown agent falls back to the hero desk. (WIRING_AUDIT P3: kill the single-hero-desk assumption.)
-  function outboundBeltTile(aid) {
+  function outboundBeltTile(aid, dockId) {
     // 1) the PRODUCING agent's own BAY hookup — finished work leaves from the dock, riding the bay→OUTBOX
     //    lane exactly like a ▸ TEST crate (2026-07-05 fix: the old desk-first order meant a hero with a
     //    belted BAY never shipped a riding crate, because no belt runs to the desk by design).
+    //    (multi-bay) from the bay the run was AT when one is known, else the agent's home dock.
     if (aid && routingPlan && routingPlan.bays) {
-      const b = routingPlan.bays.find(x => x.agentId === aid);
+      const home = routingPlan.entryDock ? routingPlan.entryDock[aid] : null;
+      const b = (dockId && routingPlan.bays.find(x => x.agentId === aid && x.propId === dockId))
+        || (home && routingPlan.bays.find(x => x.agentId === aid && x.propId === home))
+        || routingPlan.bays.find(x => x.agentId === aid);
       const cand = b ? ((b.tiles && b.tiles.length) ? b.tiles : (b.tile ? [b.tile] : [])) : [];
       // a dock can touch several lanes (inbound + outbound): prefer the hookup whose ONWARD flow ships
       // to an OUTBOX — probe from the tile past it, since the hookup itself reads as the bay
@@ -8810,17 +10698,160 @@ const World = (() => {
     const q = aid && deferredShip.get(aid);
     if (q && q.length) { clearTimeout(q.shift().t); if (!q.length) deferredShip.delete(aid); }
   }
-  function clearDeferredShips() { for (const q of deferredShip.values()) for (const e of q) clearTimeout(e.t); deferredShip.clear(); }
+  function clearDeferredShips() { for (const q of deferredShip.values()) for (const e of q) clearTimeout(e.t); deferredShip.clear(); joinedProducts.clear(); releasedJoinItems.clear(); }
+  // A JOINER-capable line can choose different paths through a FILTER. Hold its productive runs
+  // until the executor names the actual OUTBOX and the exact runs/work-items in that completed job.
+  // Wall-clock time, another job at the same join, and a guessed content tag prove no delivery.
+  const joinedProducts = new Map();   // runId -> captured productive work
+  const releasedJoinItems = new Set();
+  function lineNeedsRelease(dockId, lineId) {
+    const plan = routingPlan;
+    if (!dockId || !lineId || !plan || typeof Pipeline === 'undefined' || !Pipeline.chainStepDock) return false;
+    for (const d of Object.keys(plan.lineOfDock || {})) {
+      if (plan.lineOfDock[d] !== lineId) continue;
+      for (const tag of ['general', 'code', 'research']) {
+        const step = Pipeline.chainStepDock(plan, d, { lineId, tag }, () => 0);
+        if (step && (step.join || step.afterJoin)) return true;
+      }
+    }
+    return false;
+  }
+  function holdJoinedProduct(aid, spec, work, productive = true) {
+    // The completion listener clears its tally/cost. Its later SSE echo is not new evidence and
+    // must never replace the first completion's productive flag, work-item identity or spend.
+    if (!spec.runId || joinedProducts.has(spec.runId)) return;
+    dockLineTakeMatching(aid, work);
+    const lineId = lineOfWork(work);
+    const usd = runUsdRecon.get(spec.runId);
+    joinedProducts.set(spec.runId, { spec, lineId, productive, usd: typeof usd === 'number' && isFinite(usd) && usd > 0 ? usd : 0 });
+    if (joinedProducts.size > 400) joinedProducts.delete(joinedProducts.keys().next().value);
+  }
+  function releaseJoinedProduct(p) {
+    if (!p || p.box !== 'line-output' || !p.workitemId || !p.outboxId || !p.lineId) return;
+    if (releasedJoinItems.has(p.workitemId)) return;
+    releasedJoinItems.add(p.workitemId);
+    if (releasedJoinItems.size > 400) releasedJoinItems.delete(releasedJoinItems.values().next().value);
+    const ids = new Set(Array.isArray(p.workitemIds) ? p.workitemIds : []);
+    let worked = false, usd = 0;
+    for (const [runId, rec] of joinedProducts) {
+      if (rec.lineId !== p.lineId || (runId !== p.entryRunId && !ids.has(rec.spec.workitemId))) continue;
+      worked = worked || rec.productive; usd += rec.usd; joinedProducts.delete(runId);
+    }
+    if (!worked || !convey || !routingPlan) return;   // unseen/talk-only jobs never invent product
+    const out = (routingPlan.outs || []).find(o => o.propId === p.outboxId);
+    if (!out || !out.tile || (routingPlan.lineOfProp || {})[p.outboxId] !== p.lineId) return;
+    const weight = typeof Conveyor !== 'undefined' && Conveyor.weightForUsd ? Conveyor.weightForUsd(usd) : 0;
+    // Start at the proven OUTBOX inlet: replaying a guessed route from the last bay can take the
+    // other FILTER exit or pass a JOINER twice. The receipt proves this final belt tile was reached.
+    convey.enqueueAt(out.tile.x, out.tile.y, { outbound: true, box: 'product', weight,
+      workitemId: p.workitemId, agentId: p.agentId || '', dockId: p.dockId || null, lineId: p.lineId });
+  }
+  /* FIRST SHIP (2026-10-12): the gold toast, the milestone and the line's pulse say a line SHIPPED for the first time, so they
+     answer to the record the plate's SHIPPED counts: the sidecar's shipment receipts (line-shipments — a clean, PRODUCTIVE job of
+     that line reached its OUTBOX, counted once). Never this browser's memory alone, never today's count: a line that shipped
+     before this page loaded, while this window slept, in another window or under an older build has had its FIRST SHIP.
+       • shipBase — each line's SHIPPED over everything the record keeps (?since=1: the stats route reads its whole kept window),
+         from a read made BEFORE the receipt. A line with no count there is UNKNOWN, never 0, and nothing is claimed for it; the
+         count is re-read when the floor gains a line, a line's job starts, the stream reconnects, or the station changes.
+       • the executor's terminal receipt (workitem.delivered box 'line-output': THAT line reached THAT OUTBOX) asks. A line whose
+         FIRST SHIP is spent (Build.lineShipSpent — said here, learned from the record, or delivered on under an older build) or
+         whose count was already above 0 reads nothing; a line at 0 reads once more, and FIRST SHIP is said only when the record
+         now holds a shipment for it (0 -> 1+ across this receipt). A talk-only job reaches the OUTBOX and mints nothing, so it
+         says nothing; a crate sinking at a chute — a direct COMMS order rides one too — never asks at all.
+     Once per receipt (the SSE echo delivers it twice); Build says first; a read that fails announces nothing. Returns the
+     check's promise (null when nothing is read) for the test seam. */
+  /* A LINE'S NAME off the floor (2026-10-12) — for the surfaces that name a line by its id away from the floor: DELIVERABLES › TO
+     REVIEW, a hand-off crate's title, FIRST SHIP. ONE rule, the floor's: a line is called by its first NAMED INBOX, else LINE <the
+     letter of its first INBOX>. The station's own resolver says it when the station carries one (station.lineName); until then the
+     compiled plan says the same (compileRoutingPlan's rec.name IS the first named INBOX's label) — nothing is compiled per call.
+     null = no line with an INBOX has that id on this floor (the caller keeps its own fallback). */
+  function lineNameOf(lineId) {
+    if (lineId == null || lineId === '') return null;
+    const id = String(lineId);
+    if (station && typeof station.lineName === 'function') { try { return station.lineName(id) || null; } catch (e) { return null; } }
+    const rec = routingPlan && Array.isArray(routingPlan.lines) ? routingPlan.lines.find(l => l && String(l.lineId) === id) : null;
+    const iid = rec && Array.isArray(rec.intakes) ? rec.intakes[0] : null;
+    if (!iid) return null;
+    if (rec.name && typeof Pipeline !== 'undefined' && Pipeline.lineWord) return Pipeline.lineWord(rec.name, null);
+    const letter = station && typeof station.lineLetter === 'function' ? station.lineLetter(iid) : null;
+    return letter ? 'LINE ' + letter : null;
+  }
+  const firstShipSeen = new Set();
+  const firstShipPending = new Set();   // lines whose post-receipt read is in flight: a count read meanwhile leaves their FIRST SHIP to it
+  let shipBase = { known: false, byLine: {} };
+  let shipSeq = 0, shipApplied = 0, shipBaseReading = false, shipBaseHash = null;
+  const hasCount = (id) => shipBase.known && Object.prototype.hasOwnProperty.call(shipBase.byLine, id);
+  function readShipCounts() {
+    const seq = ++shipSeq;
+    return fetch(apiUrl('/api/routing/lines/stats?since=1'), { cache: 'no-store' })
+      .then(r => (r && r.ok ? r.json() : null))
+      .then(j => {
+        if (!j || !Array.isArray(j.lines)) return null;
+        const by = {};
+        // a line whose SHIPPED the sidecar could not read (null: an unreadable record) stays unknown — never 0
+        for (const l of j.lines) if (l && l.lineId && typeof l.shipped === 'number' && isFinite(l.shipped)) by[String(l.lineId)] = l.shipped;
+        if (seq > shipApplied) {   // a read answering late never overwrites a newer one
+          shipApplied = seq; shipBase = { known: true, byLine: by };
+          // a line the record shows SHIPPED has spent its FIRST SHIP — quietly (no toast for a shipment this page did not see)
+          if (typeof Build !== 'undefined' && Build.markLineShipped) for (const id of Object.keys(by)) if (by[id] > 0 && !firstShipPending.has(id)) Build.markLineShipped(id);
+        }
+        return by;
+      })
+      .catch(() => null);   // (offline / a refused read: the counts stay as they were)
+  }
+  function refreshShipBase() {
+    if (shipBaseReading || typeof fetch === 'undefined') return;
+    shipBaseReading = true; shipBaseHash = routingPlan ? routingPlan.hash || '' : null;
+    readShipCounts().then(() => { shipBaseReading = false; });
+  }
+  // does the posted floor have a line with no count yet (a new line, a reload)? — then the counts are read again (once per plan)
+  function shipBaseStale() {
+    if (!shipBase.known) return true;
+    const lines = routingPlan && Array.isArray(routingPlan.lines) ? routingPlan.lines : [];
+    return lines.some(l => l && l.lineId && !hasCount(String(l.lineId))) && shipBaseHash !== (routingPlan.hash || '');
+  }
+  /* the channel stream (re)connected and finished its replay (the bridge's open(): stream 'ready'): a line may have shipped while the
+     stream was down (a receipt the server no longer replays) — this page's counts are no baseline any more; read them again before
+     the next receipt is judged. Its own function, called AFTER the bridge's authoritative snapshot: FIRST SHIP's bookkeeping never
+     stands between a replay and the state refresh it owes (conveyor-final repair: inlined ahead of fetchSnapshot inside the
+     bridge's catch-all, any throw here silently skipped the reconciliation — test/channels.sse). */
+  function forgetShipBase() {
+    shipBase = { known: false, byLine: {} }; shipApplied = shipSeq; shipBaseReading = false; refreshShipBase();
+  }
+  function noteFirstShip(p) {
+    if (!p || p.box !== 'line-output' || !p.lineId || !p.outboxId || !p.workitemId || firstShipSeen.has(p.workitemId)) return null;
+    firstShipSeen.add(p.workitemId);
+    if (firstShipSeen.size > 400) firstShipSeen.delete(firstShipSeen.values().next().value);
+    if (typeof Build === 'undefined' || !Build.noteLineShipped || typeof fetch === 'undefined') return null;
+    const id = String(p.lineId);
+    if (Build.lineShipSpent && Build.lineShipSpent(id)) return null;   // said, learned, or delivered on before: nothing to read
+    if (!hasCount(id)) { refreshShipBase(); return null; }             // no count from before this receipt: no claim
+    if (shipBase.byLine[id] > 0) { if (Build.markLineShipped) Build.markLineShipped(id); return null; }   // it shipped before
+    firstShipPending.add(id);
+    return readShipCounts().then(by => {
+      firstShipPending.delete(id);
+      const now = by ? by[id] : undefined;
+      if (typeof now !== 'number' || !(now > 0)) return;   // unknown, or this job minted nothing: no claim
+      const receipt = Build.noteLineShipped(p.outboxId, id);
+      if (!receipt || !receipt.first) return;
+      firstShipPulse = { at: (typeof performance !== 'undefined') ? performance.now() : fnow, tiles: receipt.tiles };   // the wall clock: this answer lands between frames
+      motionWake();   // STILL: the FIRST SHIP pulse starts on the next vsync (this answer lands between frames)
+      if (typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify('FIRST SHIP · ' + (lineNameOf(id) || receipt.name), 'gold');
+      if (typeof SFX !== 'undefined' && SFX.milestone) SFX.milestone();
+    });
+  }
   // the crate's MASS must be read NOW: run.end drops runUsdRecon the instant this returns, so a deferred
   // ship that re-read it later would weigh every crate 0 (crate-mass honesty).
   function productCrateSpec(p) {
     const w = (typeof Conveyor !== 'undefined' && Conveyor.weightForUsd) ? Conveyor.weightForUsd(runUsdRecon.get((p && p.runId) || '')) : 0;
-    return { outbound: true, box: 'product', weight: w, workitemId: (p && p.workitemId) || '' };
+    // LINE WATCH (additive): the run it came from, so the crate card can show its recorded outcome
+    return { outbound: true, box: 'product', weight: w, workitemId: (p && p.workitemId) || (runWork.get(runKey(p)) || {}).workitemId || '', runId: (p && p.runId) || '', agentId: (p && p.agentId) || '' };
   }
-  function emitProductCrate(aid, spec) {
+  function emitProductCrate(aid, spec, dockId) {
     if (!convey) return;
-    const t = outboundBeltTile(aid);
-    if (t) convey.enqueueAt(t.x, t.y, spec);
+    if (dockId && spec && !spec.dockId) spec.dockId = dockId;   // LINE WATCH: the bay it ships from (card route)
+    const t = outboundBeltTile(aid, dockId);
+    if (t) { convey.enqueueAt(t.x, t.y, spec); motionWake(); }   // STILL: a crate released by the hand-off grace timer rides from the next vsync
   }
   function shipProductCrate(p) {
     if (!convey) return;
@@ -8839,29 +10870,48 @@ const World = (() => {
     // crate mid-weight regardless of spend. Conveyor.weightForUsd maps reconciled usd -> 0..1; a run with
     // no reconciled cost ships weight 0 (the back-compat light look), never an estimate.
     const spec = productCrateSpec(p);
-    const ch = (cAid && routingPlan && routingPlan.chains) ? routingPlan.chains[cAid] : null;
+    // LineWatch pairs starts to their exact placement. Two runs by one agent can finish out of order;
+    // use that recorded bay/line, falling back to the legacy queue only when no run record exists.
+    const work = dockWorkForRun(p);
+    const runDock = work && work.dockId ? work.dockId : null;
+    if (work && !lineOfWork(work)) {
+      dockLineTakeMatching(cAid, work);
+      emitProductCrate(cAid, spec, runDock);
+      return;
+    }
+    const dch = (runDock && routingPlan && routingPlan.dockChains) ? routingPlan.dockChains[runDock] : null;
+    const ch = dch || ((cAid && routingPlan && routingPlan.chains) ? routingPlan.chains[cAid] : null);
+    const hasNext = !!(ch && ch.next && ch.next.length);
+    if (lineNeedsRelease(runDock, lineOfWork(work))) { holdJoinedProduct(cAid, spec, work); return; }
     // consume THIS run's placement entry (oldest first) — never cancel a sibling run's held crate
-    if (ch && ch.next && ch.next.length && dockLineTake(cAid)) {
+    if (hasNext && lineOfWork(dockLineTake(cAid))) {
       const q = deferredShip.get(cAid) || [];
       const entry = {};
       entry.t = setTimeout(() => {
         const l = deferredShip.get(cAid);
         if (l) { const i = l.indexOf(entry); if (i >= 0) l.splice(i, 1); if (!l.length) deferredShip.delete(cAid); }
-        emitProductCrate(cAid, spec);
+        emitProductCrate(cAid, spec, runDock);
       }, HANDOFF_GRACE_MS);
       q.push(entry);
       deferredShip.set(cAid, q);
       return;
     }
-    emitProductCrate(cAid, spec);
+    if (!hasNext && runDock) dockLineTake(cAid);   // a terminal BAY's run consumes its entry too (multi-bay)
+    emitProductCrate(cAid, spec, runDock);
   }
   // an unproductive run produced no deliverable — ride a red-hot SLAG crate off the PRODUCING agent's bay
   // carrying its post-mortem one-liner, so the failed outcome is visible leaving the line.
-  function enqueueSlag(diag, aid) {
+  function enqueueSlag(diag, aid, run) {
     if (!convey) return;
-    const t = outboundBeltTile(aid);
+    // LINE WATCH: the bay this dead run was AT is known from its confirmed start (linewatch pairing); the oldest
+    // placement entry is the fallback (it can be a stale entry left by an earlier failed run)
+    const lr = (watch && run && run.runId) ? watch.run(run.runId) : null;
+    const w0 = dockWorkPeek(aid);
+    const w = (lr && lr.dockId) ? { dockId: lr.dockId, lineId: lr.lineId } : w0;
+    const t = outboundBeltTile(aid, w && w.dockId ? w.dockId : null);
     const clean = s => String(s || '').replace(/\bspend\b/ig, 'run resources').replace(/\bdollars?\b/ig, 'limits');
-    if (t) convey.enqueueAt(t.x, t.y, { outbound: true, box: 'slag', postmortem: (diag && (clean(diag.title) + ' - ' + clean(diag.fix))) || 'unproductive run' });
+    if (t) convey.enqueueAt(t.x, t.y, { outbound: true, box: 'slag', postmortem: (diag && (clean(diag.title) + ' - ' + clean(diag.fix))) || 'unproductive run',
+      runId: (run && run.runId) || '', agentId: aid || '', dockId: (w && w.dockId) || '', lineId: (w && w.lineId) || '', reason: (run && run.reason) || '' });   // LINE WATCH: the card resolves the dead run
   }
   /* ---------- crew bodies (the OTHER agents, standing at their bays) ---------- */
   // a LIGHT body: the full agent field-shape (so SPRITES.drawBody/drawFallback never choke) but STATIC —
@@ -8919,8 +10969,14 @@ const World = (() => {
       sweepAgentMaps(); return;
     }
     const want = new Map();
+    // ONE BODY PER AGENT, AT ITS HOME DOCK (multi-bay, 2026-09-22): a multi-dock agent stands at its entry dock
+    // (the plan's entryDock) — it used to be "the last bay wins"; its other bays never pull the body over.
+    const homeOf = aid => (routingPlan.entryDock && routingPlan.entryDock[aid]) || null;
     for (const bay of routingPlan.bays) {
       if (agent && bay.agentId === agent.id) continue;                 // the hero already represents its own bay
+      const h = homeOf(bay.agentId);
+      if (h && routingPlan.bays.some(x => x.propId === h)) { if (bay.propId !== h) continue; }   // stand at HOME
+      else if (want.has(bay.agentId)) continue;                        // no hooked home: the first bay
       const p = geo.props && geo.props.find(pp => pp.id === bay.propId);
       if (!p) continue;
       // foot IN FRONT of the bay (south approach, PropAnchor side-fallback) — never inside the bay's own
@@ -9026,7 +11082,7 @@ const World = (() => {
     }
     const f = geo ? workerFoot() : { x: 0, y: 0 };                        // pre-geo: parked at origin, re-footed on first syncCrewFromPlan
     const b = makeCrewBody(a.id, a.name || a.id, a.color || crewColor(a.id), f.x, f.y, a.skin);
-    b.summoned = true; b.wakeAt = fnow;                                   // a small materialize ripple
+    b.summoned = true; b.wakeAt = (typeof performance !== 'undefined') ? performance.now() : fnow;   // a small materialize ripple (the wall clock: a spawn lands between frames)
     b.idleUntil = fnow + U.irnd(1400, 3200);                              // hold a beat after materializing, then it strolls
     crew.push(b);
     greetNewcomer(b, fnow);                                               // somebody on the floor goes over to say hello
@@ -9105,6 +11161,7 @@ const World = (() => {
   // per-agent activity: the HERO routes to setActivity (byte-identical single-agent path); a summoned crew
   // body lights + takes the working pose while its run is live, and extinguishes when it ends.
   function setActivityFor(agentId, kind) {
+    motionWake();   // STILL: a body summoned or released (a poll's reconcile, the TTL sweep, a bus handler) moves on the next vsync
     const now0 = (typeof performance !== 'undefined') ? performance.now() : fnow;
     if (!agentId || (agent && agentId === agent.id)) {
       setActivity(kind);                                                  // HERO: byte-identical single-agent path (the seize itself is in tick)
@@ -9132,14 +11189,77 @@ const World = (() => {
     const to = bodyForAgent(toId);
     if (!to || to === agent) return;
     const now = (typeof performance !== 'undefined') ? performance.now() : fnow;
-    if (phase === 'done') { to.working = false; to.workUntil = 0; to.dir = 'south'; return; }
+    if (phase === 'done') {
+      to.working = false; to.workUntil = 0; to.dir = 'south';
+      const L = summonLinks.find(k => k.toId === toId && !k.tEnd);
+      if (L) L.tEnd = now;
+      return;
+    }
     to.working = true; to.sitting = false; to.dir = 'north'; to.target = null; to.pathPts = null; seizeFromIdle(to);   // re-path straight to its desk if it has one (stepCrew), else stand; drop any leisure latch (J4)
     to.workUntil = now + 3600000; if (!to.wakeAt || now - to.wakeAt > 1500) to.wakeAt = now;
-    sayAt(to, 'on it…');
+    if (!PLATES_ON) sayAt(to, 'on it…');
     gripeNoCompute(to);   // G0.7: a delegated worker in a computeless room complains once too
     const from = bodyForAgent(fromId) || agent;
-    if (from && from !== to) handoffBoxes.push({ fromX: from.px, fromY: from.py - 6, toX: to.px, toY: to.py - 6, t0: now, color: to.color || '#5ad0ff' });
+    if (from && from !== to) {
+      handoffBoxes.push({ fromX: from.px, fromY: from.py - 6, toX: to.px, toY: to.py - 6, t0: now, color: to.color || '#5ad0ff' });
+      for (let i = summonLinks.length - 1; i >= 0; i--) if (summonLinks[i].toId === toId) summonLinks.splice(i, 1);
+      summonLinks.push({ fromId: fromId, toId, t0: now, tEnd: 0 });
+    }
     summonGlance(to, now);   // C-Beat1: a delegated worker just started — OTHER idle in-sight bodies 50% glance at it (AFTER its seize, K3)
+  }
+  // SUMMON LINES — the floor link lead→worker (an elbow: down from the lead's feet, across to the worker's).
+  // It grows in (GROW), carries a summon pulse while the worker is on its way, idles as a slow dashed flow while
+  // the run lives, then on run end carries the result HOME and fades (BACK + FADE). Bodies are re-read every
+  // frame, so the link follows a walking worker to its desk.
+  function summonLinkPts(a, b) {
+    const ax = bodyPosX(a), ay = bodyPosY(a), bx = bodyPosX(b), by = bodyPosY(b);
+    return [{ x: ax, y: ay }, { x: ax, y: by }, { x: bx, y: by }];
+  }
+  function polyAt(pts, f) {
+    let L = 0; for (let i = 1; i < pts.length; i++) L += Math.abs(pts[i].x - pts[i - 1].x) + Math.abs(pts[i].y - pts[i - 1].y);
+    let d = L * Math.max(0, Math.min(1, f));
+    for (let i = 1; i < pts.length; i++) {
+      const s = Math.abs(pts[i].x - pts[i - 1].x) + Math.abs(pts[i].y - pts[i - 1].y);
+      if (d <= s || i === pts.length - 1) { const k = s ? Math.min(1, d / s) : 1; return { x: pts[i - 1].x + (pts[i].x - pts[i - 1].x) * k, y: pts[i - 1].y + (pts[i].y - pts[i - 1].y) * k }; }
+      d -= s;
+    }
+    return pts[pts.length - 1];
+  }
+  function strokePartial(pts, f) {
+    let L = 0; for (let i = 1; i < pts.length; i++) L += Math.abs(pts[i].x - pts[i - 1].x) + Math.abs(pts[i].y - pts[i - 1].y);
+    let left = L * f; ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length && left > 0; i++) {
+      const s = Math.abs(pts[i].x - pts[i - 1].x) + Math.abs(pts[i].y - pts[i - 1].y);
+      const k = s ? Math.min(1, left / s) : 1;
+      ctx.lineTo(pts[i - 1].x + (pts[i].x - pts[i - 1].x) * k, pts[i - 1].y + (pts[i].y - pts[i - 1].y) * k);
+      left -= s;
+    }
+    ctx.stroke();
+  }
+  function drawSummonLinks(now) {
+    if (!summonLinks.length) return;
+    const GROW = 450, PULSE = 900, BACK = 900, FADE = 700;
+    for (let i = summonLinks.length - 1; i >= 0; i--) {
+      const k = summonLinks[i];
+      const from = k.fromId ? (bodyForAgent(k.fromId) || agent) : agent, to = bodyForAgent(k.toId);
+      const age = now - k.t0, endAge = k.tEnd ? now - k.tEnd : 0;
+      if (!from || !to || (k.tEnd && endAge > BACK + FADE)) { summonLinks.splice(i, 1); continue; }
+      if (!k.tEnd && age > 5000 && !runStartByAgent.has(k.toId)) k.tEnd = now;   // the worker is no longer running: never a line to nothing
+      const pts = summonLinkPts(from, to);
+      const col = to.color || '#5ad0ff';
+      const alpha = k.tEnd && endAge > BACK ? 1 - (endAge - BACK) / FADE : 1;
+      ctx.save();
+      ctx.lineCap = 'square'; ctx.lineJoin = 'miter';
+      ctx.globalAlpha = 0.5 * alpha; ctx.strokeStyle = '#000'; ctx.lineWidth = 2.2; strokePartial(pts, Math.min(1, age / GROW));   // the floor channel
+      ctx.globalAlpha = 0.85 * alpha; ctx.strokeStyle = k.tEnd ? (k.endCol || '#7fd6a4') : col; ctx.lineWidth = 0.8;
+      ctx.setLineDash([2, 2]); ctx.lineDashOffset = -now / 160; strokePartial(pts, Math.min(1, age / GROW)); ctx.setLineDash([]);
+      // the summon pulse: lead → worker, right after the link lands
+      const pt = (age - GROW * 0.5) / PULSE;
+      if (pt > 0 && pt < 1) { const p = polyAt(pts, pt); ctx.globalAlpha = alpha; ctx.fillStyle = '#e8f2ff'; ctx.fillRect(Math.round(p.x) - 1.5, Math.round(p.y) - 1.5, 3, 3); ctx.strokeStyle = col; ctx.lineWidth = 0.6; ctx.strokeRect(Math.round(p.x) - 2.5, Math.round(p.y) - 2.5, 5, 5); }
+      // the result riding home: worker → lead
+      if (k.tEnd && endAge < BACK) { const p = polyAt(pts, 1 - endAge / BACK), rc = k.endCol || '#7fd6a4'; ctx.globalAlpha = 1; ctx.fillStyle = rc; ctx.fillRect(Math.round(p.x) - 2, Math.round(p.y) - 2, 4, 4); ctx.fillStyle = U.shade(rc, 0.45); ctx.fillRect(Math.round(p.x) - 2, Math.round(p.y) - 2, 4, 1); }
+      ctx.restore();
+    }
   }
   // draw the in-flight handoff boxes (world space, over the entities). A small arced lerp that self-expires.
   function drawHandoffBoxes(now) {
@@ -9177,6 +11297,8 @@ const World = (() => {
   // is a BAY prop's bound agent actively working (so the bay lights up)?
   function bayLit(p, now) {
     if (!p.agentId) return false;
+    // (multi-bay) an agent crewing several bays lights the bay its CURRENT work is at — never all of them
+    if (multiDock(p.agentId)) { const d = activeDock.get(p.agentId) || (routingPlan.entryDock && routingPlan.entryDock[p.agentId]); if (d && d !== p.id) return false; }
     if (agent && p.agentId === agent.id) return !!agent.working;
     const b = crew.find(x => x.agentId === p.agentId);
     return !!(b && !crewIsAwaiting(b) && b.workUntil > now);
@@ -9187,13 +11309,10 @@ const World = (() => {
     const p = (bx && bx.payload) || {};
     if (p.outbound) {
       lastOutboxFlash = fnow;   // box reached the OUTBOX -> flash the chute
-      // GUIDED WORKFLOWS: a line's FIRST real product delivery permanently retires its finish-the-line
-      // card. This is THE delivery seam (the crate that actually sank at the chute) — event-driven, and
-      // product-only: slag (an unproductive run) finishes nothing. World tiles ride over so Build maps
-      // the mouth tile to its line in its own geometry frame.
-      if (p.box === 'product' && geo && geo.origin && typeof Build !== 'undefined' && Build.noteLineDelivered) {
-        try { Build.noteLineDelivered(bx.x + geo.origin.tx, bx.y + geo.origin.ty); } catch (_) {}
-      }
+      noteOutboxSink(bx.x, bx.y);   // SEND TO: a hand-off held for this OUTBOX's crate may fly now
+      // A CRATE SINKING HERE IS A PICTURE, NOT A RECORD (2026-10-12): a direct COMMS order to the agent crewing a line's last BAY
+      // rides a crate down that line's belt too, so it books nothing — no FIRST SHIP, and the finish-the-line card stays. Both
+      // answer to the sidecar's shipment record instead (noteFirstShip, from the executor's terminal receipt).
       // slag is NOT a satisfying delivery — skip the relaxed exhale; the post-mortem already fired at run.end
       if (p.box !== 'slag' && agent && !agent.unplaced && activity === 'idle') {   // EXHALE: watch the reply leave, satisfied, then relax (downtime clock resets)
         const ob = geo && geo.props && geo.props.find(q => q.t === 'outbox');
@@ -9210,7 +11329,8 @@ const World = (() => {
     const landed = (routingPlan && routingPlan.bayTileToAgent) ? routingPlan.bayTileToAgent[bx.x + ',' + bx.y] : null;
     const aid = p.agentId || landed || ((typeof Pipeline !== 'undefined' && routingPlan) ? Pipeline.resolveTarget(routingPlan, { tag: p.tag }) : null);
     const body = bodyForAgent(aid);
-    if (body && body !== agent) { body.wakeAt = fnow; if (!(body.workUntil > fnow + 5000)) body.workUntil = fnow + 4000; }
+    // STILL: the ripple starts on the wall clock, as the hero's (wakeIn) does — never a still floor's stale fnow
+    if (body && body !== agent) { body.wakeAt = (typeof performance !== 'undefined') ? performance.now() : fnow; if (!(body.workUntil > fnow + 5000)) body.workUntil = fnow + 4000; }
     else { wakeIn(); }   // the hero (or an unrouted box)
   }
   /* ---------- the CAM-HUD ACTIVITY TICKER (stage narration) ----------
@@ -9281,7 +11401,7 @@ const World = (() => {
     const esc = s => U.esc(s == null ? '' : s);   // one complete impl (escapes & < > " ' — quote-safe if this ever moves into an attr)
     if (i > 0) {
       const nm = esc(text.slice(0, i)), rest = esc(text.slice(i + sep.length));
-      const style = suit ? ' style="color:' + suit + '"' : '';
+      const style = suit ? ' style="color:' + esc(suit) + '"' : '';
       html = '<b class="ct-name"' + style + '>' + nm + '</b><span class="ct-sep"> ▸ </span>' + rest;
     } else {
       html = esc(text);
@@ -9320,12 +11440,15 @@ const World = (() => {
   function connectChannelBridge() {
     if (bridged || typeof U === 'undefined' || !U.bus) return;
     bridged = true;
+    // STILL: every harness event that reaches a listener (SSE-bridged or the in-app run stream) wakes a still floor, so what
+    // it starts — a body summoned, a crate placed, a desk lighting — is drawn on the next vsync
+    if (typeof U.bus.tap === 'function') U.bus.tap(motionWake);
     setupTicker();   // join the .cam-hud overlay (starts empty — no fake backfill)
     // ── CAM-HUD ACTIVITY TICKER: narrate the latest REAL harness event as one diegetic camera line. ──
     U.bus.on('agent.run.start', p => {
       if (!p || !p.agentId) return;
       const trig = String(p.trigger || '').toLowerCase();
-      const tag = (trig === 'schedule') ? ' · ROUTINE' : (trig === 'event') ? ' · EVENT' : (trig === 'nightshift') ? ' · NIGHT SHIFT' : '';
+      const tag = (trig === 'schedule') ? ' · ROUTINE' : (trig === 'event') ? ' · EVENT' : (trig === 'nightshift') ? ' · AUTONOMY' : '';
       pushTicker(tickerName(p.agentId) + ' ▸ RUN INITIATED' + tag, '', tickerSuit(p.agentId));
     });
     U.bus.on('agent.tool_call', p => {
@@ -9359,7 +11482,7 @@ const World = (() => {
     U.bus.on('agent.run.start', p => {
       if (!p || !p.agentId) return;
       const k = runKey(p);
-      runWork.set(k, { agentId: p.agentId, tools: 0, dels: 0 });
+      runWork.set(k, { agentId: p.agentId, workitemId: p.workitemId || '', tools: 0, dels: 0 });
       if (runWork.size > 200) runWork.delete(runWork.keys().next().value);   // bounded (a missed run.end must not leak forever)
       const l = liveRunOrder.get(p.agentId) || [];
       if (l.indexOf(k) < 0) l.push(k);
@@ -9380,6 +11503,25 @@ const World = (() => {
     // ── STRETCH: desk work-glyph state — a tool in flight (tool_call → its tool_result) marks the agent;
     //    the render pass (drawWorkGlyphs) draws a tiny tag at that desk. run.end clears any stale mark. ──
     U.bus.on('agent.tool_call', p => { if (p && p.agentId && p.name) glyphByAgent.set(p.agentId, { name: p.name, callId: p.callId || null }); });
+    U.bus.on('agent.run.start', p => { if (p && p.agentId) plateByAgent.set(p.agentId, { runId: String(p.runId || ''), wallStart: Date.now(), task: '', taskTry: 0, model: String(p.model || ''), name: '', target: '', live: false, callId: null, usd: null, est: null, unpriced: false }); });
+    // a tag reads only ITS OWN run's events: a second run of the same agent (another session, a routine, internal self-talk
+    // whose cost still reaches the bus) never mixes its steps or spend into this card
+    const plateFor = p => { const k = p && p.agentId && plateByAgent.get(p.agentId); return k && (!p.runId || !k.runId || String(p.runId) === k.runId) ? k : null; };
+    // the lead's task in words = its settled Task Brief objective (the COMMS "MY READ" line) — never a guess
+    U.bus.on('taskbrief.settled', p => { const k = p && p.agentId && plateByAgent.get(p.agentId); if (k && (!p.runId || !k.runId || p.runId === k.runId) && p.objective) k.task = String(p.objective); });
+    U.bus.on('agent.tool_call', p => { const k = plateFor(p); if (k && p.name) Object.assign(k, { name: p.name, target: plateTarget(p.argsSummary), live: true, callId: p.callId || null }); });
+    U.bus.on('agent.tool_result', p => { const k = plateFor(p); if (k && (!p.callId || !k.callId || k.callId === p.callId)) k.live = false; });
+    U.bus.on('cost.estimate', p => { const k = plateFor(p); if (k && isFinite(+p.usd) && k.est !== false) { k.usd = +p.usd; k.est = true; } });
+    // agent.cost arrives once per model call: the tag shows the run's running SUM (an estimate stands until the first one).
+    // The loop flags an unpriced model (unpriced:true, usd 0) once per run: from then on this run has NO proven $ to show.
+    U.bus.on('agent.cost', p => { const k = plateFor(p); if (k && isFinite(+p.usd)) { k.usd = (k.est === false ? k.usd : 0) + (+p.usd); k.est = false; if (p.unpriced) k.unpriced = true; } });
+    U.bus.on('agent.run.end', p => { const k = plateFor(p); if (k) plateByAgent.delete(p.agentId); });
+    // the summon link's result packet says how the worker's run REALLY ended: delivered (green), failed (red), stopped short (amber)
+    U.bus.on('agent.run.end', p => {
+      if (!p || !p.agentId) return;
+      const L = summonLinks.filter(k => k.toId === p.agentId && !k.endCol).pop();
+      if (L) L.endCol = p.reason === 'done' ? '#7fd6a4' : (/^(error|refusal|empty)$/.test(String(p.reason || '')) ? '#e06a5f' : '#d9a95b');
+    });
     U.bus.on('agent.tool_result', p => {
       if (!p || !p.agentId) return;
       const g = glyphByAgent.get(p.agentId);
@@ -9387,8 +11529,11 @@ const World = (() => {
     });
     U.bus.on('agent.run.end', p => { if (p && p.agentId) glyphByAgent.delete(p.agentId); });
     U.bus.on('workitem.placed', p => intakeMessage(p));
-    // (workitem.delivered no longer spawns a crate — the run.end 'done' handler below is the single
-    //  crate source, so channel replies can't double-crate. delivered still feeds the floor stats fold.)
+    // LINE WATCH: the bay lamps + crate cards fold the same run/crate events the floor animates (linewatch.js)
+    for (const n of ['workitem.placed', 'workitem.superseded', 'agent.run.start', 'agent.cost', 'agent.run.error', 'agent.run.end']) U.bus.on(n, p => watchEvent(n, p));
+    // Ordinary stage deliveries do not spawn duplicates. The executor's exact terminal receipt
+    // releases productive work held for a JOINER-capable line, once the job reached its OUTBOX.
+    U.bus.on('workitem.delivered', p => { releaseJoinedProduct(p); noteFirstShip(p); });
     U.bus.on('workitem.superseded', p => { if (p && p.workitemId && convey) convey.dropWorkitem(p.workitemId); });
     // queue.status drives BOTH the numeric backpressure gauge (chanQueues) and the FloorStats backlog fold.
     U.bus.on('queue.status', p => { if (p && p.queueId != null) chanQueues.set(p.queueId, Math.max(0, p.depth | 0)); if (floor) floor.onEvent('queue.status', p); });
@@ -9420,19 +11565,36 @@ const World = (() => {
       if (floor) floor.onEvent('provider.fallback', p, Date.now());
       if (p && typeof StationUI !== 'undefined' && StationUI.notify) {
         const how = p.rotate ? 'rotated credential' : 'switched model';
-        StationUI.notify('⤳ failover (' + (p.reason || 'error') + ') · ' + how + ': ' + (p.fromModel || '?') + ' → ' + (p.toModel || '?'), 'warn');
+        // subscription stacking: a hop between connected sign-ins keeps the model — name the account it moved to
+        StationUI.notify(p.toAccount
+          ? '⤳ failover (' + (p.reason || 'error') + ') · continued on ' + p.toAccount + ' · ' + (p.toModel || '?')
+          : '⤳ failover (' + (p.reason || 'error') + ') · ' + how + ': ' + (p.fromModel || '?') + ' → ' + (p.toModel || '?'), 'warn');
       }
     });
     // THROUGHPUT + DWELL: pair each work-item's placement with its delivery (a reliable Date.now() clock,
     // since the box's belt-ride spans real wall-clock seconds) to fold items/min + time-on-line.
     U.bus.on('workitem.placed', p => { if (floor) floor.onEvent('workitem.placed', p, Date.now()); });
     U.bus.on('workitem.delivered', p => { if (floor) floor.onEvent('workitem.delivered', p, Date.now()); });
+    // the run's own error text (agent.run.error lands before its run.end), so the post-mortem can name a KNOWN
+    // cause (empty provider wallet, unavailable model, …) instead of "send it again, report it if it repeats".
+    U.bus.on('agent.run.error', p => {
+      if (!p || !p.runId) return;
+      slagErrText.set(p.runId, String(p.message || ''));
+      if (slagErrText.size > 64) slagErrText.delete(slagErrText.keys().next().value);
+    });
     U.bus.on('agent.run.end', p => {
       if (floor) floor.onEvent('agent.run.end', p, Date.now());
       const r = p && p.reason;
+      const errText = (p && p.runId) ? slagErrText.get(p.runId) : undefined;
+      if (p && p.runId) slagErrText.delete(p.runId);
       // A clean finish that PROVABLY WORKED ships: one product crate leaves the producing agent's bay
       // and rides to the OUTBOX. A done-but-workless run ("I couldn't do that") ships NOTHING.
       if (r === 'done' && runWorked(p)) shipProductCrate(p);
+      else if (r === 'done') {
+        const work = dockWorkForRun(p), lineId = lineOfWork(work);
+        // A talk-only sibling contributes observed cost, never proof that a job produced work.
+        if (lineNeedsRelease(work && work.dockId, lineId)) holdJoinedProduct(p.agentId, productCrateSpec(p), work, false);
+      }
       if (p) {                                          // the run is over — drop ITS tally (and only its), either way
         const k = runKey(p);
         runWork.delete(k);
@@ -9446,22 +11608,28 @@ const World = (() => {
       // lesson lands regardless of belts; the belt only shows it.
       lastSlagAt = performance.now();
       if (!slaglog) return;
-      const diag = slaglog.record(r, { cacheFrac: lastCacheFrac, turns: p && p.turns, usd: p && p.usd });
+      let error = null;
+      if (r === 'error' && errText && typeof Friendly !== 'undefined' && Friendly.friendlyError) {
+        try { const v = Friendly.friendlyError(new Error(errText)); error = v ? { kind: v.kind, msg: v.userMessage } : null; } catch (_) { error = null; }
+      }
+      const diag = slaglog.record(r, { cacheFrac: lastCacheFrac, turns: p && p.turns, usd: p && p.usd, error, agentId: p && p.agentId, atBalance: !!(p && p.budgetCapIsBalance === true), projected: !!(p && p.budgetProjected === true) });
       // an 'error' run has ALREADY announced itself (⚠ error row, its own toast, the RUN FAULT tick,
       // the desk strobe) — a simultaneous SLAG toast made ONE failure read as two (2026-07-31). The
       // post-mortem record + slag crate below still happen for every dead reason; only the duplicate
       // toast is skipped. Budget/step-limit/refusal deaths keep it: nothing else announces those.
       if (typeof StationUI !== 'undefined' && StationUI.notify && r !== 'error') {
         const clean = s => String(s || '').replace(/\bspend\b/ig, 'run resources').replace(/\bdollars?\b/ig, 'limits');
-        StationUI.notify('⚠ SLAG (a run died with nothing to show) · ' + clean(SlagLog.line(diag)), 'warn');
+        StationUI.notify('⚠ a run ended with nothing to show · ' + clean(SlagLog.line(diag)), 'warn', undefined, { kind: 'alert', go: { term: 'agents', section: 'record' } });
       }
-      enqueueSlag(diag, p && p.agentId);
+      enqueueSlag(diag, p && p.agentId, p);
     });
     // Stage 2: WATCH the lead delegate. A team.dispatch tool call opens a delegation window (until its tool_result);
     // any WORKER run that starts inside it flies a box lead→worker + lights the worker. Contract-free — rides the
     // existing agent.tool_call / agent.run.* events (the delegated child's lifecycle is forwarded onto the lead's stream).
     U.bus.on('agent.tool_call', p => { if (p && /^team[._]dispatch$/.test(p.name || '')) { delegateLead = p.agentId; delegateCall = p.callId; } });
-    U.bus.on('agent.tool_result', p => { if (p && p.callId && p.callId === delegateCall) { delegateLead = null; delegateCall = null; } });
+    // only the LEAD's own result closes it: a worker's step can carry the same synthesized id ('call_0' on providers with no
+    // tool-call ids) and used to close the window mid-dispatch, leaving later workers unlit and unlinked
+    U.bus.on('agent.tool_result', p => { if (p && p.callId && p.callId === delegateCall && (!p.agentId || p.agentId === delegateLead)) { delegateLead = null; delegateCall = null; } });
     // OVERLAP REFCOUNT: register every live run by runId (any trigger) BEFORE the extinguish consumers below —
     // only the LAST live run's end may darken an agent's pose/screens (see noteRunStart/noteRunEnd).
     U.bus.on('agent.run.start', p => { if (p && p.agentId) noteRunStart(p.agentId, p.runId); });
@@ -9491,8 +11659,12 @@ const World = (() => {
     // it means a clean run whose reply was exactly the [SILENT] marker (the routine chose to report nothing).
     U.bus.on('cron.result', p => {
       if (!p) return;
-      if (p.outcome === 'failed') hudNote('✕ routine failed' + (p.reason ? ' — ' + p.reason : ''), 'warn');
-      else if (p.outcome === 'ok') hudNote('◷ routine completed', 'good', undefined, 'cronDigest');
+      // (2026-10-09) the notification opens the run ITSELF — its session holds the result — never the routines list,
+      // where the result was one more click (and opening the session never settled the notification)
+      const ses = p.runId ? { ws: 'cron-' + p.runId } : { term: 'automation', section: 'routines' };
+      if (p.outcome === 'failed') hudNote('✕ routine failed' + (p.reason ? ' — ' + p.reason : ''), 'warn', { kind: 'alert', go: ses });
+      // its result is in the routine's own session (and HISTORY under AUTOMATE › ROUTINES), never in DELIVERABLES › TO REVIEW
+      else if (p.outcome === 'ok') hudNote('◷ routine completed', 'good', { go: ses }, 'cronDigest');
     });
     // REWIND: the rare, important "we rolled the workspace back" beat. checkpoint.created is frequent + quiet
     // (the workbench already pulses on shell), so only the restore is toasted.
@@ -9548,12 +11720,13 @@ const World = (() => {
       if (state === 'up') {
         if (!unhealthyChannels.delete(raw)) return;   // initial/steady health stays quiet
         hudNote('✓ ' + name + ' reconnected', 'good', { key: toastKey });
+        try { if (StationUI.settleNotifs) StationUI.settleNotifs(toastKey); } catch (_) {}   // the outage entry is handled
         return;
       }
       if (state !== 'down' && state !== 'error') return;
       unhealthyChannels.add(raw);
       const why = p.detail ? ' — ' + String(p.detail) : '';
-      hudNote((state === 'error' ? '⚠ ' + name + ' connection needs attention' : '⚠ ' + name + ' connection down') + why, 'bad', { key: toastKey });
+      hudNote((state === 'error' ? '⚠ ' + name + ' connection needs attention' : '⚠ ' + name + ' connection down') + why, 'bad', { key: toastKey, kind: 'alert', go: { term: 'messaging' } });
     });
     // G0.5 BUDGET MADE VISIBLE: budget.threshold was alarm-audio only. The payload is the frozen
     // { scope: run|day|global, usd, cap } triple (sidecar/budget.js, one emit per scope+band crossing
@@ -9563,8 +11736,8 @@ const World = (() => {
       const usd = +p.usd, cap = +p.cap;
       const scopeWord = p.scope === 'run' ? 'this run' : (p.scope === 'day' ? 'today' : 'the global pool');
       const money = v => U.usd(v);
-      if (usd >= cap) hudNote('⛔ budget cap hit for ' + scopeWord + ' — ' + money(usd) + ' of ' + money(cap), 'warn');
-      else hudNote('⚠ budget warning for ' + scopeWord + ' — ' + money(usd) + ' of ' + money(cap) + ' (' + Math.round(usd / cap * 100) + '%)', 'warn');
+      if (usd >= cap) hudNote('⛔ budget cap hit for ' + scopeWord + ' — ' + money(usd) + ' of ' + money(cap), 'warn', { kind: 'alert', key: 'budget:' + p.scope, go: { term: 'settings', section: 'budget' } });
+      else hudNote('⚠ budget warning for ' + scopeWord + ' — ' + money(usd) + ' of ' + money(cap) + ' (' + Math.round(usd / cap * 100) + '%)', 'warn', { kind: 'alert', key: 'budget:' + p.scope, go: { term: 'settings', section: 'budget' } });
     });
     // LOW CREDITS MADE VISIBLE (2026-07-25): the balance the user BOUGHT is running out. Distinct from
     // budget.threshold above — that is spend against a cap they set; this is money running down. Fired once
@@ -9573,8 +11746,8 @@ const World = (() => {
     U.bus.on('credits.low', p => {
       if (!p || !isFinite(+p.balanceUsd)) return;
       const bal = U.usd(+p.balanceUsd);
-      if (p.exhausted) hudNote('⛔ out of credits — ' + bal + ' left; managed runs will refuse until you add more', 'warn');
-      else hudNote('⚠ credits running low — ' + bal + ' left, under the ' + U.usd(+p.thresholdUsd) + ' a run can reserve', 'warn');
+      if (p.exhausted) hudNote('⛔ out of credits — ' + bal + ' left; managed runs will refuse until you add more', 'warn', { kind: 'alert', key: 'credits', go: { term: 'settings', section: 'providers' } });
+      else hudNote('⚠ credits running low — ' + bal + ' left, under the ' + U.usd(+p.thresholdUsd) + ' a run can reserve', 'warn', { kind: 'alert', key: 'credits', go: { term: 'settings', section: 'providers' } });
     });
     // G0.4 CAPDENIED MADE VISIBLE: the run genuinely STOPPED at the capability gate (loop.js emits this
     // before ending the run) — flash the acting agent's desk red + say it plainly. Today this was
@@ -9582,7 +11755,7 @@ const World = (() => {
     U.bus.on('capdenied', p => {
       flashDesk(p && p.agentId, '#ff4a3d');
       const need = (p && p.need) || 'capability';
-      hudNote('⛔ run blocked — ' + (need === 'compute' ? 'no computer in its room' : ('missing ' + need)), 'warn');
+      hudNote('⛔ run blocked — ' + (need === 'compute' ? 'no computer in its room' : ('missing ' + need)), 'warn', { kind: 'alert' });
     });
     // G0.8 RUN-ERROR DISTRESS: the run died mid-flight (model call / dispatcher / loop guard). The chat
     // panel already prints the message; now the FLOOR reacts too — the red desk strobe + one short flat
@@ -9611,7 +11784,8 @@ const World = (() => {
     // {promptId, agentId}). For the HERO, walk the body off its desk to the wait anchor and hold the waiting pose;
     // permission.response ({promptId, decision}) resumes (approve) or ends (deny) the run server-side, so we clear
     // the await and let the ongoing/finished run drive the body back to work or idle. Crew pauses hold position with the same amber tag; prompt IDs isolate overlapping approvals.
-    U.bus.on('permission.prompt', p => { if (p && (!p.agentId || (agent && p.agentId === agent.id))) enterAwait({ promptId: p.promptId || '', agentId: p.agentId || (agent && agent.id) }); else enterCrewAwait(p); });
+    // a delegated worker's ask rides its lead's run but names the worker (workerAgentId): the WORKER's body waits, not the lead's
+    U.bus.on('permission.prompt', p => { if (p && p.workerAgentId) { enterCrewAwait(Object.assign({}, p, { agentId: p.workerAgentId })); return; } if (p && (!p.agentId || (agent && p.agentId === agent.id))) enterAwait({ promptId: p.promptId || '', agentId: p.agentId || (agent && agent.id), question: p.tool === 'brief.ask' }); else enterCrewAwait(p); });
     U.bus.on('permission.response', p => {
       if (p && awaitPrompt && (!p.promptId || p.promptId === awaitPrompt.promptId)) clearAwait();
       if (p && p.promptId) for (const b of crew) clearCrewAwait(b, p.promptId, true);
@@ -9637,18 +11811,20 @@ const World = (() => {
         // T3: a SUCCESSFUL poll is authoritative — drop any tracked portal absent from it so a removed/unbound
         // connector stops glowing green (a FAILED poll stays in .catch below and keeps the last-known state).
         if (PropSprites.reconcileConnectors) PropSprites.reconcileConnectors(connIds);
+        motionWake();   // STILL: a portal's new state is drawn on the next vsync
       }).catch(() => {});   // E4/E6f: on failure keep the last-known portal states — never blank them from an error body
     }
-    connPollFn = pollConnectors; pollConnectors(); connPollTimer = setInterval(pollConnectors, 5000);
+    // idle CPU piece 3 (2026-10-20): 5 s on screen, a 30 s floor while away, a catch-up on return (pauseBridge stops it)
+    connPollFn = pollConnectors; pollConnectors(); connPollTimer = (typeof PollGate !== 'undefined' && PollGate.every) ? PollGate.every(pollConnectors, { ms: 5000, immediate: false }) : setInterval(pollConnectors, 5000);
     // JUKEBOX dead-vs-live: poll Spotify's OAuth connected state so a placed jukebox reads DEAD (unplugged)
     // until the user connects Spotify in TOOLSETS, then comes alive. Same keep-last-known-on-failure contract.
     function pollSpotify() {
       if (typeof fetch === 'undefined' || typeof PropSprites === 'undefined' || !PropSprites.setSpotifyConnected) return;
       fetch(apiUrl('/api/spotify/status')).then(r => { if (!r.ok) throw new Error('http ' + r.status); return r.json(); })
-        .then(j => PropSprites.setSpotifyConnected(!!(j && j.connected)))
+        .then(j => { PropSprites.setSpotifyConnected(!!(j && j.connected)); motionWake(); })   // STILL: the jukebox wakes on the next vsync
         .catch(() => {});   // keep last-known on a failed poll (mirrors the connector contract)
     }
-    spotifyPollFn = pollSpotify; pollSpotify(); spotifyPollTimer = setInterval(pollSpotify, 5000);
+    spotifyPollFn = pollSpotify; pollSpotify(); spotifyPollTimer = (typeof PollGate !== 'undefined' && PollGate.every) ? PollGate.every(pollSpotify, { ms: 5000, immediate: false }) : setInterval(pollSpotify, 5000);
     // TRUTH (audit T1 finding 5): the per-prop capability SURGE must reflect the tool's REAL OUTCOME, not the
     // mere attempt. agent.tool_call fires BEFORE the capability/consent gate (loop.js), so a denied or errored
     // call emits a tool_call identically to a success — pulsing the granting prop green on tool_call was a lie.
@@ -9681,7 +11857,7 @@ const World = (() => {
       if (!rec) return;                           // not a capability-prop tool (or no callId join) — nothing to surge
       surgeCall.delete(p.callId);
       const tgt = capPropFor(rec.cap, rec.agentId);   // the granting prop in the ACTING agent's OWN room (or none)
-      if (tgt) PropSprites.pulseProp(tgt.id, rec.cap, !p.isError);   // green on success, RED on error/denied
+      if (tgt && !p.held) PropSprites.pulseProp(tgt.id, rec.cap, !p.isError);   // green on success, RED on error/denied — none for a call the Task Brief held (it never ran)
     });
     // bound the correlation map: a run ending drops any of its still-open calls so a lost tool_result never leaks.
     U.bus.on('agent.run.end', () => { if (surgeCall.size > 64) surgeCall.clear(); });
@@ -9703,7 +11879,7 @@ const World = (() => {
     // followed by run.end reason 'error', so end is the one cleanup point). Internal reason-only runs
     // never reach U.bus (harness.js suppresses their start/end), so no clock ever shows for self-talk.
     U.bus.on('agent.run.start', p => { if (p && p.agentId) { if (!runStartByAgent.has(p.agentId)) runStartByAgent.set(p.agentId, performance.now()); stampRun(p.agentId); } });   // an overlapping start keeps the EARLIEST clock (the agent has been running since then)
-    U.bus.on('agent.run.end', p => { if (p && p.agentId && !noteRunEnd(p.agentId, p.runId)) { runStartByAgent.delete(p.agentId); runLastSeenByAgent.delete(p.agentId); } });
+    U.bus.on('agent.run.end', p => { if (p && p.agentId && !noteRunEnd(p.agentId, p.runId)) { runStartByAgent.delete(p.agentId); runLastSeenByAgent.delete(p.agentId); releaseActivity(p.agentId); } });
     // G0.2 SIM-TASK PROGRESS: store a desk fraction ONLY when a producer publishes a real prog/dur pair
     // on the 'task' event (subagent status events carry none and store none). Terminal states clear it.
     U.bus.on('task', t => {
@@ -9728,14 +11904,14 @@ const World = (() => {
       if (retryTimer) { try { clearTimeout(retryTimer); } catch (_) {} retryTimer = null; }
       if (chanES) return;
       try {
-        // EventSource can't send the custom auth header, so pass the per-launch token as ?token=… and
-        // prefix the sidecar base in the desktop build (where the page origin isn't the loopback http origin).
-        const _tok = (typeof window !== 'undefined' && window.__STARNET_API_TOKEN__) ? encodeURIComponent(String(window.__STARNET_API_TOKEN__)) : '';
-        chanES = new EventSource(apiUrl('/api/channels/events') + '?cursor=' + encodeURIComponent(bridgeCursor) + (_tok ? ('&token=' + _tok) : ''));
+        // EventSource can't send the custom auth header, so it presents a SINGLE-USE, 2-minute SSE ticket
+        // (ApiTicket.sseUrl — never the master token in a URL). Every (re)connect goes through open(), so each
+        // attempt mints a fresh ticket; the absolute sidecar base is prefixed on desktop (Tauri origin).
+        chanES = new EventSource(ApiTicket.sseUrl('cursor=' + encodeURIComponent(bridgeCursor)));
       } catch (_) { return; }
       const source = chanES;
       bridgeRecovering = true;
-      source.onopen = () => { if (chanES !== source) return; backoff = 1000; lastSseEventAt = (typeof performance !== 'undefined') ? performance.now() : fnow; };
+      source.onopen = () => { if (chanES !== source) return; backoff = 1000; lastSseEventAt = (typeof performance !== 'undefined') ? performance.now() : fnow; motionWake(); };   // STILL: the link state is drawn on the next vsync
       source.onmessage = ev => {
         if (chanES !== source || bridgePaused) return;
         lastSseEventAt = (typeof performance !== 'undefined') ? performance.now() : fnow;
@@ -9746,6 +11922,9 @@ const World = (() => {
             // Snapshot reconciliation is also needed after a complete replay: it repairs any
             // pre-existing local drift without pretending an expired history was delivered.
             fetchSnapshot();
+            // FIRST SHIP: a line may have shipped while the stream was down — its counts are read again (forgetShipBase), only
+            // AFTER the authoritative refresh above, which nothing of FIRST SHIP's may stand in the way of
+            forgetShipBase();
             return;
           }
           if (m && m.name) {
@@ -9758,7 +11937,7 @@ const World = (() => {
           }
         } catch (_) {}
       };
-      source.onerror = () => { if (chanES !== source) return; try { source.close(); } catch (_) {} chanES = null; bridgeRecovering = true; if (bridgePaused) return; if (retryTimer) { try { clearTimeout(retryTimer); } catch (_) {} } retryTimer = setTimeout(() => { retryTimer = null; open(); }, backoff); backoff = Math.min(15000, backoff * 2); };
+      source.onerror = () => { if (chanES !== source) return; try { source.close(); } catch (_) {} chanES = null; bridgeRecovering = true; motionWake(); if (bridgePaused) return; if (retryTimer) { try { clearTimeout(retryTimer); } catch (_) {} } retryTimer = setTimeout(() => { retryTimer = null; open(); }, backoff); backoff = Math.min(15000, backoff * 2); };
     };
     connOpenFn = open;
     open();
@@ -9767,7 +11946,9 @@ const World = (() => {
     // authoritative snapshot on a slow cadence: truth converges within ~30s in BOTH directions (a dead run is
     // cleared; a genuinely live one is re-stamped, which also keeps the per-run TTL from biting a long quiet
     // run, e.g. one paused on a consent prompt). Paused bridge = deliberate silence — no polling.
-    setInterval(() => { if (!bridgePaused) fetchSnapshot(); }, 30000);
+    // idle CPU piece 3 (2026-10-20): through PollGate — 30 s on screen and away alike, plus a catch-up read on return
+    if (typeof PollGate !== 'undefined' && PollGate.every) PollGate.every(() => { if (!bridgePaused) fetchSnapshot(); }, { ms: 30000, immediate: false });
+    else setInterval(() => { if (!bridgePaused) fetchSnapshot(); }, 30000);
   }
   /* E2: fetch the authoritative live-state snapshot on every SSE (re)open and reconcile the paired-state maps.
      404/failure-tolerant: the endpoint is owned by the lifecycle lane and may not exist here — any non-OK/throw
@@ -9779,7 +11960,13 @@ const World = (() => {
     try {
       fetch(apiUrl('/api/state/snapshot'), { cache: 'no-store' })
         .then(r => { if (!r.ok) return null; return r.json(); })
-        .then(snap => { if (snap && source === chanES && !bridgePaused) { try { reconcileFromSnapshot(snap); bridgeRecovering = false; } catch (_) {} } })
+        .then(snap => {
+          if (!snap || source !== chanES || bridgePaused) return;
+          try { reconcileFromSnapshot(snap); bridgeRecovering = false; } catch (_) {}
+          motionWake();   // STILL: run clocks, glyphs, queues and lit bodies the snapshot rewrote are drawn on the next vsync
+          // a background worker's ask this page never heard (a reload, a dropped bridge) is filed from the same snapshot
+          try { if (typeof Chat !== 'undefined' && Chat.reconcileBackgroundAsks) Chat.reconcileBackgroundAsks(snap); } catch (e) { console.warn('[bridge] background asks reconcile failed', e); }
+        })
         .catch(() => {});   // endpoint absent / offline: TTL net covers it
     } catch (_) {}
   }
@@ -9832,6 +12019,7 @@ const World = (() => {
     const top = intake.y * T - 3;                          // crates climb upward off the intake's top edge
     ctx.save();
     if (linkStaleDim) ctx.globalAlpha = 0.3;   // E1: link down → this jam length is last-known, not live; dim it
+    stillMove('crate');   // STILL: waiting crates bob — the backlog is motion while it stands
     for (let i = 0; i < shown; i++) drawWaitCrate(cx, top - i * 6 + Math.sin(now / 360 + i * 0.7) * 0.6);   // gentle idle bob
     if (depth > MAXVIS) {
       ctx.fillStyle = '#e8c860'; ctx.font = "7px 'VT323','Courier New',monospace"; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
@@ -9839,13 +12027,9 @@ const World = (() => {
     }
     ctx.restore();
   }
-  // one parked amber crate (waiting ore) — matches the riding-box silhouette/palette
+  // one parked amber crate (waiting work) — the SAME crate that rides the belts (Conveyor.drawCrate), so a job is one object
   function drawWaitCrate(cx, cy) {
-    const x = Math.round(cx - 4), y = Math.round(cy - 4);
-    ctx.fillStyle = '#161210'; ctx.fillRect(x - 1, y - 1, 11, 8);   // dark outline
-    ctx.fillStyle = '#8a7330'; ctx.fillRect(x, y + 3, 9, 3);        // shaded front face
-    ctx.fillStyle = '#caa84a'; ctx.fillRect(x, y, 9, 3);           // lit amber top
-    ctx.fillStyle = '#e8c860'; ctx.fillRect(x, y, 9, 1);           // top sheen
+    if (typeof Conveyor !== 'undefined' && Conveyor.drawCrate) Conveyor.drawCrate(ctx, Math.round(cx), Math.round(cy), 'ore');
   }
 
   /* SHIPPED TODAY — the production pride display. Every job completed today stacks a green PRODUCT
@@ -9853,14 +12037,17 @@ const World = (() => {
      SERVER truth: completed runs (reason 'done') since LOCAL midnight via /api/runs — bumped
      optimistically on agent.run.end and reconciled by a 60s poll, so a page reload never zeroes the
      day. No OUTBOX on the floor → no pallet (the outbox IS the shipping surface); nothing draws until
-     the server has actually answered (known), so it can never flash a fake number. Clicking the outbox
-     with no pending return-crates opens the LOGBOOK — the shift record behind the stack. */
+     the server has actually answered (known), so it can never flash a fake number.
+     EACH OUTBOX STACKS ONLY ITS OWN LINE (Andrew 10-03: the outbox is that conveyor's, never the whole station's): the pallet
+     is the line plate's own SHIPPED (/api/routing/lines/stats — jobs that left through THAT line's OUTBOX today), so the
+     pallet and the INBOX plate can never disagree. An OUTBOX on no line ships nothing and stacks nothing. shipStats stays
+     the station-wide day count the run ticker reads ("· N SHIPPED TODAY"). Clicking an OUTBOX opens its line's results. */
   let shipStats = { day: '', done: 0, known: false };
-  let shipFlash = -1e9;   // fnow of the latest shipped job — the newest crate pops for ~0.9s
   const shipDay = () => { const d = new Date(); return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate(); };
   const shipMidnight = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); };
   function pollShipStats() {
     if (typeof fetch === 'undefined') return;
+    pollLineStats(); pollStepTest();   // LINE WATCH rides the SAME cadence: the INBOX plates + the PAUSED lamp
     try {
       fetch(apiUrl('/api/runs?agent=*&limit=500&since=' + shipMidnight()))
         .then(r => (r.ok ? r.json() : null))
@@ -9868,7 +12055,9 @@ const World = (() => {
           if (!j || !Array.isArray(j.runs)) return;   // no answer — keep the last known truth
           // SHIPPED = done AND provably worked (successful tools or artifacts on the server's run row).
           // Rows older than the toolsOk field count only via artifacts — under-claiming, never over.
-          shipStats = { day: shipDay(), done: j.runs.filter(r => r && r.reason === 'done' && (((r.toolsOk | 0) > 0) || (Array.isArray(r.artifacts) && r.artifacts.length > 0))).length, known: true };
+          // A STEP TEST is not a shipment (2026-09-28 retest: the pallet said SHIPPED 1 after a test the panel said
+          // "is not put in the OUTBOX") — the same rule the line plates keep (line-stats: stepTest rows are TESTS).
+          shipStats = { day: shipDay(), done: j.runs.filter(r => r && r.reason === 'done' && r.stepTest !== true && (((r.toolsOk | 0) > 0) || (Array.isArray(r.artifacts) && r.artifacts.length > 0))).length, known: true };
         }).catch(() => {});
     } catch (_) {}
   }
@@ -9876,14 +12065,30 @@ const World = (() => {
   function bumpShipped() {
     const day = shipDay();
     if (shipStats.day !== day) shipStats = { day, done: 0, known: shipStats.known };
-    shipStats.done++; shipFlash = fnow;
+    shipStats.done++;
     return shipStats.done;
   }
+  const palletSeen = new Map();   // outbox propId -> { done, at }: the line's last drawn count (a rise pops the newest crate)
+  let palletPopAt = -1e9;         // the latest pop's start, any pallet (STILL: a crate popping in is motion for its 900 ms)
   function drawShippedPallet(now) {
-    if (!shipStats.known || shipStats.done <= 0 || !geo || !geo.props) return;
-    const ob = geo.props.find(p => p.t === 'outbox');
-    if (!ob) return;
-    const done = shipStats.done;
+    if (!lineStats.known || !routingPlan || !routingPlan.lineOfProp || !geo || !geo.props) return;
+    for (const ob of geo.props) {
+      if (ob.t !== 'outbox') continue;
+      const lid = routingPlan.lineOfProp[ob.id], s = lid ? lineStats.byLine[lid] : null;
+      // SHIPPED unknown (the shipment history could not be read): no count is drawn — never 0, never a stale one — and the last
+      // drawn count is held, so the history coming back does not pop a crate for work that shipped before
+      if (s && s.shipped == null) continue;
+      const done = s ? (s.shipped | 0) : 0;
+      const seen = palletSeen.get(ob.id);
+      if (!seen || seen.done !== done) {
+        const rose = !!seen && done > seen.done;
+        palletSeen.set(ob.id, { done, at: rose ? now : -1e9 });
+        if (rose) palletPopAt = now;
+      }
+      if (done > 0) drawPallet(ob, done, now - palletSeen.get(ob.id).at);
+    }
+  }
+  function drawPallet(ob, done, since) {
     const PERROW = 4, MAXVIS = 12, shown = Math.min(done, MAXVIS);
     const baseX = (ob.x + (ob.w || 1) / 2) * T;
     const baseY = (ob.y + (ob.h || 1)) * T + 6;   // the pallet sits on the floor in front of the chute
@@ -9891,7 +12096,7 @@ const World = (() => {
     if (linkStaleDim) ctx.globalAlpha = 0.3;   // E1: link down → this count is last-known, not live
     for (let i = 0; i < shown; i++) {
       const row = (i / PERROW) | 0, col = i % PERROW;
-      const pop = (i === shown - 1 && now - shipFlash < 900) ? 1 - (now - shipFlash) / 900 : 0;
+      const pop = (i === shown - 1 && since < 900) ? 1 - since / 900 : 0;
       drawShipCrate(baseX + (col - (PERROW - 1) / 2) * 10, baseY - row * 6, pop);
     }
     ctx.font = NAG_FONT; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
@@ -9900,15 +12105,12 @@ const World = (() => {
     ctx.shadowBlur = 0;
     ctx.restore();
   }
-  // one banked PRODUCT crate — the green economy family (same read as the outbound product box)
+  // one banked PRODUCT crate — the SAME green-lidded crate the outbound result rode in on (Conveyor.drawCrate)
   function drawShipCrate(cx, cy, pop) {
     const lift = pop > 0 ? Math.round(pop * 3) : 0;
-    const x = Math.round(cx - 4), y = Math.round(cy - 4) - lift;
-    ctx.fillStyle = '#0e1a12'; ctx.fillRect(x - 1, y - 1, 11, 8);   // dark outline
-    ctx.fillStyle = '#2e6b40'; ctx.fillRect(x, y + 3, 9, 3);        // shaded front face
-    ctx.fillStyle = '#3fa86a'; ctx.fillRect(x, y, 9, 3);            // lit green top
-    ctx.fillStyle = '#7ee2a8'; ctx.fillRect(x, y, 9, 1);            // top sheen
-    if (pop > 0.4) { const a = ctx.globalAlpha; ctx.globalAlpha = a * (pop - 0.4); ctx.fillStyle = '#c9ffe0'; ctx.fillRect(x, y, 9, 7); ctx.globalAlpha = a; }   // arrival glint
+    const x = Math.round(cx), y = Math.round(cy) - lift;
+    if (typeof Conveyor !== 'undefined' && Conveyor.drawCrate) Conveyor.drawCrate(ctx, x, y, 'product');
+    if (pop > 0.4) { const a = ctx.globalAlpha; ctx.globalAlpha = a * (pop - 0.4); ctx.fillStyle = '#c9ffe0'; ctx.fillRect(x - 3, y - 4, 7, 6); ctx.globalAlpha = a; }   // arrival glint
   }
 
 
@@ -9918,6 +12120,9 @@ const World = (() => {
   const _dbgSeedRun = (aid) => { if (!aid) return; runStartByAgent.set(aid, (typeof performance !== 'undefined') ? performance.now() : fnow); stampRun(aid); };
   const _dbgAgeRun = (aid, ms) => { const t = runLastSeenByAgent.get(aid); if (t != null) runLastSeenByAgent.set(aid, t - (+ms || 0)); const s = runStartByAgent.get(aid); if (s != null) runStartByAgent.set(aid, s - (+ms || 0)); const m = liveRunsByAgent.get(aid); if (m) for (const [rid, tt] of m) m.set(rid, tt - (+ms || 0)); };
   const _dbgReconcile = (snap) => { try { reconcileFromSnapshot(snap); } catch (_) {} };
+  // SEND TO verification (the hidden preview tab fires no rAF): the hand-off crates in hand + the OUTBOX plates, read-only
+  const _dbgSendTo = () => ({ crates: sendCrates.map(c => ({ fromOutbox: c.ob.id, toIntake: c.ib.id, lineId: c.p.lineId || null, fromLine: c.p.fromLine || null, held: !c.t0, ageMs: Math.round(fnow - c.born) })),
+    plates: sendPlateBoxes().map(p => ({ outbox: p.obId, text: p.text, placed: !!p.box })) });
   const _dbgSweep = () => { sweepStaleStates((typeof performance !== 'undefined') ? performance.now() : fnow); };   // drive the TTL sweep directly (rAF is throttled in a headless preview tab)
   /* LEISURE verification: the power-down and prop-dwell planners are gated behind a mood phase, an idle
      age and a 22% roll, so they cannot be observed on demand from the outside. These drive them directly
@@ -9969,13 +12174,26 @@ const World = (() => {
     const p = geo && geo.props && geo.props.find(q => q.t === t);
     if (!p || !cv) return null;
     const wx = (p.x + (p.w || 1) / 2) * T, wy = (p.y + (p.h || 1) / 2) * T;
-    const r = cv.getBoundingClientRect();
+    const r = U.pointerRect(cv);
     const c = curvePoint({ x: wx * scale + panX, y: wy * scale + panY });
     return {
       id: p.id,
       clientX: r.left + c.x * (r.width / cv.width),
       clientY: r.top + c.y * (r.height / cv.height)
     };
+  };
+  // CDP-verify hook (DESK SCREEN): CLIENT coordinates for the centre of agent `aid`'s workstation (its assigned
+  // computer prop, or the hero's synthetic fallback desk) — so a verify script dispatches a REAL canvas click on it.
+  const _dbgDeskClientPoint = (aid) => {
+    if (!cv) return null;
+    const p = deskPropFor(aid);
+    let wx, wy;
+    if (p) { const s = specOf(p.t) || {}; wx = (p.x + (p.w || s.w || 1) / 2) * T; wy = (p.y + (p.h || s.h || 1) / 2) * T; }
+    else if (agent && aid === agent.id && desk && !deskPropId) { wx = (desk.tx + desk.w / 2) * T; wy = (desk.ty + desk.h / 2) * T; }
+    else return null;
+    const r = U.pointerRect(cv);
+    const c = curvePoint({ x: wx * scale + panX, y: wy * scale + panY });
+    return { propId: p ? p.id : null, clientX: r.left + c.x * (r.width / cv.width), clientY: r.top + c.y * (r.height / cv.height) };
   };
   // E1 verification: report the live link predicate, and force the real chanES closed (a genuine dropped socket)
   // so the DOWN branch can be observed against a real non-OPEN readyState without killing the whole process.
@@ -10068,20 +12286,63 @@ const World = (() => {
     pollFeed: () => pollFeedState(),
     pollShip: () => pollShipStats()
   });
-  return { init, rebake, frameReviewRoom, crt: CRT, slagLog: () => (slaglog ? slaglog.recent() : []),
-    // REFIT freezes this world and can display its already-painted station.
+  /* STILL WAKE (2026-10-21): a call from outside that changes what the floor shows — a body's activity or skin, a bubble, a
+     camera move, a spawn, a ceremony beat, a debug drive — wakes a still floor after it runs, so it lands on the next vsync and
+     never waits out a 33 ms still interval. Reads (renderPace, cameraState, dbg, ...) stay unwrapped: a poll must not keep a
+     still floor at full pace. Every `_dbg*` hook is wrapped (dev only; a wake costs one draw). Every export that writes the
+     camera (scale, pan, a lock, an ease, a scripted move) is here — frameReviewRoom's cut (the builder frames what it built
+     from a timer) waited out a still interval until the final fixes; test/render-still.test.js walks the source and fails a
+     new camera API left out. */
+  const WAKE_API = new Set(['init', 'frameReviewRoom', 'loadStation', 'spawn', 'spawnAgent', 'despawnAgent', 'setSkin', 'relabel', 'setActivityFor', 'dropRun',
+    'focusBody', 'lockBody', 'restoreCamera', 'setOverlays', 'setChatFocus', 'chatFocusPing', 'setActivity', 'wakeIn',
+    'beginAwakening', 'playArrival', 'cancelArrival', 'setWakeProgress', 'igniteSpark', 'armKindle', 'kindleHold', 'camPushIn',
+    'camCreep', 'camPunch', 'camPullBack', 'awakenTurn', 'truthPulse', 'beginFlood', 'collapseFlood', 'endAwakening',
+    'releaseAwakening', 'say', 'focusAgent', 'refit', 'resumeBridge', 'rebake', 'invalidatePropShadows', 'setXp', 'pulseLevelUp',
+    'noteStepTest']);
+  function wakeOnCall(api) {
+    for (const k of Object.keys(api)) {
+      const f = api[k];
+      if (typeof f !== 'function' || !(WAKE_API.has(k) || k.startsWith('_dbg'))) continue;
+      api[k] = function () { try { return f.apply(this, arguments); } finally { motionWake(); } };
+    }
+    return api;
+  }
+  return wakeOnCall({ init, rebake, invalidatePropShadows, frameReviewRoom, renderStill, renderStillOfTiles, crewFrames, crt: CRT, renderPace, slagLog: () => (slaglog ? slaglog.recent() : []),
+    // STILL WAKE: voice.js flips Voice.isSpeaking / isListening from audio and STT callbacks between frames (the hero's talk
+    // track, the listening ring, a voice-held bubble) — it calls this on every flip so the change lands on the next vsync
+    voiceChanged: () => { motionWake(); },
+    // LINE WATCH: the Workflow panel pushes the step-test session it polls; reads today's numbers for a line
+    noteStepTest, lineStatsFor: id => (lineStats.known ? (lineStats.byLine[id] || null) : null), pollLineStats,
+    // a bay's live state — the lamp's own fold (WORKING only once the sidecar confirmed the run), with how long it has held
+    bayLive: id => { const w = lineWatch(); if (!w || !id) return null; const t = lwNow(), s = w.status(id, t); return Object.assign({}, s, { forMs: s.since != null ? Math.max(0, t - s.since) : null }); },
+    _dbgLineWatch: () => ({ setDraw: on => { lwDrawOff = !on; return !lwDrawOff; }, watch: watch ? watch.snapshot() : null, stats: lineStats, status: id => (watch ? watch.status(id, lwNow()) : null),
+      crates: () => (convey ? convey.peekBoxes().filter(b => b.payload && !b.payload.ghost).map(b => { const v = CRATE_DIRV[b.dir] || [0, 0]; const wx = (b.x + 0.5) * T + (b.prog - 0.5) * T * v[0], wy = (b.y + 0.5) * T + (b.prog - 0.5) * T * v[1] - 1; return { id: b.id, box: b.payload.box || null, workitemId: b.payload.workitemId || null, runId: b.payload.runId || null, sx: wx * scale + panX, sy: wy * scale + panY }; }) : []),
+      bays: () => (routingPlan && routingPlan.dockBays ? routingPlan.dockBays.filter(d => d.agentId).map(d => { const b = bayPlateBox(d); return { propId: d.propId, agentId: d.agentId, sx: b.cx * scale + panX, sy: (d.y + (d.h || 1) / 2) * T * scale + panY, lampX: (b.left + b.width - 4.75) * scale + panX, lampY: (b.top - 0.9) * scale + panY }; }) : []),
+      plates: () => (routingPlan && routingPlan.lines && geo ? routingPlan.lines.map(l => { const ip = geo.props.find(q => q.id === (l.intakes && l.intakes[0])); return ip ? { lineId: l.lineId, sx: (ip.x + (ip.w || 1) / 2) * T * scale + panX, sy: ip.y * T * scale + panY } : null; }).filter(Boolean) : []),
+      dpr: window.devicePixelRatio || 1 }),
+    // BUILD MODE freezes this world and can display its already-painted station.
     // Identity and both invalidation flags prevent borrowing another save or a
     // pre-edit bake. The editor replaces its reference on its first real edit.
     refitBake: st => st === station && !geoDirty && !bakeDirty && cache && geo
       ? { cache, geo } : null,
+    // ...and the way back (see handedBake): BUILD MODE's stitched floor, for the rebake its close() starts
+    adoptBuildBake: (st, bake) => { handedBake = st && st === station && bake && typeof st.getSeq === 'function' ? { station: st, seq: st.getSeq(), bake } : null; return !!handedBake; },
     // FEED TRUTH accessor (guided workflows): the exact server-proven state the NO FEED nag keys on —
-    // REFIT's finish-the-line card reads THIS, never a parallel poll, so the two can never disagree.
+    // BUILD MODE's finish-the-line card reads THIS, never a parallel poll, so the two can never disagree.
+    fedLines: knownFedLines,
+    // a line's name by its id, by the floor's one rule (lineNameOf) — DELIVERABLES › TO REVIEW names a SEND TO's ends with it
+    lineName: lineNameOf,
     feedState: () => ({ known: feedState.known, fed: feedState.fed }),
+    // the server answers that feed truth was read from ({ chans, cron, lt } | null until one answered) — what starts ONE line
+    startFacts: () => startFacts,
+    // does this INBOX's line wait on a routine saved while scheduling is off? (the floor's SCHEDULE OFF — CLICK) — BUILD MODE's
+    // finish card asks it with ITS OWN compiled plan (plan param), so a line stamped this session answers too
+    schedOffFor: (intakeId, plan) => schedOffFor(intakeId, plan),
     // FEED RE-CHECK on demand (2026-08-22): the INBOX card's CREATE ROUTINE path awaits this so the card, the
     // NO FEED nag and the finish checklist flip on the server's answer NOW, not on the next 60s poll / reload.
     pollFeed: () => pollFeedState(),
-    /* PLAN SYNC on demand (run-now ordering, 2026-08-22): REFIT freezes the sim (world.stop), so a floor edit
-       sets geoDirty but the recompile + POST only ran at the NEXT frame — i.e. on REFIT close. A sample / RUN
+    /* PLAN SYNC on demand (run-now ordering, 2026-08-22): BUILD MODE freezes the sim (world.stop), so a floor edit
+       sets geoDirty but the recompile + POST only ran at the NEXT frame — i.e. on BUILD MODE close. A sample / RUN
        NOW fired mid-session therefore ran the LAST POSTED line. Every run trigger awaits THIS first: recompile
        now if the floor is dirty, then resolve with the poster's verdict + the compiled plan's BLOCKING errors
        (the same codes the floor nags with), so the caller can refuse instead of running a stale or broken line. */
@@ -10090,7 +12351,13 @@ const World = (() => {
       const errors = (routingPlan && routingPlan.errors ? routingPlan.errors : []).filter(e => !e.warn);
       return planPoster.flush().then(s => Object.assign({ errors: errors, hash: routingPlan ? routingPlan.hash : null }, s));
     },
-    loadStation, spawn, spawnAgent, despawnAgent, setSkin, relabel, setActivityFor, agentRunsLive, dropRun: noteRunEnd, focusBody, lockBody, cameraMode, setCinecamIdle, setChatFocus, chatFocusPing, start, stop, setActivity, wakeIn, beginAwakening, playArrival, cancelArrival, setWakeProgress, igniteSpark, armKindle, kindleHold, camPushIn, camCreep, camPunch, camPullBack, awakenTurn, truthPulse, beginFlood, collapseFlood, endAwakening, releaseAwakening, say, focusAgent, getActivity: () => activity, getUse: () => (agent ? agent.usingProp : null), setOnClick, setOnArcade, setOnOutbox, setOnMissionBoard, setOnTrophyCase, setOnBayAssign, setOnIntakeFeed, setOnIntakeSample, refit, pauseBridge, resumeBridge, linkState, _dbgSeedRun, _dbgAgeRun, _dbgReconcile, _dbgSweep, _dbgLinkState, _dbgDropBridge, _dbgCurveState, _dbgLoseCurveContext, _dbgLoseCanvases, _dbgCanvasLoss, _dbgKillStageContext, _dbgStageState, _dbgBeltLegibility, _dbgPropClientPoint, _dbgSleep, _dbgUseProp, _dbgArrive, _dbgLeisure,
+    /* PLAN SYNC, READ-ONLY (station.layout, 2026-09-28): the facts syncPlan resolves with — the poster's verdict +
+       the compiled plan's BLOCKING errors — plus `pending` (the floor changed since its last compile, e.g. while
+       BUILD MODE holds the world frozen), WITHOUT recompiling or posting: a read must never be what sends a half-built
+       floor to the router. `station: false` = no floor loaded (nothing is known). */
+    planStatus: () => Object.assign({ station: !!station, pending: !!(station && (geoDirty || !geo)),
+      errors: (routingPlan && routingPlan.errors ? routingPlan.errors : []).filter(e => !e.warn), hash: routingPlan ? routingPlan.hash : null }, planPoster.state()),
+    loadStation, spawn, spawnAgent, despawnAgent, setSkin, relabel, setActivityFor, agentRunsLive, dropRun: dropRunFromPage, focusBody, lockBody, cameraMode, cameraState, restoreCamera, setFrameCap, yieldToUi, setOverlays, setCinecamIdle, setChatFocus, chatFocusPing, start, stop, setActivity, wakeIn, beginAwakening, playArrival, cancelArrival, setWakeProgress, igniteSpark, armKindle, kindleHold, camPushIn, camCreep, camPunch, camPullBack, awakenTurn, truthPulse, beginFlood, collapseFlood, endAwakening, releaseAwakening, awakeningHeld, say, focusAgent, getActivity: () => activity, getUse: () => (agent ? agent.usingProp : null), setOnClick, setOnArcade, setOnOutbox, setOnMissionBoard, setOnTrophyCase, setOnPluginTerminal, setOnDesk, setOnBayAssign, setOnIntakeFeed, setOnIntakeSample, refit, pauseBridge, resumeBridge, linkState, _dbgSeedRun, _dbgAgeRun, _dbgReconcile, _dbgSweep, _dbgSendTo, _dbgLinkState, _dbgDropBridge, _dbgCurveState, _dbgLoseCurveContext, _dbgLoseCanvases, _dbgCanvasLoss, _dbgKillStageContext, _dbgStageState, _dbgBeltLegibility, _dbgPropClientPoint, _dbgDeskClientPoint, _dbgSleep, _dbgUseProp, _dbgArrive, _dbgLeisure,
     // AGENT GROWTH: XpStore pushes pre-computed Xp.compute() snapshots here; pulseLevelUp fires
     // the addressed body's gold ring. The colony headline is the top-bar STATION chip.
     setXp: (agentId, a) => {
@@ -10153,6 +12420,8 @@ const World = (() => {
     _dbgSoftCross: (t) => SOFT_CROSS.has(String(t)),
     // TEST/DEBUG ONLY — containment harness: raw-place a body (bypassing every walkable-checked picker)
     // so the per-tick containment backstop (containBody / hero ensureAgentValid) is provable live.
+    // read-only proof hook (summon lines): how many links are still live and which agents wear a tag right now
+    _dbgActivity: () => ({ liveLinks: summonLinks.filter(L => !L.tEnd).map(L => (L.fromId || 'agent') + '>' + L.toId), tags: Array.from(plateByAgent.keys()) }),
     _dbgTeleport: (aid, px, py) => { const b = bodyForAgent(aid); if (!b) return false; b.pathPts = null; b.target = null; b.sitting = false; b.seated = false; b.px = +px; b.py = +py; return true; },
     // Local review controls use the real navigation path, including obstacle clearance.
     _dbgReviewWalk: (aid, tx, ty) => {
@@ -10176,6 +12445,7 @@ const World = (() => {
         return ok;
       }finally{self=keep;}
     },
+    _dbgStrain: on => { strainForce = on == null ? null : !!on; if (strainForce == null) { strained = strainProbe = false; strainDraws = 0; } return renderPace(); },   // perf A/B: force STRAINED DETAIL on/off, null = automatic
     _dbgReviewPerformance: enabled => {
       const samples=reviewPerformance.samples.slice();
       if(typeof enabled==='boolean'){reviewPerformance.enabled=enabled;reviewPerformance.samples=[];}
@@ -10449,7 +12719,7 @@ const World = (() => {
       if (!cv || !geo || !geo.props) return null;
       const p = geo.props.find(q => q.t === t);
       if (!p) return null;
-      const r = cv.getBoundingClientRect();
+      const r = U.pointerRect(cv);
       const kx = r.width / cv.width, ky = r.height / cv.height;
       const toScr = (wx, wy) => { const c = curvePoint({ x: wx * scale + panX, y: wy * scale + panY }); return { x: r.left + c.x * kx, y: r.top + c.y * ky }; };
       const a = toScr(p.x * T, p.y * T), b = toScr((p.x + (p.w || 1)) * T, (p.y + (p.h || 1)) * T);
@@ -10471,9 +12741,18 @@ const World = (() => {
         : ((station.doc && station.doc().props) || []).map(p => (station.capForProp ? station.capForProp(p.t) : null));
       const out = [], seen = {};
       for (const cap of src) {
-        if (!cap || cap === 'computer' || cap === 'connector') continue;   // compute = freebie; connectors = added server-side
+        if (!cap || cap === 'computer' || cap === 'connector' || cap === 'plugin') continue;   // compute = freebie; connectors = added server-side; plugins below
         if (seen[cap]) continue; seen[cap] = true;
         out.push({ objectType: cap });
+      }
+      // PLUGIN TERMINALS are per-instance (like connector portals) and carry WHICH plugin they are: same room scope
+      // as above — the agent's room when it has one, else the station — one entry per bound plugin.
+      const terminals = (hasBay || (viaBay && viaBay.length))
+        ? viaBay.filter(o => o && typeof o === 'object' && o.objectType === 'plugin' && o.pluginId).map(o => o.pluginId)
+        : ((station.doc && station.doc().props) || []).filter(p => p && p.t === 'plugin_terminal' && p.pluginId).map(p => p.pluginId);
+      for (const pluginId of terminals) {
+        if (seen['plugin:' + pluginId]) continue; seen['plugin:' + pluginId] = true;
+        out.push({ objectType: 'plugin', pluginId });
       }
       return out;
     },
@@ -10493,5 +12772,5 @@ const World = (() => {
       }
       return out;
     }
-  };
+  });
 })();

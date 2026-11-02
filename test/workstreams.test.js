@@ -132,6 +132,25 @@ const basis = W.titleBasis(tb.id);
 A.ok(basis.indexOf('starnessos.com') >= 0 && basis.indexOf('www subdomain') >= 0, 'basis = founding directive + latest substantive turns');
 A.ok(basis.indexOf('hey') !== 0 && basis.indexOf('thanks\n') < 0, 'small-talk turns are skipped from the basis');
 
+/* ---------- a /goal session is named from its GOAL, never the station's continuation prompt (org P29-sys x P26) ---------- */
+{
+  const GL = require('../frontend/app/goalloop.js');
+  W.reset();
+  const gs = W.create(null);
+  const step = GL.continuationPrompt(GL.create('ship the landing page', { now: 1 }));
+  gs.history.push({ role: 'user', content: step, ts: 1 });
+  A.eq(W.titleBasis(gs.id), 'ship the landing page', 'a goal step feeds the model title its goal, not the marker prompt');
+  A.eq(W.titleBasis(W.create(null).id, step), 'ship the landing page', '…also as the not-yet-stored fallback turn');
+  A.ok(W.autoTitle(gs.id, 'ship the landing page') && W.titleOf(gs) === 'ship the landing page', 'the instant placeholder is the goal');
+  A.eq(W.needsModelTitle(gs.id), true, '…and it is still the placeholder, so the model upgrade still runs on it');
+  const legacy = W.create(null);
+  legacy.history.push({ role: 'user', content: '[Continuing toward your standing goal]\nGoal: fix the build\n\nContinue working toward this goal. ', ts: 1 });
+  A.eq(W.titleBasis(legacy.id), 'fix the build', 'a pre-org-pass step counts as its goal too');
+  const brief = W.create(null);
+  brief.history.push({ role: 'user', content: step, from: 'nova', ts: 1 });
+  A.eq(W.titleBasis(brief.id), step.replace(/\s+/g, ' ').trim().slice(0, 300), 'a delegated brief keeps its own words');
+}
+
 /* ---------- healing: a weak model title (minted from a small-talk opener) upgrades ONCE real work appears ---------- */
 W.reset();
 const hw = W.create(null);
@@ -401,6 +420,7 @@ function deletionHarness(busy) {
   const remove = new Function('CTX', `
     const Workstreams = {
       get: id => CTX.streams.get(id),
+      titleOf: w => (w && w.title) || 'New session',
       activeId: () => 'work-1',
       del: id => { CTX.events.push('del:' + id); return CTX.streams.delete(id); }
     };
@@ -431,4 +451,84 @@ A.eq(idleDeletion.events.filter(e => e === 'del:work-1').length, 1, 'idle path d
 A.eq(idleDeletion.events.filter(e => e === 'persist').length, 1, 'idle deletion persists exactly once');
 A.eq(idleDeletion.events.filter(e => e === 'loadActiveStream').length, 1, 'deleting the open idle stream reloads General');
 
+/* A terminal reason is durable and belongs only to the most recent actual run. */
+W.init({}); W.adopt({ id: 'outcome', agentId: 'nova' });
+W.appendRun('outcome', 'run1'); W.noteRunEnd('outcome', 'run1', true, 'budget');
+A.eq(W.get('outcome').lastRunReason, 'budget', 'completed transport retains the actual budget outcome');
+W.appendRun('outcome', 'run1'); W.noteRunEnd('outcome', 'run1', true);
+A.eq(W.get('outcome').lastRunReason, 'budget', 'duplicate filing and old callers cannot erase a measured reason');
+W.init(JSON.parse(JSON.stringify(W.serialize())));
+A.eq(W.get('outcome').lastRunReason, 'budget', 'reason survives reload');
+W.appendRun('outcome', 'run2');
+A.eq(W.get('outcome').lastRunReason, '', 'a new run starts without a stale reason');
+A.ok(!W.noteRunEnd('outcome', 'run1', false, 'error'), 'an old run cannot settle a newer run');
+A.eq(W.get('outcome').lastRunReason, '', 'stale outcome left current reason unknown');
+W.noteRunEnd('outcome', 'run2', false, ' error ');
+A.eq(W.get('outcome').lastRunReason, 'error', 'reason is normalized');
+W.noteRunEnd('outcome', 'run2', false, 'x'.repeat(200));
+A.eq(W.get('outcome').lastRunReason.length, 80, 'saved reasons are bounded');
+W.adopt({ id: 'legacy' });
+A.eq(W.get('legacy').lastRunReason, '', 'old saves default to unknown');
+
+/* Backfilling old work never supplants an already-known newer run's truth or activity. */
+W.init({ activeId: 'recovery-order', generalId: 'general', workstreams: [
+  { id: 'general', title: null },
+  { id: 'recovery-order', title: 'Recovered work', kind: 'task', lane: 'shipped', runIds: ['newer'], lastRunOk: true, lastRunReason: 'done', lastActiveAt: 9000, lastReadAt: 9000 }
+] });
+const recoveredOrder = W.get('recovery-order');
+A.ok(W.appendRun(recoveredOrder.id, 'older', 1000, 'newer'), 'recovery inserts previously missing older work');
+A.eq(recoveredOrder.runIds, ['older', 'newer'], 'known server ordering keeps the newer run last');
+A.eq([recoveredOrder.lastRunOk, recoveredOrder.lastRunReason], [true, 'done'], 'older history preserves the latest successful outcome');
+A.eq([recoveredOrder.lastActiveAt, recoveredOrder.lastReadAt, recoveredOrder.lane], [9000, 9000, 'shipped'], 'history insertion never changes current activity, reading, or task state');
+A.ok(!W.noteRunEnd(recoveredOrder.id, 'older', false, 'error'), 'an older recovered failure cannot settle the newer run');
+W.init(JSON.parse(JSON.stringify(W.serialize())));
+A.eq(W.get(recoveredOrder.id).runIds, ['older', 'newer'], 'the restored ordering survives save and reload');
+W.appendRun(recoveredOrder.id, 'latest', 10000, 'unknown-anchor');
+A.eq(W.get(recoveredOrder.id).runIds, ['older', 'newer', 'latest'], 'an unknown anchor retains ordinary append behavior');
+A.eq([W.get(recoveredOrder.id).lastRunOk, W.get(recoveredOrder.id).lastRunReason, W.get(recoveredOrder.id).lastActiveAt], [null, '', 10000], 'ordinary appends still reset outcome and advance the event time');
+W.noteRunEnd(recoveredOrder.id, 'latest', true, 'done'); W.appendRun(recoveredOrder.id, 'older', 1000, 'newer');
+A.eq(W.get(recoveredOrder.id).runIds, ['older', 'newer', 'latest'], 'a duplicate recovery neither inserts twice nor changes ordering');
+A.eq([W.get(recoveredOrder.id).lastRunOk, W.get(recoveredOrder.id).lastRunReason], [true, 'done'], 'duplicate recovery preserves the latest outcome');
+
+/* ---- comms-threads-ui-03: WHEN a session joined its project (projectRootAt). chat.js resolves an unstamped own reply's
+   relative links at the project root only when the reply is newer than that moment, else in the agent's workspace ---- */
+{
+  const realNow = Date.now;
+  let clock = 5000; Date.now = () => clock;
+  const born = W.create(null, { projectRoot: 'C:/proj', activate: false });
+  A.eq([born.projectRoot, born.projectRootAt], ['C:/proj', born.createdAt], 'a session born in a project joined it when it was created');
+  const plain = W.create(null, { activate: false });
+  A.eq(plain.projectRootAt, null, 'a session with no project has no join time');
+  clock = 9000; W.setProjectRoot(plain.id, 'C:/proj');
+  A.eq(W.get(plain.id).projectRootAt, 9000, 'a session that joins a project later is stamped at that moment');
+  clock = 12000; W.setProjectRoot(plain.id, 'C:/proj');
+  A.eq(W.get(plain.id).projectRootAt, 9000, 'naming the same root again does not move the stamp');
+  W.setProjectRoot(plain.id, 'C:/other');
+  A.eq(W.get(plain.id).projectRootAt, 12000, 'moving to another project re-stamps it');
+  W.setProjectRoot(plain.id, null);
+  A.eq([W.get(plain.id).projectRoot, W.get(plain.id).projectRootAt], [null, null], 'leaving the project clears both');
+  clock = 15000;
+  const fresh = W.adopt({ id: 'adopt-rooted', projectRoot: 'C:/proj', createdAt: 14000 });
+  A.eq(fresh.projectRootAt, 14000, 'an adopted thread born in a project joined it when it was created');
+  const late = W.adopt({ id: 'adopt-late' });
+  A.eq(late.projectRootAt, null, '(an adopted thread with no project has no join time)');
+  clock = 16000; W.adopt({ id: 'adopt-late', projectRoot: 'C:/proj' });
+  A.eq([W.get('adopt-late').projectRoot, W.get('adopt-late').projectRootAt], ['C:/proj', 16000], 'a thread that adopts its root later is stamped at that moment');
+  W.init({ workstreams: [{ id: 'saved-old', title: 'old', projectRoot: 'C:/proj', createdAt: 100 }, { id: 'saved-new', title: 'new', projectRoot: 'C:/proj', createdAt: 100, projectRootAt: 300 }] });
+  A.eq(W.get('saved-old').projectRootAt, null, 'a session saved before the stamp existed is never given an invented one');
+  A.eq(W.get('saved-new').projectRootAt, 300, 'a saved stamp survives the reload');
+  W.init(JSON.parse(JSON.stringify(W.serialize())));
+  A.eq([W.get('saved-old').projectRootAt, W.get('saved-new').projectRootAt], [null, 300], 'and survives a save and reload round trip');
+  Date.now = realNow;
+}
+
+/* ---------- a delivery session's name is its title alone (Andrew 10-27: the ⚒ prefix pushed it off the rail's title column) ---------- */
+{
+  W.reset();
+  W.adopt({ id: 'workshop-old1', title: '⚒ Pricing page v2', lane: 'active' });
+  W.adopt({ id: 's-forge', title: '⚒ my forge notes', lane: 'active' });
+  A.eq(W.titleOf('workshop-old1'), 'Pricing page v2', 'a delivery session stored as "⚒ <title>" before 10-27 is named by its title alone');
+  A.eq(W.get('workshop-old1').title, '⚒ Pricing page v2', 'the stored title is untouched (only the name it is shown by)');
+  A.eq(W.titleOf('s-forge'), '⚒ my forge notes', 'a session someone named with a hammer keeps it: only delivery sessions carried the mark');
+}
 A.report('workstreams.test');

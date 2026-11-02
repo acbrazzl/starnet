@@ -3,8 +3,9 @@
    The notebook, todo, declined, minted, and pending stores intentionally share one injected store contract, but
    they do not share the same on-disk file: notebook:<agent> is durable long-term memory, todo:<agent> is the active
    task plan that must survive restarts/compaction, declined:<agent> is the permanent reject-list of memory
-   proposals the Commander Discarded (so reflection never re-proposes them — §5.6 "discard = never again"), and
-   pending:<agent> holds high-stakes proposals still awaiting a Keep/Edit/Discard verdict.
+   proposals the Commander Discarded (so reflection never re-proposes them — §5.6 "discard = never again"),
+   pending:<agent> holds high-stakes proposals still awaiting a Keep/Edit/Discard verdict, and embed:<agent> holds
+   the derived embedding vectors the hybrid recall lane blends with BM25 (sidecar/embed.js).
    Unknown keys are rejected instead of being accidentally mapped into a notebook filename. */
 'use strict';
 
@@ -24,6 +25,7 @@ function memoryFileFor(workspaces, pathMod, key) {
   if (k.indexOf('declined:') === 0) return pathMod.join(workspaces, agentIdFromKey(k, /^declined:/) + '.declined.json');
   if (k.indexOf('minted:') === 0) return pathMod.join(workspaces, agentIdFromKey(k, /^minted:/) + '.minted.json');
   if (k.indexOf('pending:') === 0) return pathMod.join(workspaces, agentIdFromKey(k, /^pending:/) + '.pending.json');
+  if (k.indexOf('embed:') === 0) return pathMod.join(workspaces, agentIdFromKey(k, /^embed:/) + '.embed.json');   // memory-compound: per-record embedding vectors (derived; rebuilt from the notebook on a model switch)
   throw new Error('unsupported memory store key: ' + k);
 }
 
@@ -44,11 +46,38 @@ function makeMemoryStore(deps) {
   });
   const warn = typeof deps.warn === 'function' ? deps.warn : function () {};
 
+  /* getShared(key) — a READ-ONLY, signature-checked view (perf review 10-19). Every run reads every OTHER agent's
+     notebook for the station-wide taste + standing blocks, and those rarely change between runs: re-reading and
+     re-parsing all of them per run (it was twice per run) is pure waste. A hit needs durable.signature(key) — the
+     main file's bigint stat plus this process's own write generation — to match the read it came from, so a write
+     here or a replaced file always re-reads; only a cleanly parsed main ('ok') is ever kept (a .bak-recovered,
+     corrupt or unreadable key keeps its loud uncached path). The value is FROZEN (the array and each record) and
+     shared between callers: never mutate it — get()/update() are the editable paths. */
+  const shared = new Map();   // key -> { sig, value }
+  function freezeList(v) {
+    if (Array.isArray(v)) { for (const r of v) if (r && typeof r === 'object') Object.freeze(r); }
+    return Object.freeze(v);
+  }
+  function getShared(key) {
+    const k = String(key);
+    const sig = durable.signature(k);
+    const hit = shared.get(k);
+    if (sig && hit && hit.sig === sig) return hit.value;
+    let r;
+    try { r = durable.readKey(k); }
+    catch (e) { shared.delete(k); return undefined; }
+    const value = (r.status === 'ok' || r.status === 'recovered') ? r.value : undefined;
+    if (sig && r.status === 'ok' && value && typeof value === 'object') { shared.set(k, { sig: sig, value: freezeList(value) }); return value; }
+    shared.delete(k);
+    return value;
+  }
+
   return {
     get(key) {
       try { return durable.get(key); }
       catch (e) { return undefined; }
     },
+    getShared: getShared,
     set(key, value) {
       try { durable.set(key, value); }
       catch (e) { warn('[memory] persist failed:', (e && e.message) || e); }
@@ -70,7 +99,7 @@ function makeMemoryStore(deps) {
 // without booting the server (the new-hero clean-slate is a named hard rule, not just a source-grep).
 async function resetAgentMemory(store, agentId) {
   const id = String(agentId || 'agent');
-  for (const key of ['notebook:' + id, 'declined:' + id, 'todo:' + id, 'minted:' + id, 'pending:' + id]) {
+  for (const key of ['notebook:' + id, 'declined:' + id, 'todo:' + id, 'minted:' + id, 'pending:' + id, 'embed:' + id]) {
     try { await store.update(key, () => []); } catch (e) { failNote('memory.clear', e); }
   }
 }
@@ -120,8 +149,10 @@ async function appendPending(store, agentId, runId, items, now) {
       cur.push({
         key: key, runId: String(runId == null ? '' : runId), id: String(p.id == null ? '' : p.id),
         kind: p.kind || 'note', content: String(p.content == null ? '' : p.content),
-        scope: p.scope || 'global', origin: p.origin || 'commander', createdAt: stamp,
-        ...(p.replaceId ? { replaceId: p.replaceId, previousBody: p.previousBody, streamId: p.streamId || null } : {})
+        scope: p.scope || 'global', projectRoot: p.projectRoot || null, origin: p.origin || 'commander', createdAt: stamp,
+        ...(p.replaceId ? { replaceId: p.replaceId, previousBody: p.previousBody, streamId: p.streamId || null } : {}),
+        // memory-truth-1027: how the run that raised it ENDED (done / failed / denied), so the deck can say "from a failed run"
+        ...(p.outcome ? { outcome: String(p.outcome).slice(0, 16) } : {})
       });
       added++;
     }

@@ -12,6 +12,10 @@ const os = require('os');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const { bootToken } = require('./_httpToken.js');
+// sentinels are read from the Commander's OWN words: a routine's run-context note (the leading text of the same user
+// message) quotes earlier chats as RECENT ACTIVITY, so a raw-content match would route a routine on a previous chat
+const { userWords } = require('./helpers/host-notes.js');
+const { allocatePort, BIND_REFUSED } = require('./helpers/ports.js');
 
 const HOST = '127.0.0.1';
 const INDEX = path.resolve(__dirname, '..', 'sidecar', 'index.js');
@@ -89,12 +93,12 @@ function startMockOpenRouter() {
           const hasToolResult = toolResults > 0;
           const hasMcpTool = (parsed.tools || []).some(t => t && t.function && t.function.name === 'mcp__demo__lookup');
           const hasInspectTool = (parsed.tools || []).some(t => t && t.function && t.function.name === 'station_inspect');
-          const wantsInspect = msgs.some(m => m && m.role === 'user' && String(m.content || '').indexOf('SELF_INSPECT') >= 0);
+          const wantsInspect = msgs.some(m => m && m.role === 'user' && userWords(m).indexOf('SELF_INSPECT') >= 0);
           const messageContent = m => typeof (m && m.content) === 'string' ? m.content : JSON.stringify((m && m.content) || '');
           const hasInspectResult = msgs.some(m => m && m.role === 'tool' && /\"schemaVersion\":1/.test(messageContent(m)) && /\"scheduler\":/.test(messageContent(m)));
           // A conversation carrying this sentinel asks for FOUR connector calls in a row — the shape of the
           // reported repeated-approval bug. Sentinel-gated so every other scenario in this file is untouched.
-          const wantsMany = msgs.some(m => m && m.role === 'user' && String(m.content || '').indexOf('FOURLOOKUPS') >= 0);
+          const wantsMany = msgs.some(m => m && m.role === 'user' && userWords(m).indexOf('FOURLOOKUPS') >= 0);
           requests.push(parsed);
 
           res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
@@ -144,9 +148,9 @@ function boot(port, env, attemptsLeft) {
     const onData = d => {
       out += d.toString();
       if (!settled && out.indexOf('http://' + HOST + ':' + port) >= 0) { settled = true; resolve({ child, port }); }
-      else if (!settled && /already in use/i.test(out)) {
+      else if (!settled && BIND_REFUSED.test(out)) {
         settled = true; try { child.kill(); } catch (_) {}
-        if (attemptsLeft > 0) resolve(boot(port + 1, env, attemptsLeft - 1));
+        if (attemptsLeft > 0) resolve(allocatePort().then(next => boot(next, env, attemptsLeft - 1)));
         else reject(new Error('no free port'));
       }
     };
@@ -238,7 +242,7 @@ async function readNdjson(res) {
     SKYNET_DEFAULT_MODEL: 'test/model',
     STARNET_DEFAULT_MODEL: 'test/model'
   };
-  let booted = await boot(9020 + (process.pid % 50), env, 20);
+  let booted = await boot(await allocatePort(), env, 20);
   let child = booted.child;
   let port = booted.port;
   let B = 'http://' + HOST + ':' + port;
@@ -312,6 +316,36 @@ async function readNdjson(res) {
     const listed = await (await fetch(B + '/api/connectors', { headers: { 'X-StarNet-Token': token, Origin: B } })).json();
     A.ok((listed.connectors || []).some(c => c.id === 'demo' && c.tools && c.tools.indexOf('lookup') >= 0), '/api/connectors lists the discovered MCP tool');
 
+    // EDIT ROUND-TRIP: the panel's EDIT form is filled from the MASKED status (secret query param -> <redacted>,
+    // header values -> <set> / blank). Saving it with only the label changed must keep the real URL + headers —
+    // it used to store the masks literally, so a rename silently broke a keyed connector.
+    const editUrl = mcp.url + '?api_key=URLSECRET_e2e';
+    const made = await fetch(B + '/api/connectors', { method: 'POST', headers,
+      body: JSON.stringify({ id: 'demo-edit', label: 'Edit me', transport: 'http', url: editUrl, headers: { 'X-Api-Key': 'HDRSECRET_e2e', 'X-Plain': 'plainvalue' } }) });
+    A.eq((await made.json()).state, 'up', 'keyed connector with a secret query param + headers connects');
+    const shown = ((await (await fetch(B + '/api/connectors', { headers: { 'X-StarNet-Token': token, Origin: B } })).json()).connectors || []).find(c => c.id === 'demo-edit');
+    A.ok(shown && /redacted/.test(shown.url) && shown.headers['X-Api-Key'] === '<redacted>', 'status masks the secrets (what the edit form is filled from)');
+    const formHeaders = {};
+    for (const k of Object.keys(shown.headers)) formHeaders[k] = shown.headers[k] === '<redacted>' ? '' : shown.headers[k];   // exactly connectors.js prefill
+    const callsBefore = mcp.calls.length;
+    const edited = await fetch(B + '/api/connectors', { method: 'POST', headers,
+      body: JSON.stringify({ id: 'demo-edit', label: 'Renamed', transport: 'http', oauth: false, url: shown.url, headers: formHeaders }) });
+    A.eq((await edited.json()).state, 'up', 'label-only edit reconnects');
+    const editDisk = JSON.parse(fs.readFileSync(connectorFile, 'utf8'));
+    const savedEdit = (editDisk.configs || []).find(c => c.id === 'demo-edit') || {};
+    A.eq(savedEdit.url, editUrl, 'edit kept the real secret query param (not the <redacted> mask)');
+    A.eq(JSON.stringify(savedEdit.headers), JSON.stringify({ 'X-Api-Key': 'HDRSECRET_e2e', 'X-Plain': 'plainvalue' }), 'edit kept the real header values (not blank / <set>)');
+    A.eq(savedEdit.label, 'Renamed', 'the label change itself landed');
+    const reconnect = mcp.calls.slice(callsBefore).find(c => c.msg && c.msg.method === 'initialize');
+    A.ok(reconnect && reconnect.headers['x-api-key'] === 'HDRSECRET_e2e', 'the server still receives the real header after the edit');
+    // a URL change is a different service: masks must NOT pull the old secrets onto the new endpoint
+    const moved = await fetch(B + '/api/connectors', { method: 'POST', headers,
+      body: JSON.stringify({ id: 'demo-edit', transport: 'http', oauth: false, url: 'http://127.0.0.1:1/mcp', headers: formHeaders, timeoutMs: 1000 }) });
+    await moved.json();
+    const movedSaved = (JSON.parse(fs.readFileSync(connectorFile, 'utf8')).configs || []).find(c => c.id === 'demo-edit') || {};
+    A.ok(JSON.stringify(movedSaved.headers || {}).indexOf('HDRSECRET_e2e') < 0, 'an old secret header never follows a changed URL');
+    await (await fetch(B + '/api/connectors/remove', { method: 'POST', headers, body: JSON.stringify({ id: 'demo-edit' }) })).text();
+
     // HARNESS SELF-KNOWLEDGE: plant all three mutable sources, then make a REAL /api/run call the
     // always-present station.inspect tool. The returned bytes must agree with the same live stores the
     // APIs above use — not a prompt summary or scripted fixture inside the tool.
@@ -332,9 +366,9 @@ async function readNdjson(res) {
     A.eq(inspectRun.status, 200, 'real run admitted the self-inspection request');
     await readNdjson(inspectRun);
     const inspectRequest = llm.requests.find(r => (r.messages || []).some(m => m && m.role === 'tool' && /\"schemaVersion\":1/.test(String(m.content || '')) && /\"scheduler\":/.test(String(m.content || ''))));
-    const inspectAdvertised = llm.requests.filter(r => (r.messages || []).some(m => m && m.role === 'user' && String(m.content || '').indexOf('SELF_INSPECT') >= 0))
+    const inspectAdvertised = llm.requests.filter(r => (r.messages || []).some(m => m && m.role === 'user' && userWords(m).indexOf('SELF_INSPECT') >= 0))
       .flatMap(r => (r.tools || []).map(t => t && t.function && t.function.name).filter(Boolean));
-    const inspectTrace = llm.requests.filter(r => (r.messages || []).some(m => m && m.role === 'user' && String(m.content || '').indexOf('SELF_INSPECT') >= 0))
+    const inspectTrace = llm.requests.filter(r => (r.messages || []).some(m => m && m.role === 'user' && userWords(m).indexOf('SELF_INSPECT') >= 0))
       .map(r => (r.messages || []).map(m => ({ role: m.role, name: m.name || '', calls: (m.tool_calls || []).map(c => c && c.function && c.function.name), content: String(m.content || '').slice(0, 120) })));
     A.ok(!!inspectRequest, 'the model received station.inspect and called it through the real wire-name boundary (advertised: ' + inspectAdvertised.join(',') + '; trace: ' + JSON.stringify(inspectTrace) + ')');
     A.ok(llm.requests.some(r => (r.tools || []).some(t => t && t.function && t.function.name === 'station_inspect')),
@@ -465,7 +499,7 @@ async function readNdjson(res) {
     A.ok(restartDisk.indexOf(googleClientId) >= 0 && restartDisk.indexOf(googleClientSecret) >= 0, 'restart reads the exact protected Google client credentials from durable connector state');
     A.ok(JSON.stringify(restartCatalog).indexOf(googleClientId) < 0 && JSON.stringify(restartCatalog).indexOf(googleClientSecret) < 0, 'restart catalog still exposes no Google client credential');
 
-    sse = await startSseCollector(B + '/api/channels/events?token=' + encodeURIComponent(token));
+    sse = await startSseCollector(B + '/api/channels/events?' + require('./_httpToken.js').sseQuery(token));
     const create = await fetch(B + '/api/cron', {
       method: 'POST',
       headers,
@@ -481,7 +515,7 @@ async function readNdjson(res) {
     A.ok(panel.filter(e => e.name === 'agent.token').map(e => e.payload.delta).join('').indexOf('MCP unavailable in autonomous run') >= 0, 'panel stream truthfully completes without MCP authority');
     A.ok(!mcp.calls.some(c => c.msg && c.msg.method === 'tools/call'), 'autonomous run never reaches the MCP server tool endpoint');
     A.ok(mcp.calls.some(c => c.headers && c.headers.authorization === 'Bearer mcp-secret-token'), 'MCP transport sent bearer token to the configured connector');
-    const autonomousRequests = llm.requests.filter(r => (r.messages || []).some(m => m && m.role === 'user' && String(m.content || '').indexOf('use the demo connector lookup for alpha') >= 0));
+    const autonomousRequests = llm.requests.filter(r => (r.messages || []).some(m => m && m.role === 'user' && userWords(m).indexOf('use the demo connector lookup for alpha') >= 0));
     A.ok(autonomousRequests.length > 0 && autonomousRequests.every(r => !(r.tools || []).some(t => t.function && t.function.name === 'mcp__demo__lookup')), 'autonomous model request does not expose the unknown MCP tool');
 
     await sse.waitFor(events => events.some(e => e.name === 'agent.run.end' && e.payload && e.payload.agentId === 'mcp-agent'), 5000, 'SSE run end');
@@ -638,7 +672,7 @@ async function readNdjson(res) {
   const envClientSecret = 'env-google-client-secret';
   let envChild = null;
   try {
-    const envBoot = await boot(9080 + (process.pid % 50), {
+    const envBoot = await boot(await allocatePort(), {
       SKYNET_WORKSPACES: envWs,
       STARNET_WORKSPACES: envWs,
       STARNET_GOOGLE_OAUTH_CLIENT_ID: envClientId,

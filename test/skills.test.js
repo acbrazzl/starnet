@@ -8,7 +8,10 @@ const A = require('./_assert.js');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { makeSkillStore } = require('../sidecar/skillstore.js');
+const { makeSkillStore: makeCandidateStore } = require('../sidecar/skillstore.js');
+// Exercise the isolated draft mutation engine here. Production publication gates, including
+// foreground model writes, are covered without this override in skills.review-approval.test.js.
+const makeSkillStore = opts => makeCandidateStore(Object.assign({}, opts, { stageReviews: false }));
 const runtimeSkills = require('../sidecar/skills/runtime.js');
 const skillReview = require('../sidecar/skillreview.js');
 const skillGuard = require('../sidecar/skills/guard.js');
@@ -118,9 +121,9 @@ const redact = (t) => String(t).replace(/sk-[A-Za-z0-9]{8,}/g, '[redacted]');
   clk = 2001;
   const v1 = s.view('a', 'Ship App');
   A.eq(v1.viewCount, 1, 'skill.view increments viewCount');
-  A.eq(v1.useCount, 1, 'skill.view also counts as use');
+  A.eq(v1.useCount, 0, 'a view alone is NOT a use: useCount counts runs that loaded the skill (the run end calls markUsed)');
   s.markUsed('a', 'Ship App');
-  A.eq(s.view('a', 'Ship App', { bump: false }).useCount, 2, 'markUsed increments useCount without loading body');
+  A.eq(s.view('a', 'Ship App', { bump: false }).useCount, 1, 'markUsed (once per run that loaded it) increments useCount without loading body');
   A.ok(s.manage({ agentId: 'a', action: 'archive', target: 'Ship App' }).ok, 'archive succeeds');
   A.eq(s.list('a').length, 0, 'archived skills are hidden from default list/prompt index');
   A.eq(s.view('a', 'Ship App'), null, 'archived skills are hidden from default view');
@@ -147,7 +150,7 @@ const redact = (t) => String(t).replace(/sk-[A-Za-z0-9]{8,}/g, '[redacted]');
 
   // ---- relevance-ranked index: opts.query reorders by BM25 over {name, summary}; no query -> caller order ----
   {
-    // caller (skillStore mine()) order: pinned first, then updatedAt desc — feed that shape in directly.
+    // a pinned-first, updatedAt-desc caller order (skillStore mine()'s shape; the run prompt passes listAccessible) — fed in directly.
     const idx = [
       { id: 'p1', name: 'Pinned Ops', summary: 'unrelated ops runbook', state: 'active', pinned: true, updatedAt: 1000 },
       { id: 'n1', name: 'Deploy Pipeline', summary: 'ship the app safely', state: 'active', updatedAt: 3000 },
@@ -166,6 +169,44 @@ const redact = (t) => String(t).replace(/sk-[A-Za-z0-9]{8,}/g, '[redacted]');
       'a no-overlap query degrades to updatedAt-desc caller order (tiebreak law)');
     const stopQ = runtimeSkills.composeIndex(idx, { query: 'the of and' });
     A.ok(stopQ.text.indexOf('Deploy Pipeline') < stopQ.text.indexOf('Video Editing'), 'a stopword-only query is treated as no query');
+  }
+  // ---- the run prompt's real caller (listAccessible): pinned first on a turn with no query, and no redundant
+  // owner tags on the agent's own skills (skills-eval-18) ----
+  {
+    const st = makeSkillStore({ io: memIo(), clock, redact });
+    for (const name of ['Alpha brief', 'Beta report', 'Zoom setup']) st.write({ agentId: 'a', name, summary: 'when ' + name.toLowerCase() + ' comes up', body: 'steps' });
+    A.ok(st.manage({ agentId: 'a', action: 'pin', target: 'Zoom setup' }).ok, 'pin the alphabetically last skill');
+    st.write({ agentId: 'b', name: 'Shared runbook', summary: 'station ops', body: 'steps' });
+    A.ok(st.share({ agentId: 'b', target: 'Shared runbook', scope: 'station', actor: 'user' }).ok, 'b shares a station skill');
+    const own = runtimeSkills.composeIndex(st.listAccessible('a', {}), {});
+    A.ok(own.text.indexOf('Zoom setup') >= 0 && own.text.indexOf('Zoom setup') < own.text.indexOf('Alpha brief'), 'a pinned skill leads the index on a turn with no query');
+    const line = name => own.text.split('\n').find(l => l.indexOf('- ' + name) === 0) || '';
+    A.ok(line('Alpha brief') && line('Alpha brief').indexOf('[owner:') < 0, 'the agent\'s own skill carries no owner tag: ' + line('Alpha brief'));
+    A.ok(line('Shared runbook').indexOf('[owner: b, scope: station]') > 0, 'a skill shared by another agent still names its owner and scope');
+    const tight = runtimeSkills.composeIndex(st.listAccessible('a', {}), { budget: 60 });
+    A.ok(/Additional saved skills/.test(tight.text) && tight.text.indexOf('- Beta report [owner:') < 0 && tight.text.indexOf('- Shared runbook [owner: b]') >= 0, 'the names-only overflow applies the same rule');
+    // Another agent's pinned station skill never jumps ahead of the agent's own skills, even when the caller passes
+    // no agentId (the run prompt): listAccessible's agent-scope rows are the caller's own, so they name the owner.
+    A.ok(st.manage({ agentId: 'b', action: 'pin', target: 'Shared runbook' }).ok, 'b pins its station skill');
+    const noQuery = runtimeSkills.composeIndex(st.listAccessible('a', {}), {}).text;
+    A.ok(noQuery.indexOf('Zoom setup') < noQuery.indexOf('Alpha brief') && noQuery.indexOf('Beta report') < noQuery.indexOf('Shared runbook'), 'with no query, the agent\'s own pin leads and another agent\'s pin keeps its place after the agent\'s own skills');
+    const asked = runtimeSkills.composeIndex(st.listAccessible('a', {}), { query: 'alpha brief' }).text;
+    A.ok(asked.indexOf('Zoom setup') < asked.indexOf('Alpha brief') && asked.indexOf('Alpha brief') < asked.indexOf('Shared runbook'), 'with a query, another agent\'s pin ranks by relevance, not ahead of it');
+  }
+  // ---- listAccessible keeps mine()'s order inside the own-first grouping: own pins, then most recently updated,
+  // then name; another agent's newer skill stays after the agent's own (skills-eval-18) ----
+  {
+    const saved = clk;
+    const st = makeSkillStore({ io: memIo(), clock, redact });
+    clk = 5000; st.write({ agentId: 'a', name: 'Alpha old', summary: 'x', body: 'steps' });
+    clk = 6000; st.write({ agentId: 'a', name: 'Beta mid', summary: 'x', body: 'steps' });
+    clk = 7000; st.write({ agentId: 'a', name: 'Gamma new', summary: 'x', body: 'steps' });
+    clk = 7500; A.ok(st.manage({ agentId: 'a', action: 'pin', target: 'Alpha old' }).ok, 'pin the oldest own skill');
+    clk = 8000; st.write({ agentId: 'b', name: 'Aardvark station', summary: 'x', body: 'steps' });
+    A.ok(st.share({ agentId: 'b', target: 'Aardvark station', scope: 'station', actor: 'user' }).ok, 'b shares a newer station skill');
+    A.eq(st.listAccessible('a', {}).map(s => s.name), ['Alpha old', 'Gamma new', 'Beta mid', 'Aardvark station'],
+      'own pin first, then own skills newest first, then other agents\' skills');
+    clk = saved;
   }
   A.eq(runtimeSkills.extractInvocations([{ role: 'user', content: '/skill Deploy\ncontinue' }])[0], 'Deploy', 'slash /skill invocation is parsed');
   A.ok(/PRELOADED SKILLS/.test(runtimeSkills.composeLoaded([s.view('a', 'Deploy', { bump: false })])), 'explicit preload composes full skill bodies');
@@ -330,7 +371,7 @@ const redact = (t) => String(t).replace(/sk-[A-Za-z0-9]{8,}/g, '[redacted]');
   for (let i = 0; i < 4; i++) {
     clk += 10;
     s.view('a', id);                 // the skill.view TOOL passes no opts — bump AND hydrate default ON
-    s.markUsed('a', [id]);           // every run does this for every indexed skill id
+    s.markUsed('a', [id]);           // the run end does this for every skill the run loaded
     const stored = s.view('a', id, { bump: false, hydrate: false });
     sizes.push(String(stored.body).length);
     digests.push(stored.contentDigest);
@@ -383,6 +424,68 @@ const redact = (t) => String(t).replace(/sk-[A-Za-z0-9]{8,}/g, '[redacted]');
   A.ok(fixedPoint({ name: 'X', setup: 'a\n\nb', body: 'B' }), 'render/split is a FIXED POINT with a multi-paragraph setup');
   A.ok(fixedPoint({ name: 'X', body: '## Setup\nthe author typed this themselves' }), 'render/split is a FIXED POINT when the BODY itself opens with a Setup heading');
   A.ok(fixedPoint({ name: 'X', setup: 'S', body: '' }), 'render/split is a FIXED POINT for a setup-only skill');
+}
+
+// ---- S. SKILL LEARNING FIRES (2026-09-28): the nudge, the first-skill line, and use = loaded ----
+{
+  // the nudge: turns carry across runs, reach the bar, and start over when the agent writes a skill itself
+  A.eq(skillReview.NUDGE_EVERY, 10, 'the default bar is 10 turns (Hermes parity)');
+  A.eq(skillReview.parseNudgeEvery(undefined), 10, 'no env -> default bar');
+  A.eq(skillReview.parseNudgeEvery('3'), 3, 'an explicit bar is honored');
+  A.eq(skillReview.parseNudgeEvery('0'), 0, 'a literal 0 turns the nudge off');
+  A.eq(skillReview.parseNudgeEvery('ten'), 10, 'junk falls back to the default, never to off');
+  let n = skillReview.nudgeAfterRun(0, { turns: 4, every: 10 });
+  A.eq(n, { count: 4, due: false }, 'one 4-turn run is not due yet');
+  n = skillReview.nudgeAfterRun(n.count, { turns: 4, every: 10 });
+  A.eq(n, { count: 8, due: false }, 'the count CARRIES across runs');
+  n = skillReview.nudgeAfterRun(n.count, { turns: 3, every: 10 });
+  A.eq(n, { count: 10, due: true }, 'the third run crosses the bar -> due, and the count is CLAMPED at the bar');
+  A.eq(skillReview.nudgeAfterRun(10, { turns: 7, every: 10 }), { count: 10, due: true }, 'a due count that could not review stays exactly due (no growth, no rewrite)');
+  A.eq(skillReview.nudgeAfterRun(9, { turns: 5, managed: true, every: 10 }), { count: 0, due: false }, 'an agent that changed a skill itself this run starts over (no review owed)');
+  A.eq(skillReview.nudgeAfterRun(50, { turns: 5, every: 0 }).due, false, 'every 0 = the nudge never fires');
+  A.eq(skillReview.nudgeAfterRun(-4, { turns: 'x' }), { count: 0, due: false }, 'garbage in -> a clean zero, never NaN');
+
+  // the first-skill line: an empty skillbase still asks the agent to save its first skill, when the host opts in
+  A.eq(runtimeSkills.composeIndex([], {}).text, '', 'no emptyGuide -> an empty skillbase still composes nothing (old callers unchanged)');
+  const g = runtimeSkills.composeIndex([], { emptyGuide: true, canManage: true }).text;
+  A.ok(/## SAVED AGENT SKILLS/.test(g) && /no saved skills yet/.test(g), 'emptyGuide -> a zero-skill agent is told it has none and what a skill is');
+  A.ok(g.indexOf('skill.manage (action create)') >= 0, 'the line names the create call the agent actually has');
+  A.ok(g.indexOf('It applies once approved in ABILITIES > SKILLS.') >= 0, 'the line never implies a saved skill applies before the Commander approves it');
+  A.ok(/skill.write/.test(runtimeSkills.composeIndex([], { emptyGuide: true, canManage: false }).text), 'without skill.manage the line names skill.write');
+  A.eq(runtimeSkills.composeIndex([], { emptyGuide: true, canManage: true }).text, g, 'the line is a constant (rides the cached prefix)');
+  const allArchived = runtimeSkills.composeIndex([{ name: 'Old', body: 'x', state: 'archived' }, { name: 'Older', body: 'y', state: 'archived' }], { emptyGuide: true, canManage: true }).text;
+  A.ok(allArchived.indexOf('no saved skills yet') < 0, 'an all-archived skillbase is NEVER told it has no saved skills (that steers it to recreate)');
+  A.ok(allArchived.indexOf('no active saved skills (2 archived') >= 0 && allArchived.indexOf('action restore') >= 0, 'it is told how many are archived and how to restore one');
+  A.ok(allArchived.indexOf('Old') < 0, 'archived rows still never enter the index');
+
+  // aging after use = loaded: only a MODEL-authored skill auto-archives; the Commander's own and installed ones only go stale
+  {
+    let ct = 1000;
+    const cs = makeSkillStore({ io: memIo(), clock: { now: () => ct }, redact });
+    cs.write({ agentId: 'a', name: 'Agent Made', body: '1. a', createdBy: 'agent' });
+    cs.write({ agentId: 'a', name: 'Review Made', body: '1. r', createdBy: 'background-review' });
+    cs.write({ agentId: 'a', name: 'Mine', body: '1. m', createdBy: 'user' });
+    cs.write({ agentId: 'a', name: 'Installed', body: '1. i', createdBy: 'community' });
+    const r = cs.curate('a', { now: 1000 + 100, staleMs: 10, archiveMs: 50 });
+    const st = (nm) => cs.view('a', nm, { bump: false, includeArchived: true }).state;
+    A.eq([st('Agent Made'), st('Review Made'), st('Mine'), st('Installed')], ['archived', 'archived', 'stale', 'stale'], 'past the archive age: agent/review skills archive, user + installed skills only go stale');
+    A.eq([r.archived, r.stale], [2, 2], 'curate reports exactly that');
+  }
+
+  // use = loaded: a maintenance read (countViews:false) moves no counter and no aging clock
+  let t = 1000;
+  const store = makeSkillStore({ io: memIo(), clock: { now: () => t }, redact });
+  store.write({ agentId: 'a', name: 'Deploy', body: '1. npm ci' });
+  const { makeSkillTools } = require('../sidecar/tools/builtin/skills.js');
+  const quiet = makeSkillTools({ store, countViews: false });
+  t = 5000;
+  quiet.viewTool.run({ name: 'Deploy' }, { agentId: 'a' });
+  const after = store.view('a', 'Deploy', { bump: false });
+  A.eq([after.viewCount, after.useCount, after.lastUsedAt], [0, 0, null], 'a review/curator read (countViews:false) is not a view, not a use, and does not reset aging');
+  const live = makeSkillTools({ store });
+  live.viewTool.run({ name: 'Deploy' }, { agentId: 'a' });
+  const viewed = store.view('a', 'Deploy', { bump: false });
+  A.eq([viewed.viewCount, viewed.useCount, viewed.lastUsedAt], [1, 0, 5000], 'a skill.view in a run counts a view and freshness; the use lands at run end');
 }
 
 A.report('skills.test');

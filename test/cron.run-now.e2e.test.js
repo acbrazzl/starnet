@@ -12,6 +12,7 @@ const os = require('os');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const { bootToken } = require('./_httpToken.js');
+const { allocatePort, BIND_REFUSED } = require('./helpers/ports.js');
 
 const HOST = '127.0.0.1';
 const INDEX = path.resolve(__dirname, '..', 'sidecar', 'index.js');
@@ -68,9 +69,9 @@ function boot(port, env, attemptsLeft) {
     const onData = d => {
       out += d.toString();
       if (!settled && out.indexOf('http://' + HOST + ':' + port) >= 0) { settled = true; resolve({ child, port }); }
-      else if (!settled && /already in use/i.test(out)) {
+      else if (!settled && BIND_REFUSED.test(out)) {
         settled = true; try { child.kill(); } catch (_) {}
-        if (attemptsLeft > 0) resolve(boot(port + 1, env, attemptsLeft - 1));
+        if (attemptsLeft > 0) resolve(allocatePort().then(next => boot(next, env, attemptsLeft - 1)));
         else reject(new Error('no free port'));
       }
     };
@@ -158,7 +159,7 @@ async function readNdjson(res) {
     SKYNET_DEFAULT_MODEL: 'test/model',
     SKYNET_CRON_TICK_MS: '1000'
   };
-  const { child, port } = await boot(8910 + (process.pid % 50), env, 20);
+  const { child, port } = await boot(await allocatePort(), env, 20);
   const B = 'http://' + HOST + ':' + port;
   let sse = null;
   try {
@@ -177,7 +178,7 @@ async function readNdjson(res) {
     const job = (await create.json()).job;
     A.ok(job && job.id, 'routine id returned');
 
-    sse = await startSseCollector(B + '/api/channels/events?token=' + encodeURIComponent(token), async event => {
+    sse = await startSseCollector(B + '/api/channels/events?' + require('./_httpToken.js').sseQuery(token), async event => {
       if (event.name !== 'station.command') return;
       const p = event.payload;
       await fetch(B + '/api/station/ack', { method: 'POST', headers,
@@ -215,6 +216,17 @@ async function readNdjson(res) {
     });
     A.eq(plan.chains['research-agent'].next, ['writer-agent'], 'the drawn floor chains the two docks');
     for (const b of plan.bays.concat(plan.dockBays)) b.objects = ['computer'];   // an unequipped bay grants no compute
+    /* the docks' ROOM is bounded by the saved station (a posted plan may narrow a bay's grant, never widen it —
+       qa/bugs/a9a4f53c): save both bays with a workstation each and no dish, so the bay room is computer-only */
+    const WM = require('../frontend/app/worldmodel.js');
+    const stDoc = WM.defaultDoc();
+    stDoc.props.push({ id: 'b1', t: 'bay', x: 2, y: 1, w: 1, h: 1, agentId: 'research-agent' }, { id: 'pc1', t: 'console', x: 4, y: 1, w: 2, h: 1, agentId: 'research-agent' },
+      { id: 'b2', t: 'bay', x: 8, y: 1, w: 1, h: 1, agentId: 'writer-agent' }, { id: 'pc2', t: 'console', x: 10, y: 1, w: 2, h: 1, agentId: 'writer-agent' });
+    stDoc._nid = 5;
+    const prior = ((await (await fetch(B + '/api/save?agent=agent', { headers })).json()) || {}).save;
+    const sv = await fetch(B + '/api/save', { method: 'POST', headers,
+      body: JSON.stringify({ schema: 'starnet.save', version: 5, _saveRevision: (prior && prior._saveRevision) || 0, updatedAt: Date.now(), agent: { id: 'agent' }, station: stDoc }) });
+    A.ok(sv.status === 200 && ((await sv.json()) || {}).ok === true, 'the station the line runs on (two computer-only bays) is saved');
     const posted = await fetch(B + '/api/routing', { method: 'POST', headers, body: JSON.stringify(plan) });
     A.eq(posted.status, 200, 'the two-stage floor deploys');
 
@@ -240,8 +252,26 @@ async function readNdjson(res) {
     const stage1 = mock.requests.slice(callsBefore).find(r =>
       (r.messages || []).some(m => m.role === 'user' && String(m.content || '').indexOf('gather relevant AI news') >= 0));
     A.ok(stage1, "found stage one's recorded provider request");
+    /* RUN NOW GETS THE SCHEDULED FIRE'S TOOLS (B5). Stage one passed no `station`, so runOnce fell back to the broad
+       autonomous office and Run Now had a dish (web_fetch/web_request) the routine's computer-only bay does not —
+       "test it now" proved tools the scheduled fire lacks. Recorded off the REAL provider requests: the floorless
+       fire runs in the default office (dish included), the bay-bound fire only in its bay room. */
+    const toolNamesOf = req => (req.tools || []).map(t => String((t.function && t.function.name) || t.name || ''));
+    A.ok(preFloor.some(r => toolNamesOf(r).indexOf('web_fetch') >= 0), 'before a floor is posted, Run Now runs in the default office (web_fetch offered)');
+    A.ok(stage1 && toolNamesOf(stage1).indexOf('web_fetch') < 0 && toolNamesOf(stage1).indexOf('web_request') < 0,
+      "a bay-bound Run Now runs in its computer-only bay room like the scheduled fire: no dish, no web tools");
     A.ok(sysOf(stage1).indexOf('YOUR STANDING BRIEF FOR THIS STATION:\nDig three primary sources and cite them.') >= 0,
       "stage one's system carries the dock's standing brief under the hub's exact section header");
+    /* A HOP IS NOT A RESUME (token-burn audit 2026-10-17). The downstream stage arrives as ONE handoff turn on the fire's
+       shared cron-<runId> stream; runOnceCore's resume seed used to prepend that stream's transcript — stage one's directive,
+       tool traffic and reply — as the writer's OWN past turns, on top of a handoff that already carries both. Recorded off the
+       REAL provider request of the writer's first call: one user turn, no replayed assistant/tool rows. */
+    const stage2 = mock.requests.slice(callsBefore).find(r =>
+      (r.messages || []).some(m => m.role === 'user' && /^PIPELINE HANDOFF — you are stage 2\b/.test(String(m.content || '').replace(/^[\s\S]*?(?=PIPELINE HANDOFF)/, ''))));
+    A.ok(stage2, "found the writer stage's recorded provider request");
+    const replayed = stage2 ? (stage2.messages || []).filter(m => m.role === 'assistant' || m.role === 'tool') : [];
+    A.eq(replayed.length, 0, 'the writer stage is NOT seeded with stage one\'s turns (its handoff already carries the upstream output)');
+    A.ok(stage2 && (stage2.messages || []).filter(m => m.role === 'user').length === 1, 'the writer stage carries exactly its one handoff turn');
 
     /* ---- A ROUTINE THAT DOES NOT BELONG TO THE LINE BUYS EXACTLY ONE RUN (2026-08-07, Andrew's ruling) ----
        THE MONEY CASE, on the real Run Now path and the same armed two-stage floor. Deciding "does this fire a
@@ -257,6 +287,14 @@ async function readNdjson(res) {
       A.eq(mk.status, 200, 'a routine created WITHOUT the marker is accepted');
       const legacy = (await mk.json()).job;
       A.eq(legacy.runsLine, false, 'and it is terminal by default — the durable record says so');
+      /* SETTLE FIRST: the previous stage's fire-and-forget aux passes (reflection, then the profile update) can still be
+         in flight here, and one that lands after the window opens is counted against this routine. That race flaked on
+         trunk and turned steady once routine runs stopped paying for a skill review after every run (2026-09-28): the
+         reviews had been slowing the test enough to hide it. Wait until the provider has been quiet for 1.5 s. */
+      for (let last = -1, quiet = 0, n = 0; quiet < 6 && n < 60; n++) {
+        await new Promise(res => setTimeout(res, 250));
+        if (mock.requests.length === last) quiet++; else { last = mock.requests.length; quiet = 0; }
+      }
       const before = mock.requests.length;
       const r = await fetch(B + '/api/cron/run', { method: 'POST', headers, body: JSON.stringify({ id: legacy.id }) });
       A.eq(r.status, 200, 'Run Now streams');

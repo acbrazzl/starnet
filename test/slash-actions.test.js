@@ -4,6 +4,7 @@
    is TOLD. The recurring failure this guards is a command that reports success the store never performed —
    a created routine that cannot fire, a queued build behind an OFF grant, a deleted routine that still exists. */
 'use strict';
+const { readSidecarSource } = require('./helpers/source');
 
 const A = require('./_assert.js');
 const { makeSlashActions } = require('../sidecar/slash-actions.js');
@@ -100,6 +101,21 @@ const mk = (over) => { const d = deps(over); return { S: makeSlashActions(d), ca
     const r = await S.run('routine', 'add every 30m | check the build');
     A.ok(r.ok, 'creating while disarmed still succeeds');
     A.ok(/NOT armed/.test(r.text), 'creating while disarmed says it will not fire');
+  }
+
+  {
+    // (org wire AUTO-P16-1) ONE ARM RULE: the host's save turns a never-set switch on (scheduler.armedNow) and keeps an explicit OFF
+    let armedS = false;
+    const { S } = mk({ cron: { armed: () => armedS, create: async (spec) => { armedS = true; return { ok: true, job: job({ name: spec.name }), scheduler: { armed: true, armedNow: true, offByChoice: false } }; } } });
+    const r = await S.run('routine', 'add every 30m | check the build');
+    A.ok(/Scheduling is now on\./.test(r.text) && !/NOT armed/.test(r.text), '/routine add says the save turned scheduling on: ' + r.text);
+    const off = await mk({ cron: { armed: () => false, offByChoice: () => true, create: async (spec) => ({ ok: true, job: job({ name: spec.name }), scheduler: { armed: false, armedNow: false, offByChoice: true } }) } })
+      .S.run('routine', 'add every 30m | check the build');
+    A.ok(/Scheduling is off \(you turned it off\), so nothing will fire — \/cron on to turn it on\./.test(off.text) && !/now on/.test(off.text), 'an explicit OFF is kept and said as the Commander\'s choice: ' + off.text);
+    const fs = require('fs'), path = require('path');
+    const idx = readSidecarSource();
+    const host = idx.slice(idx.indexOf('const slashActions = slashActionsMod.makeSlashActions({'), idx.indexOf('const slashActions = slashActionsMod.makeSlashActions({') + 2400);
+    A.ok(/armedNow = armOnSaveIfUnset\(\) && !cronHalted;/.test(host) && /offByChoice: \(\) => !cronArmed && !!cronArmSet,/.test(host), 'the host\'s /routine add create goes through the one arm rule and exposes the explicit OFF');
   }
 
   {
@@ -261,8 +277,9 @@ const mk = (over) => { const d = deps(over); return { S: makeSlashActions(d), ca
     });
     const r = await S.run('away', 'list');
     A.ok(/2 queued/.test(r.title), 'the listing counts the backlog');
-    A.ok(/built — waiting in OUTBOX/.test(r.lines[1]), 'a finished build is marked as waiting');
-    A.ok(r.lines.some(l => /waiting for your keep\/discard/.test(l)), 'pending builds are surfaced');
+    A.ok(/built — waiting in DELIVERABLES › NEEDS A DECISION/.test(r.lines[1]), 'a finished build is marked as waiting where it is decided (the library\'s NEEDS A DECISION)');
+    A.ok(!r.lines.some(l => /TO REVIEW/.test(l)), 'never sent to TO REVIEW: that rating list has no KEEP IT or DISCARD (org P12)');
+    A.ok(r.lines.some(l => /waiting for your KEEP IT or DISCARD — open MY WORK › DELIVERABLES \(NEEDS A DECISION\)/.test(l)), 'pending builds are surfaced, with where they are decided');
     A.ok(r.lines.some(l => /Build while away: OFF/.test(l)), 'the grant state is always stated');
   }
 
@@ -275,7 +292,7 @@ const mk = (over) => { const d = deps(over); return { S: makeSlashActions(d), ca
       }
     });
     const r = await S.run('away', 'list');
-    A.ok(!/waiting in OUTBOX/.test(r.lines[0]), 'a build whose manifest no longer validates is not shown as waiting');
+    A.ok(!/waiting in (OUTBOX|DELIVERABLES)/.test(r.lines[0]), 'a build whose manifest no longer validates is not shown as waiting');
     A.ok(/files are gone/.test(r.lines[0]), 'it says what actually happened to it');
   }
 
@@ -285,7 +302,7 @@ const mk = (over) => { const d = deps(over); return { S: makeSlashActions(d), ca
     const failed = await mk({ workshop: { shiftNow: async () => ({ ok: true, fired: true, reason: 'no-manifest', parked: false }) } })
       .S.run('away', 'now');
     A.eq(failed.ok, false, 'a shift that produced nothing is a failure, not a success');
-    A.ok(!/waits in OUTBOX/.test(failed.text), 'a failed shift never claims work is waiting in OUTBOX');
+    A.ok(!/waits in (OUTBOX|DELIVERABLES)/.test(failed.text), 'a failed shift never claims work is waiting in DELIVERABLES');
     A.ok(/nothing usable/.test(failed.text), 'it says the shift produced nothing usable');
     // a PARKED item will never be retried — the user must be told, or the work silently disappears
     const parked = await mk({ workshop: { shiftNow: async () => ({ ok: true, fired: true, reason: 'run-failed', parked: true }) } })
@@ -295,7 +312,7 @@ const mk = (over) => { const d = deps(over); return { S: makeSlashActions(d), ca
     const built = await mk({ workshop: { shiftNow: async () => ({ ok: true, fired: true, reason: 'built', manifest: { title: 'a build-time dashboard' } }) } })
       .S.run('away', 'now');
     A.ok(/a build-time dashboard/.test(built.text), 'a real build names itself from the manifest');
-    A.ok(/OUTBOX/.test(built.text), 'a real build points at OUTBOX');
+    A.ok(/MY WORK › DELIVERABLES \(NEEDS A DECISION\) for KEEP IT or DISCARD/.test(built.text) && !/TO REVIEW/.test(built.text), 'a real build points at the library\'s NEEDS A DECISION, where KEEP IT / DISCARD live, never TO REVIEW (org P12): ' + built.text);
   }
 
   {
@@ -307,7 +324,7 @@ const mk = (over) => { const d = deps(over); return { S: makeSlashActions(d), ca
     // legible raw. It must name the door that fixes it.
     const cap = await mk({ workshop: { shiftNow: async () => ({ ok: true, fired: false, reason: 'no-capability' }) } })
       .S.run('away', 'now');
-    A.ok(/PROVIDERS/.test(cap.text), 'a missing credential names where to add one');
+    A.ok(/AI & MODELS/.test(cap.text), 'a missing credential names where to add one');
     // an UNKNOWN code is passed through verbatim rather than swallowed or guessed at
     const odd = await mk({ workshop: { shiftNow: async () => ({ ok: true, fired: false, reason: 'brand-new-code' }) } })
       .S.run('away', 'now');
@@ -375,9 +392,22 @@ const mk = (over) => { const d = deps(over); return { S: makeSlashActions(d), ca
     const broken = await makeSlashActions({ budget: { snapshot: async () => { throw new Error('ledger unreadable'); } } }).run('usage', '', {});
     A.eq(broken.ok, false, 'an unreadable ledger is a refusal, never a fabricated zero');
     A.ok(/ledger unreadable/.test(broken.text), 'the real error reaches the user');
+    // the host's own refusal already ends in a period (live 2026-10-20: "…See SETTINGS › SPENDING LIMITS.." on Telegram and COMMS)
+    const unsettled = await makeSlashActions({ budget: { snapshot: async () => ({ ok: false, error: 'Spend history is unavailable or not durably saved. See SETTINGS › SPENDING LIMITS.' }) } }).run('usage', '', {});
+    A.ok(/SPENDING LIMITS\.$/.test(unsettled.text) && !/\.\.$/.test(unsettled.text), 'a refusal that ends in a period is not doubled: ' + unsettled.text);
     const none = await makeSlashActions({}).run('usage', '', {});
     A.eq(none.ok, false, 'usage with no ledger dep refuses instead of reporting zero spend');
+    // UNPRICED + SUBSCRIPTION runs are counted in "N runs" but carry no proven dollars: say so, never imply $0 (sweep/providers)
+    const mixed = await makeSlashActions({ budget: { snapshot: async () => Object.assign({}, SNAP, { unpricedRuns: 2, unmeteredRuns: 3 }) } }).run('usage', '', {});
+    A.ok(mixed.lines.some(l => /2 runs? .*no published price/.test(l) && /3 .*subscription/.test(l) && /not in these dollars/.test(l)), 'unpriced and subscription runs are named as outside the dollar figures (' + mixed.lines.join(' | ') + ')');
+    A.ok(!r0usageHasCaveat(await makeSlashActions({ budget: { snapshot: async () => SNAP } }).run('usage', '', {})), 'a fully priced ledger carries no caveat line');
+    // a run STOPPED mid-answer (80de2a75) is on a priced model: its booked dollars are in the total, as a floor — never
+    // the "no published price" caveat
+    const cut = await makeSlashActions({ budget: { snapshot: async () => Object.assign({}, SNAP, { usageMissingRuns: 1 }) } }).run('usage', '', {});
+    A.ok(cut.lines.some(l => /^1 run stopped mid-answer/.test(l) && /at least/.test(l)), 'a stopped run says the dollars are a floor (' + cut.lines.join(' | ') + ')');
+    A.ok(!r0usageHasCaveat(cut), 'a stopped run on a priced model is never called unpriced or a subscription (' + cut.lines.join(' | ') + ')');
   }
+  function r0usageHasCaveat(res) { return res.lines.some(l => /no published price|subscription/.test(l)); }
 
   /* ---------------- contract ---------------- */
   {

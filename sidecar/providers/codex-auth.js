@@ -194,7 +194,9 @@
     if (resp.status === 429) {
       // Quota exhausted on the token endpoint — the refresh token is still valid, so re-auth would not help.
       // Classify distinctly so the UI says "retry later" instead of a misleading "sign in again".
-      throw authError('Codex provider quota exhausted (429). Credentials are still valid; retry after the limit resets.', 'codex_rate_limited', false);
+      // A 429 HERE is the auth service throttling refreshes — quota lives at the inference API — so no 'quota' word: the
+      // browser read it as an empty wallet ("out of credit") on a subscription that has none (sweep/providers 2026-10-20).
+      throw authError('The OpenAI sign-in service is rate-limiting token refresh (HTTP 429). Your credentials are still valid; wait a minute and try again.', 'codex_rate_limited', false);
     }
     if (resp.status !== 200) {
       let code = 'codex_refresh_failed', message = 'Codex token refresh failed with status ' + resp.status + '.', relogin = false;
@@ -213,8 +215,11 @@
       } catch (e) { /* keep the status-based default */ }
       if (code === 'invalid_grant' || code === 'invalid_token' || code === 'invalid_request') relogin = true;
       if (code === 'refresh_token_reused') {
-        message = 'Codex refresh token was already consumed by another client (e.g. the Codex CLI or VS Code extension). '
-          + 'Run `codex` in your terminal to mint fresh tokens, then sign in with ChatGPT again.';
+        // #92: no Codex CLI needed — StarNet's own device-code sign-in mints fresh tokens. A copied station
+        // folder carries the single-use refresh token too, so name that cause alongside the CLI/editor.
+        message = 'Codex refresh token was already consumed by another client (the Codex CLI, the VS Code extension, '
+          + 'or a copy of this station on another computer). Sign in with ChatGPT again: ⏼ RECONNECT on the ChatGPT card '
+          + 'in SETTINGS › AI & MODELS.';
         relogin = true;
       }
       if ((resp.status === 401 || resp.status === 403) && !relogin) relogin = true;   // a 401/403 always means dead refresh token

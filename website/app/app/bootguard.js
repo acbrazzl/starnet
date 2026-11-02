@@ -37,7 +37,7 @@
   const TAIL = 24;   // bounded tails: diagnostics need the shape of the failure, not an unbounded log
   const state = {
     uncaught: 0, rejections: 0, scriptFailures: 0,
-    errors: [], rejected: [], scripts: [],
+    errors: [], rejected: [], scripts: [], where: [],
     missing: [], checked: false, fired: false, startedAt: Date.now(),
     // shared/ catalog retry ledger — see header (4). attempts counts retries scheduled since page load;
     // pending is the retry currently in flight (verify() defers the banner while one is); recovered marks a
@@ -138,6 +138,15 @@
     // reload budget spent (a flapping engine): the page is still bound to an empty catalog → say so.
     r.exhausted = true; if (r.deferred) verify();
   }
+  // the error's TYPE name ('SyntaxError', 'TypeError', …) or '' — a bare identifier, so it can never carry data
+  function errorKind(e) {
+    try {
+      const n = e && e.error && typeof e.error.name === 'string' ? e.error.name : '';
+      if (/^[A-Z][A-Za-z]{0,40}Error$/.test(n)) return n;
+      const m = /^(?:Uncaught )?([A-Z][A-Za-z]{0,40}Error)\b/.exec(String((e && e.message) || ''));
+      return m ? m[1] : '';
+    } catch (_) { return ''; }
+  }
   function reasonText(r) {
     if (r == null) return 'unhandled rejection (no reason)';
     if (typeof r === 'object') return String(r.message || r.reason || r.name || (function () { try { return JSON.stringify(r); } catch (_) { return '[object]'; } })());
@@ -160,7 +169,14 @@
         return;
       }
       state.uncaught++;
-      push(state.errors, (e && e.message ? e.message : 'error') + ' @ ' + shortPath(e && e.filename) + (e && e.lineno ? ':' + e.lineno : ''));
+      const at = shortPath(e && e.filename) + (e && e.lineno ? ':' + e.lineno : '');
+      push(state.errors, (e && e.message ? e.message : 'error') + ' @ ' + at);
+      // WHERE, for the copied diagnostics (#136: "page errors: 1 uncaught error(s)" was all a Mac report could say while a
+      // SyntaxError dropped app/workflowline.js). File:line + the error's type name only — never the message, which can
+      // carry data — so a module that failed to parse is named by every report, banner or not. Distinct places, FIRST seen
+      // kept (a boot-time parse error must not be pushed out by a later error looping in one place), bounded.
+      const kind = errorKind(e), w = at + (kind ? ' (' + kind + ')' : '');
+      if (state.where.indexOf(w) < 0 && state.where.length < TAIL) state.where.push(w.slice(0, 300));
     } catch (_) {}
   }
   function onRejection(e) {
@@ -189,11 +205,27 @@
   }
 
   /* ---- 3. the report + the banner ---- */
+  /* AN OUTDATED WEB ENGINE is not a broken file. macOS 10.15 (Safari 13 WebKit, 2026-10-08 report) parsed the bundle
+     into four SyntaxError/TypeErrors — regex lookbehind, class fields, replaceChildren, MediaQueryList listeners —
+     and the banner said "a broken or blocked file", which RELOAD can never fix. The station code needs regex
+     lookbehind (Safari 16.4 WebKit); on macOS the app window uses the SYSTEM WebKit, which only updates with
+     Safari / macOS. Two literal feature probes (the CSP forbids eval, not `new RegExp`) name the real cause. */
+  function webviewTooOld() {
+    try { new RegExp('(?<=a)b'); } catch (_) { return true; }
+    try { if (typeof Element !== 'undefined' && Element.prototype && !Element.prototype.replaceChildren) return true; } catch (_) {}
+    return false;
+  }
+  function isMacUA() {
+    try { return /Macintosh|Mac OS X/.test(String(root.navigator && root.navigator.userAgent || '')); } catch (_) { return false; }
+  }
   function summaryLine() {
     const parts = [];
     if (state.scriptFailures) parts.push(state.scriptFailures + ' script load failure(s): ' + state.scripts.join(', '));
     if (state.missing.length) parts.push(state.missing.length + ' missing module(s): ' + state.missing.map(m => m.name).join(', '));
-    if (state.uncaught) parts.push(state.uncaught + ' uncaught error(s)');
+    if (state.uncaught) {
+      const w = state.where;
+      parts.push(state.uncaught + ' uncaught error(s)' + (w.length ? ' at ' + w.slice(0, 4).join(', ') + (w.length > 4 ? ' +' + (w.length - 4) + ' more' : '') : ''));
+    }
     if (state.rejections) parts.push(state.rejections + ' unhandled rejection(s)');
     return parts.length ? parts.join(' · ') : 'none recorded since page load';
   }
@@ -206,6 +238,7 @@
     if (state.missing.length) L.push('missing:        ' + state.missing.map(m => m.name + ' (' + m.file + ')').join(', '));
     if (state.scripts.length) L.push('scripts failed: ' + state.scripts.join(', '));
     if (state.retry.attempts) L.push('shared retry:   ' + state.retry.attempts + ' attempt(s) for ' + state.retry.src + (state.retry.recovered ? ' — recovered (reloaded ' + state.retry.reloads + '×)' : state.retry.exhausted ? ' — script load retries exhausted' : ' — in progress'));
+    if (webviewTooOld()) L.push('web engine:     TOO OLD — no regex lookbehind / replaceChildren (needs Safari 16.4+ WebKit on macOS)');
     L.push('page errors:    ' + summaryLine());
     state.errors.forEach(x => L.push('  error:        ' + x));
     state.rejected.forEach(x => L.push('  rejection:    ' + x));
@@ -232,13 +265,20 @@
     const wrap = doc.createElement('div');
     wrap.id = 'bootguard-fatal'; wrap.className = 'bgf'; wrap.setAttribute('role', 'alert');
     // inline essentials so the banner is visible even if app.css itself failed to arrive
-    wrap.style.cssText = 'position:fixed;inset:0;z-index:900;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.88);font-family:VT323,monospace;';
+    // top/left/right/bottom, not `inset`: the outdated-engine case below must still cover the window (inset is Safari 14.1+)
+    wrap.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:900;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.88);font-family:VT323,monospace;';
 
     const card = doc.createElement('div'); card.className = 'bgf-card';
     const head = doc.createElement('div'); head.className = 'bgf-head';
-    head.textContent = '▮ STATION FAILED TO BOOT';
+    const old = webviewTooOld();
+    const mac = isMacUA();
+    head.textContent = old ? (mac ? '▮ STARNET NEEDS A NEWER macOS' : '▮ STARNET NEEDS A NEWER WEB ENGINE') : '▮ STATION FAILED TO BOOT';
     const lead = doc.createElement('div'); lead.className = 'bgf-lead';
-    lead.textContent = 'the app window loaded, but a required module did not. this is a broken or blocked file, not your station — your saved station has not been changed by this screen.';
+    lead.textContent = old
+      ? (mac
+        ? 'this Mac’s built-in web engine is too old to run StarNet. StarNet needs macOS 11 Big Sur or later with Safari 16.4 or newer — macOS 13.3 Ventura or later works out of the box. nothing is broken and your station is untouched: update macOS (or Safari) in System Settings, then reopen StarNet.'
+        : 'this computer’s web engine is too old to run StarNet (it has no regular-expression lookbehind). nothing is broken and your station is untouched: update the system web engine (WebKitGTK on Linux, WebView2 on Windows), then reopen StarNet.')
+      : 'the app window loaded, but a required module did not. this is a broken or blocked file, not your station — your saved station has not been changed by this screen.';
     const list = doc.createElement('ul'); list.className = 'bgf-list';
     why.forEach(w => { const li = doc.createElement('li'); li.textContent = w; list.appendChild(li); });
     const pre = doc.createElement('pre'); pre.className = 'bgf-pre'; pre.textContent = report();
@@ -256,7 +296,7 @@
     };
     const reloadBtn = doc.createElement('button'); reloadBtn.type = 'button'; reloadBtn.className = 'btn-xl bgf-reload'; reloadBtn.textContent = '⟳ RELOAD';
     reloadBtn.onclick = () => { try { root.location.reload(); } catch (_) {} };
-    acts.appendChild(copyBtn); acts.appendChild(reloadBtn);
+    acts.appendChild(copyBtn); if (!old) acts.appendChild(reloadBtn);   // RELOAD cannot update a web engine
     card.appendChild(head); card.appendChild(lead); card.appendChild(list); card.appendChild(pre); card.appendChild(acts);
     wrap.appendChild(card);
     doc.body.appendChild(wrap);
@@ -285,6 +325,6 @@
     state: () => state,
     installed, summaryLine, report, check, render, verify,
     PROBES: PROBES.map(p => ({ name: p[0], file: p[1] })),
-    _internals: { onError, onRejection, shortPath, isStationScript, isSharedScript, reasonText, PROBES, RETRY_WAITS, RELOAD_MAX }
+    _internals: { webviewTooOld, onError, onRejection, shortPath, isStationScript, isSharedScript, reasonText, errorKind, PROBES, RETRY_WAITS, RELOAD_MAX }
   };
 });

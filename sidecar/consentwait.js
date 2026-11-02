@@ -17,6 +17,7 @@
    Pure + injected deps (map, signal, clock, uuid, emit) so the timing semantics are unit-testable with fake
    timers (test/consentwait.test.js) — the REAL sidecar path rides this exact module, not a copy. */
 'use strict';
+const { note } = require('./failopen.js');   // a failing auto-deny announcer is noted, never silent
 
 function makeConsentWait(deps) {
   const pending = deps.pending;                 // Map: promptId -> finish(decision) (handleConsent's lookup)
@@ -27,13 +28,35 @@ function makeConsentWait(deps) {
   const setT = deps.setTimeoutFn || setTimeout;
   const clearT = deps.clearTimeoutFn || clearTimeout;
   const emitPrompt = deps.emitPrompt;           // (promptId) => emit the permission.prompt event
+  // (promptId) => tell the run's surfaces nobody answered: a timeout or a dropped run fail-closes to deny, and the page's
+  // card / CREW frame must not keep asking a question the run already stopped waiting on (sweep 2026-10-02). Its second
+  // argument says which: true = the timer expired (nobody answered), false = the asker's signal aborted (it was stopped)
+  const onAutoDeny = typeof deps.onAutoDeny === 'function' ? deps.onAutoDeny : null;
+  /* TIMEOUT IS NOT A NO (2026-10-11). An unanswered prompt still fail-closes, but a caller may ask for the timer's
+     expiry to resolve with its OWN decision word (channels pass 'timeout'; the broker maps it to a distinct denial the
+     model reads as "nobody answered", never "the Commander declined") and to hear about it (onTimeout -> the chat is
+     told the action did not run). An abort/disconnect stays a plain 'deny'. Absent = byte-identical to before. */
+  const timeoutDecision = typeof deps.timeoutDecision === 'string' && deps.timeoutDecision ? deps.timeoutDecision : 'deny';
+  /* A WITHDRAWN ASK IS NOT A NO EITHER (review 10-14). An abort (the run stopped, the page went away) or a prompt never shown
+     resolves with the caller's abortDecision when it names one — the capability consent passes 'cancelled', which the broker
+     keeps CLOSED but marks withdrawn, so a worker whose ask died with its run never tells the Commander "you declined".
+     The finisher carries it (finish.abortDecision) for the host's own teardown. Absent = a plain 'deny', as before. */
+  const abortDecision = typeof deps.abortDecision === 'string' && deps.abortDecision ? deps.abortDecision : 'deny';
+  const onTimeout = typeof deps.onTimeout === 'function' ? deps.onTimeout : null;
 
   // ask() returns a Promise<decision string>; the registered finisher carries .extend() for the ack route.
   function ask() {
     return new Promise((resolve) => {
       const promptId = uuid();
       let settled = false, timer = null, extended = false;
-      function onAbort() { finish('deny'); }
+      function onAbort() { autoDeny(false); }
+      function onTimer() { autoDeny(true); }
+      function autoDeny(expired) {
+        if (settled) return;
+        finish(expired ? timeoutDecision : abortDecision);
+        if (onAutoDeny) { try { onAutoDeny(promptId, expired === true); } catch (e) { note('consent.autoDeny', e); } }
+        if (expired && onTimeout) { try { onTimeout(promptId); } catch (e) { note('consent.onTimeout', e); } }
+      }
       function finish(decision) {
         if (settled) return; settled = true;
         pending.delete(promptId);
@@ -46,13 +69,14 @@ function makeConsentWait(deps) {
         if (settled || extended) return false;
         extended = true;
         if (timer) clearT(timer);
-        timer = setT(() => finish('deny'), extendMs);
+        timer = setT(onTimer, extendMs);
         return true;
       };
+      finish.abortDecision = abortDecision;
       pending.set(promptId, finish);
-      if (signal.aborted) return finish('deny');
+      if (signal.aborted) return finish(abortDecision);   // never shown: nothing to retract
       signal.addEventListener('abort', onAbort, { once: true });
-      timer = setT(() => finish('deny'), timeoutMs);
+      timer = setT(onTimer, timeoutMs);
       emitPrompt(promptId);
     });
   }

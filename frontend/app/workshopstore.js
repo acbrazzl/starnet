@@ -194,7 +194,8 @@ const WorkshopStore = (() => {
     try {
       const r = await fetch('/api/workshop/decide', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       const j = await r.json().catch(() => null);
-      if (r.ok && j && j.ok !== false) {
+      if (r.ok && j && j.ok === true) {
+        if (decision !== 'later' && typeof NeedsYou !== 'undefined' && NeedsYou.refreshFeeds) NeedsYou.refreshFeeds(true);   // org P01: its NEEDS YOU row leaves now
         const keptPath = (j && j.destPath) || body.destPath;
         // Keep is a filesystem copy only. Renderer IPC cannot prove a fresh user
         // gesture, so a run may not launch an OS file manager on the user's desktop.
@@ -210,40 +211,24 @@ const WorkshopStore = (() => {
   }
 
   /* IMPLEMENT-AS-BUILD (2026-08-14) — POST /api/workshop/implement and run what a PLAN deliverable describes.
-     The response is an NDJSON run stream, not a JSON body, so Harness.api.post (which calls r.json() on the whole
-     body) cannot read it — every frame is parsed here instead. Each frame is re-emitted onto U.bus exactly like
-     harness.js's run reader, so the station animates the build LIVE (floor, COMMS beats, work item) rather than
-     the Commander staring at a frozen card for minutes. Resolves the final workshop.implement.result payload.
+     The build is a run, so its lines ride the page's ONE run stream (Harness.streamPost — never a connection of its
+     own held for minutes, 2026-10-21). Each line is re-emitted onto U.bus exactly like harness.js's run reader, so
+     the station animates the build LIVE (floor, COMMS beats, work item) rather than the Commander staring at a frozen
+     card for minutes. Resolves the final workshop.implement.result payload.
      Never throws: an unreachable station resolves { fired:false, reason:'unreachable' }. */
   async function implement(agentId, runId, note) {
     const body = { agentId: agentId || 'agent', runId: String(runId) };
     // what the Commander typed on the card — WHICH part of the plan to build. Rides into the build prompt, not
     // the chat stream (see chat.js: on a buildable card the box is a build steer, not a message).
     if (note != null && String(note).trim()) body.note = String(note).trim().slice(0, 2000);
-    let res;
-    try {
-      res = await fetch('/api/workshop/implement', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    } catch (_) { return { fired: false, reason: 'unreachable' }; }
-    if (!res.ok || !res.body) return { fired: false, reason: 'http ' + res.status };
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = '', result = null;
-    try {
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        let nl;
-        while ((nl = buf.indexOf('\n')) >= 0) {
-          const s = buf.slice(0, nl).trim();
-          buf = buf.slice(nl + 1);
-          if (!s) continue;
-          let ev; try { ev = JSON.parse(s); } catch (_) { continue; }
-          if (ev.name === 'workshop.implement.result') { result = ev.payload || {}; continue; }
-          if (typeof U !== 'undefined' && U.bus) { try { U.bus.emit(ev.name, ev.payload || {}); } catch (_) {} }
-        }
-      }
-    } catch (_) { /* a dropped stream mid-build: the run continues server-side; report what we latched */ }
+    if (typeof Harness === 'undefined' || !Harness.streamPost) return { fired: false, reason: 'unreachable' };
+    let result = null;
+    const r = await Harness.streamPost('/api/workshop/implement', body, { onEvent: (name, payload) => {
+      if (name === 'workshop.implement.result') { result = payload || {}; return; }
+      if (typeof U !== 'undefined' && U.bus) { try { U.bus.emit(name, payload || {}); } catch (_) {} }
+    } });
+    if (!r.ok) return { fired: false, reason: r.status ? 'http ' + r.status : 'unreachable' };
+    try { await r.done; } catch (_) { /* a dropped stream mid-build: the run continues server-side; report what we latched */ }
     return result || { fired: false, reason: 'no-result' };
   }
 
@@ -279,19 +264,13 @@ const WorkshopStore = (() => {
   }
 
   // W7 — the URL that RUNS a workshop file in a browser tab, served from the jailed read-only /workshop-run/ static
-  // route. A tab navigation (window.open) can't send the token header, so it rides ?token= exactly like /api/file.
-  // The per-launch token is injected synchronously into the page (window.__STARNET_API_TOKEN__), so read it directly
-  // (Harness.apiToken() is a promise — not usable in a sync href). Returns '' if the token isn't present yet.
+  // route. A tab navigation (window.open) can't send the token header, so the URL carries a RUN-SCOPED 10-minute
+  // ticket in its path (/workshop-run/~t/<ticket>/<agent>/<run>/<file>) — relative assets inherit it, nothing else
+  // is reachable with it, and the master token never lands in (OS-)browser history. Minted synchronously so the
+  // open stays inside the click gesture; absolute sidecar base on desktop (ApiTicket). '' when no token is present.
   function runUrl(agentId, runId, relPath) {
-    const tok = (typeof window !== 'undefined' && window.__STARNET_API_TOKEN__) ? String(window.__STARNET_API_TOKEN__) : '';
-    if (!tok) return '';
-    // Desktop: the page's origin is the Tauri webview (bundled frontend), NOT the sidecar, and the injected
-    // fetch shim only rewrites '/api/'-prefixed strings — so this URL must carry the sidecar base explicitly
-    // (window.__STARNET_API__ = http://127.0.0.1:<port>). Browser build: __STARNET_API__ is unset → relative.
-    const base = (typeof window !== 'undefined' && window.__STARNET_API__) ? String(window.__STARNET_API__) : '';
-    const parts = String(relPath || '').split('/').map(encodeURIComponent).join('/');
-    return base + '/workshop-run/' + encodeURIComponent(agentId || 'agent') + '/' + encodeURIComponent(runId) + '/' + parts
-      + '?token=' + encodeURIComponent(tok);
+    if (typeof ApiTicket === 'undefined' || !ApiTicket.runUrl) return '';
+    return ApiTicket.runUrl(agentId || 'agent', runId, relPath);
   }
 
   // W7 — OS launch is intentionally unavailable: neither loopback API possession nor
@@ -306,6 +285,8 @@ const WorkshopStore = (() => {
   /* ---- SESSION DELIVERY (the seam that replaced feed injection, 2026-07-15) ---- */
   const SESSION_PREFIX = 'workshop-';   // = the sidecar's shift streamId prefix, so session id ≡ durable stream
   const sessionIdOf = (runId) => SESSION_PREFIX + String(runId);
+  // the session's name as the rail shows it (NEEDS YOU names a build's row by it before the click adopts the session)
+  const sessionTitleOf = (m) => (String((m && m.title) || '').trim() || 'built while you were away').slice(0, 70);
 
   // Adopt (idempotent) the deliverable's OWN session: unread in the rail, never focused. A re-offer of a
   // still-undecided deliverable bumps the existing session unread again (Workstreams.markUnread — undecided =
@@ -320,14 +301,17 @@ const WorkshopStore = (() => {
     if (existing) {
       // re-flag unread (undecided = still owed) WITHOUT re-stamping lastActiveAt — touch() here made the
       // rail's "last worked" time read "now" on every boot/return poll even though nothing new happened.
-      if (Workstreams.markUnread) Workstreams.markUnread(id);
+      // with THE ONE RETURN REPORT live, the briefing session carries the single "still owed" flag — N build rows
+      // re-bolding on every return poll was the pile-of-sessions feeling; the build stays reachable from the briefing
+      if (briefingOwnsReturn()) { /* no re-flag */ }
+      else if (Workstreams.markUnread) Workstreams.markUnread(id);
       else if (Workstreams.touch) Workstreams.touch(id);   // older store without markUnread: keep the unread bump
     } else {
       // DELETED = GONE: the Commander removed this deliverable's session; adopt() refuses the
       // tombstoned id, so the row must not re-form (the delete path also discards server-side).
       const adopted = Workstreams.adopt({
         id: id,
-        title: '⚒ ' + (String(m.title || '').trim() || 'built while you were away').slice(0, 70),
+        title: sessionTitleOf(m),
         agentId: m.agentId || 'agent', lane: 'active', kind: 'chat',
         history: [{ role: 'system', sys: true, content: '⚒ built while you were away — “' + String(m.title || 'a deliverable') + '”.'
           + (String(m.summary || '').trim() ? ' ' + String(m.summary).trim() : '')
@@ -390,6 +374,7 @@ const WorkshopStore = (() => {
   // Returns true when the reveal happened; false → the caller keeps the unread-row + toast fallback. The
   // direct presentCard makes the card unconditional on the open (chat.js load() → presentFor also fires and
   // re-fetches; its data-wsrun dedupe keeps exactly one live card).
+  function briefingOwnsReturn() { try { return typeof Briefing !== 'undefined' && !!(Briefing.ownsReturn && Briefing.ownsReturn()); } catch (_) { return false; } }
   function reveal(m) {
     if (!m || !m.runId) return false;
     if (commanderEngaged()) return false;
@@ -474,7 +459,7 @@ const WorkshopStore = (() => {
       if (!ws || historyTellsTheStory(ws)) return;
       let row = null;
       try {
-        const r = await fetch('/api/deliverables?query=' + encodeURIComponent(runId), { cache: 'no-store' });
+        const r = await fetch('/api/deliverables?includeCleared=1&query=' + encodeURIComponent(runId), { cache: 'no-store' });
         if (r.ok) {
           const j = await r.json().catch(() => null);
           const items = (j && Array.isArray(j.items)) ? j.items : [];
@@ -517,7 +502,7 @@ const WorkshopStore = (() => {
     // ensureSession returns null for a deliverable whose session the Commander DELETED — never
     // resurrect it, and never reveal it (deleted = gone, the whole point of the tombstone).
     const live = pending.filter(m => ensureSession(m) != null);
-    if (live.length) reveal(live[live.length - 1]);   // backlog order: last = newest build
+    if (live.length && !briefingOwnsReturn()) reveal(live[live.length - 1]);   // backlog order: last = newest build (the briefing greets the return instead when it is live)
   }
 
   /* RETURN RE-PRESENT (2026-07-14, reshaped for session delivery 2026-07-15): a night-shift build lands
@@ -530,7 +515,7 @@ const WorkshopStore = (() => {
     if (!enabled) return;
     const list = (await fetchRaw()).filter(m => m && m.runId && !state.later[m.runId]);
     const live = list.filter(m => ensureSession(m) != null);   // deleted sessions stay deleted
-    if (live.length) reveal(live[live.length - 1]);   // greet the return with the newest build's card
+    if (live.length && !briefingOwnsReturn()) reveal(live[live.length - 1]);   // greet the return with the newest build's card (or let the briefing do it)
   }
 
   /* LIVE PUSH — the attach-time poll above only covers session OPEN, so a deliverable that landed while the
@@ -550,11 +535,13 @@ const WorkshopStore = (() => {
     if (ensureSession(m) == null) return;   // marks seen; a DELETED session never re-forms or re-toasts
     // DELIVERY REVEAL: the moment the build lands, open its session with the full card. Fallback (the
     // Commander is mid-something, or no App yet): unread row + ONE actionable toast that jumps there.
+    // the Commander is AWAY: the build waits in its session and the ONE briefing reports it on return — no focus jump, no toast
+    if (briefingOwnsReturn() && Briefing.isAway && Briefing.isAway()) return;
     const opened = reveal(m);
     if (!opened) try {
       if (typeof StationUI !== 'undefined' && StationUI.notify) {
         const jump = () => { try { if (typeof App !== 'undefined' && App.openWorkstream) App.openWorkstream(sessionIdOf(runId)); } catch (_) {} };
-        StationUI.notify('✦ built while you were away: ' + String(m.title || 'a deliverable') + ' — click to review it', 'gold', 'cronDigest', { onClick: jump });
+        StationUI.notify('✦ built while you were away: ' + String(m.title || 'a deliverable') + ' — click to review it', 'gold', 'cronDigest', { onClick: jump, kind: 'result', go: { ws: sessionIdOf(runId) } });
       }
     } catch (_) {}
     try { if (typeof World !== 'undefined' && World.say) World.say('✦ finished a build — it’s waiting in its own session'); } catch (_) {}   // ambient in-world cue, same family as the desk-draft delivery
@@ -576,7 +563,9 @@ const WorkshopStore = (() => {
   // S2/new-hero: a fresh Commander inherits no prior "later" list.
   function reset() { state = hydrate(null); fired = false; try { localStorage.removeItem(KEY); } catch (_) {} }
 
-  return { init, queue, decide, implement, discardIfPending, readFile, runUrl, openFile, desktopDefault, fetchPending, presentOnReturn, presentFor, ensureSession, reset, queueConfirmLine, grantOf, openGrant, onBuilt, _hydrate: hydrate, _pfDelays: pfDelays, _maybePresent: maybePresent };
+  // pendingAll(): every agent's undecided builds, unfiltered (NEEDS YOU lists each one, org P01); pendingAllOk(): whether
+  // that last read was answered by the station (an unreachable station is not "nothing to decide")
+  return { init, queue, decide, implement, discardIfPending, readFile, runUrl, openFile, desktopDefault, fetchPending, pendingAll: fetchRaw, pendingAllOk: () => lastRawOk, presentOnReturn, presentFor, ensureSession, sessionIdOf, sessionTitleOf, reset, queueConfirmLine, grantOf, openGrant, onBuilt, _hydrate: hydrate, _pfDelays: pfDelays, _maybePresent: maybePresent };
 })();
 
 if (typeof module !== 'undefined' && module.exports) module.exports = { WorkshopStore };

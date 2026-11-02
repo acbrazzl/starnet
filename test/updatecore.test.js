@@ -3,6 +3,7 @@
    overlap, retry backoff, notification de-dupe, remind-later, skip-version, and
    progress math. */
 'use strict';
+const { readSidecarSource } = require('./helpers/source');
 const A = require('./_assert.js');
 const U = require('../frontend/app/updatecore.js');
 const fs = require('fs');
@@ -50,6 +51,23 @@ const now = 1_000_000;
   A.eq(s.nextCheckAt, now + U.RETRY_MAX_MS, 'retry delay caps');
 }
 
+// A remembered update may bypass the steady interval, never a failed-check retry deadline.
+{
+  let s = U.recordCheckResult({}, { update: { version: '0.13.2' } }, now);
+  const runtime = { desktop: true, phase: 'error', hasUpdate: false, currentVersion: '0.13.1' };
+  for (let attempt = 1; attempt <= 7; attempt++) {
+    s = U.recordCheckError(s, now);
+    const waiting = U.nextAction({ settings: s, runtime, now: s.nextCheckAt - 1 });
+    A.eq(waiting.action, 'noop', 'known update respects retry deadline on failure ' + attempt);
+    A.eq(waiting.nextAt, s.nextCheckAt, 'retry preserves exponential deadline ' + attempt);
+    A.eq(U.nextAction({ settings: s, runtime, now: s.nextCheckAt }).action, 'check', 'retry resumes exactly at deadline ' + attempt);
+  }
+  A.eq(U.nextAction({ settings: U.hydrateSettings(JSON.parse(JSON.stringify(s))), runtime: { ...runtime, phase: 'idle' }, now }).action,
+    'noop', 'restart preserves failed-check backoff');
+  s = U.recordCheckResult(s, { update: { version: '0.13.2' } }, now);
+  A.eq(U.nextAction({ settings: s, runtime, now }).reason, 'known-update', 'successful checks permit immediate rearming again');
+}
+
 // ---- notification loop: once per version, critical bypasses skips/reminders ----
 {
   let s = U.hydrateSettings(null);
@@ -87,6 +105,37 @@ const now = 1_000_000;
   A.ok(/2 agents/.test(U.installBlockReason('2', false) || ''), 'numeric-string count still guards');
 }
 
+// ---- a found update survives a restart: the next launch re-arms it instead of waiting out the interval ----
+// (0.13.1 → 0.13.2 report: the toast fires once per version and the native pending update lives only in memory,
+//  so a restart inside CHECK_INTERVAL_MS showed "no update" while the station already knew one existed.)
+{
+  let s = U.recordCheckResult({}, { checkedAt: now, update: { version: '0.13.2' } }, now);
+  A.eq(s.availableVersion, '0.13.2', 'a check that finds an update remembers its version');
+  s = U.recordNotified(s, '0.13.2');
+  const later = now + HOUR;   // well inside the 6h interval
+  const a = U.nextAction({ settings: s, runtime: { desktop: true, phase: 'idle', hasUpdate: false, currentVersion: '0.13.1' }, now: later });
+  A.eq(a.action, 'check', 'a relaunch that knows of a newer version checks at once');
+  A.eq(a.reason, 'known-update', 'the reason names the remembered update');
+  A.eq(U.nextAction({ settings: s, runtime: { desktop: true, phase: 'available', hasUpdate: true, currentVersion: '0.13.1' }, now: later }).reason,
+    'waiting-interval', 'once re-armed, the steady interval resumes');
+  A.eq(U.nextAction({ settings: s, runtime: { desktop: true, phase: 'idle', hasUpdate: false, currentVersion: '0.13.2' }, now: later }).reason,
+    'waiting-interval', 'after the update landed, the remembered version is the running one: no forced check');
+  A.eq(U.nextAction({ settings: U.ignoreVersion(s, '0.13.2'), runtime: { desktop: true, phase: 'idle', currentVersion: '0.13.1' }, now: later }).reason,
+    'waiting-interval', 'a skipped version never forces a check');
+  A.eq(U.nextAction({ settings: Object.assign({}, s, { autoCheck: false }), runtime: { desktop: true, phase: 'idle', currentVersion: '0.13.1' }, now: later }).reason,
+    'auto-disabled', 'AUTO-CHECK off still means no automatic request');
+  s = U.recordCheckResult(s, { checkedAt: later, update: null }, later);
+  A.eq(s.availableVersion, '', 'a check that finds nothing forgets the version');
+  A.eq(U.hydrateSettings({ availableVersion: 7 }).availableVersion, '', 'a non-string remembered version is dropped');
+}
+
+// ---- opening the Update Center re-checks unless this launch checked recently ----
+{
+  A.ok(U.shouldCheckOnOpen(0, now), 'no check yet this launch: opening checks');
+  A.ok(!U.shouldCheckOnOpen(now, now + U.OPEN_RECHECK_MS - 1), 'a fresh check this launch is reused');
+  A.ok(U.shouldCheckOnOpen(now, now + U.OPEN_RECHECK_MS), 'a stale answer is re-checked');
+}
+
 // ---- public privacy claims follow the real first-run default and plaintext OAuth inventory ----
 {
   const ROOT = path.resolve(__dirname, '..');
@@ -96,7 +145,7 @@ const now = 1_000_000;
     ['website privacy', read('website/legal/privacy.html')],
     ['website no-credits privacy', read('website/legal/_privacy.nocredits.html')]
   ];
-  const sidecar = read('sidecar/index.js');
+  const sidecar = readSidecarSource();
 
   A.ok(/const OAUTH_PROVIDER_IDS = \['grok', 'kimi'\]/.test(sidecar), 'runtime owns Grok and Kimi OAuth stores');
   A.ok(/path\.join\(WORKSPACES, id, 'tokens\.json'\)/.test(sidecar), 'runtime persists each device-OAuth token under its provider directory');
@@ -106,7 +155,7 @@ const now = 1_000_000;
     A.ok(/Automatic update checks are on by default/i.test(doc), label + ' discloses the default');
     A.ok(/On first run and at the configured interval/i.test(doc), label + ' discloses first-run timing');
     A.ok(/AUTO-CHECK FOR UPDATES/i.test(doc), label + ' names the opt-out control');
-    A.ok(/SYSTEM (?:>|&gt;) SETTINGS (?:>|&gt;) UPDATES/i.test(doc), label + ' names the opt-out location');
+    A.ok(/SYSTEM (?:>|&gt;) SETTINGS (?:>|&gt;) APP (?:&|&amp;) BACKUP/i.test(doc), label + ' names the opt-out location (the AUTO-CHECK toggle lives in SETTINGS › APP & BACKUP)');
     A.ok(!/no ["&quot;]*phone home["&quot;]* of any kind/i.test(doc), label + ' omits the retired absolute phone-home claim');
     A.ok(!/talks to the network[^\n<]*only[^\n<]*work you asked for/i.test(doc), label + ' does not hide the automatic update request');
     for (const provider of ['codex', 'grok', 'kimi']) {

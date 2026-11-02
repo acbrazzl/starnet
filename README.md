@@ -65,7 +65,7 @@ Desktop builds are published on the
 | Platform | Asset |
 | --- | --- |
 | **Windows** (10/11, 64-bit) | `StarNet_<version>_x64-setup.exe` |
-| **macOS — Apple Silicon** (M1–M4) | `StarNet_<version>_aarch64.dmg` |
+| **macOS — Apple Silicon** (M1 or later) | `StarNet_<version>_aarch64.dmg` |
 | **macOS — Intel** | `StarNet_<version>_x64.dmg` |
 
 > **Apple Silicon note:** use the native `aarch64` DMG. Avoid the `x64` DMG on Apple Silicon:
@@ -103,10 +103,12 @@ explicitly use a network tool or connector. See [PRIVACY.md](PRIVACY.md) for the
 ### Run free with a local model
 
 No key, no account, no bill: install [Ollama](https://ollama.com), pull a model
-(`ollama pull llama3.1`), and pick **OLLAMA** as the provider — on the first-run brain screen, or
+(`ollama pull qwen3:8b`), and pick **OLLAMA** as the provider — on the first-run brain screen, or
 later in **SETTINGS → PROVIDERS**. StarNet talks to Ollama on `127.0.0.1:11434` and only reports
-it ready once it can list your local models. Honest caveat: local models are smaller than the
-cloud ones, so expect slower and rougher work on long tasks.
+it ready once it can list your local models. Pick a model that supports tools (`ollama show <model>`
+lists them): agents act through tool calls. Honest caveat: local models are smaller than the
+cloud ones, so expect slower and rougher work on long tasks, and a task needs a large context
+window — an 8B model takes about 10 GB of graphics memory while it works.
 
 For desktop development:
 
@@ -116,11 +118,38 @@ npm run desktop:dev     # dev shell
 npm run desktop:build   # build installers locally
 ```
 
+## Terminal mode
+
+The desktop app ships a `starnet` command beside it. Run it with no arguments and it opens a live
+dashboard on the station the app is running: the crew down the left (a spinner on whoever is working),
+the chosen agent's conversation beside it, and every approval as a card you answer with `y` or `n`
+(`v` shows the full request first). It reads the same state the app does, so it never shows work the
+station cannot prove.
+
+StarNet doesn't have to be open. With it closed, `starnet` starts it in the background: the same station
+with your keys (they stay in the app's keychain), and no window opens; the tray icon shows it's running.
+When the last `starnet` session ends it closes again, unless routines are armed or StarNet is set to stay
+in the tray (the same as closing its window). Opening StarNet while it runs shows that same station; on
+macOS, open it from its menu-bar icon (Open StarNet), since a Dock click doesn't bring that window back yet.
+
+| Platform | The command |
+| --- | --- |
+| **Windows** | `%LOCALAPPDATA%\StarNet\bin\starnet.cmd` |
+| **macOS** | `/Applications/StarNet.app/Contents/Resources/bin/starnet` |
+
+So you can just type `starnet` in a new terminal: the Windows installer puts that folder on your user
+`PATH` (the uninstaller takes it off), and on macOS StarNet links the command into `~/.local/bin` the
+first time it starts, adding that folder to `~/.zprofile` if no shell profile has it yet
+(`STARNET_NO_CLI_LINK=1` turns that off). Other commands: `starnet ls` (every agent
+and its open asks), `starnet approve` / `starnet deny`, `starnet watch` (the live event stream, one line
+each), `starnet flow` (workflows) and `starnet -p "<task>"` (one run, answer on stdout).
+`starnet --help` lists them all. From a checkout, use `node bin/starnet.js`.
+
 ## Coming from OpenClaw or Hermes?
 
 StarNet can import an existing agent: point it at your on-disk OpenClaw or Hermes home and it
 mints a StarNet agent from the persona, instructions, memory, and model it finds. API keys
-never transfer — you re-enter those in the KEYS tab.
+never transfer — you re-enter those in CONNECT › ABILITIES › CONNECTED › API KEYS.
 
 ## Architecture
 

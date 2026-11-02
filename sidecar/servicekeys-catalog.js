@@ -18,6 +18,12 @@
      authHint — the header shape, ONLY where verified. Omitted rather than guessed: a wrong hint would send
                 every agent down a broken path, which is worse than no hint (the agent reads docsUrl).
      note     — anything that would otherwise surprise the user (e.g. OAuth, per-store hosts)
+     retiredDocsUrls — docs links this row USED to carry. A saved key stores its docsUrl and that copy is what
+                the prompt reads, so a key saved before a vendor moved its docs heals to docsUrl on load.
+     apiNotes — the few facts an agent gets wrong without them, ONLY where verified against the vendor's own API
+                reference (with the date). Rides into the system prompt under the key when the run has web_request.
+     apiVia   — set ONLY when the vendor publishes no API of its own; names the API the row actually uses, and
+                the card says "via <apiVia>" instead of claiming a first-party API.
 
    Adding a platform is a DATA ROW here, never new code — same extension model as mcp/catalog.js. */
 'use strict';
@@ -37,7 +43,17 @@
       authHint: 'Authorization: Bearer ${PRINTIFY_API_KEY}',
       aliases: ['pod', 'print on demand', 'merch', 'marketplace products'],
       blurb: 'Print-on-demand: shops, blueprints, products, orders, publishing.',
-      note: 'Create a personal access token under Printify → Settings → API.' },
+      note: 'Create a personal access token under Printify → Settings → API.',
+      /* Verified 2026-10-12 against developers.printify.com, after a Publisher agent burned hours on a mockup endpoint
+         that does not exist (405), PUTs that sent part of the variant list, and ids copied from a truncated response. */
+      apiNotes: 'Mockups are read-only and have no endpoint of their own: they are the images[] (src, variant_ids, position, is_default) of GET /v1/shops/{shop_id}/products/{product_id}.json. '
+        + 'Upload artwork with POST /v1/uploads/images.json and {"file_name":"art.png","url":"https://..."} or {"file_name":"art.png","contents":"${file:path/art.png}"}; read it back with GET /v1/uploads/{image_id}.json. '
+        + 'Update with PUT /v1/shops/{shop_id}/products/{product_id}.json: a partial document is accepted, but if you send variants, EVERY variant of the product must be in the request. '
+        + 'A product is locked while publishing (is_locked); POST .../products/{product_id}/publishing_succeeded.json or publishing_failed.json unlocks it. '
+        + 'Variant catalog: GET /v1/catalog/blueprints/{blueprint_id}/print_providers/{print_provider_id}/variants.json (?show-out-of-stock=1 includes out-of-stock). '
+        + 'Ids are opaque strings (e.g. 5de6593ebff03b5313567d22): copy them exactly from a response, never retype or shorten them. '
+        + 'Limits: 600 requests/min, catalog 100/min, publishing 200 per 30 min. '
+        + 'Product documents are large: pass web_request select, e.g. ["id","variants[].id","variants[].is_enabled","variants[].price","print_areas","images[].src"].' },
 
     { id: 'printful', name: 'Printful', category: 'Commerce & Print-on-Demand', envVar: 'PRINTFUL_API_KEY',
       docsUrl: 'https://developers.printful.com/', apiBase: 'https://api.printful.com',
@@ -79,10 +95,16 @@
 
     // Commerce & POD — the unique verticals: supplements, creator merch, jewelry, sustainable apparel.
     { id: 'supliful', name: 'Supliful', category: 'Commerce & Print-on-Demand', envVar: 'SUPLIFUL_API_KEY',
-      docsUrl: 'https://docs.supliful.com/', apiBase: 'https://app.supliful.com/api/v1',
+      /* 2026-10-07: docs.supliful.com no longer resolves (no DNS record) and app.supliful.com/api/v1 is the app's
+         login-gated internal API. Supliful's own help center documents ONE custom-app route: Shopify's Admin API
+         on a store with the Supliful app installed — orders created there are fulfilled by Supliful. */
+      docsUrl: 'https://help.supliful.com/en/articles/12459926-connect-your-custom-app-to-supliful-using-shopify-admin-api',
+      retiredDocsUrls: ['https://docs.supliful.com/'], apiVia: 'Shopify Admin API',
+      apiBase: 'https://{your-store}.myshopify.com/admin/api',
+      authHint: 'X-Shopify-Access-Token: ${SUPLIFUL_API_KEY}',
       aliases: ['pod', 'supplements', 'vitamins', 'skincare', 'coffee', 'private label'],
       blurb: 'Supplement, coffee, and skincare print-on-demand: white-label products, orders, fulfilment.',
-      note: 'Create an API key in the Supliful app. An agent can design labels, create products, and route orders.' },
+      note: 'Supliful publishes no public API of its own. Its documented route: install the Supliful app on a Shopify store, create a Shopify custom app there, and save that app’s Admin API access token here. Orders created in that store through the Admin API are fulfilled by Supliful.' },
     { id: 'fourthwall', name: 'Fourthwall', category: 'Commerce & Print-on-Demand', envVar: 'FOURTHWALL_API_KEY',
       docsUrl: 'https://docs.fourthwall.com/', apiBase: 'https://api.fourthwall.com/open-api/v1.0',
       aliases: ['pod', 'creator merch', 'merch storefront', 'fan shop'],
@@ -97,12 +119,14 @@
       aliases: ['pod', 'print on demand', 'spreadshirt', 'apparel'],
       blurb: 'Spreadshirt\'s print-on-demand engine: articles, orders, shipping, stock.' },
     { id: 'teemill', name: 'Teemill', category: 'Commerce & Print-on-Demand', envVar: 'TEEMILL_API_KEY',
-      docsUrl: 'https://teemill.com/api-info/', apiBase: 'https://api.teemill.com',
+      docsUrl: 'https://teemill.com/api-docs/', apiBase: 'https://api.teemill.com',
+      retiredDocsUrls: ['https://teemill.com/api-info/'],   // 404s since 2026-10
       authHint: 'Authorization: Bearer ${TEEMILL_API_KEY}',
       aliases: ['pod', 'sustainable', 'organic apparel', 'circular fashion'],
       blurb: 'Sustainable organic-cotton print-on-demand: create products from an image URL in one call.' },
     { id: 'zazzle', name: 'Zazzle', category: 'Commerce & Print-on-Demand', envVar: 'ZAZZLE_API_KEY',
-      docsUrl: 'https://www.zazzle.com/sell/developers/createaproduct', apiBase: 'https://www.zazzle.com/api/create',
+      docsUrl: 'https://www.zazzle.com/api', apiBase: 'https://www.zazzle.com/api/create',
+      retiredDocsUrls: ['https://www.zazzle.com/sell/developers/createaproduct'],   // 404s since 2026-10
       aliases: ['pod', 'print on demand', 'mugs', 'cards', 'gifts'],
       blurb: 'Create-a-Product across ~1,300 Zazzle product types (mugs, cards, wrapping paper, skateboards…).',
       note: 'Zazzle uses your associate/member ID in Create-a-Product URLs, not a secret header — save your associate ID as the key.' },
@@ -155,7 +179,7 @@
       docsUrl: 'https://docs.stripe.com/api', apiBase: 'https://api.stripe.com/v1',
       authHint: 'Authorization: Bearer ${STRIPE_API_KEY}',
       blurb: 'Payments, customers, invoices, subscriptions.',
-      note: 'Prefer a restricted key. Stripe also has a one-click MCP connector in CATALOG — use that if you want tools instead of raw REST.' },
+      note: 'Prefer a restricted key. Stripe also has a one-click MCP connector in APPS — use that if you want tools instead of raw REST.' },
 
     // ── Email & Messaging ──
     { id: 'resend', name: 'Resend', category: 'Email & Messaging', envVar: 'RESEND_API_KEY',
@@ -191,7 +215,7 @@
       docsUrl: 'https://developers.notion.com/reference/intro', apiBase: 'https://api.notion.com/v1',
       authHint: 'Authorization: Bearer ${NOTION_API_KEY}',
       blurb: 'Pages, databases, and blocks.',
-      note: 'Notion also has a one-click OAuth connector in CATALOG — that is usually the easier route.' },
+      note: 'Notion also has a one-click OAuth connector in APPS — that is usually the easier route.' },
 
     // ── Developer Tools ──
     { id: 'jina', name: 'Jina', category: 'Developer Tools', envVar: 'JINA_API_KEY',
@@ -203,7 +227,7 @@
       docsUrl: 'https://docs.github.com/rest', apiBase: 'https://api.github.com',
       authHint: 'Authorization: Bearer ${GITHUB_API_KEY}',
       blurb: 'Repos, issues, pull requests, actions.',
-      note: 'GitHub also has a one-click MCP connector in CATALOG.' },
+      note: 'GitHub also has a one-click MCP connector in APPS.' },
 
     { id: 'porkbun', name: 'Porkbun', category: 'Developer Tools', envVar: 'PORKBUN_API_KEY',
       docsUrl: 'https://porkbun.com/api/json/v3/documentation', apiBase: 'https://api.porkbun.com/api/json/v3',
@@ -286,5 +310,19 @@
 
   function byId(id) { return PLATFORMS.find(p => p.id === String(id || '')) || null; }
 
-  return { PLATFORMS, CATEGORY_ORDER, categories, grouped, byId };
+  // The verified API notes for a saved key: its row by env var, else by the docs link it was saved with.
+  function notesFor(envVar, docsUrl) {
+    const row = PLATFORMS.find(p => p.envVar === String(envVar || '')) || (docsUrl ? PLATFORMS.find(p => p.docsUrl === String(docsUrl).trim()) : null);
+    return row && row.apiNotes ? String(row.apiNotes) : '';
+  }
+
+  // A saved key carrying a docs link its row has retired gets the current link; anything else is returned as is.
+  function healDocsUrl(record) {
+    if (!record || typeof record !== 'object' || Array.isArray(record)) return record;
+    const row = byId(record.id) || PLATFORMS.find(p => p.envVar === record.envVar);
+    if (!row || !Array.isArray(row.retiredDocsUrls) || row.retiredDocsUrls.indexOf(String(record.docsUrl || '').trim()) < 0) return record;
+    return Object.assign({}, record, { docsUrl: row.docsUrl });
+  }
+
+  return { PLATFORMS, CATEGORY_ORDER, categories, grouped, byId, healDocsUrl, notesFor };
 });

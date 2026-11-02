@@ -1,0 +1,512 @@
+{
+  "setId": "reptilian",
+  "group": "walk-cycle-fix-0917",
+  "repairs": [
+    {
+      "dir": "south",
+      "frame": 0,
+      "headFrom": 1,
+      "why": [
+        "head outlier x2.24"
+      ]
+    },
+    {
+      "dir": "west",
+      "frame": 5,
+      "headFrom": 0,
+      "why": [
+        "head outlier x4.48"
+      ]
+    }
+  ],
+  "directions": {
+    "south": {
+      "colourDrift": 2.2,
+      "areaRatio": 0.913,
+      "scale": 1,
+      "rotBox": {
+        "l": 29,
+        "t": 12,
+        "w": 38,
+        "h": 76,
+        "foot": 88,
+        "clipped": false,
+        "cw": 96,
+        "ch": 96
+      },
+      "standingHeight": 76,
+      "standingFoot": 112,
+      "frames": [
+        {
+          "i": 0,
+          "height": 75,
+          "width": 36,
+          "foot": 111,
+          "clipped": false
+        },
+        {
+          "i": 1,
+          "height": 78,
+          "width": 43,
+          "foot": 114,
+          "clipped": false
+        },
+        {
+          "i": 2,
+          "height": 77,
+          "width": 40,
+          "foot": 113,
+          "clipped": false
+        },
+        {
+          "i": 3,
+          "height": 75,
+          "width": 36,
+          "foot": 111,
+          "clipped": false
+        },
+        {
+          "i": 4,
+          "height": 78,
+          "width": 38,
+          "foot": 114,
+          "clipped": false
+        },
+        {
+          "i": 5,
+          "height": 77,
+          "width": 42,
+          "foot": 113,
+          "clipped": false
+        }
+      ]
+    },
+    "south-east": {
+      "colourDrift": 2.7,
+      "areaRatio": 1.006,
+      "scale": 0.987,
+      "rotBox": {
+        "l": 28,
+        "t": 12,
+        "w": 39,
+        "h": 77,
+        "foot": 89,
+        "clipped": false,
+        "cw": 96,
+        "ch": 96
+      },
+      "standingHeight": 76,
+      "standingFoot": 112,
+      "frames": [
+        {
+          "i": 0,
+          "height": 76,
+          "width": 39,
+          "foot": 111,
+          "clipped": false
+        },
+        {
+          "i": 1,
+          "height": 74,
+          "width": 46,
+          "foot": 109,
+          "clipped": false
+        },
+        {
+          "i": 2,
+          "height": 73,
+          "width": 42,
+          "foot": 108,
+          "clipped": false
+        },
+        {
+          "i": 3,
+          "height": 75,
+          "width": 40,
+          "foot": 110,
+          "clipped": false
+        },
+        {
+          "i": 4,
+          "height": 78,
+          "width": 43,
+          "foot": 113,
+          "clipped": false
+        },
+        {
+          "i": 5,
+          "height": 77,
+          "width": 41,
+          "foot": 112,
+          "clipped": false
+        }
+      ]
+    },
+    "east": {
+      "colourDrift": 5.2,
+      "areaRatio": 1.096,
+      "scale": 0.9744,
+      "rotBox": {
+        "l": 25,
+        "t": 11,
+        "w": 43,
+        "h": 78,
+        "foot": 89,
+        "clipped": false,
+        "cw": 96,
+        "ch": 96
+      },
+      "standingHeight": 76,
+      "standingFoot": 112,
+      "frames": [
+        {
+          "i": 0,
+          "height": 77,
+          "width": 43,
+          "foot": 112,
+          "clipped": false
+        },
+        {
+          "i": 1,
+          "height": 76,
+          "width": 47,
+          "foot": 112,
+          "clipped": false
+        },
+        {
+          "i": 2,
+          "height": 76,
+          "width": 42,
+          "foot": 111,
+          "clipped": false
+        },
+        {
+          "i": 3,
+          "height": 76,
+          "width": 43,
+          "foot": 111,
+          "clipped": false
+        },
+        {
+          "i": 4,
+          "height": 74,
+          "width": 49,
+          "foot": 110,
+          "clipped": false
+        },
+        {
+          "i": 5,
+          "height": 77,
+          "width": 43,
+          "foot": 112,
+          "clipped": false
+        }
+      ]
+    },
+    "north-east": {
+      "colourDrift": 5.3,
+      "areaRatio": 0.97,
+      "scale": 1.0133,
+      "rotBox": {
+        "l": 23,
+        "t": 11,
+        "w": 43,
+        "h": 75,
+        "foot": 86,
+        "clipped": false,
+        "cw": 96,
+        "ch": 96
+      },
+      "standingHeight": 76,
+      "standingFoot": 112,
+      "frames": [
+        {
+          "i": 0,
+          "height": 76,
+          "width": 49,
+          "foot": 113,
+          "clipped": false
+        },
+        {
+          "i": 1,
+          "height": 77,
+          "width": 51,
+          "foot": 114,
+          "clipped": false
+        },
+        {
+          "i": 2,
+          "height": 77,
+          "width": 48,
+          "foot": 114,
+          "clipped": false
+        },
+        {
+          "i": 3,
+          "height": 75,
+          "width": 42,
+          "foot": 112,
+          "clipped": false
+        },
+        {
+          "i": 4,
+          "height": 73,
+          "width": 52,
+          "foot": 110,
+          "clipped": false
+        },
+        {
+          "i": 5,
+          "height": 73,
+          "width": 47,
+          "foot": 110,
+          "clipped": false
+        }
+      ]
+    },
+    "north": {
+      "colourDrift": 3.3,
+      "areaRatio": 0.993,
+      "scale": 1.0411,
+      "rotBox": {
+        "l": 22,
+        "t": 11,
+        "w": 43,
+        "h": 73,
+        "foot": 84,
+        "clipped": false,
+        "cw": 96,
+        "ch": 96
+      },
+      "standingHeight": 76,
+      "standingFoot": 112,
+      "frames": [
+        {
+          "i": 0,
+          "height": 77,
+          "width": 45,
+          "foot": 114,
+          "clipped": false
+        },
+        {
+          "i": 1,
+          "height": 78,
+          "width": 44,
+          "foot": 115,
+          "clipped": false
+        },
+        {
+          "i": 2,
+          "height": 76,
+          "width": 44,
+          "foot": 113,
+          "clipped": false
+        },
+        {
+          "i": 3,
+          "height": 77,
+          "width": 46,
+          "foot": 114,
+          "clipped": false
+        },
+        {
+          "i": 4,
+          "height": 78,
+          "width": 43,
+          "foot": 115,
+          "clipped": false
+        },
+        {
+          "i": 5,
+          "height": 77,
+          "width": 44,
+          "foot": 114,
+          "clipped": false
+        }
+      ]
+    },
+    "north-west": {
+      "colourDrift": 4.4,
+      "areaRatio": 0.951,
+      "scale": 1.0133,
+      "rotBox": {
+        "l": 31,
+        "t": 11,
+        "w": 36,
+        "h": 75,
+        "foot": 86,
+        "clipped": false,
+        "cw": 96,
+        "ch": 96
+      },
+      "standingHeight": 76,
+      "standingFoot": 112,
+      "frames": [
+        {
+          "i": 0,
+          "height": 73,
+          "width": 38,
+          "foot": 110,
+          "clipped": false
+        },
+        {
+          "i": 1,
+          "height": 73,
+          "width": 43,
+          "foot": 110,
+          "clipped": false
+        },
+        {
+          "i": 2,
+          "height": 73,
+          "width": 39,
+          "foot": 110,
+          "clipped": false
+        },
+        {
+          "i": 3,
+          "height": 75,
+          "width": 36,
+          "foot": 112,
+          "clipped": false
+        },
+        {
+          "i": 4,
+          "height": 76,
+          "width": 39,
+          "foot": 113,
+          "clipped": false
+        },
+        {
+          "i": 5,
+          "height": 75,
+          "width": 39,
+          "foot": 112,
+          "clipped": false
+        }
+      ]
+    },
+    "west": {
+      "colourDrift": 1.6,
+      "areaRatio": 1.054,
+      "scale": 0.987,
+      "rotBox": {
+        "l": 27,
+        "t": 12,
+        "w": 43,
+        "h": 77,
+        "foot": 89,
+        "clipped": false,
+        "cw": 96,
+        "ch": 96
+      },
+      "standingHeight": 76,
+      "standingFoot": 112,
+      "frames": [
+        {
+          "i": 0,
+          "height": 76,
+          "width": 53,
+          "foot": 111,
+          "clipped": false
+        },
+        {
+          "i": 1,
+          "height": 73,
+          "width": 65,
+          "foot": 108,
+          "clipped": false
+        },
+        {
+          "i": 2,
+          "height": 75,
+          "width": 61,
+          "foot": 110,
+          "clipped": false
+        },
+        {
+          "i": 3,
+          "height": 75,
+          "width": 58,
+          "foot": 110,
+          "clipped": false
+        },
+        {
+          "i": 4,
+          "height": 75,
+          "width": 60,
+          "foot": 110,
+          "clipped": false
+        },
+        {
+          "i": 5,
+          "height": 75,
+          "width": 59,
+          "foot": 110,
+          "clipped": false
+        }
+      ]
+    },
+    "south-west": {
+      "colourDrift": 0.4,
+      "areaRatio": 0.991,
+      "scale": 0.987,
+      "rotBox": {
+        "l": 29,
+        "t": 12,
+        "w": 44,
+        "h": 77,
+        "foot": 89,
+        "clipped": false,
+        "cw": 96,
+        "ch": 96
+      },
+      "standingHeight": 76,
+      "standingFoot": 112,
+      "frames": [
+        {
+          "i": 0,
+          "height": 76,
+          "width": 52,
+          "foot": 111,
+          "clipped": false
+        },
+        {
+          "i": 1,
+          "height": 79,
+          "width": 55,
+          "foot": 114,
+          "clipped": false
+        },
+        {
+          "i": 2,
+          "height": 79,
+          "width": 51,
+          "foot": 114,
+          "clipped": false
+        },
+        {
+          "i": 3,
+          "height": 76,
+          "width": 48,
+          "foot": 111,
+          "clipped": false
+        },
+        {
+          "i": 4,
+          "height": 74,
+          "width": 52,
+          "foot": 109,
+          "clipped": false
+        },
+        {
+          "i": 5,
+          "height": 74,
+          "width": 48,
+          "foot": 109,
+          "clipped": false
+        }
+      ]
+    }
+  }
+}

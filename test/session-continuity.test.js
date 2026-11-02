@@ -19,11 +19,11 @@ async function campaign(root, seed) {
     App:{persist:()=>{saves++; saved=JSON.stringify([...sessions.values()]);}},
     fetch:(_url,opts)=>new Promise(resolve=>requests.push({resolve,signal:opts.signal})),
     renderHistory:()=>paints++, replayChannel(){}, syncStatus(){}, maybeEmptyState(){}, pinLoadedHistoryAfterLayout(){},
-    log:{innerHTML:''}, activeWs:w, historyPinSeq:5, historyPinPending:0,
+    log:{innerHTML:''}, activeWs:w, historyPinSeq:5, historyPinPending:0, revealKey:'',
   });
-  const merge = A.fnBody(src,'function mergeCanonicalHistory(local, turns)');
+  const merge = A.fnBody(src,'function mergeCanonicalHistory(local, turns)')+'\n'+A.fnBody(src,'function placeSteerNotes(rows)');   // the read-back places mid-run notes after merging (comms-flow 10-26)
   const seam = src.slice(src.indexOf('  const historyLoads = new WeakMap();'), src.indexOf('\n  // swap the rendered conversation',src.indexOf('  const historyLoads = new WeakMap();')));
-  assert.ok(seam.length>1000 && seam.length<12000, 'bounded production seam');
+  assert.ok(seam.length>1000 && seam.length<16000, 'bounded production seam');   // history-restore-boot-race's bound: the seam grew by the desk-copy redaction (qw18, 10-27)
   vm.runInContext(merge+'\n'+seam+'\nthis.api={loadServerHistory,ensureHistoryReady,continuityDiagnostics};',context);
   const {api}=context;
   const reply = (index,turns,status=200)=>requests[index].resolve({ok:status===200,json:async()=>({turns})});
@@ -46,9 +46,13 @@ async function campaign(root, seed) {
   assert.deepEqual(restored.history,JSON.parse(JSON.stringify(w.history)),'round-trip keeps accepted order');
   const before=JSON.stringify(w.history);
   const failed=api.loadServerHistory(w,5); reply(2,[],503);assert.equal(await failed,false);
-  await assert.rejects(api.ensureHistoryReady(w,new AbortController().signal),/history could not be restored/);
   assert.equal(JSON.stringify(w.history),before,'unavailable is not empty and cannot erase history');
-  const retry=api.ensureHistoryReady(w,new AbortController().signal);reply(3,freshRows);await retry;
+  // A send after an unanswered read asks the station again; it never refuses on the settled failure (soak S2 boot
+  // race, 2026-10-15). The bounded wait and its honest refusal: test/history-restore-boot-race.test.js.
+  const retry=api.ensureHistoryReady(w,new AbortController().signal);
+  for(let n=0;n<20&&requests.length<4;n++) await new Promise(r=>setImmediate(r));
+  assert.equal(requests.length,4,'the send asked the station again');
+  reply(3,freshRows);await retry;
   const removed=api.loadServerHistory(w,5);sessions.delete('a');reply(4,freshRows);assert.equal(await removed,false);
   assert.equal(saves,1,'removed session cannot be persisted by late response');
   sessions.set('a',w);

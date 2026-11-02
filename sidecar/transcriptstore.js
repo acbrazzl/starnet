@@ -17,7 +17,7 @@
    agent's own fs.* tools can neither read nor corrupt the record of its own conversations. Legacy
    transcript.jsonl(.1) inputs remain in place after import. It holds no key (those are stored separately).
 
-     makeTranscriptStore({ io, clock, redact?, limit? }) -> {
+     makeTranscriptStore({ io, clock, redact?, limit?, deletedAt? }) -> {   // deletedAt: the deleted-session ledger (see below)
        append({ streamId, agentId, role, content }) -> entry,   // stamps ts, redacts content, appends, returns it
        history(streamId, { limit }?) -> entry[],   // CHRONOLOGICAL (oldest-first) for replay; last `limit` of that stream
        all() -> entry[],   count() -> int
@@ -37,10 +37,25 @@
   // silently admits every Object.prototype key — and these keys come off persisted/model-supplied data.
   const ROLES = new Set(['user', 'assistant', 'tool', 'system']);
   const DEFAULT_LIMIT = 400;        // a sane cap so history() never returns an unbounded transcript
+  const FINAL_CONTENT_MAX = 1048576; // matches the structured result validator; final writes reject oversize, never truncate
   const CONTENT_MAX = 200000;       // per-turn guard against a pathological payload bloating the file
   const RAM_ROWS_MAX = 3000;        // global ceiling across many short streams; disk keeps lifetime truth
   function num(v) { return (typeof v === 'number' && isFinite(v)) ? v : 0; }
   function str(v) { return v == null ? '' : String(v); }
+
+  /* ROW PROVENANCE — the one rule for reading a stored row's taint (review memory-learning-07; docs/DECISIONS.md).
+     A row with `taint` was written by a run that had read untrusted content: that is its source. A row whose writer
+     passed a taint value (null included) carries the clean stamp, taintKnown (buildEntry), and is clean. Any other row
+     has no provenance — written before the clean stamp existed, or by a writer that passed no taint value — and its
+     age proves nothing (an older build kept writing un-stamped tainted rows after the stamping release for anyone who
+     upgraded late), so it is unverifiable, never clean. A browse preview reads the same way through
+     { taint: previewTaint, taintKnown: previewTaintKnown }. */
+  const UNVERIFIED_ROW = 'historical conversation (taint unverifiable: missing row provenance)';
+  function rowTaint(row) {
+    if (!row || typeof row !== 'object') return UNVERIFIED_ROW;
+    if (row.taint) return str(row.taint).slice(0, 200);
+    return row.taintKnown === true ? null : UNVERIFIED_ROW;
+  }
 
   // an OpenAI-format message's content is either a plain string or a multimodal parts array
   function flattenContent(c) {
@@ -76,6 +91,90 @@
     return n;
   }
 
+  // Conversation display uses the finalized dispatch answer; run-specific reads keep raw execution evidence.
+  // Durable row markers stay authoritative after the bounded run log expires. A final transcript projection
+  // retains the complete answer, independently of the run envelope's 24k delivery-text cap.
+  function conversationPreview(row) {
+    if (!row) return '';
+    if (row.dispatchState === 'final') return str(row.dispatchPrompt);
+    return !row.dispatchState && row.role === 'user' ? str(row.content) : '';
+  }
+  function isFinalDeliveryRow(row, hash, expected) {
+    if (!row || row.dispatchState !== 'final' || row.role !== 'assistant' || !row.sourceRunId || typeof row.content !== 'string') return false;
+    const hasIntegrity = row.textLength != null || row.textSha256 != null;
+    const verified = hasIntegrity ? Number.isSafeInteger(row.textLength) && row.textLength === row.content.length
+      && /^[a-f0-9]{64}$/.test(String(row.textSha256 || '')) && (typeof hash !== 'function' || hash(row.content) === row.textSha256)
+      : row.content.length < CONTENT_MAX; // old rows at the historical cap may be truncated
+    if (!verified) return false;
+    if (expected && expected.state === 'final') {
+      if (!row.content.startsWith(String(expected.text || '')) || row.dispatchReason !== expected.reason
+          || (row.dispatchRepairRunId != null && row.dispatchRepairRunId !== expected.repairRunId)) return false;
+      if (hasIntegrity || expected.textLength != null || expected.textSha256 != null) {
+        if (row.textLength !== expected.textLength || row.textSha256 !== expected.textSha256) return false;
+      }
+    }
+    return true;
+  }
+  function projectConversation(turns, readRun, hash) {
+    const rows = Array.isArray(turns) ? turns : [];
+    const finals = new Map(), records = new Map(), prompts = new Set(), emitted = new Set();
+    const record = id => { if (!records.has(id)) records.set(id, typeof readRun === 'function' ? readRun(id) : null); return records.get(id); };
+    for (const row of rows) {
+      const id = String(row.sourceRunId || '');
+      if (row.dispatchState === 'final') { if (!finals.has(id)) finals.set(id, row); }
+    }
+    const out = [];
+    const closedAfter = new Map();   // runId -> out index just past that run's last row (page-closed line goes there)
+    for (const row of rows) {
+      const id = String(row.sourceRunId || '');
+      if (row.dispatchState === 'final') { if (isFinalDeliveryRow(row, hash, (record(id) || {}).dispatchDelivery) && !emitted.has(id)) { out.push(row); emitted.add(id); } continue; }
+      const run = id ? record(id) : null, delivery = run && run.dispatchDelivery;
+      const state = row.dispatchState || (delivery && delivery.state);
+      if (!state) { out.push(row); if (pageClosedLine(run)) closedAfter.set(id, out.length); continue; } // pre-envelope history keeps its exact existing shape
+      if (state === 'internal') continue;
+      const final = finals.get(id);
+      // A run StarNet stopped before it finished was never finalized and never will be. Show its directive and one
+      // plain interrupted line, so the thread is not silently empty; its raw partial output stays hidden. A run whose
+      // record still says pending may be mid-finalize, so it stays hidden until its accepted answer lands.
+      // The line is the station's, re-sent on every read: transcriptPending tells the desk and phone merges
+      // (chat.js mergeCanonicalHistory, remote/host.js mergeCanonical) to drop their saved copy and take this one,
+      // so reopening the thread never stacks it, and it goes away once the station stops reporting it.
+      if (!final && run && run.reason === 'interrupted' && !(delivery && (delivery.state === 'final' || delivery.state === 'pending'))) {
+        if (row.role === 'user' && !prompts.has(id)) {
+          out.push(row); prompts.add(id);
+          out.push({ streamId: row.streamId, agentId: row.agentId, role: 'assistant', sys: true, error: true, transcriptPending: true, sourceRunId: id,
+            dispatchState: 'interrupted', ts: row.ts, content: str(run.error) || (run.continuedRunId
+              ? 'interrupted: StarNet stopped before this delegated run finished; it was continued as another run'
+              : 'interrupted: StarNet stopped before this delegated run finished; no result was accepted') });
+        }
+        continue;
+      }
+      const finalPrompt = final ? final.dispatchPrompt : delivery && delivery.state === 'final' && run.deliveryPrompt;
+      if (row.role === 'user' && finalPrompt && !prompts.has(id)) {
+        out.push(Object.assign({}, row, { content: finalPrompt })); prompts.add(id);
+      }
+    }
+    // THE PAGE WENT AWAY MID-ASK (rc-walk #60): one station line after the run's last row, saying it ended there and
+    // that nothing it waited on was approved. Same shape and rule as the interrupted line above (transcriptPending: the
+    // merges take the station's copy on every read, so it never stacks). Inserted back to front so indexes stay true.
+    const at = Array.from(closedAfter.entries()).sort((a, b) => b[1] - a[1]);
+    for (const [id, idx] of at) {
+      const run = record(id), last = out[idx - 1] || {};
+      out.splice(idx, 0, { streamId: last.streamId, agentId: last.agentId, role: 'assistant', sys: true, error: true, transcriptPending: true, sourceRunId: id,
+        dispatchState: 'page-closed', ts: num(run.pageClosed.at) || num(run.endedAt) || num(last.ts), content: pageClosedLine(run) });
+    }
+    return out;
+  }
+  // the line for a desk run cancelled because its page closed while approvals waited ('' = no line: nothing waited,
+  // or the run was not cancelled). Words come from the run record only (runstore `pageClosed`), never from the page.
+  function pageClosedLine(run) {
+    const pc = run && run.reason === 'cancelled' && run.pageClosed;
+    const waiting = pc && Array.isArray(pc.waitingOn) ? pc.waitingOn.map(str).filter(Boolean) : [];
+    if (!waiting.length) return '';
+    // "reconnected": the page's own teardown (App.disconnect → Chat.abort, then re-entry) drops the stream like a reload does
+    return '■ the run ended when this page closed, reloaded or reconnected while it waited for ' + waiting.join(' and ') + ' — nothing was approved';
+  }
+
   function makeTranscriptStore(opts) {
     opts = opts || {};
     const io = opts.io || { readAll() { return []; }, append() {} };
@@ -89,20 +188,75 @@
     // the host adapter loads only recent rows here and answers lifetime recall lazily from per-segment indexes.
     const ramPerStream = num(opts.ramPerStream) > 0 ? num(opts.ramPerStream) : Math.max(cap * 3, 1200);
     const ramMax = num(opts.ramMax) > 0 ? num(opts.ramMax) : RAM_ROWS_MAX;
+    /* A DELETED SESSION IS NOT READ BACK (qa/bugs/3e926b6a). opts.deletedAt(streamId) -> ms (0 = never deleted) is the
+       host's session tombstone ledger (session-tombstones.js). A row of a deleted session stamped at or before its
+       delete is FORGOTTEN: every read that hands rows on (history, reconstruct, search, streams, around, all) answers
+       as if it were not on disk, so resume, recall, cross-session reads and the evidence pack can never hand it to a
+       model. The bytes stay in the append-only segments; a session re-opened under the same id hears only what is
+       said after the delete. Writes and counts are untouched. taintOf is the one reader that still sees every row: it
+       returns only a taint source, never a word of dialogue, and a copy of the history held elsewhere still carries
+       whatever taint its rows had. */
+    const deletedAt = typeof opts.deletedAt === 'function' ? opts.deletedAt : null;
+    function forgotten(r) {
+      if (!deletedAt || !r) return false;
+      const at = num(deletedAt(r.streamId));
+      return at > 0 && num(r.ts) <= at;
+    }
+    function keep(list) { return deletedAt ? list.filter(r => !forgotten(r)) : list; }
+    /* THE STATION'S SELF-TALK IS NOT DIALOGUE (bug 4dee26ba). A reason-only internal call with no workstream (the quiet
+       title, the goal judge, pitch, autopilot, …) is filed in 'global'. Its rows are stamped dispatchState 'internal'
+       (runOnce), and the readers that hand rows to a model as conversation (search, around) skip them, so recall never
+       quotes them as the Commander's words — and a deleted session's opening lines never live on there through the
+       title prompt. Rows a station wrote before the stamp existed are recognised by the fixed shapes of those prompts,
+       in 'global' only (the same words in a named session are the Commander's). Nothing is deleted. */
+    function legacyPrompt(r) {
+      if (!r || r.streamId !== 'global' || r.role !== 'user') return false;
+      const c = str(r.content);
+      return c.indexOf('\n\nAssistant reply (context only): ') >= 0 || c.startsWith('INTERNAL —')
+        || (c.startsWith('Goal:\n') && /Is the goal satisfied — done or continue\?$/.test(c));
+    }
+    /* A pre-stamp self-talk REPLY (the title itself, the goal judge's verdict restating the goal) has no shape of its
+       own: it is known by its run, the sourceRunId of a recognised prompt. Learned from every row this store loads,
+       appends or reads back, and once from disk (learnFromDisk) before the first search or scroll that can reach
+       'global' rows RAM never held. */
+    const selfTalkRuns = new Set();
+    function learn(r) { if (r && r.sourceRunId && legacyPrompt(r)) selfTalkRuns.add(str(r.sourceRunId)); }
+    let learnedFromDisk = false;
+    function learnFromDisk() {
+      if (learnedFromDisk || typeof io.search !== 'function') return;
+      learnedFromDisk = true;
+      // the segment index offers every 'global' row holding one of the prompts' fixed words to `exclude` before it
+      // ranks it: exclude learns it and declines it, so nothing is ranked or returned
+      try { io.search('global', 'context internal satisfied', { limit: 1, scope: 'stream', exclude: r => { learn(r); return true; } }); }
+      catch (e) { failNote('transcript.io', e); }
+    }
+    function selfTalk(r) {
+      if (!r) return false;
+      if (r.dispatchState === 'internal') return true;
+      if (r.streamId === 'global' && r.sourceRunId && selfTalkRuns.has(str(r.sourceRunId))) return true;
+      return legacyPrompt(r);
+    }
+    function hidden(r) { return forgotten(r) || selfTalk(r); }
 
     // in-memory mirror loaded once; append keeps RAM + disk in lockstep so history() is O(n) over RAM.
     let rows = [];
+    // Streams whose RAM rows can differ from their durable rows: RAM dropped some of them (trimmed), or an append to
+    // them failed in this process (a fail-open write keeps its row in RAM only; a failed rollback can leave one on
+    // disk only). history() answers those from disk, as it always did.
+    const ramGaps = new Set();
     try {
       const raw = typeof io.readRecent === 'function' ? io.readRecent({ perStream: ramPerStream, globalLimit: ramMax }) : io.readAll();
       if (Array.isArray(raw)) rows = raw.filter(r => r && typeof r === 'object');
     }
     catch (e) { rows = []; }
     // trim the boot load per-stream too, so a huge bounded-boot load of one stream can't start us over the cap.
+    for (const r of rows) learn(r);   // before the trims: a prompt the boot load held still names its run's reply
     trimStreamRam();   // no arg => sweep every over-cap stream once
     trimGlobalRam();
 
     function trimGlobalRam() {
-      if (rows.length > ramMax) rows.splice(0, rows.length - ramMax);
+      if (rows.length <= ramMax) return;
+      for (const r of rows.splice(0, rows.length - ramMax)) ramGaps.add(r.streamId);
     }
 
     // drop the OLDEST rows of `streamId` when that stream exceeds ramPerStream. Splices only that stream's rows,
@@ -115,6 +269,7 @@
         for (let i = 0; i < rows.length; i++) if (rows[i].streamId === sid) idxs.push(i);
         const over = idxs.length - ramPerStream;
         if (over <= 0) continue;
+        ramGaps.add(sid);
         const drop = new Set(idxs.slice(0, over));   // the oldest `over` rows of this stream
         rows = rows.filter((_, i) => !drop.has(i));
       }
@@ -155,19 +310,23 @@
       const all = o.scope === 'all';
       const want = normStream(streamId);
       if (typeof io.search === 'function') {
-        try { return io.search(want, query, { limit: limit, scope: all ? 'all' : 'stream' }) || []; } catch (e) { failNote('transcript.io', e); }
+        // the segment index ranks among the rows it may return (exclude), so a deleted session or self-talk never takes a slot
+        if (all || want === 'global') learnFromDisk();
+        try { return (io.search(want, query, { limit: limit, scope: all ? 'all' : 'stream', exclude: hidden }) || []).filter(r => !hidden(r)); } catch (e) { failNote('transcript.io', e); }
       }
       const scored = [];
       for (let i = 0; i < rows.length; i++) {
         const r = rows[i];
         if (!all && r.streamId !== want) continue;
-        const tf = {}; for (const t of tokenize(r.content)) tf[t] = (tf[t] || 0) + 1;
+        if (hidden(r)) continue;
+        // a null-prototype map: `{}`['constructor'] is Object, so that query word "matched" every row with a string score
+        const tf = Object.create(null); for (const t of tokenize(r.content)) tf[t] = (tf[t] || 0) + 1;
         let distinct = 0, freq = 0;
         for (const t of terms) { if (tf[t]) { distinct++; freq += tf[t]; } }
-        if (distinct) scored.push({ idx: i, streamId: r.streamId, role: r.role, content: r.content, ts: r.ts, score: distinct * 1000 + freq });
+        if (distinct) scored.push({ idx: i, streamId: r.streamId, role: r.role, content: r.content, ts: r.ts, score: distinct * 1000 + freq, taint: r.taint || '', taintKnown: r.taintKnown === true || !!r.taint });
       }
       scored.sort((a, b) => (b.score - a.score) || (b.ts - a.ts) || (b.idx - a.idx));
-      return scored.slice(0, limit).map(x => ({ streamId: x.streamId, role: x.role, content: x.content, ts: x.ts, score: x.score }));
+      return scored.slice(0, limit).map(x => ({ streamId: x.streamId, role: x.role, content: x.content, ts: x.ts, score: x.score, taint: x.taint, taintKnown: x.taintKnown }));
     }
 
     // BROWSE (reference-harness parity: "list recent sessions"): every workstream present in the transcript, with its
@@ -179,21 +338,68 @@
       const limit = num(o.limit) > 0 ? Math.min(num(o.limit), 100) : 20;
       const previewMax = num(o.previewChars) > 0 ? num(o.previewChars) : 160;
       if (typeof io.streams === 'function') {
-        try { return io.streams({ limit: limit, previewChars: previewMax }) || []; } catch (e) { failNote('transcript.io', e); }
+        // the segment summaries count and preview every row: a deleted session drops out, and one re-opened after its
+        // delete is listed from the rows said since (history() already forgets the rest)
+        try { return globalPreview(deletedAt ? liveStreams(io.streams({ limit: 100, previewChars: previewMax }) || [], previewMax).slice(0, limit) : (io.streams({ limit: limit, previewChars: previewMax }) || []), previewMax); } catch (e) { failNote('transcript.io', e); }
       }
       const by = new Map();
       for (let i = 0; i < rows.length; i++) {
         const r = rows[i];
+        if (forgotten(r)) continue;
         let e = by.get(r.streamId);
         if (!e) { e = { streamId: r.streamId, turns: 0, lastAt: 0, preview: '' }; by.set(r.streamId, e); }
         e.turns++;
         if (r.ts >= e.lastAt) e.lastAt = r.ts;
-        // last USER line wins the preview — the assistant's reply is the answer, the user's line is the topic.
-        if (r.role === 'user' && r.content) e.preview = str(r.content).replace(/\s+/g, ' ').trim().slice(0, previewMax);
+        const preview = selfTalk(r) ? '' : conversationPreview(r);
+        if (preview) {
+          e.preview = preview.replace(/\s+/g, ' ').trim().slice(0, previewMax);
+          e.previewTaint = r.taint || ''; e.previewTaintKnown = r.taintKnown === true || !!r.taint;
+        }
       }
       const out = Array.from(by.values());
       out.sort((a, b) => (b.lastAt - a.lastAt) || (a.streamId < b.streamId ? -1 : a.streamId > b.streamId ? 1 : 0));
       return out.slice(0, limit);
+    }
+    /* 'global' is where the station's self-talk is filed, so its listing preview is never the segment summary's: that
+       keeps the latest user row cut to 160 characters, and a pre-stamp title prompt or goal judge whose opening is a long
+       first message loses the very marker that names it as self-talk — the listing then quoted that session's opening
+       line, even a deleted session's. The preview is re-read from the stream's own newest rows (deletes honoured), the
+       newest that is not self-talk; none among them lists with no preview. */
+    const GLOBAL_PREVIEW_SCAN = 200;
+    function globalPreview(list, previewMax) {
+      return list.map(s => {
+        if (!s || s.streamId !== 'global') return s;
+        const e = Object.assign({}, s, { preview: '', previewTaint: '', previewTaintKnown: false });
+        const recent = history('global', { limit: GLOBAL_PREVIEW_SCAN });
+        for (let i = recent.length - 1; i >= 0; i--) {
+          const r = recent[i];
+          const preview = selfTalk(r) ? '' : conversationPreview(r);
+          if (!preview) continue;
+          // the segment summary's own bound (160), so a listing reads the same as before for every ordinary row
+          e.preview = preview.replace(/\s+/g, ' ').trim().slice(0, Math.min(160, previewMax));
+          e.previewTaint = r.taint || ''; e.previewTaintKnown = r.taintKnown === true || !!r.taint;
+          break;
+        }
+        return e;
+      });
+    }
+    function liveStreams(list, previewMax) {
+      const out = [];
+      for (const s of list) {
+        const at = s && num(deletedAt(s.streamId));
+        if (!s || !(at > 0)) { if (s) out.push(s); continue; }
+        if (num(s.lastAt) <= at) continue;   // nothing said since the delete
+        const kept = history(s.streamId, { limit: cap });
+        if (!kept.length) continue;
+        const e = { streamId: s.streamId, turns: kept.length, lastAt: 0, preview: '' };
+        for (const r of kept) {
+          if (num(r.ts) >= e.lastAt) e.lastAt = num(r.ts);
+          const preview = conversationPreview(r);
+          if (preview) { e.preview = preview.replace(/\s+/g, ' ').trim().slice(0, previewMax); e.previewTaint = r.taint || ''; e.previewTaintKnown = r.taintKnown === true || !!r.taint; }
+        }
+        out.push(e);
+      }
+      return out;
     }
 
     // SCROLL (reference-harness parity: anchored drill-down): the window of turns around a point in ONE stream, so a
@@ -206,10 +412,11 @@
       const want = normStream(streamId);
       const at = num(ts);
       if (typeof io.around === 'function') {
-        try { return io.around(want, ts, { window: win, rowId: o.rowId }) || []; } catch (e) { failNote('transcript.io', e); }
+        if (want === 'global') learnFromDisk();
+        try { const got = io.around(want, ts, { window: win, rowId: o.rowId }) || []; got.forEach(learn); return got.filter(r => !hidden(r)); } catch (e) { failNote('transcript.io', e); }
       }
       const mine = [];
-      for (let i = 0; i < rows.length; i++) { if (rows[i].streamId === want) mine.push(rows[i]); }
+      for (let i = 0; i < rows.length; i++) { if (rows[i].streamId === want && !hidden(rows[i])) mine.push(rows[i]); }
       if (!mine.length) return [];
       // the row closest to the anchor (mine is append-ordered, so ties resolve to the earliest match — stable).
       let anchor = 0, best = Infinity;
@@ -224,8 +431,11 @@
 
     function buildEntry(e) {
       e = e || {};
-      let content = str(e.content).slice(0, CONTENT_MAX);
-      try { content = str(redact(content)).slice(0, CONTENT_MAX); } catch (e) { failNote('transcript.redact', e); }
+      const final = e.dispatchState === 'final';
+      let content = final ? str(e.content) : str(e.content).slice(0, CONTENT_MAX);
+      try { content = str(redact(content)); } catch (error) { if (final) throw error; failNote('transcript.redact', error); }
+      if (final && content.length > FINAL_CONTENT_MAX) throw new Error('Final dispatch transcript exceeds the 1 MiB persistence limit');
+      if (!final) content = content.slice(0, CONTENT_MAX);
       const entry = {
         streamId: normStream(e.streamId),
         agentId: str(e.agentId),
@@ -244,6 +454,24 @@
       // Recovery provenance is deliberately an opaque run id, never tool arguments. It lets boot reconciliation
       // prove that a journal's final rows already reached durable transcript storage before retiring the journal.
       if (e.sourceRunId != null) { const id = str(e.sourceRunId).slice(0, 200); if (id) entry.sourceRunId = id; }
+      if (['pending', 'internal', 'final'].includes(e.dispatchState)) entry.dispatchState = e.dispatchState;
+      if (e.dispatchState === 'final') {
+        entry.dispatchPrompt = str(redact(str(e.dispatchPrompt))).slice(0, 4000);
+        entry.dispatchReason = str(e.dispatchReason).slice(0, 80);
+        entry.dispatchRepairRunId = str(e.dispatchRepairRunId).slice(0, 100);
+        if (Number.isSafeInteger(e.textLength) && /^[a-f0-9]{64}$/.test(str(e.textSha256))) {
+          entry.textLength = e.textLength; entry.textSha256 = e.textSha256;
+        }
+      }
+      // WHO wrote a user-role row that the Commander did not type: the agent that delegated this run (display only —
+      // the row stays a user turn for the model). Absent on every Commander turn.
+      if (e.from != null) { const f = str(e.from).slice(0, 80); if (f) entry.from = f; }
+      // UNTRUSTED-CONTENT TAINT (additive, sec-taint 09-25): the writing run's taint source at the moment this row
+      // was written. A later run that REPLAYS this row replays untrusted content, so it must start tainted (taintOf).
+      if (e.taint) { const t = str(e.taint).slice(0, 200); if (t) entry.taint = t; }
+      // Distinguish the host explicitly checking a clean row from legacy/missing provenance.
+      // Never infer clean merely because old storage omitted its taint field.
+      if (Object.prototype.hasOwnProperty.call(e, 'taint')) entry.taintKnown = true;
       return entry;
     }
 
@@ -254,10 +482,12 @@
         const persisted = writer.call(io, entry);
         if (persisted && typeof persisted === 'object') stored = persisted;
       } catch (e) {
+        ramGaps.add(entry.streamId);
         if (strict) throw e;
         /* ordinary transcript writes remain fail-open; recovery-owned finalization uses appendStrict below */
       }
       rows.push(stored);
+      learn(stored);
       trimStreamRam(stored.streamId);   // bound THIS stream's RAM only (per-stream fairness; disk keeps full log)
       trimGlobalRam();                  // and bound the aggregate across thousands of short streams
       return stored;
@@ -287,14 +517,15 @@
     // shape and same skip rule (injected 'system' fences are not dialogue), so the durable file is unchanged;
     // only WHICH messages are considered new differs. Idempotent: appending the same array twice writes once,
     // which also makes it safe to drain mid-run (at a compaction) and again at run end.
-    function appendNew(streamId, agentId, messages) {
+    function appendNew(streamId, agentId, messages, opts) {
       if (!Array.isArray(messages)) return 0;
+      const taint = opts && opts.taint ? opts.taint : null;
       let n = 0;
       for (const m of messages) {
         if (!m || typeof m !== 'object' || m[PERSISTED]) continue;
         markPersisted([m]);                                    // mark BEFORE the role filter so fences aren't re-checked
         if (!ROLES.has(m.role) || m.role === 'system') continue;
-        append({ streamId: streamId, agentId: agentId, role: m.role, content: flattenContent(m.content), toolCalls: m.tool_calls, toolCallId: m.tool_call_id });
+        append({ streamId: streamId, agentId: agentId, role: m.role, content: flattenContent(m.content), toolCalls: m.tool_calls, toolCallId: m.tool_call_id, taint: taint, sourceRunId: opts && opts.sourceRunId, dispatchState: opts && opts.dispatchState });
         n++;
       }
       return n;
@@ -310,31 +541,150 @@
       for (const m of messages) {
         if (!m || typeof m !== 'object' || m[PERSISTED]) continue;
         if (!ROLES.has(m.role) || m.role === 'system') { markPersisted([m]); continue; }
-        appendStrict({ streamId: streamId, agentId: agentId, role: m.role, content: flattenContent(m.content), toolCalls: m.tool_calls, toolCallId: m.tool_call_id, sourceRunId: opts.sourceRunId });
+        appendStrict({ streamId: streamId, agentId: agentId, role: m.role, content: flattenContent(m.content), toolCalls: m.tool_calls, toolCallId: m.tool_call_id, sourceRunId: opts.sourceRunId, dispatchState: opts.dispatchState, taint: opts.taint || null });
         markPersisted([m]);
         n++;
       }
       return n;
     }
 
+    /* H2 RECOVERY RECONCILIATION — which recovered turns does the transcript ALREADY hold?
+       A recovery continuation starts from the run journal's provider-valid checkpoint of an interrupted run. The
+       interrupted run wrote its turns to this transcript as it went (per-turn persistence), but not necessarily
+       ALL of them: a hard kill can land between the journal checkpoint and the transcript write, a parallel tool
+       batch's results can be journaled but not yet checkpointed, and the recovery planner adds its own pairing
+       results for calls that never returned. Marking the whole recovered prompt persisted (the old rule) dropped
+       those rows forever; appending it all again would duplicate everything the source run did write.
+       markRecorded() marks exactly the recovered messages that `rows` (the source run's own transcript rows)
+       already prove durable, by IDENTITY rather than position — the source may have compacted, so the recovered
+       working set is not a positional copy of what it wrote: a tool result by its tool_call_id, an assistant
+       tool-call turn by its call ids, any other turn by role + stored (redacted, capped) content. Multiset:
+       each recorded row vouches for ONE message. Everything left unmarked is genuinely missing and is appended
+       by the next appendNewStrict — in order, strictly. System fences are marked (they are never dialogue). */
+    function callIdsKey(ids) { return ids.map(id => str(id).slice(0, 200)).join('\u0001'); }
+    function rowIdentity(r) {
+      if (!r || typeof r !== 'object') return '';
+      if (r.role === 'tool') return 'tool\u0000' + str(r.toolCallId);
+      if (r.role === 'assistant' && r.toolCalls) {
+        let ids = null;
+        try { const tc = JSON.parse(r.toolCalls); if (Array.isArray(tc) && tc.length) ids = tc.map(c => c && c.id); }
+        catch (e) { failNote('transcript.rowIdentity', e); }   // a capped/unparsable call list falls back to content
+        if (ids) return 'calls\u0000' + callIdsKey(ids);
+      }
+      return str(r.role) + '\u0000' + str(r.content);
+    }
+    function messageIdentity(m) {
+      if (m.role === 'tool') return 'tool\u0000' + str(m.tool_call_id).slice(0, 200);
+      if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) return 'calls\u0000' + callIdsKey(m.tool_calls.map(c => c && c.id));
+      return str(m.role) + '\u0000' + buildEntry({ content: flattenContent(m.content) }).content;
+    }
+    function markRecorded(messages, recordedRows) {
+      if (!Array.isArray(messages)) return 0;
+      const vouch = new Map();
+      for (const r of (Array.isArray(recordedRows) ? recordedRows : [])) {
+        const k = rowIdentity(r);
+        if (k) vouch.set(k, (vouch.get(k) || 0) + 1);
+      }
+      let n = 0;
+      for (const m of messages) {
+        if (!m || typeof m !== 'object' || m[PERSISTED]) continue;
+        if (!ROLES.has(m.role) || m.role === 'system') { markPersisted([m]); continue; }
+        const k = messageIdentity(m);
+        const left = vouch.get(k) || 0;
+        if (!left) continue;
+        vouch.set(k, left - 1);
+        markPersisted([m]);
+        n++;
+      }
+      return n;
+    }
+
+    /* REPLAYED TAINT (sec-taint 09-25). Does replaying `messages` (a run's prior context on `streamId`) bring back
+       rows a TAINTED run wrote? Two independent proofs, either suffices:
+         1. IDENTITY — a replayed message matches a stored tainted row (same identity markRecorded uses: tool result
+            by call id, tool-call turn by call ids, anything else by role + redacted content).
+         2. WINDOW — a caller-held history (the browser's own copy) may not be byte-identical to the stored rows, so
+            the stream's newest rows covering as many user/assistant turns as were replayed are checked too.
+       Decay is structural, never silent: once tainted rows fall outside what is replayed (a new session, a history
+       window that no longer reaches them) the next run starts clean, because the untrusted text is no longer in its
+       context. Returns the first taint source found, else null.
+       Only an explicit `taint` counts here: a replayed row with no provenance (rowTaint's unverifiable case — all
+       history from before the clean stamp) does not taint the run, or every older conversation would start tainted
+       after an update. recall_conversation does treat it as unverifiable; docs/DECISIONS.md records the split. */
+    function taintOf(streamId, messages, o) {
+      o = o || {};
+      const prior = (Array.isArray(messages) ? messages : []).filter(m => m && typeof m === 'object' && ROLES.has(m.role) && m.role !== 'system');
+      if (!prior.length) return null;
+      // every row, deleted or not: forgetting a session never clears the taint of text that is replayed from it
+      const rowsNow = readHistory(streamId, { limit: num(o.limit) > 0 ? num(o.limit) : 1200 }, false);
+      if (!rowsNow.some(r => r && r.taint)) return null;          // the common case: this stream never carried taint
+      const tainted = new Map();
+      for (const r of rowsNow) if (r && r.taint) { const k = rowIdentity(r); if (k && !tainted.has(k)) tainted.set(k, str(r.taint)); }
+      for (const m of prior) { const hit = tainted.get(messageIdentity(m)); if (hit) return hit; }
+      let turns = prior.filter(m => m.role === 'user' || m.role === 'assistant').length;
+      for (let i = rowsNow.length - 1; i >= 0 && turns > 0; i--) {
+        const r = rowsNow[i];
+        if (r && r.taint) return str(r.taint);
+        if (r && (r.role === 'user' || r.role === 'assistant')) turns--;
+      }
+      return null;
+    }
+
+    /* RAM ANSWERS WHEN IT HOLDS THE WHOLE STREAM (perf review 2026-10-19, #5). Every row RAM holds is a durable row
+       (read back at boot, or the proven copy an append returned), in the same order. So when the count RAM holds for
+       a stream equals the count the durable summaries record for it (io.streamRows), RAM holds every one of them and
+       the segment scan would return exactly these rows. A stream RAM has trimmed, or whose append failed this process,
+       is never answered here; neither is a host that cannot count (no streamRows, or -1). null = ask the disk. */
+    function ramHistory(want, limit, sourceRunId, dispatchState) {
+      if (ramGaps.has(want) || typeof io.streamRows !== 'function') return null;
+      let held = 0;
+      const out = [];
+      for (let i = rows.length - 1; i >= 0; i--) {
+        const r = rows[i];
+        if (r.streamId !== want) continue;
+        held++;
+        if (out.length < limit && (!sourceRunId || r.sourceRunId === sourceRunId) && (!dispatchState || r.dispatchState === dispatchState)) out.push(Object.assign({}, r));
+      }
+      let durable;
+      try { durable = io.streamRows(want); } catch (e) { failNote('transcript.io', e); return null; }
+      if (typeof durable !== 'number' || durable < 0 || durable !== held) return null;
+      return out.reverse();
+    }
+
     // the recent dialogue for ONE workstream, oldest-first (ready to replay back into COMMS). We keep the LAST
     // `limit` turns of that stream (the most recent), then return them in chronological order.
-    function history(streamId, o) {
+    /* A PROOF READ (o.proof === true) sees a deleted session's rows. It answers only "is this row already durable?" —
+       a dispatch delivery's accepted answer (dispatch-delivery.js), a recovery continuation's source rows (index.js
+       transcriptRecoveryTail → markRecorded) — and never hands a row to a model or the page. Forgetting them there made
+       boot never settle a deleted session's pending delivery, let a second accepted answer be appended after the delete
+       stamp, and made a continuation re-append every source turn: the deleted words came back, duplicated. */
+    function history(streamId, o) { return readHistory(streamId, o, !(o && o.proof === true)); }
+    // honorDeletes=false is taintOf's read and a proof read: neither hands a row on
+    function readHistory(streamId, o, honorDeletes) {
       o = o || {};
+      const kept = honorDeletes ? keep : (list => list);
+      const gone = honorDeletes ? forgotten : (() => false);
       const limit = num(o.limit) > 0 ? num(o.limit) : cap;
       const want = normStream(streamId);
       const sourceRunId = String(o.sourceRunId || '');
       // Segmented hosts retain lifetime rows outside the bounded RAM working set. Ask the
-      // durable index/segments first so an old, idle conversation still resumes exactly.
+      // durable index/segments first so an old, idle conversation still resumes exactly —
+      // unless RAM provably holds every durable row of this stream (ramHistory), which is the
+      // same answer without reading and parsing segments 2-4 times per run. A strict read
+      // always proves the bytes on disk.
       if (typeof io.history === 'function') {
+        // a deleted session's rows are all older than anything said after its delete, so the newest `limit` rows
+        // minus the forgotten ones are exactly the newest `limit` rows that remain
+        const held = o.strict ? null : ramHistory(want, limit, sourceRunId, o.dispatchState);
+        if (held) return kept(held);
         try {
-          const found = io.history(want, { limit, sourceRunId });
-          if (Array.isArray(found)) return found.map(r => Object.assign({}, r));
-        } catch (e) { failNote('transcript.io', e); }
+          const found = io.history(want, { limit, sourceRunId, dispatchState: o.dispatchState, strict: o.strict, since: num(o.since) });
+          if (Array.isArray(found)) return kept(found).map(r => Object.assign({}, r));
+        } catch (e) { if (o.strict) throw e; failNote('transcript.io', e); }
       }
       const out = [];
       for (let i = rows.length - 1; i >= 0 && out.length < limit; i--) {
-        if (rows[i].streamId === want && (!sourceRunId || rows[i].sourceRunId === sourceRunId)) out.push(Object.assign({}, rows[i]));
+        if (rows[i].streamId === want && (!sourceRunId || rows[i].sourceRunId === sourceRunId) && (!o.dispatchState || rows[i].dispatchState === o.dispatchState) && !gone(rows[i])) out.push(Object.assign({}, rows[i]));
       }
       out.reverse();   // newest-first scan -> chronological for replay
       return out;
@@ -348,6 +698,7 @@
       const rows = history(streamId, o);   // chronological, capped
       const out = [];
       for (const r of rows) {
+        if (r.dispatchState === 'final') continue; // display projection; the execution already appears above
         if (r.role === 'user') out.push({ role: 'user', content: r.content });
         else if (r.role === 'assistant') {
           const m = { role: 'assistant', content: r.content || '' };
@@ -364,12 +715,12 @@
     }
 
     return {
-      append, appendStrict, appendTurns, appendNew, appendNewStrict, markPersisted, history, reconstruct, search, streams, around,
-      all() { return rows.map(r => Object.assign({}, r)); },
+      append, appendStrict, appendTurns, appendNew, appendNewStrict, markPersisted, markRecorded, history, reconstruct, taintOf, search, streams, around,
+      all() { return keep(rows).map(r => Object.assign({}, r)); },
       count() { return rows.length; },
       _internals: { normStream, SID_RE }
     };
   }
 
-  return { makeTranscriptStore, markPersisted, _internals: { SID_RE, ROLES, PERSISTED, flattenContent } };
+  return { makeTranscriptStore, projectConversation, conversationPreview, isFinalDeliveryRow, markPersisted, rowTaint, UNVERIFIED_ROW, _internals: { SID_RE, ROLES, PERSISTED, flattenContent } };
 });

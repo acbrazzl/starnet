@@ -1,4 +1,5 @@
 'use strict';
+const { readSidecarSource } = require('./helpers/source');
 const A = require('./_assert.js');
 const fs = require('fs');
 const path = require('path');
@@ -41,11 +42,12 @@ A.eq(host.approvalMode, 'ask', 'This Computer can still ask before risky calls')
 A.eq(host.physicalDesktop, 'full-power-or-lease', 'This Computer reports the Full Power or paired-owner desktop routes');
 A.eq(host.physicalDesktopGranted, false, 'profile choice alone does not grant that lease');
 
-const src = fs.readFileSync(path.join(__dirname, '..', 'sidecar', 'index.js'), 'utf8');
+const src = readSidecarSource();
 A.ok(/executionProfile\.capabilityObjects[\s\S]{0,180}stationWithObject/.test(src), 'run projection materializes profile capability objects');
 A.ok(/executionProfile\.connectors[\s\S]{0,120}stationWithConnectors/.test(src), 'trusted profiles materialize connector projection');
 A.ok(/executionProfile\.filesystemScope === 'host-paths-except-hard-floor'/.test(src), 'This Computer reaches the path-trust authority seam');
-A.ok(/const unrestrictedHostNow = \(\) => FULL_ACCESS \|\| masterBypassOn\(\) \|\| agentFullAccessNow\(\)/.test(src), 'one central predicate composes every Full Power scope');
+A.ok(/const unrestrictedHostNow = \(\) => stationBypassNow\(\) \|\| agentFullAccessNow\(\)/.test(src), 'one central predicate composes every Full Power scope');
+A.ok(/const stationBypassNow = \(\) => !hostPowerWithheld && \(FULL_ACCESS \|\| masterBypassOn\(\)\)/.test(src), 'the station scopes (env + master bypass) are one withheld-aware predicate');
 A.ok(/Object\.keys\(CAP_REGISTRY\)[\s\S]{0,120}stationWithObject/.test(src), 'Full Power materializes every available built-in capability family');
 A.ok(/exact: '\/api\/execution-profiles'/.test(src), 'backend exposes the authoritative profile/runtime catalog');
 A.ok(!/executionProfile\.physicalDesktopGranted[^\n]+remoteDesktopAuthorized\s*=/.test(src), 'profile data never mints the desktop lease');

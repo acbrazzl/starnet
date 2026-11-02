@@ -111,7 +111,7 @@ A.eq(setInitiativeCalls, [], 'two rough runs do not demote (below the streak bar
 fb('work_miss');
 A.eq(setInitiativeCalls, ['propose'], 'the third consecutive miss demotes the earned rung one step — applied through the same dial writer');
 A.eq(notices.length, 1, 'the demotion fired ONE explicit notice (never silent)');
-A.ok(/rough runs|earn it back/.test(notices[0].text), 'the notice is the honest "stepping back — earn it back" line');
+A.ok(/stepping back a rung/.test(notices[0].text) && !/leash|earn it back/.test(notices[0].text), 'the notice is the honest "stepping back a rung" line, never leash/earn-it-back talk (call #57)');
 A.eq(TrustStore._state().earned.initiative, undefined, 'stepping back TO the manual floor clears the earned record');
 fb('work_miss');
 A.eq(setInitiativeCalls.length, 1, 'further misses with NO earned rung never touch the dial (the manual posture is untouchable)');
@@ -305,6 +305,21 @@ for (let i = 0; i < 5; i++) TrustStore._state().track = Trust.fold(TrustStore._s
 const o = TrustStore.currentOffer(); if (o) { TrustStore.accept(o); TrustStore.decline(o); TrustStore.ignore(o); }
 TrustStore.reset();
 A.eq(emitted, 0, 'TrustStore never emits on U.bus (read-only citizen; lint-emits stays green)');
+
+// Initiative writes use the same acknowledgement rule as grants.
+initiative = 'propose';
+let finishWrite;
+TrustStore.init({ getPosture: () => ({ initiative }), setInitiative: () => new Promise(r => { finishWrite = r; }) });
+TrustStore.reset();
+const acceptance = TrustStore.accept({ kind: 'initiative', to: 'leash' });
+A.eq(TrustStore._state().earned.initiative, undefined, 'pending initiative has no earned provenance');
+finishWrite({ ok: false });
+A.eq(await acceptance, false, 'failed asynchronous initiative is not accepted');
+A.eq(TrustStore._state().earned.initiative, undefined, 'failed initiative leaves no provenance');
+const accepted = TrustStore.accept({ kind: 'initiative', to: 'leash' });
+initiative = 'leash'; finishWrite({ ok: true });
+A.eq(await accepted, true, 'confirmed asynchronous initiative is accepted');
+A.eq(TrustStore._state().earned.initiative.to, 'leash', 'only confirmed initiative records provenance');
 
 A.report('truststore.test');
 

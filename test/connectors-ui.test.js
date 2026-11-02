@@ -7,6 +7,7 @@
       (transport toggle, stdio fields, headers, timeout, edit, reload), and the Spotify card must
       stay intact. Mirrors the provider-connections-ui source-guard style. */
 'use strict';
+const { readSidecarSource } = require('./helpers/source');
 const fs = require('fs');
 const path = require('path');
 const vm = require('node:vm');
@@ -124,7 +125,7 @@ function fakeStack(tools) {
   const idx = fs.readFileSync(path.join(__dirname, '..', 'frontend', 'index.html'), 'utf8');
 
   // the panel is still reachable + Spotify (the pre-existing card) is untouched
-  A.ok(/data-term="connectors"/.test(idx), 'CONNECTORS panel entry still exists');
+  A.ok(/id="bb-connect" data-family="connect"/.test(idx) && /connect: \{ label: 'CONNECT', tabs: \[\s*\{ id: 'abilities', k: 'connectors'/.test(fs.readFileSync(path.join(__dirname, '..', 'frontend', 'app', 'stationui.js'), 'utf8')), 'the CONNECTORS panel is reached from the dock: BUILD › CONNECT opens it as its ABILITIES tab (ONE MENU, 2026-10-01)');
   A.ok(/function buildConnectors/.test(station), 'buildConnectors panel builder present');
   A.ok(/setupSpotify\(body\)/.test(station), 'Spotify card is still wired (not regressed)');
   A.ok(/id="sp-connect"/.test(station), 'Spotify connect control preserved');
@@ -196,7 +197,7 @@ function fakeStack(tools) {
 
   // ---------- 3. CONNECTOR CATALOG tab (one-click browse-and-add) ----------
   // the tab exists and is fed by the catalog route
-  A.ok(/id:\s*'catalog'/.test(station) && /label:\s*'CATALOG'/.test(station), 'CATALOG tab registered on the connectors console');
+  A.ok(/id:\s*'catalog', label:\s*'APPS'/.test(station), 'the catalog is the APPS section of the connectors console (ONE FLAT LIST 2026-10-26)');
   A.ok(/id="cc-list"/.test(station), 'catalog list container present');
   A.ok(/\/api\/connectors\/catalog/.test(station), 'catalog pane fetches GET /api/connectors/catalog');
   A.ok(/function ccCard/.test(station) && /function ccGroupHTML/.test(station), 'catalog card + category-group renderers present');
@@ -217,7 +218,7 @@ function fakeStack(tools) {
   A.ok(/openSignIn\(/.test(station) && /window\.open\(/.test(stationCore), 'sign-in opens the provider consent in a popup (via the shared openSignIn helper)');
   A.ok(/ccPending/.test(station), 'sign-in has a per-connector in-flight guard (no duplicate popups / concurrent pollers)');
   A.ok(/e\.authType === 'oauth'/.test(station), 'the UI gates on the authType tier from the catalog');
-  const sidecar = fs.readFileSync(path.join(__dirname, '..', 'sidecar', 'index.js'), 'utf8');
+  const sidecar = readSidecarSource();
   A.ok(/resolveConnectorOauthTarget\([^\n]+connectorCatalog, connectorConfigs\)/.test(sidecar),
     'OAuth start resolves both catalog and durably saved custom connector ids');
   A.ok(/connectorOauthPublicUrl[\s\S]{0,500}assertResolvedSafe/.test(sidecar) && /fetchImpl: connectorOauthFetch/.test(sidecar)
@@ -259,6 +260,9 @@ function fakeStack(tools) {
   A.eq(popularGroups([{ category: 'Other', connectors: [{ id: 'custom' }] }])[0].category, 'Other', 'no empty popular heading');
   const keyCard = renderCatalog({ id: 'key', name: 'Key service', authType: 'apikey', homepage: 'https://example.com', blurb: 'test' });
   A.ok(keyCard.includes('SET UP API KEY') && keyCard.includes('Paste it below, then choose CONNECT'), 'key setup states the next action before submission');
+  const viaCard = renderCatalog({ id: 'supliful', name: 'Supliful', platformApi: true, apiVia: 'Shopify Admin API', authType: 'apikey', blurb: 'test' });
+  A.ok(viaCard.includes('via Shopify Admin API') && !viaCard.includes('✓ official API'), 'a platform with no API of its own never claims a first-party API');
+  A.ok(renderCatalog({ id: 'printify', name: 'Printify', platformApi: true, authType: 'apikey', blurb: 'test' }).includes('✓ official API'), 'first-party platform APIs keep their badge');
   A.ok(/state === 'up'/.test(station), 'the connect result badge reflects the real manager state, not an assumption');
   // on-theme styling for the new cards
   A.ok(/\.cc-card/.test(css) && /\.cc-grid/.test(css) && /\.cc-chip/.test(css), 'catalog card styles present');
@@ -311,15 +315,18 @@ function fakeStack(tools) {
     'platform cards are identity-namespaced so GitHub/Notion/Stripe cannot collide with same-id MCP cards');
   A.ok(!/id="ky-catalog"/.test(station) && /CONNECTED API KEYS/.test(station),
     'KEYS shows connected credentials and no longer hides the curated platform catalog inside its add form');
-  const routeSource = /const ROUTES = (\[[\s\S]*?\n\s*\]);/.exec(station);
-  const routes = routeSource ? vm.runInNewContext(routeSource[1]) : [];
-  const podRoute = routes.find(r => /print.on.demand|\bPOD\b/i.test(r.title + ' ' + r.blurb));
-  A.ok(podRoute && podRoute.to === 'catalog',
-    'the ABILITIES front door routes POD discovery through CATALOG before the KEYS setup path');
-  A.eq(routes.filter(r => r.to === 'catalog').length, 1,
-    'service and platform discovery share one catalog route');
-  A.ok(/to: 'catalog', title: 'Connect a service you use'/.test(station) && /entry\.platformApi \? 'keys' : 'mcp'/.test(station),
-    'one service front door preserves the correct platform-key and connector management paths');
+  /* ONE FLAT LIST (UX night 2026-10-26, Andrew: CONNECT should be "more like the setting menu where u can see all the
+     different options"): the ROUTES front door and its INSTALLED / DISCOVER / CREATE switch are gone. The rail IS the
+     front door, APPS first, so every service and platform (print-on-demand included) is found in APPS before anyone
+     reaches the API KEYS form; a platform card's MANAGE lands on the API KEYS block, a service's on its CONNECTED row. */
+  A.ok(!/const ROUTES = \[/.test(station) && !/secRouter|id="ab-routes"/.test(station), 'no router front door above the rail');
+  const railSrc = station.slice(station.indexOf("mountConsole(body, 'connectors', ["), station.indexOf("searchLabel: 'Search abilities'"));
+  A.eq([...railSrc.matchAll(/\{ id: '([a-z-]+)', label: '([A-Z ]+)'/g)].map(m => m[2]).join(' / '), 'APPS / CONNECTED / TOOLS / EXTENSIONS',
+    'the rail reads APPS first, then CONNECTED, then (after the skills lane) TOOLS and EXTENSIONS');
+  A.ok(/lanes\.reduce\(\(acc, l\) => acc\.concat\(l\.sections\), \[\]\)/.test(railSrc) && !/groups:/.test(railSrc), 'the skills lane joins the same flat rail, with no intent groups');
+  A.ok(/id="ab-keys"><span class="sec-l">API KEYS/.test(station) && /secMcp \+ secKeys/.test(railSrc), 'API KEYS is a block of CONNECTED, under its services');
+  A.ok(/if \(act === 'manage'\) \{[\s\S]{0,200}#con-tab-connectors-mcp[\s\S]{0,120}if \(entry\.platformApi\) \{[^\n]*#ab-keys/.test(station),
+    'MANAGE on a platform card lands on CONNECTED, scrolled to API KEYS; a service lands on its CONNECTED row');
 
   const availabilitySource = A.fnBody(station, 'function tsAvailability(');
   const availability = vm.runInNewContext('(' + availabilitySource + ')');
@@ -345,6 +352,16 @@ function fakeStack(tools) {
   A.ok(rejectedRow.includes('Sign in below') && rejectedRow.includes('data-act="resign"'), 'rejected OAuth grant has a visible recovery instruction and sign-in action');
   A.ok(rejectedRow.includes('Error &amp; connection details') && rejectedRow.includes('Rejected &lt;grant>'), 'complete error stays inspectable and escaped');
   A.ok(!rejectedRow.includes('· OAuth authorized'), 'stored rejected OAuth grant does not claim authorization');
+  // A saved-token row whose catalog entry now signs in (Intercom 2026-10-07) gets the SAME sign-in engine and says the
+  // token survives until approval — EDIT → OAUTH, the only other route, drops the token before the browser opens.
+  const switchRow = renderService({id:'intercom',label:'Intercom',catalogSignIn:true,enabled:true,state:'up',hasToken:true,url:'https://mcp.intercom.com/mcp',toolCount:15},0);
+  A.ok(switchRow.includes('data-act="resign"') && switchRow.includes('⏼ SIGN IN') && switchRow.includes('only after you approve'),
+    'a saved-token row on a now-OAuth catalog service offers a sign-in that keeps the token until approval');
+  A.ok(!renderService({id:'docs',enabled:true,state:'up',hasToken:true,url:'https://example.test'},0).includes('data-act="resign"'), 'an ordinary token row offers no sign-in');
+  for (const src of [station, webStation]) {
+    A.ok(/const c = found && found\.oauth \? found : null;/.test(A.fnBody(src, 'async function ccSignIn(')),
+      'the sign-in poll counts only an OAuth row as signed in (a saved-token row is already up before consent)');
+  }
   const toolsRow = renderService({id:'docs',state:'up',enabled:true,tools:['read_docs','search_docs'],toolCount:2,url:'https://example.test'},0);
   A.ok(toolsRow.includes('2 tools') && /<details[\s\S]*read_docs[\s\S]*search_docs[\s\S]*<\/details>/.test(toolsRow), 'tools remain fully inspectable without an always-expanded tool wall');
   A.ok(/\.mc-row\s*\{[^}]*flex-direction:\s*column/.test(css), 'shared record cards stack instead of inheriting the legacy horizontal header');

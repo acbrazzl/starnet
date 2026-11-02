@@ -87,10 +87,10 @@
 
   const ul = document.getElementById('crew');
   const left = document.getElementById('left');
-  const sumEl = document.getElementById('crew-sum');
   const vseam = document.getElementById('crew-vresizer');
   const crewSearch = document.getElementById('crew-search-wrap');
-  const attention = document.getElementById('ws-attention');
+  // NEEDS YOU (needsyou.js) rides between the roster and SESSIONS — it replaced the old #ws-attention button
+  const needs = document.getElementById('ws-needs');
 
   // The dragged row count, or null for "measure it for me". Stored as a ROW COUNT and not as a
   // height on purpose: rows change height (a WORKING row opens its in-flight bar) and the roster
@@ -109,7 +109,30 @@
     // offsetTop is measured from the offsetParent, which is #crew itself only if #crew is
     // positioned (then row tops exclude its border) and the shared ancestor otherwise.
     const base = rows[0].offsetParent === ul ? -(parseFloat(cs.borderTopWidth) || 0) : ul.offsetTop;
-    return [].map.call(rows, (r) => (r.offsetTop - base) + r.offsetHeight + padBottom);
+    // The CREW cards (crew-glass) carry a 4px margin, which the old "bottom + list padding" cut
+    // ignored: the last notch left the list 4px taller than its window (a permanent scrollbar
+    // sliver, the ▾ under the card) and every other notch let the NEXT card peek in. So a mid-list
+    // cut ends exactly where the next row's box begins, and only the last one adds the trailing
+    // margin + list padding — which is then the list's whole scrollHeight, so nothing scrolls.
+    // The LAST cut is the list's whole scrollHeight, so it is read from the row's true (fractional) bottom and rounded UP:
+    // offsetTop/offsetHeight round to whole pixels, and a card ending in .4 (TEXT SIZE zoom; a working card whose run clock
+    // took the line under its name) left the list 1px taller than its window — a scrollbar that narrowed every card.
+    const ulTop = ul.getBoundingClientRect().top, z = zoomOf();
+    return [].map.call(rows, (r, i) => {
+      const next = rows[i + 1];
+      if (next) return next.offsetTop - base;
+      const bottom = Math.max((r.offsetTop - base) + r.offsetHeight, Math.ceil((r.getBoundingClientRect().bottom - ulTop) / z + (ul.scrollTop || 0) - 0.01));
+      return bottom + (parseFloat(getComputedStyle(r).marginBottom) || 0) + padBottom;
+    });
+  }
+
+  // Everything riding between the roster's bottom edge and the seam, MEASURED from the seam itself.
+  // It used to be "#crew-sum's height", which assumed the WORKING/IDLE strip sat under the list —
+  // the CREW cards seat it in the header (crewcards.js seatSummary), so that guess turned into a
+  // -99px error and the drag landed rows away from the cursor.
+  function belowList() {
+    if (!vseam || vseam.hidden) return 0;
+    return Math.max(0, vseam.getBoundingClientRect().top - ul.getBoundingClientRect().bottom);
   }
 
   // TEXT SIZE is a body zoom: rects are VISUAL px while #crew's own px (the cap, clientHeight) are
@@ -126,9 +149,13 @@
 
     // What the column can actually spare.
     const z = zoomOf();
-    const sumH = sumEl ? sumEl.getBoundingClientRect().height : 0;
-    const attentionH = attention ? attention.getBoundingClientRect().height : 0;
-    const spare = (left.getBoundingClientRect().bottom - ul.getBoundingClientRect().top - sumH - attentionH) / z - WS_FLOOR;
+    // NEEDS YOU is not flex-shrunk, so it comes off the column whole, its margins with it (review app-shell-ui-04)
+    let needsH = 0;
+    if (needs && !needs.hidden) {
+      const ns = getComputedStyle(needs);
+      needsH = needs.getBoundingClientRect().height + (parseFloat(ns.marginTop) || 0) + (parseFloat(ns.marginBottom) || 0);
+    }
+    const spare = (left.getBoundingClientRect().bottom - ul.getBoundingClientRect().top - belowList() - needsH) / z - WS_FLOOR;
 
     // Search temporarily opens a deliberately shut roster, then restores the saved split on close.
     const searching = crewSearch && !crewSearch.hidden;
@@ -151,10 +178,17 @@
     // ROW COUNT — crewRender replaces the list wholesale. Deliberately NOT subtree: crewTick
     // rewrites every status line's textContent once a second, and a subtree childList observer
     // turns that into ~8 forced layouts a second for nothing.
-    new MutationObserver(schedule).observe(ul, { childList: true });
-    for (const control of [crewSearch, attention]) {
-      if (control) new MutationObserver(schedule).observe(control, { attributeFilter: ['hidden'] });
-    }
+    // ROW HEIGHT, the way no class announces: a working card's run clock takes the line under the name when the two do
+    // not fit side by side (crew-glass.css), and a clock can outgrow its line mid-run (9:59 → 10:00). Each row is watched
+    // for its own size (a ResizeObserver fires on a real size change only, never on the 1s status rewrite).
+    const rowSize = typeof ResizeObserver === 'function' ? new ResizeObserver(schedule) : null;
+    const watchRows = () => { if (!rowSize) return; rowSize.disconnect(); ul.querySelectorAll('.crew-row').forEach(r => rowSize.observe(r)); };
+    new MutationObserver(() => { watchRows(); schedule(); }).observe(ul, { childList: true });
+    watchRows();
+    if (crewSearch) new MutationObserver(schedule).observe(crewSearch, { attributeFilter: ['hidden'] });
+    // NEEDS YOU appearing, gaining or losing an ask, or expanding "N more" — a ResizeObserver, not a hidden-attribute
+    // watch: needsyou.js re-sets `hidden` on every 1s tick while the list is empty, and that would re-fit every second
+    if (needs && typeof ResizeObserver === 'function') new ResizeObserver(schedule).observe(needs);
     // ROW HEIGHT — crewTick toggles .working, which opens the in-flight bar inside the row.
     new MutationObserver(schedule).observe(ul, { subtree: true, attributeFilter: ['class', 'hidden'] });
     // …and that bar is TRANSITIONED (motion.css §17, --t-med 220ms), so the class toggle above
@@ -202,15 +236,12 @@
       wantRows = Math.max(0, Math.min(n, cuts.length));   // 0 = shut, and 0 is not "unset"
       fitCrew();
     }
-    // Where the cursor is asking the roster's bottom edge to be. The seam sits under the
-    // WORKING/IDLE strip, so everything between #crew's bottom edge and the handle (that strip and
-    // its margin) rides along and comes off the target — measured, never a constant.
+    // Where the cursor is asking the roster's bottom edge to be. Whatever sits between #crew's
+    // bottom edge and the handle rides along and comes off the target — measured, never a constant.
     function rowsAtCursor(clientY) {
       const cuts = rowCuts();
       if (!cuts.length) return 0;
-      const ulR = ul.getBoundingClientRect();
-      const below = sumEl ? (sumEl.getBoundingClientRect().bottom - ulR.bottom) : 0;
-      return rowsAtHeight(cuts, (clientY - ulR.top - below) / zoomOf());
+      return rowsAtHeight(cuts, (clientY - ul.getBoundingClientRect().top - belowList()) / zoomOf());
     }
 
     // pendingRows is null-or-a-count, never 0-as-empty: 0 IS a notch (the roster dragged shut), so
@@ -360,4 +391,20 @@
     const cur = parseInt(getComputedStyle(game).getPropertyValue('--crew-w'), 10);
     if (cur) applyW(cur);
   });
+
+  // SESSIONS / PROJECTS that don't fit (Andrew 10-25 circled the + key sitting on PROJECTS): pipglass.css spaces the tabs
+  // by the strip's width, but a width rule only guesses at the words. This reads the real thing — any tab cut at its own
+  // edge marks the strip .tabs-tight (the narrowest rail's spacing). Unmarked first, so a strip that has room again
+  // gets its spacing back.
+  const head = document.querySelector('#left .ws-head');
+  if (head) {
+    const fitTabs = () => {
+      head.classList.remove('tabs-tight');
+      const cut = Array.from(head.querySelectorAll('.ws-tab')).some(t => t.offsetWidth && t.scrollWidth > t.clientWidth + 1);
+      if (cut) head.classList.add('tabs-tight');
+    };
+    if (typeof ResizeObserver === 'function') new ResizeObserver(fitTabs).observe(head);
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(fitTabs, () => {});
+    fitTabs();
+  }
 })();

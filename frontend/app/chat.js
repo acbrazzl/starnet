@@ -35,14 +35,20 @@ const Chat = (() => {
   // Channels (channels.js) so streams are isolated and survive a switch — chat.js is the DOM view over it. The
   // one thing that can't live in the pure model is the live AbortController (not serializable), so it stays here.
   const aborters = new Map();   // workstreamId -> AbortController for that stream's in-flight run
+  const liveRunRoots = new Map();   // workstreamId -> the project root its in-flight run was sent with (null = none): a switch-back replays its files there
   const interrupted = new Set();   // wsIds the Commander deliberately STOPPED this turn — send()'s catch reads this as a
                                    // graceful stop (keep the partial reply, log no error) rather than a disconnect. Consumed in finally.
   const interruptedStreams = new Set();   // wsIds whose in-flight run lost its stream; durable recovery decides
+  const stopSource = new Map();   // wsId -> 'esc' | 'you': HOW the Commander stopped it (the card names it); consumed with `interrupted`
                                    // whether work resumes automatically or stops for explicit review.
   const recoveryClaims = new Set();       // source run ids already being recovered by this page
   const recoveryNotices = new Set();      // review-required run ids already explained on this page
   let reconnectTimer = 0;          // the single reconnect health-probe poll (armed only while interruptedStreams is non-empty)
   const queued = new Map();        // TYPE-AHEAD: wsId -> [text,…] follow-ups typed while the stream was busy; auto-sent in order as it frees
+  const sentNow = new Map();       // SEND NOW: wsId -> [{ id, text, wire, runId, accepted, landed }] queued lines handed to the live run (sendQueuedNow) — kept until that run ends, so a STOP can give back any its transcript never showed landing (and on disk until settled: keepSentNow)
+  const heldBack = new Map();      // wsId -> [{ texts, line, ids }] words a confirmed STOP gave back while ANOTHER session was on screen: they go into the message box when you return (returnHeld)
+  const sentNowChecks = new Map(); // wsId -> the in-flight ask about its leftover sent-now lines (reconcileSentNow): one per conversation at a time
+  const sentNowRetry = new Map();  // noteId -> the retry armed for it (askSentNow): one chain per line, however many asks find it still waiting
   let activeLiveRow = null;     // streaming text controller for the DISPLAYED stream's in-flight run; rebound by replayChannel on switch
                                 // CLASSIC HARNESS FLOW: prose and the agent's actions (tool ▶/◀ lines, deliverables, approval
                                 // prompts) render CHRONOLOGICALLY — newest at the bottom — instead of pinning one reply block to
@@ -69,7 +75,17 @@ const Chat = (() => {
   let activeTurnin = null;      // the single visible memory-review deck; later batches queue behind it
   const turninQueue = [];       // memory-review batches waiting for the visible deck to finish
   const activeChoiceRows = new Set();   // one-shot chip rows; cleared when a typed answer supersedes them
-  const receiptRunsSeen = new Set();    // runIds whose SILENT auto-saved receipts already rendered (memory.write triggers once per run)
+  /* memory-truth (2026-10-11): receipts are tracked per SAVE, not per run. A run can save mid-run (notebook.write) AND
+     after it ends (reflection); the old once-per-run gate showed the first batch and then hid every later save of the
+     same run. receiptShown: runId -> keys already rendered; receiptFetching: runIds with a fetch already scheduled. */
+  const receiptShown = new Map();
+  const receiptFetching = new Set();
+  // the saves of this batch not yet shown for its run — marked shown as they are handed back (renders exactly once)
+  function unshownReceipts(runId, saved) {
+    let seen = receiptShown.get(runId);
+    if (!seen) { seen = new Set(); receiptShown.set(runId, seen); if (receiptShown.size > 200) receiptShown.delete(receiptShown.keys().next().value); }
+    return saved.filter(p => { const k = String(p.key || p.id || p.content || ''); if (seen.has(k)) return false; seen.add(k); return true; });
+  }
   const clarificationRuns = new Set();  // an intent-question turn is a continuation, not completed work
   /* Deliverable titles this run ALREADY announced inline, as they happened. The recap card is the run's
      ledger and must stay complete, but on a short run the same filename landed three times in a row — the
@@ -108,8 +124,69 @@ const Chat = (() => {
   let stick = true;   // STICKY-BOTTOM: auto-scroll only fires when the Commander is already at/near the bottom,
                       // so scrolling UP to re-read history mid-stream isn't yanked back down by every token.
   let historyPinSeq = 0, historyPinPending = 0;   // a load owns one final post-layout pin; a real user gesture cancels it
+  let revealKey = '';   // selector of the last explicit reveal (revealHistory); a fresh load or the reader's own gesture forgets it
+  let userScrollHeld = false;
+  let userScrollAt = 0;   // last real scroll GESTURE on the log (wheel/touch/scrollbar/keys) — only a gesture can unstick
+  /* A PRESS IS NOT A SCROLL (live walk 10-14: the approval card and the MY READ card landed below the fold under a NEW
+     MESSAGES pill). Every pointer release in the WINDOW stamped a gesture — the click on the composer or the send key —
+     and so did a press on a key inside the log (Approve once, a brief chip). Content landing in the next 1.2 s then read
+     as "they scrolled up" and the follow stopped mid-exchange. Only a scroll gesture on the log counts: wheel, touch, the
+     scrollbar or text drag (a hold that began ON the log), or a key that moves the reader. */
+  const PRESS_SEL = 'button, a[href], input, textarea, select, label, summary, [role="button"], [contenteditable="true"]';
+  function isPress(ev) { const t = ev && ev.target; return !!(t && t.closest && t.closest(PRESS_SEL)); }
+  /* A KEY THAT MOVES THE READER IS A GESTURE WHEREVER FOCUS SITS (review 10-14: with focus left on a message's copy key, PageUp
+     and ArrowUp were read as layout moving under a follower and pulled straight back down — the reader could not move and no
+     pill showed). Only a key that ACTS on a control is a press: Enter or Space on a key, link or chip, and typing or caret keys
+     in a field. PageUp / PageDown / Tab move the reader even from a field (Tab scrolls the next key into view). */
+  const READ_KEYS = ['PageUp', 'PageDown', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'Tab', ' ', 'Spacebar'];
+  const FIELD_SEL = 'input, textarea, select, [contenteditable="true"]';
+  function keyMovesReader(ev) {
+    const k = ev.key, t = ev.target, on = sel => !!(t && t.closest && t.closest(sel));
+    if (READ_KEYS.indexOf(k) < 0) return !on(PRESS_SEL);   // any other key: on the log itself as ever; on a key or in a field it acts there
+    if (k === 'PageUp' || k === 'PageDown' || k === 'Tab') return true;
+    if (on(FIELD_SEL)) return false;   // arrows / Home / End / Space move a caret or type a space
+    return !((k === ' ' || k === 'Spacebar') && on(PRESS_SEL));   // Space presses a key; arrows / Home / End on a key scroll the log
+  }
+  function logGesture(ev) { if (ev && ev.type === 'keydown' ? keyMovesReader(ev) : !isPress(ev)) userScrollAt = Date.now(); }
+  function logHold(ev) { if (!isPress(ev)) userScrollHeld = true; }
+  function endLogHold() { if (!userScrollHeld) return; userScrollHeld = false; userScrollAt = Date.now(); }   // a release ends a hold begun on the log, never stamps one begun elsewhere
   function nearBottom() { return !log || (log.scrollHeight - log.scrollTop - log.clientHeight < 40); }
   function autoscroll() { if (stick && log) log.scrollTop = log.scrollHeight; else if (log) showNewPill(true); }   // content landed while unstuck → "new messages"
+  /* A QUESTION OR APPROVAL CARD follows the bottom like any row — unless that cuts its TOP off (who asks and what): then it
+     shows from its top and the follow waits until it is answered (2026-10-13 review). One card is held at a time: a second
+     one waits its turn (no jump, no focus) and is shown from its top once the first is answered. A live card carries
+     data-live-ask until it is settled, so a session load re-holds it after its history pin. */
+  let heldCard = null, heldScrollTop = 0;
+  const heldQueue = [];
+  // the log's offset of a node in LAYOUT px: TEXT SIZE is a body zoom, so a rect delta is scaled (deliverTurns does the same)
+  function topInLog(el) { const k = log.offsetHeight ? (log.getBoundingClientRect().height / log.offsetHeight) || 1 : 1; return (el.getBoundingClientRect().top - log.getBoundingClientRect().top) / k; }
+  function holdCard(el) { log.scrollTop += topInLog(el) - 8; stick = false; heldCard = el; heldScrollTop = log.scrollTop; hideNewPill(); }
+  function revealCard(el) {
+    noteAskLanding();   // a live question / approval card is on screen: an offer panel over COMMS steps aside for its keys
+    if (!log || !el || !el.getBoundingClientRect || !log.clientHeight) { autoscroll(); return; }   // COMMS has no layout (behind CREW / ACTIVITY / cinema): nothing to reveal
+    if (heldCard && heldCard !== el && log.contains(heldCard)) { if (!heldQueue.includes(el)) heldQueue.push(el); return 'queued'; }
+    if (!stick) { autoscroll(); return; }
+    log.scrollTop = log.scrollHeight;
+    // the presence line lands under the card right after this (~50px) and the follow goes with it: leave it the room
+    if (topInLog(el) < 0 || el.offsetHeight + 90 > log.clientHeight) holdCard(el);
+  }
+  // answered (here or elsewhere): the run goes on, so the transcript follows it again — or shows the next waiting card
+  function releaseCard(el) {
+    if (!el) return;
+    if (el.dataset) delete el.dataset.liveAsk;
+    const queued = heldQueue.indexOf(el); if (queued >= 0) heldQueue.splice(queued, 1);
+    if (heldCard !== el) return;
+    heldCard = null;
+    if (!log || !log.contains(el)) { heldQueue.length = 0; return; }   // another session's card: never move the transcript being read
+    let next = null;
+    while (heldQueue.length && !next) { const c = heldQueue.shift(); if (log.contains(c) && c.dataset && c.dataset.liveAsk) next = c; }
+    if (Math.abs(log.scrollTop - heldScrollTop) > 40) { if (!stick) showNewPill(false); return; }   // they scrolled away: leave them there
+    stick = true;
+    if (next) { revealCard(next); try { next.focus({ preventScroll: true }); } catch (_) { /* focus is a courtesy */ } return; }
+    log.scrollTop = log.scrollHeight; hideNewPill();
+  }
+  // a pressed key is removed with its row: keep the keyboard on the card instead of dropping it to <body>
+  function keepFocus(el) { try { const a = document.activeElement; if (!a || a === document.body) el.focus({ preventScroll: true }); } catch (_) { /* focus is a courtesy */ } }
 
   /* COMMS-PREMIUM · the jump-to-bottom pill. Two states over ONE control (stick machinery, no new scroll state):
      • scrolled UP to re-read (stick=false) → a dim, PERSISTENT "↓ latest" affordance (so a keyboard/AT user
@@ -119,11 +196,50 @@ const Chat = (() => {
      so it rides a one- or multi-line composer instead of a magic offset. Click jumps down + re-arms stickiness. */
   function jumpToBottom() { if (log) { log.scrollTop = log.scrollHeight; stick = true; hideNewPill(); } }
   function cancelHistoryPin() { historyPinPending = 0; }
+  // An explicit search/attention/result jump is reading intent, including when a session load still owes its pin.
+  function revealHistory(target) {
+    if (!log || !target || !log.contains(target)) return false;
+    cancelHistoryPin(); stick = false; userScrollAt = Date.now();
+    if (target.offsetHeight + 16 > log.clientHeight) log.scrollTop += topInLog(target) - 8; else target.scrollIntoView({ block: 'center' });
+    showNewPill(false);
+    revealKey = revealSelector(target);
+    return true;
+  }
+  // The revealed row as a selector, so the load's server-history repaint (which rebuilds every row) can find it again.
+  function revealSelector(target) {
+    const sel = attr => (target.hasAttribute && target.hasAttribute(attr)) ? '[' + attr + '="' + String(target.getAttribute(attr)).replace(/["\\]/g, '\\$&') + '"]' : '';
+    return sel('data-dg-row') || sel('data-clarify-prompt') || sel('data-consent-prompt');   // an approval card too (NEEDS YOU › Review)
+  }
+  function forgetReveal() { revealKey = ''; }
+  // ONE HOP TO A QUESTION (2026-10-13 review: from NEEDS YOU it took Answer → the worker's row → Answer → the card). A
+  // question is answered on its own question card; the row's Answer key and NEEDS YOU both land there. If the card is not
+  // in the transcript, draw it again from the conversation's open ask, so the key is never dead.
+  // AN APPROVAL TOO (live walk 10-14): NEEDS YOU › Review on an approval re-opened the session and left its card below
+  // the fold. Review lands on the approval card the same way (a delegated worker's ask lives on its delegation card:
+  // permissionRow draws nothing for it, and NEEDS YOU unfolds that worker's row instead).
+  function revealAsk(promptId) {
+    if (!log || promptId == null) return false;
+    const id = String(promptId);
+    const find = () => Array.from(log.querySelectorAll('[data-clarify-prompt], [data-consent-prompt]')).find(n => (n.dataset.clarifyPrompt || n.dataset.consentPrompt) === id);
+    let card = find();
+    if (!card && activeWs && typeof Channels !== 'undefined' && Channels.pendingAllOf) {
+      const p = Channels.pendingAllOf(activeWs.id).find(x => x && String(x.promptId) === id);
+      if (p) { permissionRow(p, activeWs); card = find(); }
+    }
+    if (!card) return false;
+    noteAskLanding();   // NEEDS YOU › Review / Answer: the card it lands on is never under an offer panel
+    revealHistory(card);
+    if (card.dataset.liveAsk) { heldCard = card; heldScrollTop = log.scrollTop; heldQueue.length = 0; hideNewPill(); }   // answering it resumes the follow
+    try { card.focus({ preventScroll: true }); } catch (_) { /* focus is a courtesy: the card is already in view */ }
+    return true;
+  }
   function pinLoadedHistoryAfterLayout(seq) {
     const pin = () => {
       if (!log || historyPinPending !== seq) return;
       log.scrollTop = log.scrollHeight;
       historyPinPending = 0;
+      const live = Array.from(log.querySelectorAll('[data-live-ask]'));
+      if (live.length) { heldCard = null; heldQueue.length = 0; stick = true; for (const c of live) revealCard(c); if (heldCard) return; }
       stick = nearBottom();
       if (stick) hideNewPill();
     };
@@ -140,10 +256,12 @@ const Chat = (() => {
   }
   function showNewPill(hasNew) {
     const panel = el('chat-panel'); if (!panel || stick) return;
+    // a card held from its top is what you are reading: no "latest" key on top of it (only real new content brings one)
+    if (!hasNew && heldCard && log && log.contains(heldCard)) return;
     let pill = el('comms-newpill');
     if (!pill) {
       pill = document.createElement('button'); pill.id = 'comms-newpill'; pill.type = 'button'; pill.className = 'comms-newpill';
-      pill.onclick = () => { if (typeof SFX !== 'undefined' && SFX.click) SFX.click(); jumpToBottom(); };
+      pill.onclick = () => { if (typeof SFX !== 'undefined' && SFX.press) SFX.press(); jumpToBottom(); };
       panel.appendChild(pill);
     }
     if (hasNew) pill.classList.add('hasnew');
@@ -224,9 +342,15 @@ const Chat = (() => {
     }
     return card;
   }
+  // the ask THIS conversation's live run is paused on. A background worker's ask (filed on the same conversation) never
+  // pauses it: the run keeps working, so its presence card must not read AWAITING APPROVAL for someone else's wait
+  function runPendingOf(ws) {
+    if (!ws || typeof Channels === 'undefined') return null;
+    return Channels.runPendingOf ? Channels.runPendingOf(ws.id) : Channels.pendingOf(ws.id);
+  }
   // derive the presence VERB from the same real state syncStatus() reads (pending approval > working > thinking)
   function presenceVerb() {
-    const p = (activeWs && typeof Channels !== 'undefined') ? Channels.pendingOf(activeWs.id) : null;
+    const p = runPendingOf(activeWs);
     // A clarify question rides the SAME consent transport as a permission grant, but it is not one:
     // "AWAITING APPROVAL / approve brief.ask" told the Commander to approve an internal tool name when
     // the run is simply waiting for them to answer a question (caught in shot review, 2026-08-14).
@@ -246,23 +370,25 @@ const Chat = (() => {
     // PAUSED-ON-APPROVAL: the run is stopped on the sidecar waiting for the Commander. Restyle the card so it
     // reads as a deliberate pause (no working pulse) and NAME the pending action — truth source is the same
     // Channels.pendingOf payload that renders the approval prompt, so this can never claim a pause that isn't real.
-    const pend = (activeWs && typeof Channels !== 'undefined') ? Channels.pendingOf(activeWs.id) : null;
+    const pend = runPendingOf(activeWs);
     const paused = !!pend;
     card.classList.toggle('paused', paused);
     const verb = card.querySelector('.cp-verb'); if (verb) verb.textContent = presenceVerb();
     const tool = card.querySelector('.cp-tool');
     if (tool) {
       if (paused) {
-        // e.g. "paused — waiting for you to approve fs.write"; a clarify question is an ANSWER, not a grant
-        const t = pend.tool === 'brief.ask'
-          ? 'paused — waiting for your answer to the question above'
-          : 'paused — waiting for you to approve ' + shortName(pend.tool);
+        // e.g. "paused — waiting for your approval to change notes.md" (the card's own words, never a raw tool id like
+        // fs.write — 2026-10-13); a clarify question is an ANSWER, not a grant
+        const t = pend.tool === 'brief.ask' ? 'see the question above' : 'to ' + glance(actionPhrase(pend), 70);
         if (tool.textContent !== t) tool.textContent = t;
-        tool.classList.add('has'); tool.classList.add('paused-note');
+        tool.classList.add('has'); tool.classList.add('paused-note'); tool.classList.remove('wait-note');
       } else {
         tool.classList.remove('paused-note');
-        const t = presenceCurTool ? shortName(presenceCurTool) : '';
-        if (tool.textContent !== t) tool.textContent = t; tool.classList.toggle('has', !!t);
+        // the running tool wins; with none, the sidecar's own word on a slow/retrying model call (LIVE WAIT LINE)
+        const t = presenceCurTool ? shortName(presenceCurTool) : waitNoteText(presenceWaitNote());
+        if (tool.textContent !== t) paintToolLine(tool, t, presenceCurTool ? null : presenceWaitNote());
+        tool.classList.toggle('has', !!t);
+        tool.classList.toggle('wait-note', !presenceCurTool && !!t);   // the wait line WRAPS: its numbers never clip
       }
     }
     const time = card.querySelector('.cp-time'); const txt = fmtElapsed(Channels.elapsedOf(activeWs.id, Date.now()));
@@ -280,6 +406,120 @@ const Chat = (() => {
   }
   function presenceToolCall(ws, name) { presenceCurTool = name || null; if (isActiveWs(ws)) renderPresence(); }
   function presenceToolResult(ws) { presenceCurTool = null; if (isActiveWs(ws)) renderPresence(); }
+  /* LIVE WAIT LINE (2026-09-23, live-events lane). The retry ladder (~105 s) and a slow model (up to minutes before a
+     first byte) used to leave this card reading THINKING and nothing else. The sidecar now says so itself —
+     provider.retry before each backoff, agent.waiting on a ~15 s heartbeat while a model call shows nothing — and the
+     card's .cp-tool slot (the same transient line that names the running tool) renders exactly that:
+     "retry 3/6 in 30s (overloaded) — <model>" · "waiting for 45s on <model>". Truthful telemetry: every
+     number is read off the latest event for the DISPLAYED run (no local countdown, no guessed state), and the line
+     clears the moment the run shows output (a token, a tool call), fails over, or ends. */
+  const waitNotes = new Map();   // runId -> the latest wait note (see foldWaitNote)
+  // PURE: the next wait note for a run given one bus event (null = no wait to show). Locked by comms-wait-line.test.js.
+  function foldWaitNote(prev, name, p) {
+    p = p || {};
+    if (name === 'provider.retry') {
+      return { model: String(p.model || (prev && prev.model) || ''), phase: 'retry_backoff', sinceMs: 0,
+        retry: { attempt: p.attempt, maxAttempts: p.maxAttempts, reason: String(p.reason || ''), delayMs: p.delayMs } };
+    }
+    if (name === 'agent.waiting') {
+      // a beat during the backoff keeps the retry it belongs to; any other phase means the retry already went out.
+      // `note` = the sidecar's own facts about this wait, as the beat states them (#99: where Ollama has the model); a beat
+      // without one means there is none now, so it is never carried over from an earlier beat.
+      return { model: String(p.model || (prev && prev.model) || ''), phase: String(p.phase || ''), sinceMs: p.sinceMs,
+        note: String(p.note || '').slice(0, 240),
+        retry: (p.phase === 'retry_backoff' && prev && prev.retry) ? prev.retry : null };
+    }
+    if (name === 'agent.token') return p.delta ? null : prev;   // an empty delta shows the Commander nothing
+    if (name === 'agent.tool_call' || name === 'agent.tool_result' || name === 'provider.fallback'
+      || name === 'agent.run.end' || name === 'agent.run.error') return null;   // output, a failover or the end: the wait is over
+    return prev;
+  }
+  /* PURE: the text for a wait note ('' = nothing to show). FACTS FIRST, MODEL LAST (live browser proof, 2026-09-24): the
+     line used to lead with "waiting on <model>", so the default 520 px panel clipped every retry line's reason and a
+     300 px panel showed "· waiting on anthropic…" and nothing else. The rung, countdown, reason and duration now lead;
+     the model id (the least new fact — it is the agent's roster model) trails, and the slot wraps (.wait-note). No
+     trailing "…": it read exactly like the clip ellipsis. */
+  // PURE: the model as the wait line names it — the bare id without its vendor path ("anthropic/claude-sonnet-4.6" ->
+  // "claude-sonnet-4.6"; still the model, in a third of a 300 px line), capped at 48 chars.
+  function waitModelLabel(n) {
+    const model = String((n && n.model) || '').trim();
+    const bare = model.slice(model.lastIndexOf('/') + 1) || model;
+    return bare ? (bare.length > 48 ? bare.slice(0, 47) + '…' : bare) : 'the model';
+  }
+  function waitNoteText(n) {
+    if (!n) return '';
+    const name = waitModelLabel(n);
+    const since = Math.max(0, Number(n.sinceMs) || 0);
+    const r = n.retry;
+    if (r) {
+      // "in Ns" rounds UP: a 400 ms rung reads "in 1s", never "in 0s"
+      const left = Math.max(0, (Number(r.delayMs) || 0) - since);
+      const of = Number(r.maxAttempts) > 0 ? '/' + r.maxAttempts : '';
+      const why = String(r.reason || '').replace(/_/g, ' ').trim();
+      return 'retry ' + r.attempt + of + (left > 0 ? ' in ' + fmtElapsed(Math.ceil(left / 1000) * 1000) : ' now') + (why ? ' (' + why + ')' : '') + ' — ' + name;
+    }
+    if (n.phase === 'retry_backoff') return 'retry backoff' + (since >= 1000 ? ', ' + fmtElapsed(since) + ' so far' : '') + ' — ' + name;
+    const dur = since >= 1000 ? ' for ' + fmtElapsed(since) : '';
+    // the sidecar's facts about the wait (#99, a local Ollama: prompt size, GPU/CPU share, window) follow the duration
+    if (n.note) return 'waiting' + dur + ' · ' + n.note + ' — ' + name;
+    if (n.phase === 'connect') return 'connecting' + dur + ' to ' + name;   // (the model id is always LAST: renderPresence splits it off)
+    return 'waiting' + dur + (n.phase === 'streaming' ? ' (stream open)' : '') + ' on ' + name;
+  }
+  // the model id closes every wait line as ONE token (.cp-model): it wraps whole and clips only itself, never mid-id
+  function paintToolLine(tool, t, note) {
+    const m = note ? waitModelLabel(note) : '';
+    if (m && t.endsWith(m)) {
+      tool.textContent = t.slice(0, t.length - m.length);
+      const s = document.createElement('span'); s.className = 'cp-model'; s.textContent = m; tool.appendChild(s);
+    } else tool.textContent = t;
+  }
+  function presenceWaitNote() {
+    const rid = (activeWs && typeof Channels !== 'undefined' && Channels.runIdOf) ? Channels.runIdOf(activeWs.id) : null;
+    return rid ? (waitNotes.get(rid) || null) : null;
+  }
+  /* VOICE CHAT MODEL NOTICE (Hermes parity): a spoken turn that could NOT use SETTINGS › Models › VOICE CHAT MODEL ran
+     on the agent's own model — say so ONCE per model+reason, in the stream it happened in, from the sidecar's own
+     agent.run.start voiceRoute (never inferred here). A turn the voice model answered needs no line: its receipt
+     already names the model that answered. PURE text builder, test-locked in test/voice-chat-route.test.js. */
+  const VOICE_ROUTE_REASONS = { not_configured: 'its provider is not connected', too_large: 'this conversation is larger than its context window' };
+  function voiceRouteNoticeText(vr) {
+    if (!vr || vr.used || !vr.reason || !VOICE_ROUTE_REASONS[vr.reason] || !vr.wanted || !vr.wanted.model) return '';
+    return 'VOICE MODEL ' + vr.wanted.model + ' not used — ' + VOICE_ROUTE_REASONS[vr.reason] + '; spoken replies use ' + (vr.model || 'the agent’s model');
+  }
+  const voiceRouteNoticed = new Set();
+  let voiceRouteWired = false;
+  function wireVoiceRouteNotice() {
+    if (voiceRouteWired || typeof U === 'undefined' || !U.bus) return;
+    voiceRouteWired = true;
+    U.bus.on('agent.run.start', p => {
+      const text = voiceRouteNoticeText(p && p.voiceRoute);
+      if (!text) return;
+      if (!activeWs || !p.streamId || String(p.streamId) !== String(activeWs.id)) return;
+      const once = p.voiceRoute.reason + '|' + p.voiceRoute.wanted.model;
+      if (voiceRouteNoticed.has(once)) return;
+      voiceRouteNoticed.add(once);
+      broadcast(text, { highlight: p.voiceRoute.wanted.model });
+    });
+  }
+  let waitWired = false;
+  function wireWaitNotes() {
+    if (waitWired || typeof U === 'undefined' || !U.bus) return;
+    waitWired = true;
+    ['provider.retry', 'agent.waiting', 'agent.token', 'agent.tool_call', 'agent.tool_result', 'provider.fallback', 'agent.run.end', 'agent.run.error'].forEach(name => {
+      U.bus.on(name, p => {
+        const rid = p && p.runId;
+        if (!rid) return;
+        const prev = waitNotes.get(rid) || null;
+        if (!prev && name !== 'provider.retry' && name !== 'agent.waiting') return;   // hot path: a token for a run with no wait
+        const next = foldWaitNote(prev, name, p);
+        if (next === prev) return;
+        waitNotes.delete(rid);
+        if (next) { waitNotes.set(rid, next); if (waitNotes.size > 24) waitNotes.delete(waitNotes.keys().next().value); }
+        const shown = (activeWs && typeof Channels !== 'undefined' && Channels.runIdOf) ? Channels.runIdOf(activeWs.id) : null;
+        if (shown && shown === rid) renderPresence();   // only the displayed stream's own run draws here
+      });
+    });
+  }
   // remove any live presence card without a summary (used when switching away / re-rendering a stream)
   function clearPresence() { const c = log && log.querySelector('#comms-presence'); if (c) { if (c.classList.contains('resolved')) c.removeAttribute('id'); else c.remove(); } presenceCurTool = null; }   // a resolved summary is history — keep it, only live cards are torn down
   function bindPresenceFold(card, fold) {
@@ -308,11 +548,16 @@ const Chat = (() => {
     if (!card) return;
     const presenceRunId = (typeof Channels !== 'undefined') ? Channels.runIdOf(ws.id) : '';
     if (presenceRunId) card.dataset.runId = presenceRunId;
+    // the honest machine time rides the card, so the later telemetry hydration can never swap in wall-clock time
+    if (started) card.dataset.ms = String(Math.max(0, Math.round(Channels.elapsedOf(ws.id, Date.now()) || 0)));
     card.classList.remove('cp-live');
     presenceCurTool = null;
     const isErr = !!opts.error, needsVerify = !!opts.verificationRequired, isStop = needsVerify || !!opts.stopped || (opts.endReason && opts.endReason !== 'done') || !!opts.cutShort;
     card.classList.add('resolved'); if (isErr) card.classList.add('err'); else if (isStop) card.classList.add('stopped');
-    let label = isErr ? '■ RUN FAILED' : needsVerify ? '■ VERIFICATION REQUIRED' : opts.cutShort ? '■ CUT SHORT' : isStop ? '■ RUN STOPPED' : '■ RUN COMPLETE';
+    // WHO stopped it (2026-10-11): the Commander's own Stop/Esc says so on the card — a bare "RUN STOPPED" after Esc
+    // read as the run quitting on its own. opts.stoppedBy: 'esc' | 'you' (stopActive's record); absent = not proven.
+    const byYou = opts.stoppedBy === 'esc' ? '■ STOPPED BY YOU (ESC)' : opts.stoppedBy === 'you' ? '■ STOPPED BY YOU' : '';
+    let label = isErr ? '■ RUN FAILED' : needsVerify ? '■ VERIFICATION REQUIRED' : opts.cutShort ? '■ CUT SHORT' : (isStop && byYou) ? byYou : isStop ? '■ RUN STOPPED' : '■ RUN COMPLETE';
     const bits = [];
     if (dur) bits.push(dur);
     if (typeof opts.steps === 'number' && opts.steps > 0) bits.push(opts.steps + (opts.steps === 1 ? ' step' : ' steps'));
@@ -320,9 +565,9 @@ const Chat = (() => {
     // TWO-TIER TRANSCRIPT: the run's tool rails FOLD under this resolved line so the machinery recedes
     // and the speech stays contiguous. The rails are MOVED, never deleted — the full work log is one
     // click away (truthful telemetry intact, just collapsed).
-    const rails = runRails.filter(r => r && r.isConnected && r.childElementCount > 0);
+    const rails = runRails.filter(r => r && r.isConnected && railChips(r).length > 0);
     runRails = [];
-    const tools = rails.reduce((n, r) => n + r.childElementCount, 0);
+    const tools = rails.reduce((n, r) => n + railChips(r).length, 0);   // the chips only: a folded rail's summary row is not a tool
     if (tools > 0) bits.push(tools + (tools === 1 ? ' tool' : ' tools'));
     card.textContent = '';
     const sum = document.createElement('span'); sum.className = 'cp-sum';
@@ -342,7 +587,38 @@ const Chat = (() => {
     } else {
       card.setAttribute('role', 'note');
     }
+    settleSummaryUnderReply(card);
     autoscroll();
+  }
+  /* THE SUMMARY IS THE REPLY'S FOOTER. The live card re-pins itself to the bottom on each elapsed tick, so where it
+     resolved depended on timing: a quick run left "■ RUN COMPLETE" wedged between the Commander's question and the
+     answer, a slow one left it under the answer. It now always settles directly under this run's last prose row
+     (with its fold), so a turn reads question → answer → quiet footer. Stops at the next Commander turn; a run
+     that spoke no prose leaves the card where it is. */
+  function settleSummaryUnderReply(card) {
+    if (!card || !card.parentNode) return;
+    const fold = card.nextElementSibling && card.nextElementSibling.classList.contains('run-fold') ? card.nextElementSibling : null;
+    let anchor = null;
+    for (let n = (fold || card).nextElementSibling; n; n = n.nextElementSibling) {
+      // a note the Commander sent mid-run belongs to this run's stretch; only their next real turn ends it
+      if (!n.classList.contains('steer-echo') && n.classList.contains('user')) break;
+      if (n.classList.contains('cmsg') && n.classList.contains('agent') && !n.matches('.nudge,.consent,.turnin,.tool,.deliverable')) anchor = n;
+    }
+    if (anchor) {
+      anchor.after(card);
+      if (fold) card.after(fold);
+    }
+    // the rails that split the answer into paragraphs just folded away, so its rows are ADJACENT now — a follow-up row
+    // stamped the same minute as the one above becomes one message (same rule row() applies at creation). Every pair in
+    // this run's stretch, back to the turn that started it: a mid-run note or a station line between two paragraphs no
+    // longer ends the walk (10-26: "8:23 PM" stood alone between two paragraphs of one reply). Same speaker only.
+    const prose = n => !!(n && n.classList && n.classList.contains('agent') && n.classList.contains('cmsg') && !n.matches('.nudge,.consent,.turnin,.tool,.deliverable'));
+    const headOf = n => { const w = n.querySelector(':scope > .cmsg-head > .who'), t = n.querySelector(':scope > .cmsg-head > .cmsg-ts'); return w && t ? w.textContent + '|' + t.textContent : ''; };
+    for (let n = anchor || card.previousElementSibling; n; n = n.previousElementSibling) {
+      if (!n.classList.contains('steer-echo') && n.classList.contains('user')) break;
+      const p = n.previousElementSibling;
+      if (prose(n) && prose(p) && headOf(n) && headOf(n) === headOf(p)) n.classList.add('ts-repeat');
+    }
   }
   // POST-RUN DEDUPE: when a recap card is about to render (it owns cost · duration · model + the artifact list),
   // strip the metrics from the already-resolved presence line above it so the two don't print the same numbers.
@@ -406,7 +682,7 @@ const Chat = (() => {
       if (brief && brief.status === 'clarifying' && brief.questions.some(q => !q.answer)) return 'deferred';
     } catch (_) { return 'unavailable'; }
     let rows;
-    try { rows = await Harness.runRecoveries(); } catch (_) { return 'unavailable'; }
+    try { rows = await Harness.runRecoveries({ streamId: ws.id, agentId: ws.agentId || 'agent' }); } catch (_) { return 'unavailable'; }
     const owned = rows.filter(r => r && r.streamId === ws.id && r.agentId === (ws.agentId || 'agent'))
       .sort((a, b) => (+b.startedAt || 0) - (+a.startedAt || 0));
     const safe = owned.find(r => r.canAutoContinue && !recoveryClaims.has(r.runId));
@@ -421,24 +697,64 @@ const Chat = (() => {
       return review ? 'review' : 'none';
     }
     recoveryClaims.add(safe.runId);
-    if (announce && isActiveWs(ws)) toolLine('connection restored — safely continuing from the last durable step.');
     let recovery;
     try { recovery = await Harness.prepareAutomaticRecovery(safe); }
     catch (_) { recoveryClaims.delete(safe.runId); return 'unavailable'; }
     // Preparation is durable and idempotent. If focus changed while it was in flight, leave it ready for the
     // next load instead of crossing conversations.
     if (!isActiveWs(ws) || Channels.isBusy(ws.id)) { recoveryClaims.delete(safe.runId); return 'deferred'; }
+    if (announce) toolLine('recovery prepared — requesting continuation from the last durable step.');
     await send(String(safe.userTitle || 'Continue the interrupted task.'), {
       retry: true, recoveryResume: true, recovery
     });
     return 'started';
   }
 
+  let lastDegradedLine = '';   // the degraded reason already named in COMMS (once per reason, reset when the service answers)
+  let reconnectProbeInFlight = false;
   async function probeReconnect() {
-    if (!interruptedStreams.size) { reconnectTimer = 0; return; }
-    let alive = false;
-    try { const r = await fetch('/api/health', { cache: 'no-store' }); alive = !!(r && r.ok); } catch (_) { alive = false; }
+    if (reconnectProbeInFlight) return;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = 0;
+    if (!interruptedStreams.size) return;
+    reconnectProbeInFlight = true;
+    let alive = false, degraded = '';
+    let deadlineTimer = 0, response = null, expired = false;
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    // A timed-out answer's body is dropped unread. Cancel runs a tick later so it can never throw into the
+    // deadline; a refused cancel (the stream is already locked or closed) changes nothing about the probe.
+    const cancelBody = () => {
+      const body = response && response.body;
+      if (body && typeof body.cancel === 'function') Promise.resolve().then(() => body.cancel()).catch(() => {});
+    };
+    try {
+      // Same 4s local-health budget as Harness.engineState, including the 503 body. Do not use that
+      // helper's broader HTTP success rule or its separate desktop-status lookup here.
+      const deadline = new Promise(resolve => {
+        deadlineTimer = setTimeout(() => {
+          expired = true;
+          resolve({ alive: false, degraded: '' });   // settle first: nothing below can keep the poll from re-arming
+          if (controller) controller.abort();
+          cancelBody();
+        }, 4000);
+      });
+      const answer = (async () => {
+        const r = response = await fetch('/api/health', Object.assign({ cache: 'no-store' }, controller ? { signal: controller.signal } : {}));
+        if (expired) { cancelBody(); return { alive: false, degraded: '' }; }
+        let reason = '';
+        // Only the existing 503 degraded prefix is eligible for the unchanged once-per-reason notice.
+        if (r && r.status === 503) { const t = String(await r.text() || '').trim(); if (/^degraded/i.test(t)) reason = t; }
+        if (expired) return { alive: false, degraded: '' };
+        return { alive: !!(r && r.ok), degraded: reason };
+      })();
+      ({ alive, degraded } = await Promise.race([answer, deadline]));
+    } catch (_) { alive = false; }
+    finally {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      reconnectProbeInFlight = false; // only health is single-flight; recovery preparation may remain pending
+    }
     if (alive) {
+      lastDegradedLine = '';
       // report each interrupted stream once. Only the DISPLAYED stream draws a line (same rule as tool/error
       // lines); a background stream's flag is cleared quietly — its error row already recorded the failure.
       const wasActive = activeWs && interruptedStreams.has(activeWs.id);
@@ -450,14 +766,18 @@ const Chat = (() => {
         if (outcome === 'none' || outcome === 'unavailable') toolLine('connection restored — no safe automatic continuation was available; use Try again.', true);
       }
     } else {
-      reconnectTimer = setTimeout(probeReconnect, 3000);   // still down — keep watching
+      if (degraded && degraded !== lastDegradedLine && activeWs && interruptedStreams.has(activeWs.id)) {
+        lastDegradedLine = degraded;
+        toolLine('station service ' + degraded + (Harness.canRestartEngine && Harness.canRestartEngine() ? ' — restart it from LINK DOWN at the top.' : ''), true);
+      }
+      if (interruptedStreams.size) reconnectTimer = setTimeout(probeReconnect, 3000);   // still down — keep watching
     }
   }
   function armReconnectWatch() {
-    if (reconnectTimer) return;
+    if (reconnectTimer || reconnectProbeInFlight) return;
     // if the browser signals it's back online, probe immediately; otherwise poll on a slow cadence.
     reconnectTimer = setTimeout(probeReconnect, 2000);
-    try { if (typeof window !== 'undefined' && !window.__runtruthOnlineHook) { window.__runtruthOnlineHook = true; window.addEventListener('online', () => { if (interruptedStreams.size && !reconnectTimer) probeReconnect(); }); } } catch (_) {}
+    try { if (typeof window !== 'undefined' && !window.__runtruthOnlineHook) { window.__runtruthOnlineHook = true; window.addEventListener('online', () => { if (interruptedStreams.size && !reconnectTimer && !reconnectProbeInFlight) probeReconnect(); }); } } catch (_) {}
   }
 
   // RETIRE A SETTLED BEAT: a decided memory card / answered nudge fades + collapses, then drops out of the
@@ -491,10 +811,20 @@ const Chat = (() => {
   // COMMS-PREMIUM — a subtle HH:MM stamp for a transmission-card header. The stored history carries no
   // per-message time, so replayed history gets NO stamp (never fabricate one); only rows created live at
   // render time get a real wall-clock stamp. Pure presentation, dim + right-aligned in the header row.
-  function fmtClock(d) {
+  // 12-hour clock (Andrew 10-03: "military time is NONSENSE"). A stamp from an earlier day carries its date —
+  // "Yesterday 9:14 PM" / "Oct 1, 9:14 PM" — so an old turn's bare clock is never read as today's.
+  const CLOCK_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  function fmtClock(d, nowMs) {
     d = d || new Date();
+    if (isNaN(d.getTime())) return '';
     const h = d.getHours(), m = d.getMinutes();
-    return (h < 10 ? '0' : '') + h + ':' + (m < 10 ? '0' : '') + m;
+    const clock = ((h % 12) || 12) + ':' + (m < 10 ? '0' : '') + m + ' ' + (h < 12 ? 'AM' : 'PM');
+    const now = new Date(nowMs == null ? Date.now() : nowMs);
+    const day = x => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+    const daysAgo = Math.round((day(now) - day(d)) / 86400000);
+    if (daysAgo === 0) return clock;
+    if (daysAgo === 1) return 'Yesterday ' + clock;
+    return CLOCK_MONTHS[d.getMonth()] + ' ' + d.getDate() + (d.getFullYear() !== now.getFullYear() ? ' ' + d.getFullYear() : '') + ', ' + clock;
   }
 
   // LINKIFY (XSS-safe): model output is untrusted, so we NEVER assign raw model text to innerHTML. Instead we
@@ -511,6 +841,9 @@ const Chat = (() => {
       let url = m[0];
       const trail = /[.,;:!?'")\]}>*`]+$/.exec(url); // don't swallow sentence punctuation OR markdown markers (**url**, `url`) trailing the URL
       if (trail) url = url.slice(0, url.length - trail[0].length);
+      // a ')' that CLOSES a '(' inside the URL is part of it (https://en.wikipedia.org/wiki/Foo_(bar) linked to …Foo_(bar, a 404 —
+      // QA 2026-10-02); only an unbalanced ')' is sentence punctuation
+      while (m[0].charAt(url.length) === ')' && (url.split('(').length - 1) > (url.split(')').length - 1)) url += ')';
       if (!url) continue;                            // pathological match (scheme only) — let escape handle it
       out += escapeHtml(s.slice(last, m.index));     // escaped text before the URL
       const safe = escapeHtml(url);                  // escape the URL too (its href + visible text are both safe)
@@ -525,7 +858,7 @@ const Chat = (() => {
      invariant is inviolate: every model substring is HTML-ESCAPED first (escapeHtml / linkify both escape), and
      we only ever wrap ALREADY-ESCAPED text in our OWN tags — model output never reaches innerHTML raw. `code`
      spans are pulled to placeholders before the bold pass so a ** inside code stays literal. */
-  const MD_MARKERS = /\||^\s*>|^\s*\d+[.)]\s|\*\*|`|^#{1,6}\s|^[ \t]*[-*+]\s/m;   // cheap gate: does this text carry any markdown we render?
+  const MD_MARKERS = /\||^\s*>|^\s*\d+[.)]\s|\*\*|\*[^\s*][^*\n]*\*|`|^#{1,6}\s|^[ \t]*[-*+]\s|\r?\n[ \t]*\r?\n|\]\(/m;   // plain paragraph breaks need the same spacing as formatted prose; *italic* too
   function mdInline(safe) {
     // `safe` is escaped-and-linkified HTML. Pull `inline code` to placeholders, bold the rest, restore code.
     const codes = [];
@@ -540,22 +873,173 @@ const Chat = (() => {
       '<span class="md-pre">' + escapeHtml(lines.join('\n')) + '</span>' +
       '</span>';
   }
+  /* A LABEL THAT IS AN ADDRESS SHOWS WHERE IT REALLY GOES (QA 2026-10-02). [https://bank.com](https://evil.com) read as
+     bank.com and opened evil.com — agent output can be steered by a page the agent read, and the desktop window has no
+     status bar to show a link's target. When the label names a host the target does not have, the target's host follows. */
+  function hostOf(u) {
+    const t = String(u || '').trim();
+    const m = /^(?:https?:\/\/)?(?:www\.)?([a-z0-9-]+(?:\.[a-z0-9-]+)*\.([a-z]{2,24}))(?=[\/:?#]|$)/i.exec(t);
+    if (!m) return '';
+    // a bare dotted word is a host only when it ends like one: never a version (v0.12.5) or a file name (README.md, app.js)
+    if (!/^(?:https?:\/\/|www\.)/i.test(t) && /^(?:md|txt|js|mjs|cjs|ts|tsx|jsx|json|py|rb|go|rs|java|kt|c|h|cpp|cs|php|html?|css|scss|xml|ya?ml|toml|ini|cfg|conf|lock|log|csv|tsv|pdf|png|jpe?g|gif|svg|webp|mp[34]|wav|zip|tar|gz|exe|dll|sh|ps1|bat|env|sql|db)$/i.test(m[2])) return '';
+    return m[1].toLowerCase();
+  }
+  function linkHostNote(label, href) {
+    const shown = hostOf(label), real = hostOf(href);
+    return (shown && real && shown !== real) ? ' <span class="md-host">(' + escapeHtml(real) + ')</span>' : '';
+  }
+  /* FILES THE AGENT NAMES (2026-10-10, Andrew's screenshot: "[Review the original…](review/x/index.html)" and "![…](…/final.jpg)"
+     sat in the transcript as raw markdown). Agents point at the files they made with RELATIVE paths — their workspace (or, in
+     a group, a shared file). A link becomes a real file link; an image becomes the picture, opened in the lightbox on click.
+     Escaping law unchanged: the path and the label are escaped into OUR markup; renderProse hydrates them afterwards through
+     a resolver (the jailed /api/file seams by default — the server refuses any escape). A target that is neither a web
+     address nor a plain relative path (an anchor, an absolute or '..' path, a scheme) keeps just its readable label. */
+  const REL_PATH = /^(?![\/\\#])(?!.*\.\.)[^\s:<>"'()]+$/;
+  /* THE APP'S OWN FILE ADDRESS (user report 10-20: asked twice for the design boards, saw raw markdown, then bare labels).
+     image_generate and the browser tools hand the agent its viewer address, '/api/file?agent=<id>&path=<rel>[&project=<root>]',
+     so a model showing the picture writes ![…](/api/file?…): an absolute target, which kept only its label. Read it back into
+     the same jailed seam — the path inside must still be a plain relative path, and the server's jail refuses the rest. */
+  function appFileRef(target) {
+    const m = /^\/api\/file\?([^#\s]*)$/.exec(target);
+    if (!m) return null;
+    const q = new URLSearchParams(m[1].replace(/&amp;/g, '&')), path = q.get('path') || '', agent = q.get('agent') || '';
+    if (!REL_PATH.test(path) || !/^[\w.-]{1,80}$/.test(agent)) return null;
+    return { path, attrs: ' data-md-agent="' + escapeHtml(agent) + '"' + (q.get('project') ? ' data-md-project="' + escapeHtml(q.get('project')) + '"' : '') };
+  }
+  function fileRefLink(label, target) {
+    const app = appFileRef(target);
+    if (!app && !REL_PATH.test(target)) return escapeHtml(label);
+    // a link to a picture IS the picture (user reports 10-20: "my agent can't show me the slides" — it linked its JPGs, and a
+    // link only opened a tab; the model had no way to know an image needs the '!'), still a click away from the lightbox
+    if (/\.(png|jpe?g|gif|webp|avif|bmp|svg)$/i.test(app ? app.path : target)) return fileRefImage(label, target);
+    return '<a class="md-file" href="#" data-md-path="' + escapeHtml(app ? app.path : target) + '"' + (app ? app.attrs : '') + '>' + escapeHtml(label) + '</a>';
+  }
+  function fileRefImage(alt, target) {
+    if (/^https?:\/\//i.test(target)) { const name = alt || target.split('/').pop(); return '<a href="' + escapeHtml(target) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(name) + '</a>' + linkHostNote(name, target); }
+    const app = appFileRef(target), path = app ? app.path : target, name = alt || path.split('/').pop();
+    if (!app && !REL_PATH.test(target)) return escapeHtml(name);
+    return '<span class="md-img" data-md-path="' + escapeHtml(path) + '" data-md-alt="' + escapeHtml(name) + '"' + (app ? app.attrs : '') + '><span class="md-img-alt">' + escapeHtml(name) + '</span></span>';
+  }
+  // the default resolver: the speaking agent's workspace, through the same open/preview/lightbox seams as every deliverable
+  const fileRefCache = new Map();   // message|agent|path -> Promise<blob url>; failures stay cached for that message too
+  let fileRefScope = 0;
+  function cachedBlob(key, load) {
+    if (fileRefCache.has(key)) return fileRefCache.get(key);
+    const p = load();   // a missing file is stable within one message; a later message gets a fresh read
+    fileRefCache.set(key, p);
+    if (fileRefCache.size > 60) { const [old, op] = fileRefCache.entries().next().value; fileRefCache.delete(old); op.then(u => { try { URL.revokeObjectURL(u); } catch (_) {} }, () => {}); }
+    return p;
+  }
+  // fetch an image for an <img>: the file routes serve .svg as a download (application/octet-stream / text/plain, so it can
+  // never run as a page) — an <img> never runs script, so the blob is retyped to image/svg+xml purely so it decodes
+  function imageBlobUrl(url, path) {
+    return fetch(url, { cache: 'no-store' }).then(r => { if (!r.ok) throw new Error('file HTTP ' + r.status); return r.blob(); })
+      .then(b => URL.createObjectURL(/\.svg$/i.test(String(path || '')) && b.type !== 'image/svg+xml' ? new Blob([b], { type: 'image/svg+xml' }) : b));
+  }
+  function workspaceFileRefs(agentId, messageKey, projectRoot) {
+    const scope = messageKey == null ? 'body:' + (++fileRefScope) : String(messageKey);
+    return {
+      wire: (a, path) => wireFileOpen(a, path, agentId || attachAgentId(), projectRoot),
+      image: path => { const aid = agentId || attachAgentId(); return cachedBlob(scope + '|' + aid + '|' + (projectRoot || '') + '|' + path, () => imageBlobUrl(fileUrl(path, aid, projectRoot), path)); }
+    };
+  }
+  /* WHERE A COMMS REPLY'S FILES LIVE: where the run that wrote them put them. A run sent with a project root wrote its
+     relative files AT that root; a run sent without one wrote them in its agent's own workspace. A session can join a
+     project mid-conversation (a path.trust ALWAYS anchors it), so the session's CURRENT root says nothing about an
+     earlier reply: send() stamps every reply it persists with the root its run was sent with (projectRoot: string, or
+     null for none), and a WORK LINE stage is stamped null (the hop's Harness.chat sends no root) whoever ran it.
+     turn = a history turn, or a live reply's { agentId, projectRoot }. agentId = the stamped speaker (none = session agent). */
+  function turnFileRefs(turn) {
+    const t = turn || {};
+    const sessionAgent = (activeWs && activeWs.agentId) || null;
+    const own = !t.agentId || t.agentId === (sessionAgent || 'agent');
+    return workspaceFileRefs(own ? sessionAgent : t.agentId, null, turnProjectRoot(t, own) || undefined);
+  }
+  function turnProjectRoot(t, own) {
+    if (t.projectRoot !== undefined) return t.projectRoot || '';   // the turn's own record of its run
+    if (!own) return '';   // an older work-line stage of another agent: a hop never ran with the root
+    // An unstamped reply (an older build, or a turn the server filled in): the session root only when the reply is
+    // newer than the moment the session joined that project; with no record of that moment, the agent's workspace.
+    const root = activeWs && activeWs.projectRoot, at = Number(activeWs && activeWs.projectRootAt);
+    return root && at > 0 && Number(t.ts) >= at ? root : '';
+  }
+  // roots (optional) = the nodes to hydrate instead of the whole body: a live reply's re-drawn blocks (renderProseLive) — its
+  // kept blocks were wired when they were drawn, and wiring a link twice would open it twice
+  function hydrateFileRefs(bodyEl, roots) {
+    const within = roots || [bodyEl];
+    if (!within.some(r => r.querySelector && r.querySelector('.md-file, .md-img'))) return;
+    const bodyRefs = bodyEl.__fileRefs || (bodyEl.__fileRefs = workspaceFileRefs(null));
+    // a ref read from the app's own /api/file address names its agent (and project): it resolves there, not in the body's
+    const refsOf = n => n.hasAttribute('data-md-agent') ? workspaceFileRefs(n.getAttribute('data-md-agent'), null, n.getAttribute('data-md-project') || undefined) : bodyRefs;
+    const all = sel => within.reduce((out, r) => (r.querySelectorAll ? out.concat(Array.from(r.querySelectorAll(sel))) : out), []);
+    all('a.md-file').forEach(a => { try { refsOf(a).wire(a, a.getAttribute('data-md-path')); } catch (_) {} });
+    all('.md-img:not([data-ready])').forEach(box => {
+      const path = box.getAttribute('data-md-path'), alt = box.getAttribute('data-md-alt') || path, refs = refsOf(box);
+      box.setAttribute('data-ready', 'loading');   // carry pending and failed slots across streaming re-renders too
+      const link = document.createElement('a'); link.className = 'thumb md-thumb'; link.href = '#'; link.setAttribute('aria-label', 'Enlarge ' + alt);
+      const img = document.createElement('img'); img.alt = alt; img.decoding = 'async';
+      link.appendChild(img);
+      link.addEventListener('click', ev => { ev.preventDefault(); ev.stopPropagation(); openLightbox(() => refs.image(path), alt, { revoke: false }); });
+      /* An image that decodes AFTER the transcript pinned itself to the bottom grows the log; the browser's scroll anchoring
+         then holds the old offset, the reader drifts off the bottom and the "new messages" pill lies about them scrolling up.
+         If the reader was following the conversation, follow the image too. */
+      // (the transcript is looked up when it matters, not at render time: a replayed or streaming body may not be attached yet)
+      const hostOf = n => (n && n.closest) ? n.closest('#chat-log, #gc-log') : null;
+      img.addEventListener('load', () => {
+        const host = hostOf(link); if (!host) return;
+        const following = host === log ? (stick || historyPinPending) : host.__mdWasAtBottom;
+        if (following) { host.scrollTop = host.scrollHeight; if (host === log) hideNewPill(); }
+      });
+      Promise.resolve().then(() => refs.image(path)).then(u => {
+        const host = hostOf(box);
+        if (host) host.__mdWasAtBottom = host.scrollHeight - host.scrollTop - host.clientHeight < 60;
+        img.src = u; box.replaceChildren(link); box.setAttribute('data-ready', '1');
+      }, () => {
+        box.setAttribute('data-ready', 'missing');
+        box.classList.add('md-img-missing');   // not on disk (or not shared): say so instead of a broken frame
+        box.querySelector('.md-img-alt').textContent = alt + ' — image not found';
+      });
+    });
+  }
   function reportInline(raw) {
     // Tokenize raw text before escaping; generated markup never enters another pass.
-    const re = /`([^`\n]+)`|\[([^\]\n]+)\]\((https?:\/\/[^\s<>"']+)\)|\*\*([^*\n]+)\*\*|https?:\/\/[^\s<>"']+/g;
+    const re = /`([^`\n]+)`|\[([^\]\n]+)\]\((https?:\/\/[^\s<>"']+)\)|\*\*([^*\n]+)\*\*|!\[([^\]\n]*)\]\(([^)\s<>"']+)\)|\[([^\]\n]+)\]\(([^)\s<>"']+)\)|\*(?![\s*])([^*\n]*?[^\s*\\])\*(?![*\w])|https?:\/\/[^\s<>"']+/g;
     let out='',last=0,m;
     while((m=re.exec(raw))) {
+      // *italic* opens only where a word does not (no lookbehind — older macOS WebKit cannot parse one): "2*3*4" and
+      // "file*name*" keep their asterisks; the scan resumes one character on so a real *italic* later still matches
+      if(m[9]!==undefined && m.index>0 && /[\w*]/.test(raw[m.index-1])){re.lastIndex=m.index+1;continue;}
       out+=escapeHtml(raw.slice(last,m.index));
-      if(m[1]!==undefined)out+='<code class="md-code">'+escapeHtml(m[1])+'</code>';
-      else if(m[2]!==undefined)out+='<a href="'+escapeHtml(m[3])+'" target="_blank" rel="noopener noreferrer">'+escapeHtml(m[2])+'</a>';
-      else if(m[4]!==undefined)out+='<span class="md-b">'+escapeHtml(m[4])+'</span>';
+      // A code span that IS a URL (`http://localhost:8765`) stays code-styled but clickable: models
+      // backtick server addresses constantly, and a dead address costs the user a copy-paste.
+      if(m[1]!==undefined){const code='<code class="md-code">'+escapeHtml(m[1])+'</code>';out+=/^https?:\/\/[^\s<>"'`]+$/.test(m[1])?'<a href="'+escapeHtml(m[1])+'" target="_blank" rel="noopener noreferrer">'+code+'</a>':code;}
+      else if(m[2]!==undefined)out+='<a href="'+escapeHtml(m[3])+'" target="_blank" rel="noopener noreferrer">'+escapeHtml(m[2])+'</a>'+linkHostNote(m[2],m[3]);
+      // bold holds no '*', so its inside can be read again for code, [label](url) and bare links (QA 2026-10-02: **`npm run dev`**
+      // showed its backticks, **[docs](url)** showed '[docs](' around a bare link); reportInline escapes everything it emits
+      else if(m[4]!==undefined)out+='<span class="md-b">'+reportInline(m[4])+'</span>';
+      else if(m[6]!==undefined)out+=fileRefImage(m[5],m[6]);
+      else if(m[8]!==undefined)out+=fileRefLink(m[7],m[8]);
+      // *italic* (rc walk 2026-10-14: "*speed*", "*does*" sat in replies with their asterisks) — like bold, its inside holds no
+      // '*' and is read again for code and links
+      else if(m[9]!==undefined)out+='<span class="md-i">'+reportInline(m[9])+'</span>';
       else out+=linkify(m[0]);
       last=re.lastIndex;
     }
     return out+escapeHtml(raw.slice(last));
   }
-  function renderMarkdown(raw) {
-    const lines=String(raw).split('\n');
+  /* A STREAMING REPLY RE-PARSES ONLY ITS OPEN END (perf p5, 2026-10-20: "eats my PC's resources"). The live paragraph was
+     re-parsed whole and rebuilt through innerHTML on every frame — O(n) per frame, O(n²) per answer, and a 20 KB reply cost
+     ~2 ms of parsing alone each frame before the DOM rebuild. Every line the parse reads, and every "is there a line here?"
+     check, raises `seen`; at each top-level step with no paragraph open the parse leaves a mark {i, n: blocks so far, seen}.
+     Everything before a mark was decided by lines 0..seen alone, so on the next frame (live = { prev }) the parse resumes
+     from the last mark whose lines are unchanged and keeps the blocks before it: the same HTML, block for block, as a full
+     parse (locked by test/live-markdown-incremental.test.js). live.next carries this frame's parse, live.kept the number of
+     blocks that stayed. Without `live` this is the plain renderer it always was. */
+  function renderMarkdown(raw, live) {
+    const norm=String(raw).replace(/\r\n?/g,'\n'), lines=norm.split('\n');
+    let seen=-1;
+    const at=x=>{if(x>seen)seen=x;return lines[x];};
+    const has=(x,to)=>{if(x>seen)seen=x;return x<to;};
     // Older macOS WebKit cannot PARSE lookbehind, even in a function not yet called.
     // Consume escaped pipes before splitting; retain the existing immediate-backslash semantics.
     const cells = line => {
@@ -570,58 +1054,125 @@ const Chat = (() => {
       return result;
     };
     const listMatch=line=>/^([ \t]*)([-*+][ \t]+|\d+[.)][ \t]+)(.*)$/.exec(line);
-    function blocks(from,to,depth) {
-      const parts=[];let i=from;
-      while(i<to) {
-        const ln=lines[i];
+    // marks (top level of a live parse only): where the parse may resume; out: the blocks so far (a resumed parse's kept ones)
+    function blocks(from,to,depth,marks,out) {
+      const parts=out||[],paragraph=[];let i=from;
+      const flushParagraph=()=>{
+        if(paragraph.length)parts.push('<span class="md-p">'+paragraph.splice(0).join('\n')+'</span>');
+      };
+      for(;;) {
+        if(marks && !paragraph.length)marks.push({i,n:parts.length,seen});
+        if(!has(i,to))break;
+        const ln=at(i);
+        if(!ln.trim()){flushParagraph();i++;continue;}
         if(/^[ \t]*```/.test(ln)) {
+          flushParagraph();
           const code=[];i++;
-          while(i<to && !/^[ \t]*```/.test(lines[i]))code.push(lines[i++]);
-          if(i<to)i++;parts.push(renderFence(code));continue;
+          while(has(i,to) && !/^[ \t]*```/.test(at(i)))code.push(at(i++));
+          if(has(i,to))i++;parts.push(renderFence(code));continue;
         }
         const h=/^(#{1,6})\s+(.*)$/.exec(ln);
-        if(h){parts.push('<span class="md-h" role="heading" aria-level="'+h[1].length+'">'+reportInline(h[2])+'</span>');i++;continue;}
+        if(h){flushParagraph();parts.push('<span class="md-h" role="heading" aria-level="'+h[1].length+'">'+reportInline(h[2])+'</span>');i++;continue;}
         if(/^\s*>/.test(ln)) {
+          flushParagraph();
           const quote=[];
-          while(i<to && /^\s*>/.test(lines[i]))quote.push(reportInline(lines[i++].replace(/^\s*> ?/,'')));
+          while(has(i,to) && /^\s*>/.test(at(i)))quote.push(reportInline(at(i++).replace(/^\s*> ?/,'')));
           parts.push('<blockquote class="md-quote">'+quote.join('<br>')+'</blockquote>');continue;
         }
-        if(i+1<to && ln.includes('|') && cells(lines[i+1]).length>1 && cells(lines[i+1]).every(c=>/^:?-{3,}:?$/.test(c))) {
+        if(has(i+1,to) && ln.includes('|') && cells(at(i+1)).length>1 && cells(at(i+1)).every(c=>/^:?-{3,}:?$/.test(c))) {
+          flushParagraph();
           const headers=cells(ln);i+=2;
           let table='<div class="md-table-scroll" tabindex="0" role="region" aria-label="Report table"><table class="md-table"><thead><tr>'+headers.map(c=>'<th scope="col">'+reportInline(c)+'</th>').join('')+'</tr></thead><tbody>';
-          while(i<to && lines[i].includes('|') && lines[i].trim())table+='<tr>'+cells(lines[i++]).map(c=>'<td>'+reportInline(c)+'</td>').join('')+'</tr>';
+          while(has(i,to) && at(i).includes('|') && at(i).trim())table+='<tr>'+cells(at(i++)).map(c=>'<td>'+reportInline(c)+'</td>').join('')+'</tr>';
           parts.push(table+'</tbody></table></div>');continue;
         }
         const first=listMatch(ln);
         if(first && depth<16) {
+          flushParagraph();
           const indent=first[1].replace(/\t/g,'    ').length;
           const ordered=/\d/.test(first[2]),tag=ordered?'ol':'ul';
           let list='<'+tag+' class="md-list"'+(ordered?' start="'+parseInt(first[2],10)+'"':'')+'>';
-          while(i<to) {
-            const item=listMatch(lines[i]);
+          while(has(i,to)) {
+            // Loose Markdown lists remain one list; blank separators are not visible rows.
+            let next=i;
+            while(has(next,to) && !at(next).trim())next++;
+            const following=has(next,to) && listMatch(at(next));
+            if(following && following[1].replace(/\t/g,'    ').length===indent && /\d/.test(following[2])===ordered)i=next;
+            const item=listMatch(at(i));
             if(!item || item[1].replace(/\t/g,'    ').length!==indent || /\d/.test(item[2])!==ordered)break;
             list+='<li>'+reportInline(item[3]);i++;
             const begin=i;
-            while(i<to && lines[i].trim() && /^\s/.test(lines[i]) && (lines[i].match(/^\s*/)[0].replace(/\t/g,'    ').length>indent))i++;
+            while(has(i,to)) {
+              let continuation=i;
+              while(has(continuation,to) && !at(continuation).trim())continuation++;
+              if(!has(continuation,to) || !/^[ \t]/.test(at(continuation)) || at(continuation).match(/^[ \t]*/)[0].replace(/\t/g,'    ').length<=indent)break;
+              i=continuation+1;
+            }
             if(i>begin)list+=blocks(begin,i,depth+1);
             list+='</li>';
           }
           parts.push(list+'</'+tag+'>');continue;
         }
-        parts.push(reportInline(ln));i++;
+        paragraph.push(reportInline(depth ? ln.trimStart() : ln));i++;
       }
-      return parts.join('\n');
+      flushParagraph();
+      return parts.join('');
     }
-    return blocks(0,lines.length,0);
+    if(!live)return blocks(0,lines.length,0);
+    // the first line that differs from the previous frame's (a streamed token only ever touches the last one)
+    const prev=live.prev;let mark={i:0,n:0,seen:-1},marks=[],kept=[];
+    if(prev) {
+      let d=0;
+      if(norm.startsWith(prev.norm))d=(norm.length===prev.norm.length||norm.charCodeAt(prev.norm.length)===10)?prev.lines.length:prev.lines.length-1;
+      else{const end=Math.min(prev.lines.length,lines.length);while(d<end&&prev.lines[d]===lines[d])d++;}
+      for(let k=prev.marks.length-1;k>=0;k--)if(prev.marks[k].seen<d){mark=prev.marks[k];marks=prev.marks.slice(0,k);kept=prev.parts.slice(0,mark.n);break;}
+    }
+    seen=mark.seen;
+    const html=blocks(mark.i,lines.length,0,marks,kept);
+    live.next={norm,lines,marks,parts:kept};live.kept=mark.n;
+    return html;
   }
   // render agent prose into a body span. Fast textContent path when there's no URL AND no markdown marker (the
   // common streamed token) — no per-token HTML reparse; otherwise the escaped+linkified+markdown pipeline.
-  function renderProse(bodyEl, raw) {
+  function renderProse(bodyEl, raw, opts) {
     if (!bodyEl) return;
     raw = String(raw == null ? '' : raw);
     bodyEl.__proseSource = raw;
+    if (opts && opts.files) bodyEl.__fileRefs = opts.files;   // where this body's relative file links resolve (kept across re-renders)
+    const prior = bodyEl.__mdLive; bodyEl.__mdLive = null;   // a streaming reply's previous frame (renderProseLive), kept only while it streams
     if (raw.indexOf('http') === -1 && !MD_MARKERS.test(raw)) { bodyEl.textContent = raw; return; }
+    if ((opts && opts.live) || prior) { renderProseLive(bodyEl, raw, prior, !!(opts && opts.live)); return; }
+    // a streaming reply re-renders every frame: carry an image that already loaded into the new markup instead of
+    // rebuilding it (a rebuilt <img> collapses and re-grows each frame — flicker, and the log jumps under the reader)
+    const shown = new Map();
+    if (bodyEl.querySelectorAll) bodyEl.querySelectorAll('.md-img[data-ready]').forEach(n => { const k = n.getAttribute('data-md-path'); if (!shown.has(k)) shown.set(k, n); });
     bodyEl.innerHTML = renderMarkdown(raw);
+    if (shown.size) bodyEl.querySelectorAll('.md-img:not([data-ready])').forEach(n => { const k = n.getAttribute('data-md-path'), old = shown.get(k); if (old) { n.replaceWith(old); shown.delete(k); } });
+    hydrateFileRefs(bodyEl);
+  }
+  /* A LIVE REPLY'S FRAME (renderProse with opts.live — the streaming paragraph). The blocks renderMarkdown kept (live.kept) keep
+     their DOM nodes, so a link, a loaded picture or a selection in an earlier block survives the next token; only the blocks
+     after them are drawn again, from the same markup a full render makes. Every block is one element, so the body's children
+     map one to one onto the parse's blocks. prior = the previous frame's { md, nodes }, good only while the body still holds
+     exactly those nodes (anything else drew into it: draw it all). keep = hold this frame for the next (false on the closing
+     render, which frees it). */
+  function renderProseLive(bodyEl, raw, prior, keep) {
+    const kids = bodyEl.childNodes;
+    const ok = !!prior && prior.nodes.length === kids.length && prior.nodes.every((n, k) => n === kids[k]);
+    const live = { prev: ok ? prior.md : null };
+    renderMarkdown(raw, live);
+    const md = live.next, from = ok ? live.kept : 0;
+    const gone = ok ? prior.nodes.slice(from) : Array.from(kids);
+    // an image that already loaded keeps its node when its block is drawn again (the full render's carry-over, above)
+    const shown = new Map();
+    for (const r of (ok ? gone : [bodyEl])) if (r.querySelectorAll) r.querySelectorAll('.md-img[data-ready]').forEach(n => { const k = n.getAttribute('data-md-path'); if (!shown.has(k)) shown.set(k, n); });
+    for (const n of gone) bodyEl.removeChild(n);
+    const before = kids.length;
+    bodyEl.insertAdjacentHTML('beforeend', md.parts.slice(from).join(''));
+    const added = Array.from(kids).slice(before);
+    if (shown.size) for (const r of added) if (r.querySelectorAll) r.querySelectorAll('.md-img:not([data-ready])').forEach(n => { const k = n.getAttribute('data-md-path'), old = shown.get(k); if (old) { n.replaceWith(old); shown.delete(k); } });
+    hydrateFileRefs(bodyEl, added);
+    if (keep && added.length === md.parts.length - from) bodyEl.__mdLive = { md, nodes: (ok ? prior.nodes.slice(0, from) : []).concat(added) };
   }
 
   function messageCopyText(bodyEl) {
@@ -676,7 +1227,7 @@ const Chat = (() => {
     system = opts.system || ''; name = opts.name || 'AGENT';
     sentHistory.length = 0; histIdx = -1; histDraft = '';   // recall never crosses a session/agent switch
     onTurn = opts.onTurn || null; interview = null;
-    receiptRunsSeen.clear(); clearChoices(); turninQueue.length = 0; activeTurnin = null; wiQDepth.clear(); queued.clear(); interrupted.clear();   // C2: per-session run-tracking + the queue gauge + turn-control state start clean for each agent (listeners stay once-registered)
+    receiptShown.clear(); receiptFetching.clear(); clearChoices(); turninQueue.length = 0; activeTurnin = null; wiQDepth.clear(); queued.clear(); sentNow.clear(); heldBack.clear(); interrupted.clear();   // C2: per-session run-tracking + the queue gauge + turn-control state start clean for each agent (listeners stay once-registered)
     // GROWTH Tier 1: the study side starts clean per session too — a prior hero's deferred study/taste beats must
     // never flush into a new session (same law as turninQueue above). A fresh beat-slot arbiter matches the DOM.
     arcRunsSeen.clear();   // GROWTH Tier 2: the arc side starts clean per session (a prior hero's arc offers never carry over)
@@ -700,10 +1251,57 @@ const Chat = (() => {
     if (log) {
       log.addEventListener('scroll', () => {
         if (historyPinPending) return;   // row()-driven replay scroll events cannot cancel the load's final pin
-        stick = nearBottom(); if (stick) hideNewPill(); else showNewPill(false);
+        /* ONLY THE COMMANDER UNSTICKS (2026-10-10). A scroll event also fires when the BROWSER moves the log — a reply
+           image decoding, a row re-rendering, scroll anchoring holding an old offset — and reading every one of those as
+           "they scrolled up" stopped the follow mid-reply and lit "new messages" over a conversation nobody had left.
+           Now: at the bottom = following; off the bottom right after a real gesture (wheel/touch/scrollbar/keys) =
+           reading history; off the bottom with NO gesture = layout moved under a follower, so follow it back down. */
+        const near = nearBottom();
+        if (near) stick = true;
+        else if (userScrollHeld || Date.now() - userScrollAt < 1200) stick = false;
+        else if (stick) log.scrollTop = log.scrollHeight;
+        // …and the same inside the near band: an approval card shrinking as its keys leave moved a follower ~34 px up and left
+        // the working line cut off under the fold (live walk 10-14). No gesture, still following: back to the newest line.
+        if (near && stick && !userScrollHeld && Date.now() - userScrollAt >= 1200 && log.scrollHeight - log.scrollTop - log.clientHeight > 1) log.scrollTop = log.scrollHeight;
+        if (stick) hideNewPill(); else showNewPill(false);
       });   // at the bottom → retire the pill; scrolled up → a persistent "↓ latest" affordance
       // A real attempt to inspect history wins even during the two-frame settle window.
       ['wheel', 'touchstart', 'pointerdown'].forEach(type => log.addEventListener(type, cancelHistoryPin, { passive: true }));
+      ['wheel', 'touchstart', 'pointerdown', 'keydown'].forEach(type => log.addEventListener(type, forgetReveal, { passive: true }));   // …and their own reading (keys too: PageUp/arrows) wins over an earlier reveal
+      ['wheel', 'touchmove'].forEach(type => log.addEventListener(type, () => { userScrollAt = Date.now(); }, { passive: true }));
+      ['touchstart', 'pointerdown', 'keydown'].forEach(type => log.addEventListener(type, logGesture, { passive: true }));   // a press on a key in the log is not reading history
+      log.addEventListener('pointerdown', logHold, { passive: true });
+      if (!window.__chatScrollReleaseWired) {
+        window.__chatScrollReleaseWired = true;
+        ['pointerup', 'pointercancel', 'blur'].forEach(type => window.addEventListener(type, endLogHold, { passive: true }));
+      }
+    }
+    // LINKS OUTSIDE COMMS (QA 2026-10-02): group chats, a group's .md file preview and the WORKFLOWS results render through
+    // this same renderProse, but the OS-browser hand-off below lives on #chat-log only — so on desktop those links were dead
+    // (a target=_blank <a> goes nowhere under the Tauri window policy). One document-level handler, wired once, covers them.
+    if (typeof document !== 'undefined' && !document.__proseLinksWired) {
+      document.__proseLinksWired = true;
+      document.addEventListener('click', e => {
+        if (e.defaultPrevented || !e.target || !e.target.closest) return;
+        const link = e.target.closest('#gc-log a, #gc-preview a, .wf-md a');
+        if (!link || !/^https?:\/\//i.test(link.getAttribute('href') || '')) return;
+        if (window.getSelection && String(window.getSelection())) { e.preventDefault(); return; }   // ending a text selection never opens a link
+        const invoke = (window.__TAURI__ && window.__TAURI__.core) ? window.__TAURI__.core.invoke : null;
+        if (!invoke) return;   // a plain browser: target=_blank works as is
+        e.preventDefault();
+        invoke('open_external_url', { url: link.href }).catch(() => { if (typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify('could not open your browser for that link', 'warn'); });
+      });
+    }
+    // CODE BLOCKS OUTSIDE COMMS (walk 10-14): the WORKFLOWS results, the Workflow panel and DELIVERABLES draw replies through this
+    // renderProse too (.wf-md), and a fenced block's ⧉ key there copies that block exactly as it does in COMMS — wired once.
+    if (typeof document !== 'undefined' && !document.__proseCopyWired) {
+      document.__proseCopyWired = true;
+      document.addEventListener('click', e => {
+        const codeBtn = (e.target && e.target.closest) ? e.target.closest('.wf-md .md-copy') : null;
+        if (!codeBtn) return;
+        const wrap = codeBtn.closest('.md-pre-wrap'), codeEl = wrap && wrap.querySelector('.md-pre');
+        if (codeEl) copyText(codeEl.textContent || '').then(ok => showCopyResult(codeBtn, ok));
+      });
     }
     // COPY: one delegated click handler for every (current + future) message row's ⧉ button — copies the
     // row's prose, then flashes a ✓ confirm. Wired once per log element so a re-init can't stack handlers.
@@ -728,7 +1326,7 @@ const Chat = (() => {
         }
         // TOOL CHIP: clicking a chip's head toggles its expanded detail (checked before the copy button)
         const chipHead = e.target.closest('.tc-head');
-        if (chipHead) { if (selecting) return; toggleChip(chipHead); if (typeof SFX !== 'undefined' && SFX.click) SFX.click(); return; }
+        if (chipHead) { if (selecting) return; toggleChip(chipHead); if (typeof SFX !== 'undefined' && SFX.press) SFX.press(); return; }
         // FENCED CODE: each block owns a copy control. Resolve the text from that exact wrapper so one click
         // never sweeps up the surrounding prose or a neighboring block in the same response.
         const codeBtn = e.target.closest('.md-copy');
@@ -738,7 +1336,7 @@ const Chat = (() => {
           if (!codeEl) return;
           copyText(codeEl.textContent || '').then(ok => {
             showCopyResult(codeBtn, ok);
-            if (ok && typeof SFX !== 'undefined' && SFX.click) SFX.click();
+            if (ok && typeof SFX !== 'undefined' && SFX.press) SFX.press();
           });
           return;
         }
@@ -748,7 +1346,7 @@ const Chat = (() => {
         if (!txt) return;
         copyText(txt).then(ok => {
           showCopyResult(btn, ok);
-          if (ok && typeof SFX !== 'undefined' && SFX.click) SFX.click();
+          if (ok && typeof SFX !== 'undefined' && SFX.press) SFX.press();
         });
       });
     }
@@ -758,12 +1356,15 @@ const Chat = (() => {
     wireProposals();   // Cortex turn-in beat: listen for reflection's memory.proposed (registers once)
     wireStudy();       // GROWTH Tier 1: after a salient run, offer ≤1 dossier belief-update at turn-in priority (registers once)
     wireBriefRead();   // TASTE EXTRACTION: the announce-and-act READ card (taskbrief.settled → correctable assumptions; registers once)
+    wireVoiceRouteNotice();   // a spoken turn that could not use the VOICE CHAT MODEL says so once
+    wireWaitNotes();   // LIVE WAIT LINE: provider.retry / agent.waiting → the presence card's transient line (registers once)
     wireTrust();       // GROWTH Tier 3: after a clean run, offer ONE earned-autonomy raise at the LOWEST beat priority — below the arc (registers once)
     wireThreads();     // NS-6: after a mined task run, offer ONE thread turn-in (Keep/Edit/Discard) at the lowest beat priority — study wins the moment first (registers once)
     wireCrewCapture(); // P3.2: record each dispatched worker's forwarded run-end spend so a 👍 on a crew run splits XP honestly (registers once)
     wireCuriosity();   // Commander Dossier: one gentle "tell me about X" nudge after a clean run (registers once)
     wireConnectorRequired();   // beginner seam Lane 1: a run that hit an unwired connector earns the ⇄ CONNECT chip
-    wireBgExit();      // E6: surface shell.bg.exit (a background dev-server/watcher ended) as a terse COMMS system line — was a zero-listener event (registers once)
+    wireKeySaved();    // keys.save: a key pasted into chat now lives in KEYS — its bubble + saved history show the placeholder (registers once)
+    wireBgExit();     // E6: surface shell.bg.exit (a background dev-server/watcher ended) as a terse COMMS system line — was a zero-listener event (registers once)
     wireSkillAside();  // A2: after a background review distills a skill, ONE quiet "distilled this run…" aside (registers once)
     wireIdBar();       // COMMS agent selector: a change switches to (or mints) a workstream bound to that agent (registers once)
     load(opts.ws);
@@ -789,6 +1390,8 @@ const Chat = (() => {
         if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeSlash(); return; }
         // any other key falls through to normal typing → the 'input' listener re-filters the palette
       }
+      // @ MENU (group-chat.js) owns ↑ ↓ Enter Tab Esc while it lists agents over the message box
+      if (typeof GroupChat !== 'undefined' && GroupChat.mentionKey && GroupChat.mentionKey(e)) return;
       // INPUT HISTORY — recall starts only from an EMPTY box (a draft in progress is never hijacked);
       // once recalling, ArrowUp/ArrowDown walk the sent list, ArrowDown past the newest restores the draft.
       if (e.key === 'ArrowUp' && sentHistory.length && (histIdx >= 0 || input.value === '')) {
@@ -809,7 +1412,7 @@ const Chat = (() => {
         submitComposer();
       } else if (e.key === 'Escape' && isBusy()) {
         e.preventDefault(); e.stopPropagation();   // INTERRUPT: beat navdock's global Esc-closes-menus while a run is live
-        stopActive();
+        stopActive('esc');   // the card then says STOPPED BY YOU (ESC) — an Esc stop must never read as the run quitting
       }
     };
     // SLASH PALETTE: a leading "/" opens the command menu and filters it live as you type past it.
@@ -861,17 +1464,46 @@ const Chat = (() => {
       return;
     }
     if (t) recordSent(t);
+    // "@finn take a look" from a DIRECT chat reaches FINN: the chat becomes a group with them first (General stays
+    // General — a fresh group opens beside it), then the message goes to that group. A refusal (the agent here is
+    // still mid-run, the backend said no) keeps the words in the box and says why.
+    const pulled = activeWs && activeWs.conversationMode !== 'group' && t && typeof GroupChat !== 'undefined' && GroupChat.mentionTargets ? GroupChat.mentionTargets(t, activeWs) : [];
+    if (pulled.length) {
+      const g = await GroupChat.startWith(pulled);
+      const ws = g && Workstreams.get(g.id);
+      if (!ws || activeWs?.id !== ws.id) return;
+      if (hasStaged) await settleAttachments();
+      if (activeWs?.id !== ws.id) return;   // you moved on while the files uploaded: the message stays in the box
+      const atts = pendingAtts.filter(entry => entry.status === 'ready' && entry.ref).map(entry => entry.ref);
+      stepOfferAside('turn');   // a turn typed here never reaches send(): it steps an offer aside the same way (review 10-27)
+      const sent = await GroupChat.sendText(t, { attachments: atts, attachmentAgent: ws.agentId });
+      if (sent) typedTaskCompletesHandoff(t, ws);
+      if (sent && activeWs?.id === ws.id) { takeAttachments(); if (input.value.trim() === t) input.value = ''; closeSlash(); autoGrowInput(); }
+      return;
+    }
     if (activeWs?.conversationMode === 'group' && typeof GroupChat !== 'undefined') {
       const ws = activeWs;
       if (hasStaged) await settleAttachments();
       if (activeWs?.id !== ws.id || focusVersion !== submissionFocusVersion) return;
       const atts = pendingAtts.filter(entry => entry.status === 'ready' && entry.ref).map(entry => entry.ref);
+      stepOfferAside('turn');   // a group turn never reaches send(): it steps an offer aside the same way (review 10-27)
       const sent = await GroupChat.sendText(t, { attachments: atts, attachmentAgent: ws.agentId });
+      if (sent) typedTaskCompletesHandoff(t, ws);
       if (sent && activeWs?.id === ws.id) { takeAttachments(); if (input.value.trim() === t) input.value = ''; closeSlash(); autoGrowInput(); }
       return;
     }
+    // ANSWER, NOT QUEUE: the run is waiting on one question of its lead's in this conversation — this text is the
+    // answer (askAnswerers). Files still wait for the next send; a failed answer keeps the words in the box.
+    if (isBusy() && t && !hasStaged && pendingAskFor(activeWs)) {
+      const ws = activeWs;
+      input.value = ''; closeSlash(); autoGrowInput();
+      if (!(await answerPendingAsk(ws, t)) && activeWs === ws && !input.value.trim()) { input.value = t; autoGrowInput(); }
+      return;
+    }
     // BUSY: type-ahead queues TEXT; staged files wait in the strip for the next idle send (one run per stream).
-    if (isBusy()) { if (t) { input.value = ''; closeSlash(); autoGrowInput(); enqueue(t); } return; }
+    // a typed task queued here is the Commander's all the same: it completes a pending first-task hand-off now (the queue later
+    // sends it with no composer mark, so send() could not tell it was typed)
+    if (isBusy()) { if (t) { input.value = ''; closeSlash(); autoGrowInput(); enqueue(t); stepOfferAside('turn'); typedTaskCompletesHandoff(t, activeWs); } return; }
     // SETTLE UPLOADS: a staged attachment still uploading must not be silently dropped — uploads to the local
     // sidecar are near-instant, so we AWAIT them before snapshotting. A failed one already notified per-file.
     if (hasStaged) await settleAttachments();
@@ -879,7 +1511,7 @@ const Chat = (() => {
     const atts = takeAttachments();   // snapshot the READY refs + clear the composer strip
     if (!t && !atts.length) return;   // everything failed to upload and there's no text → nothing to send
     input.value = ''; closeSlash(); autoGrowInput();   // COMPOSER: collapse back to one line after a send
-    send(t, { attachments: atts });
+    send(t, { attachments: atts, composer: true });   // composer: the Commander typed this turn (a pending first task reads it)
   }
 
   /* ── ATTACHMENTS ────────────────────────────────────────────────────────────────────────────────────
@@ -1250,13 +1882,42 @@ const Chat = (() => {
     sel.__wired = true;
     sel.addEventListener('change', () => {
       const id = sel.value;
-      if (typeof SFX !== 'undefined' && SFX.click) SFX.click();
+      if (typeof SFX !== 'undefined' && SFX.press) SFX.press();
       if (typeof App !== 'undefined' && App.selectAgent) App.selectAgent(id);
       // App.selectAgent → switchWorkstream → Chat.load → renderIdBar, so the model readout follows the switch.
     });
   }
 
   function mergeCanonicalHistory(local, turns) {
+    // Only the canonical final row can supersede saved prose, and only by explicit run identity.
+    const finals = new Map(), finalSlots = new Map();
+    const sameRun = (a, b) => !!a.sourceRunId && String(a.sourceRunId) === String(b.sourceRunId)
+      && (!a.agentId || !b.agentId || a.agentId === b.agentId)
+      && (!a.streamId || !b.streamId || a.streamId === b.streamId);
+    const withFinal = (prior, canonical) => {
+      const row = Object.assign({}, prior, canonical);
+      // A rejected attempt's failure flags are evidence, not the accepted answer's status.
+      // In particular, error:true would exclude this accepted answer from the next model turn.
+      const supersededStatus = Object.assign({}, prior.supersededStatus, canonical.supersededStatus);
+      for (const key of ['error', 'stopped', 'stopNote']) {
+        if (prior[key] != null) supersededStatus[key] = prior[key];
+        delete row[key];
+        if (Object.prototype.hasOwnProperty.call(canonical, key)) row[key] = canonical[key];
+      }
+      if (Object.keys(supersededStatus).length) row.supersededStatus = supersededStatus;
+      if (canonical.taint || prior.taint) row.taint = canonical.taint || prior.taint;
+      const attachments = [], seen = new Set();
+      for (const item of [].concat(prior.attachments || [], canonical.attachments || [])) {
+        const key = JSON.stringify(item);
+        if (!seen.has(key)) { seen.add(key); attachments.push(item); }
+      }
+      if (attachments.length) row.attachments = attachments;
+      return row;
+    };
+    for (const turn of Array.isArray(turns) ? turns : []) {
+      if (turn && !turn.sys && turn.role === 'assistant' && turn.dispatchState === 'final'
+          && turn.sourceRunId && String(turn.content || '').trim() && !finals.has(String(turn.sourceRunId))) finals.set(String(turn.sourceRunId), turn);
+    }
     const runParts = new Map();
     for (const turn of Array.isArray(turns) ? turns : []) {
       if (!turn || turn.role !== 'assistant' || !turn.sourceRunId) continue;
@@ -1265,54 +1926,71 @@ const Chat = (() => {
       const parts = runParts.get(String(turn.sourceRunId)) || [];
       parts.push(text); runParts.set(String(turn.sourceRunId), parts);
     }
-    // Streaming can combine several provider turns into one local reply. Prefer
-    // their durable turns only when the run identity AND exact contiguous bytes
-    // prove that the entire aggregate is already committed. This also heals old
-    // saves, whose assistant row inherited identity only from its preceding user.
-    const committedAggregate = (row, runId) => {
-      if (row.role !== 'assistant' || row.rowId || row.stopped || row.error || (row.attachments && row.attachments.length)) return false;
-      const parts = runParts.get(runId) || [], text = String(row.content || '');
+    /* EXPLICIT RUN IDENTITY, HARNESS BYTES ASIDE (rc walk 2026-10-14: a reload showed a reply twice — its durable turns AND
+       the page's saved aggregate). The page's aggregate of a run differs from that run's durable turns only by what the
+       harness itself adds or removes: the paragraph break streamed after a hidden Task Brief step (loop.js TURN BREAK) and
+       the choice marker the chat strips before saving. Only for a row that names its run (an unattributed one stays exact).
+       Self-contained (the phone runs this same function): the marker rule is fork.js's — a list number, keyword (MARKER_KEY's
+       one case rule), colon, `||` options. */
+    const squash = s => String(s == null ? '' : s).replace(/(?:\d{1,2}[.)][ \t]*)?[*_`~]*(?:\bF(?:ORK|ork)|[Tt][Aa][Ss][Kk]_[Qq][Uu][Ee][Ss][Tt][Ii][Oo][Nn])[*_`~]*[ \t]*:[^\n]*\|\|[^\n]*/g, '').replace(/\s+/g, '');
+    // A steering note folded mid-run streams into the local reply as a '\n[steering] …\n' line, but the durable
+    // transcript stores only the model's own turns. Twins are matched WITHOUT those lines; the local row (which
+    // still carries them, so a reload can redraw the note) is the one that survives.
+    const steerless = text => String(text || '').replace(/(?:^|\n)\[steering\] [^\n]*\n?/g, '');
+    const hasSteer = text => /(?:^|\n)\[steering\] /.test(String(text || ''));
+    // the [start, end] run of contiguous parts that joins to exactly `text`, or null
+    const joinsTo = (parts, text) => {
       for (let start = 0; start < parts.length - 1; start++) {
         if (!text.startsWith(parts[start])) continue;
         let joined = parts[start];
         for (let end = start + 1; end < parts.length; end++) {
           joined += parts[end];
-          if (joined === text) return true;
+          if (joined === text) return [start, end];
           if (joined.length >= text.length) break;
         }
       }
-      return false;
+      return null;
     };
-    // THE LOCAL THREAD OWNS ITS ORDER (2026-09-13). The durable transcript is NOT a byte-exact superset of what
-    // the Commander saw: a group/@mention run records its user turn as a "Shared conversation context…" packet,
-    // a screen capture is journaled as a synthetic user turn, and error / stopped / delegated / retried rows only
-    // ever exist locally. The old merge emitted the server's turns first and pushed every unmatched local row to
-    // the END — so a user's own questions slid to the bottom, internal prompts surfaced as their messages, and
-    // App.persist() made the scramble permanent on every open ("history disappears"). Now: walk the local rows in
-    // their own order and keep every one in place; a durable turn with an exact local twin ENRICHES that row
-    // (ts / rowId / sourceRunId); a durable turn the local thread never saw (headless cron / channel / page-closed
-    // completion) is INSERTED right after the last row a durable turn anchored to. Nothing is ever reordered.
-    const kept = [];   // { row, key } — the surviving local rows, original order
-    const buckets = new Map();   // role\0content -> queue of kept indices (occurrence-aware, like before)
+    // the durable parts this saved aggregate already shows (so a steered row can be enriched by them), or null.
+    // A rowId marks a durable row — except on a steered row: the merge that kept it lent it its first part's rowId, and that
+    // save is the next load's input (the desk's next open, the phone's every read), so it must find its span again each load.
+    const committedAggregate = (row, runId, explicit) => {
+      if (row.role !== 'assistant' || (row.rowId && !hasSteer(row.content)) || row.stopped || row.error || (row.attachments && row.attachments.length)) return null;
+      const parts = runParts.get(runId) || [], text = steerless(row.content);
+      let span = joinsTo(parts, text);
+      if (!span && explicit) { const target = squash(text); span = target ? joinsTo(parts.map(squash), target) : null; }
+      return span ? parts.slice(span[0], span[1] + 1) : null;
+    };
+    const kept = [], buckets = new Map();
     let userRunId = '';
-    for (const row of Array.isArray(local) ? local : []) {
-      // settled local status lines (failed / silent / nothing-to-report) stay exactly where they were. A pending
-      // transcript warning is rebuilt from the latest read below, so it vanishes as soon as canonical prose lands.
+    for (let row of Array.isArray(local) ? local : []) {
       if (row && row.sys) { if (!row.transcriptPending) kept.push({ row, key: null }); continue; }
       if (!row || (row.role !== 'user' && row.role !== 'assistant')) continue;
+      const final = row.role === 'assistant' && finals.get(String(row.sourceRunId || ''));
+      if (final && sameRun(row, final)) {
+        const id = String(final.sourceRunId);
+        if (finalSlots.has(id)) {
+          const keptRow = kept[finalSlots.get(id)];
+          keptRow.row = withFinal(row, keptRow.row);
+          continue;
+        }
+        row = withFinal(row, final);
+        finalSlots.set(id, kept.length);
+      }
       if (row.role === 'user') userRunId = String(row.sourceRunId || '');
-      if (committedAggregate(row, String(row.sourceRunId || userRunId))) continue;
+      const aggregate = committedAggregate(row, String(row.sourceRunId || userRunId), !!row.sourceRunId);
+      if (aggregate && !hasSteer(row.content)) continue;
+      if (aggregate) {   // keep the steered row: each durable part it already shows enriches it instead of re-inserting
+        for (const part of aggregate) { const k = 'assistant\u0000' + part, q = buckets.get(k) || []; q.push(kept.length); buckets.set(k, q); }
+        kept.push({ row, key: null });
+        continue;
+      }
       if (row.role === 'assistant' && !String(row.content == null ? '' : row.content).trim()) continue;
-      const key = row.role + '\u0000' + String(row.content || '');
+      const key = row.role + '\u0000' + (row.role === 'assistant' ? steerless(row.content) : String(row.content || ''));
       const q = buckets.get(key) || []; q.push(kept.length); buckets.set(key, q);
       kept.push({ row, key });
     }
-    // User-role rows the sidecar journals that were never typed by the Commander: the group-session context packet
-    // (sidecar/group-sessions.js) and the screen-capture injection (sidecar/loop.js). Prefix-matched on purpose —
-    // both are fixed harness strings, and a real message that merely mentions them does not START with them.
     const internalTranscriptPrompt = text => /^Shared conversation context \(/.test(text) || /^\[BEGIN EXTERNAL SCREEN CAPTURE/.test(text);
-    // Durable-only turns, keyed by the kept index they follow (-1 = before the first local row). Occurrence queues,
-    // rather than a Set, keep two identical user turns distinct while still preventing a duplicate final answer.
     const inserts = new Map();
     let anchor = -1;
     for (const turn of Array.isArray(turns) ? turns : []) {
@@ -1320,21 +1998,33 @@ const Chat = (() => {
       const content = String(turn.content == null ? '' : turn.content);
       if (turn.role === 'assistant' && !content.trim()) continue;
       const key = turn.role + '\u0000' + content;
-      const q = buckets.get(key), idx = (q && q.length) ? q.shift() : -1;
+      const q = buckets.get(key), authoritative = turn.role === 'assistant' && turn.dispatchState === 'final' && finals.get(String(turn.sourceRunId || '')) === turn;
+      // A matching sentence from another run must never acquire this dispatch's identity.
+      const at = q ? q.findIndex(i => authoritative ? sameRun(kept[i].row, turn)
+        : finalSlots.get(String(kept[i].row.sourceRunId || '')) !== i) : -1;
+      const idx = at >= 0 ? q.splice(at, 1)[0] : -1;
       if (idx >= 0) {
         const prior = kept[idx].row;
-        kept[idx].row = Object.assign({}, turn, prior, { role: turn.role, content, ts: turn.ts != null ? turn.ts : prior.ts });
+        kept[idx].row = authoritative ? withFinal(prior, turn) : Object.assign({}, turn, prior, { role: turn.role, content: hasSteer(prior.content) ? prior.content : content, ts: turn.ts != null ? turn.ts : prior.ts });
         anchor = idx;
         continue;
       }
-      if (turn.role === 'user' && internalTranscriptPrompt(content)) continue;   // harness packets are not Commander speech
+      if (turn.role === 'user' && internalTranscriptPrompt(content)) continue;
       const list = inserts.get(anchor) || []; list.push(Object.assign({}, turn, { role: turn.role, content })); inserts.set(anchor, list);
     }
     const merged = [];
     for (const turn of inserts.get(-1) || []) merged.push(turn);
     for (let i = 0; i < kept.length; i++) {
       merged.push(kept[i].row);
-      for (const turn of inserts.get(i) || []) merged.push(turn);
+      const list = inserts.get(i) || [], run = String(kept[i].row.sourceRunId || '');
+      /* A RUN KEEPS ITS OWN STATION ROWS (SEND NOW reload lane, 2026-10-14): a reload mid-run saves no copy of that run's
+         directive, so the transcript inserts it here, after the last row it matched — which put the NEXT run's directive
+         between an earlier run and the steer echo filed for it. This row's run gets its own inserted turns first, then
+         the station rows of the same run that follow it, then everyone else's. */
+      let k = 0;
+      if (run) while (k < list.length && String(list[k].sourceRunId || '') === run) merged.push(list[k++]);
+      while (run && k < list.length && i + 1 < kept.length && kept[i + 1].row.sys && String(kept[i + 1].row.sourceRunId || '') === run && !(inserts.get(i + 1) || []).length) merged.push(kept[++i].row);
+      for (; k < list.length; k++) merged.push(list[k]);
     }
     return merged;
   }
@@ -1353,48 +2043,130 @@ const Chat = (() => {
     if (continuityEvents.length > 64) continuityEvents.shift();
   }
   function continuityDiagnostics() { return continuityEvents.map(e => ({ ...e })); }
-  function loadServerHistory(ws, loadToken) {
+  function loadServerHistory(ws, loadToken, timeoutMs) {
     if (!ws || !ws.id) return Promise.resolve(false);
-    const read = { history: ws.history, promise: null };
+    const read = { history: ws.history, promise: null, timeoutMs: timeoutMs > 0 ? timeoutMs : 0, retryable: false, serverFailed: false };   // 0 = the open-time 8 s window
     historyLoads.set(ws, read);
     noteContinuity(ws, 'history-loading');
     read.promise = reconcileServerHistory(ws, loadToken, read);
     return read.promise;
   }
 
+  /* THE FIRST MESSAGE AFTER A RESTART (soak S2, 2026-10-15). Opening a conversation reads its history once, in an 8 s
+     window. Right after a station restart the sidecar can take longer than that to answer (the soak's own API calls
+     took 5-11 s in the first seconds after boot, 0.5 s once warm), so that read can time out — and the FIRST send then
+     awaited the already-settled failure and refused ("history could not be restored") without asking the station
+     again; no run started. A send now asks again while the station has not answered: a fresh read, a longer window
+     per read (a busy boot answers late, not never), short backoff between unanswered reads, all inside one bounded
+     wait. The message is admitted only once a read REALLY answered (never on a guess), exactly once (admission
+     happens before the run is requested, so a retry can never double-send). STOP or a removed conversation ends the
+     wait at once; a station that never answers still ends in the same honest refusal, message kept; a refusal the
+     station answered on purpose (4xx) is final. The COMMS status stays 'connecting…' throughout — no run exists yet.
+     A SERVER ERROR IS AN ANSWER (night-sr-fix, 2026-10-15): a station that answers every read at once with a 5xx (a
+     degraded station's 503, a broken transcript store's 500) is not silent, and asking it again every 1-4 s only held
+     the message at 'connecting…' for the whole 45 s bound against identical answers (test/session-reliability.e2e
+     hung its 30 s page evaluate on that wait). It gets ONE fresh ask — the failure this send found may predate it —
+     and then the same honest refusal at once, message kept; the backoff stays for reads that got no answer at all. */
+  const HISTORY_SEND_READ_MS = 20000;    // one send-time read's window (an open-time read keeps 8 s: reconcileServerHistory)
+  const HISTORY_SEND_WAIT_MS = 45000;    // the whole wait a send gives an unanswered history before it refuses
+  function changedBeforeSending() { return new Error('Conversation changed before sending.'); }
+  // Wait for a promise, but let the send's own abort (STOP) end the wait at once. The read itself is shared with the
+  // open-time load and keeps its own owner rules; only this send stops waiting on it.
+  function untilAborted(promise, signal) {
+    return new Promise((resolve, reject) => {
+      if (signal.aborted) { reject(changedBeforeSending()); return; }
+      const changed = () => reject(changedBeforeSending());
+      signal.addEventListener('abort', changed, { once: true });
+      promise.then(v => { signal.removeEventListener('abort', changed); resolve(v); },
+        e => { signal.removeEventListener('abort', changed); reject(e); });
+    });
+  }
+
   async function ensureHistoryReady(ws, signal) {
-    let read = historyLoads.get(ws);
-    if (!read || !read.promise) { loadServerHistory(ws, historyPinSeq); read = historyLoads.get(ws); }
-    let ready = await read.promise;
-    // A second open can supersede the request while this turn waits. Follow the
-    // latest owner, never admit inference on a previous visit's settled promise.
-    while (historyLoads.get(ws) !== read) {
-      if (signal.aborted) throw new Error('Conversation changed before sending.');
+    const deadline = Date.now() + HISTORY_SEND_WAIT_MS;
+    let asked = 0, read = null;
+    for (;;) {
       read = historyLoads.get(ws);
-      ready = await read.promise;
-    }
-    if (!ready) {
+      if (!read || !read.promise) {
+        loadServerHistory(ws, historyPinSeq, Math.max(1000, Math.min(HISTORY_SEND_READ_MS, deadline - Date.now())));
+        read = historyLoads.get(ws); asked++;
+      }
+      let ready = await untilAborted(read.promise, signal);
+      // A second open can supersede the request while this turn waits. Follow the
+      // latest owner, never admit inference on a previous visit's settled promise.
+      while (historyLoads.get(ws) !== read) {
+        if (signal.aborted) throw changedBeforeSending();
+        read = historyLoads.get(ws);
+        ready = await untilAborted(read.promise, signal);
+      }
+      if (ready) break;
       if (historyLoads.get(ws) === read) read.promise = null;
-      noteContinuity(ws, 'send-held-history-unavailable');
-      throw Object.assign(new Error('Conversation history could not be restored. Your message is kept; try again when the connection returns.'), { code: 'HISTORY_UNAVAILABLE' });
+      if (signal.aborted || (typeof Workstreams !== 'undefined' && Workstreams.get(ws.id) !== ws)) throw changedBeforeSending();
+      // a settled failure from before this send (the open-time read) is asked again at once; this send's own
+      // unanswered reads back off 1 s, 2 s, then 4 s. A server error answering this send's own read is final.
+      const pause = asked ? Math.min(4000, 500 * Math.pow(2, asked)) : 0;
+      const askAgain = read.retryable || (read.serverFailed && !asked);
+      if (!askAgain || Date.now() + pause >= deadline) {
+        noteContinuity(ws, 'send-held-history-unavailable');
+        throw Object.assign(new Error('Conversation history could not be restored. Your message is kept; try again when the connection returns.'), { code: 'HISTORY_UNAVAILABLE' });
+      }
+      noteContinuity(ws, 'send-history-retry');
+      if (pause) await untilAborted(new Promise(resolve => setTimeout(resolve, pause)), signal);
     }
-    if (signal.aborted || (typeof Workstreams !== 'undefined' && Workstreams.get(ws.id) !== ws)) throw new Error('Conversation changed before sending.');
+    if (signal.aborted || (typeof Workstreams !== 'undefined' && Workstreams.get(ws.id) !== ws)) throw changedBeforeSending();
     noteContinuity(ws, 'send-history-ready');
     return read;
+  }
+
+  /* THE DESK REDACTS ITS COPY BEFORE IT MERGES, as the phone does (remote/host.js mergedTurns; wave 1 qw18, 10-27). The
+     save is raw and the station redacts each row it writes, so a turn holding a secret never keyed equal: it showed twice,
+     raw copy kept. When the station's rows carry a redaction, the station redacts this copy's turn texts with the store's
+     own redact (the page has none). A row it holds then merges as ONE turn, redacted; a row it does not hold (this send's
+     own turn) stays as typed.
+     TYPED FIRST (review, 10-27): a station row keeps the redaction of its day, so a value held only later is raw there
+     and today's redaction of the copy missed it (twice, then once more per open). The copy merges as typed first; only
+     rows left unmatched are asked and keyed redacted, so a row that matched as typed (a steered reply holding its parts
+     included) is never re-keyed. At most REDACT_ASK_MAX texts go, newest first, within REDACT_ASK_CHARS of JSON (the
+     route takes 500 and 8 MB); a row past that merges as typed. THE RETRY TARGET (the newest directive with no answer
+     after it) keeps the Commander's words, as one row, since retryLast re-sends it; the next open after an answer
+     redacts it. */
+  const REDACT_ASK_MAX = 400;          // a station read returns at most 200 turns
+  const REDACT_ASK_CHARS = 2000000;    // at most 6 MB of UTF-8
+  function redactAsk(rows) {
+    const texts = [], seen = new Set();
+    let chars = 0;
+    for (let i = rows.length - 1; i >= 0 && texts.length < REDACT_ASK_MAX; i--) {
+      const t = rows[i].content, size = JSON.stringify(t).length + 1;
+      if (seen.has(t) || chars + size > REDACT_ASK_CHARS) continue;
+      seen.add(t); chars += size; texts.push(t);
+    }
+    return texts;
+  }
+  // -> Map(raw -> redacted), or false (no answer in the window: the merge runs on the raw copy, as before)
+  async function redactedTexts(texts, ms) {
+    const controller = new AbortController(), timeout = setTimeout(() => controller.abort(), ms);
+    try {
+      const r = await fetch('/api/transcript/redact', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ texts }), cache: 'no-store', signal: controller.signal });
+      const j = r.ok ? await r.json() : null;
+      return !!j && Array.isArray(j.texts) && j.texts.length === texts.length && new Map(texts.map((t, i) => [t, String(j.texts[i])]));
+    } catch (_) { return false; } finally { clearTimeout(timeout); }
   }
 
   async function reconcileServerHistory(ws, loadToken, read) {
     if (!ws || !ws.id) return;
     const cronSession = String(ws.id).indexOf('cron-') === 0;
+    const startedAt = Date.now(), windowMs = read.timeoutMs > 0 ? read.timeoutMs : 8000;   // a send's read may wait longer (ensureHistoryReady)
     let busy = false;
     try { busy = typeof Channels !== 'undefined' && Channels.isBusy && Channels.isBusy(ws.id); } catch (_) {}
     const waits = cronSession && !busy ? [120, 400] : [];
-    let turns = [], reachable = false;
+    let turns = [], reachable = false, refused = false, failed = false;
     for (let attempt = 0; attempt <= waits.length; attempt++) {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 8000);
+      const timeout = setTimeout(() => controller.abort(), windowMs);
       try {
         const r = await fetch('/api/transcript?agent=' + encodeURIComponent(ws.agentId || 'agent') + '&stream=' + encodeURIComponent(ws.id) + '&limit=200', { cache: 'no-store', signal: controller.signal });
+        refused = !r.ok && r.status >= 400 && r.status < 500;   // the station answered "no": asking again cannot change it
+        failed = !r.ok && r.status >= 500;                       // the station answered "broken": an answer, not silence
         if (r.ok) {
           const j = (await r.json()) || {};
           if (!Array.isArray(j.turns)) break; // malformed is unknown, never an empty transcript
@@ -1402,16 +2174,51 @@ const Chat = (() => {
           reachable = true;
           if (!cronSession || turns.some(t => t && t.role === 'assistant' && String(t.content == null ? '' : t.content).trim())) break;
         }
-      } catch (_) { /* retry the bounded cron persistence window below */ }
+      } catch (_) { refused = failed = false; /* no answer (timeout / connection): retry the bounded cron persistence window below */ }
       finally { clearTimeout(timeout); }
       if (attempt < waits.length) await new Promise(resolve => setTimeout(resolve, waits[attempt]));
     }
+    read.retryable = !reachable && !refused && !failed;   // unanswered (or unreadable) — a send may keep asking (ensureHistoryReady)
+    read.serverFailed = !reachable && failed;              // answered 5xx — a send asks once more, then refuses (ensureHistoryReady)
     // A superseded read, removed session or deliberate clear cannot write back.
-    if (historyLoads.get(ws) !== read || (typeof Workstreams !== 'undefined' && Workstreams.get(ws.id) !== ws)
-      || (read.history.length && !ws.history.length)) { noteContinuity(ws, 'history-stale-discarded'); return false; }
+    const stale = () => historyLoads.get(ws) !== read || (typeof Workstreams !== 'undefined' && Workstreams.get(ws.id) !== ws)
+      || (read.history.length && !ws.history.length);
+    if (stale()) { noteContinuity(ws, 'history-stale-discarded'); return false; }
     noteContinuity(ws, reachable ? 'history-loaded' : 'history-unavailable');
     if (!reachable && !cronSession) return false;
-    const next = mergeCanonicalHistory(ws.history, turns);
+    // the typed merge, and the turn rows it left unmatched (a row that comes back as itself matched nothing)
+    const typedMerge = () => { const merged = mergeCanonicalHistory(ws.history, turns), out = new Set(merged);
+      return { merged, left: ws.history.filter(r => out.has(r) && r && !r.sys && (r.role === 'user' || r.role === 'assistant') && typeof r.content === 'string') }; };
+    const ask = turns.some(t => t && /\[redacted-/.test(String(t.content))) ? redactAsk(typedMerge().left) : [];
+    // what is left of this read's own window, never a fresh one: a send's wait stays bounded
+    const clean = ask.length ? await redactedTexts(ask, Math.max(1000, windowMs - (Date.now() - startedAt))) : null;
+    if (clean !== null && stale()) { noteContinuity(ws, 'history-stale-discarded'); return false; }
+    if (clean === false) noteContinuity(ws, 'history-redact-unavailable');
+    const first = typedMerge();   // again: the copy may have grown while the redaction was out
+    let merged = first.merged;
+    if (clean) {
+      // TYPED: the row as typed (the merge carries a matched copy's own fields, this one too)
+      const TYPED = Symbol('typed'), left = new Set(first.left), copies = new Set();
+      const local = ws.history.map(r => {
+        const t = left.has(r) ? clean.get(r.content) : undefined;
+        if (t === undefined || t === r.content) return r;
+        const copy = Object.assign({}, r, { content: t, [TYPED]: r }); copies.add(copy); return copy;
+      });
+      if (copies.size) {
+        const keyed = mergeCanonicalHistory(local, turns);
+        const lastUser = keyed.map(m => m && m.role).lastIndexOf('user');
+        const answered = keyed.slice(lastUser + 1).some(m => m && m.role === 'assistant' && !m.error && !m.stopped && String(m.content == null ? '' : m.content).trim());
+        merged = keyed.map((m, i) => {
+          const row = m && m[TYPED];
+          if (!row) return m;
+          if (copies.has(m)) return row;   // a copy the station did not match goes back as it was
+          const out = Object.assign({}, m, i === lastUser && !answered && m.role === 'user' ? { content: row.content } : null);   // the retry target
+          delete out[TYPED];
+          return out;
+        });
+      }
+    }
+    const next = placeSteerNotes(merged);
     const readable = next.some(m => m && (
       (m.role === 'assistant' && String(m.content == null ? '' : m.content).trim()) ||
       (m.sys && !m.transcriptPending && String(m.content == null ? '' : m.content).trim())
@@ -1430,6 +2237,11 @@ const Chat = (() => {
     if (log) log.innerHTML = '';
     renderHistory(); replayChannel(); syncStatus(); maybeEmptyState();
     read.repaint = false;
+    if (typeof Briefing !== 'undefined' && Briefing.presentFor) { try { Briefing.presentFor(ws.id).catch(() => {}); } catch (_) {} }   // the repaint wiped the chips
+    if (typeof Delegated !== 'undefined' && Delegated.presentFor) { try { Delegated.presentFor(ws.id).catch(() => {}); } catch (_) {} }   // …and the delegated cards
+    // An explicit reveal made before this repaint (NEEDS YOU Open, a search hit) keeps its place: the repaint rebuilt
+    // every row, so find the same one again rather than leave the reader at the top of the conversation.
+    if (revealKey && !stick && log) { const again = log.querySelector(revealKey); if (again) revealHistory(again); }
     pinLoadedHistoryAfterLayout(loadToken);
     return reachable;
   }
@@ -1442,14 +2254,62 @@ const Chat = (() => {
     if (typeof Channels !== 'undefined') Channels.setComposeTarget(ws.id);
     updateControls(); autoGrowInput();
   }
+  /* ORG P26 — THE OPEN SESSION IN THE COMMS TITLE ('COMMS · <session>'). ONE writer for #comms-title: Chat.load and the
+     rail's repaint (renames, a first message's auto-title, group membership) call paintTitle. Two owners borrow it and
+     hand it back: a PROJECT HOME (project-home.js) while it is shown, and the HUD's ACTIVITY view (hudmode.js titleWas)
+     — on exit each calls paintTitle again. A title names WHICH conversation, never run state (comms-header-no-run-state).
+     An untitled group reads like its rail row ('ULTRON, CYPHER +3'); every other name is Workstreams.titleOf. */
+  function sessionTitleText(ws) {
+    if (!ws) return '';
+    // 'Group chat' is the server's placeholder for an untitled group (group-sessions.js create), not a name anyone gave it
+    if ((!ws.title || ws.title === 'Group chat') && ws.conversationMode === 'group' && typeof GroupChat !== 'undefined' && GroupChat.membersOf) {
+      const members = GroupChat.membersOf(ws.id) || [];
+      if (members.length >= 2) {
+        const ids = [ws.agentId].concat(members.filter(id => id !== ws.agentId)).filter(id => members.includes(id));
+        const nm = id => (typeof App !== 'undefined' && App.agentName && App.agentName(id)) || id;
+        const more = ids.length - 2;
+        return ids.slice(0, 2).map(nm).join(', ') + (more > 0 ? ' +' + more : '');
+      }
+    }
+    return shownName(ws);
+  }
+  // the name the RAIL prints for a session (App.sessionDisplayName: D12's "New session · NOVA" / "… 2" included), else
+  // streamLabel — so the COMMS title and the busy row never name a session the rail no longer shows by that name
+  function shownName(w) {
+    const n = (w && typeof App !== 'undefined' && App.sessionDisplayName) ? App.sessionDisplayName(w) : '';
+    return n || streamLabel(w);
+  }
+  function paintTitle() {
+    const t = el('comms-title'); if (!t) return;
+    if (typeof ProjectHome !== 'undefined' && ProjectHome.owns && ProjectHome.owns()) return;   // the project home names the panel while shown
+    if (document.body && document.body.classList.contains('hud-view-activity')) return;          // the HUD's ▮ ACTIVITY view owns it
+    const ws = activeWs || (typeof Workstreams !== 'undefined' ? Workstreams.active() : null);
+    const name = ws ? sessionTitleText(ws) : '';
+    const painted = name ? (t.dataset.session === name && !!t.querySelector('.comms-session')) : t.textContent === 'COMMS';
+    if (painted) return;
+    t.dataset.session = name;
+    if (!name) { t.textContent = 'COMMS'; t.removeAttribute('data-tip'); return; }
+    t.textContent = 'COMMS';
+    const s = document.createElement('span'); s.className = 'comms-session'; s.textContent = ' · ' + name;
+    t.appendChild(s);
+    t.setAttribute('data-tip', 'This conversation: ' + name);   // the whole name when the panel clamps it
+  }
   function load(ws) {
     const historyPin = ++historyPinSeq;
     historyPinPending = historyPin;
+    revealKey = '';   // a reveal into this conversation runs after load(); this only drops a stale one
     const nextWs = ws || (typeof Workstreams !== 'undefined' ? Workstreams.active() : null);
+    const prevWs = activeWs;
     if (activeWs?.id !== nextWs?.id) focusVersion++;
     activeWs = nextWs;
+    paintTitle();
+    // ANOTHER CONVERSATION IS ON SCREEN (gh#158): an offer panel over COMMS (the first-task hand-off included) steps aside,
+    // unanswered, so COMMS shows the conversation now open and its message box. A re-sync of the same one never does.
+    if (prevWs && nextWs && prevWs.id !== nextWs.id) stepOfferAside('session');
     noteContinuity(activeWs, 'session-selected');
+    heldCard = null; heldQueue.length = 0;
     if (activeWs && activeWs.conversationMode === 'group' && typeof GroupChat !== 'undefined') {
+      hideNewPill();
       loadGroupConversation(activeWs);
       return; // Group history/recovery is backend-owned; never auto-resume it through the direct-run path.
     }
@@ -1474,8 +2334,10 @@ const Chat = (() => {
     syncStatus();      // also paints the Stop control + this stream's queued pills (updateControls)
     maybeEmptyState();   // brand-new / empty + idle stream → a one-line hint instead of a blank void
     maybeDeskPrompt();   // …and if this stream's agent still has nowhere to sit, the required next step + its door
-    loadServerHistory(activeWs, historyPin);
-    if (activeWs) flushQueued(activeWs.id);   // returned to an idle stream that has a queued follow-up → send it now
+    // once its history is merged, the conversation's leftover SEND NOW lines (a reload, close, crash or reconnect lost the page
+    // that held them) are asked about: shown as read, or back in this message box (reconcileSentNow)
+    { const w = activeWs; Promise.resolve(loadServerHistory(activeWs, historyPin)).catch(() => false).then(() => { if (w) reconcileSentNow(w); }); }
+    if (activeWs) { returnHeld(activeWs.id); flushQueued(activeWs.id); }   // returned: what its confirmed STOP held goes back in the box; an idle stream's queued follow-up sends now
     // GOAL LOOP: returned to an idle stream with an ACTIVE standing goal (its moment was blocked / it was
     // backgrounded mid-loop) → continue it. kickGoal no-ops when busy/blocked/paused, so this is always safe.
     if (activeWs && typeof GoalLoop !== 'undefined' && goalOf(activeWs)) { const w = activeWs; setTimeout(() => { if (isActiveWs(w)) kickGoal(w); }, 0); }
@@ -1491,6 +2353,14 @@ const Chat = (() => {
     // every other id, re-checks the server (undecided only), and the card itself is pinned to this session.
     if (activeWs && typeof WorkshopStore !== 'undefined' && WorkshopStore.presentFor) {
       try { WorkshopStore.presentFor(activeWs.id).catch(() => {}); } catch (_) {}
+    }
+    // THE ONE RETURN REPORT: opening the briefing session offers each briefed item's own session as a chip
+    if (activeWs && typeof Briefing !== 'undefined' && Briefing.presentFor) {
+      try { Briefing.presentFor(activeWs.id).catch(() => {}); } catch (_) {}
+    }
+    // DELEGATED WORK: a conversation that handed work to the crew shows one live card per dispatch (delegated.js)
+    if (activeWs && typeof Delegated !== 'undefined' && Delegated.presentFor) {
+      try { Delegated.presentFor(activeWs.id).catch(() => {}); } catch (_) {}
     }
     pinLoadedHistoryAfterLayout(historyPin);
     // Reconcile a run that died while this page was closed or the sidecar restarted. Only the server's durable
@@ -1579,7 +2449,9 @@ const Chat = (() => {
     // drop LOCAL markers that are records, not dialogue: the history-cap marker (truncated) and any system status
     // line (sys — e.g. an autosessions "routine ran, nothing to report" / "couldn't load the output" framing line).
     // These must NEVER be replayed to the model as prior turns (a frontend-authored string is not the agent's word).
-    const real = history.filter(m => !(m && (m.truncated || m.sys)));
+    // …and the ⚠ error/stop rows COMMS writes when a run fails (error:true): the Commander keeps seeing the reason after a
+    // reload, but the model must never be shown "Something went wrong…" as if it had said it (2026-10-11).
+    const real = history.filter(m => !(m && (m.truncated || m.sys || m.error)));
     const turnCapped = real.length > HISTORY_CAP ? real.slice(-HISTORY_CAP) : real;
     return fitHistoryBytes(turnCapped, HISTORY_WIRE_MAX_BYTES);
   }
@@ -1626,6 +2498,16 @@ const Chat = (() => {
   function historyWindow(ws) {
     return ws ? modelFitHistory(ws.history, ws) : [];
   }
+  /* A retry re-runs the LAST user turn, so nothing after it may ride the wire. retryLast() trims the local rows,
+     but load() then re-syncs the thread from the server transcript, which puts the replaced attempt's replies back
+     before send() builds the request — and current Claude models refuse a conversation that ends on an assistant
+     message ("This model does not support assistant message prefill"): every Try again / retry failed in ~1.5s
+     with "Provider returned error" (first-hour walk 2026-09-28, re-proven live on the fix branch). */
+  function endOnUserTurn(messages) {
+    const list = Array.isArray(messages) ? messages : [];
+    const at = list.map(m => m && m.role).lastIndexOf('user');
+    return at >= 0 ? list.slice(0, at + 1) : list;
+  }
   function contextIssueFor(messages, limit, projectedUsed) {
     limit = Math.max(0, Number(limit) || 0);
     if (!limit) return null;   // unknown catalog => never invent a ceiling
@@ -1659,19 +2541,45 @@ const Chat = (() => {
      raw ws.history) so the gauge estimates the same bytes the send path actually puts on the wire:
      local markers the model never sees must not inflate the reading. Returns null with no active
      stream, which the gauge reads as "nothing to measure yet". */
+  /* THE GAUGE READS A MEMO (idle CPU piece 3, 2026-10-20). The 1 s station tick asks for this every second, and
+     historyWindow re-serialized the whole conversation three or four times per call (JSON.stringify + TextEncoder per
+     message for the byte cap, again per message for the token fit, and again for the calibrated refit) — on a long chat,
+     every second, with nothing changed. Its answer can only move when one of these does: the conversation and its agent,
+     the history array (replaced, appended, popped or spliced — chat.js never edits a kept message's content in place, and a
+     streaming reply's growing content is in the key), the selected model or its catalog limit, or a context reading
+     (Harness.contextRevision, bumped on every write to the readings). A 15 s ceiling re-derives it anyway, so an edit none
+     of these can see is never stale for long. Without contextRevision (an older harness) nothing is memoized. */
+  const CTX_MEMO_TTL_MS = 15000;
+  let ctxMemo = null;
   function contextRef() {
     if (!activeWs) return null;
-    return { agentId: activeWs.agentId || 'agent', streamId: activeWs.id, messages: historyWindow(activeWs) };
+    let key = null;
+    try {
+      if (typeof Harness !== 'undefined' && Harness.contextRevision) {
+        const h = Array.isArray(activeWs.history) ? activeWs.history : null;
+        const last = h && h.length ? h[h.length - 1] : null;
+        const model = Harness.getModel ? (Harness.getModel() || '') : '';
+        key = [activeWs.id, activeWs.agentId, h, h ? h.length : -1, last, last ? String(last.content == null ? '' : last.content).length : -1,
+          model, Harness.contextLimitOf ? Harness.contextLimitOf(model) : 0, Harness.contextRevision()];
+      }
+    } catch (_) { key = null; }
+    const now = Date.now(), age = ctxMemo ? now - ctxMemo.at : -1;   // a negative age (the wall clock stepped back) cannot be measured: re-derive
+    if (key && ctxMemo && age >= 0 && age < CTX_MEMO_TTL_MS && ctxMemo.key.every((v, i) => v === key[i])) return ctxMemo.ref;
+    const ref = { agentId: activeWs.agentId || 'agent', streamId: activeWs.id, messages: historyWindow(activeWs) };
+    ctxMemo = key ? { key, at: now, ref } : null;
+    return ref;
   }
   // A streamed fragment is real assistant output even when the transport dies before a clean result envelope.
   // Persist it as its own turn before the failure marker so switch/reload cannot erase what was already visible.
+  // The turn records the project root its in-flight run was sent with (send's liveRunRoots; null = none), so its file
+  // links resolve where that run wrote them.
   function persistPartial(ws, text) {
     if (!ws || !ws.history) return false;
     const content = String(text == null ? '' : text);
     if (!content.trim()) return false;
     const last = ws.history[ws.history.length - 1];
     if (last && last.role === 'assistant' && !last.error && last.content === content) return false;
-    ws.history.push({ role: 'assistant', content: content, ts: Date.now() });
+    ws.history.push({ role: 'assistant', content: content, ts: Date.now(), projectRoot: liveRunRoots.get(ws.id) });
     capHistory(ws);
     return true;
   }
@@ -1687,8 +2595,11 @@ const Chat = (() => {
   function busyPeerFor(ws) {
     if (!ws || typeof Workstreams === 'undefined' || typeof Channels === 'undefined') return null;
     const aid = ws.agentId || 'agent';
-    const list = Workstreams.list ? Workstreams.list({ includeArchived: true }) : (Workstreams.all ? Workstreams.all() : []);
-    return list.find(w => w && w.id !== ws.id && (w.agentId || 'agent') === aid && Channels.isBusy(w.id)) || null;
+    const list = Workstreams.list ? Workstreams.list({ includeArchived: true, includeWorkers: true }) : (Workstreams.all ? Workstreams.all() : []);
+    const peer = list.find(w => w && w.id !== ws.id && (w.agentId || 'agent') === aid && Channels.isBusy(w.id)) || null;
+    // busy on delegated work: name the conversation that asked (the worker's own thread is not a place you go)
+    const home = peer && Workstreams.isHidden && Workstreams.isHidden(peer) ? Workstreams.get(peer.parentStreamId) : null;
+    return home && home.id !== ws.id ? home : (home ? null : peer);
   }
   function renderAgentBusy(peer, detail) {
     if (!log) return;
@@ -1697,7 +2608,9 @@ const Chat = (() => {
     const rowEl = old || document.createElement('div');
     rowEl.id = 'comms-agent-busy'; rowEl.className = 'choice-row comms-agent-busy'; rowEl.textContent = '';
     const label = document.createElement('span'); label.className = 'dim';
-    label.textContent = peer ? ('ALSO RUNNING IN ' + streamLabel(peer).toUpperCase()) : String(detail || 'AGENT BUSY');
+    // ORG P25: say WHO is busy and WHERE — it explains why a first message here queues (kept visible in an empty session)
+    const busyName = peer ? ((typeof App !== 'undefined' && App.agentName && App.agentName(peer.agentId || 'agent')) || name || 'This agent') : '';
+    label.textContent = peer ? (String(busyName).toUpperCase() + ' IS BUSY IN ' + shownName(peer).toUpperCase()) : String(detail || 'AGENT BUSY');
     rowEl.appendChild(label);
     if (peer) {
       const view = document.createElement('button'); view.type = 'button'; view.className = 'choice'; view.textContent = 'VIEW ACTIVE RUN';
@@ -1710,20 +2623,27 @@ const Chat = (() => {
     if (!statusEl) return;
     statusEl.textContent = s;
     const low = String(s || '').toLowerCase();
-    statusEl.classList.remove('status-thinking', 'status-working', 'status-approval', 'status-stopping', 'status-connecting', 'status-online', 'status-down');
-    statusEl.classList.add(low.indexOf('approval') >= 0 ? 'status-approval'
+    statusEl.classList.remove('status-thinking', 'status-working', 'status-approval', 'status-stopping', 'status-connecting', 'status-online', 'status-down', 'status-idle');
+    // NO RUN STATE IN THE COMMS HEADER (Andrew, asked 5x; locked 10-03): 'awaiting your answer…' / 'awaiting your context…'
+    // are the same pause as an approval (the card + presence line say it), and 'waking…' is a run state too — every one
+    // lands on a class the header hides. Faults (unreachable, voice errors) still show.
+    statusEl.classList.add(low.indexOf('approval') >= 0 || low.indexOf('awaiting') >= 0 ? 'status-approval'
+      : /^waking\b/.test(low.trim()) ? 'status-thinking'
       : low.indexOf('stopping') >= 0 ? 'status-stopping'
       : low.indexOf('working') >= 0 ? 'status-working'
       : low.indexOf('thinking') >= 0 ? 'status-thinking'
       : low.indexOf('connecting') >= 0 ? 'status-connecting'
       : low.indexOf('unreachable') >= 0 ? 'status-down'
       : 'status-online');
+    // a plain idle 'online' is hidden in the header (css); every run-state and fault still shows.
+    if (low.trim() === 'online') statusEl.classList.add('status-idle');
   }
   // derive the DISPLAYED stream's status from real state, so a low-priority write (a finishing turn) can't
   // clobber the high-priority 'awaiting your approval…' after a switch-back. One source of truth.
   function syncStatus() {
     if (interview) { status('waking…'); stopElapsedTimer(); return; }
-    const p = (activeWs && typeof Channels !== 'undefined') ? Channels.pendingOf(activeWs.id) : null;
+    // a working run reads its OWN ask (a background worker waiting does not pause it); an idle one reads any ask filed here
+    const p = isBusy() ? runPendingOf(activeWs) : ((activeWs && typeof Channels !== 'undefined') ? Channels.pendingOf(activeWs.id) : null);
     const channelStatus = (activeWs && typeof Channels !== 'undefined' && Channels.statusOf) ? Channels.statusOf(activeWs.id) : '';
     // F2 (2026-07-14 adversarial sweep): the idle claim folds the REAL bridge health (World.linkState — the
     // same E1 predicate the topbar #sig / canvas LINK DOWN already read). A dead sidecar kept this label
@@ -1735,7 +2655,7 @@ const Chat = (() => {
     // a peer run no longer blocks THIS session — the status stays an honest 'online' (send is allowed) with
     // the peer named beside it; the soft #comms-agent-busy row below carries the VIEW ACTIVE RUN route.
     // ('running', not 'busy'/'working': status() classifies by substring and this session is NOT the one working.)
-    status(p ? 'awaiting your approval…' : (isBusy() ? (channelStatus || 'thinking…') : (peer ? ('online · also running in ' + streamLabel(peer)) : (down ? 'station unreachable' : 'online'))));
+    status(p ? 'awaiting your approval…' : (isBusy() ? (channelStatus || 'thinking…') : (down ? 'station unreachable' : 'online')));
     renderAgentBusy(peer);
     // keep the elapsed readout matched to the DISPLAYED stream — switching to a busy stream picks up its
     // live count, switching to an idle one clears it. (send() also starts it the instant a run begins.)
@@ -1762,17 +2682,25 @@ const Chat = (() => {
   function starterOptions() {
     return { system, modelKey: typeof Harness !== 'undefined' ? Harness.getProv() + ':' + Harness.getModel() : '' };
   }
+  // Whose ideas a shown generation is: personalization on or paused, and the agent. Drift keeps them; a change here rebuilds.
+  function starterOwner(ctx) { return (ctx && ctx.enabled === false ? 'paused' : 'on') + ':' + String((ctx && ctx.agentId) || 'agent'); }
   function refreshStarters() {
     if (!log || !activeWs || activeWs.history.length || isBusy() || interview || (input && input.value.trim())) return;
     const d = log.querySelector('.cmsg-empty');
     if (!d) { maybeEmptyState(); return; }
-    const key = JSON.stringify([starterContext(), starterOptions()]);
+    const ctxNow = starterContext();
+    const key = JSON.stringify([ctxNow, starterOptions()]);
     if (d.starterKey === key && !(d.retryAt && Date.now() >= d.retryAt) && Date.now() < d.expiresAt) return;
     // Keep focus stable during keyboard selection. The next idle tick can refresh it.
     if (d.contains(document.activeElement)) return;
     if (d.starterKey === key && d.retryAt && Date.now() >= d.retryAt && d.forcePending) {
       requestStarterIdeas(d, d.querySelector('.cmsg-empty-hint'), starterContext(), starterOptions(), true); return;
     }
+    // PERSONALIZED ideas from a finished generation stay up while the context drifts (a crew run elsewhere, a busy flag
+    // flipping): every click re-validates its evidence and destination (openStarter), and REFRESH SUGGESTIONS asks again.
+    // Rebuilding on each drift asked the model once a minute while an empty session sat open. Pausing personalization or
+    // another agent is not drift: the owner changed, so it rebuilds (test/starter-drift.test.js).
+    if (d.keptOwner && d.keptOwner === starterOwner(ctxNow) && Date.now() < d.expiresAt) return;
     clearEmptyState(); maybeEmptyState();
   }
   function openStarter(st, hint) {
@@ -1787,14 +2715,27 @@ const Chat = (() => {
       const target = Workstreams.get(st.sessionId);
       if (!target || target.archived || Channels.isBusy(target.id)) return;
       ws = Workstreams.switch(target.id);
-    } else ws = Workstreams.create(st.label, { agentId: ctx.agentId, projectRoot: ctx.projectRoot || undefined });
+    } else {
+      // ORG P25: a starter picked on a BLANK open session fills THAT session instead of minting another empty row
+      // beside it. Blank = Workstreams.isUntouched (the same test +NEW uses: a plain untitled chat with no messages,
+      // runs, deliverables or spend, not pinned / a task card / a room / a goal loop), not a worker, not busy, same
+      // agent and project. A titled TO DO card or a pinned empty session keeps today's create.
+      const cur = Workstreams.active ? Workstreams.active() : null;
+      const blank = !!cur && Workstreams.isUntouched(cur) && cur.worker !== true && !Channels.isBusy(cur.id)
+        && (cur.agentId || 'agent') === (ctx.agentId || 'agent') && (cur.projectRoot || '') === (ctx.projectRoot || '');
+      ws = blank ? cur : Workstreams.create(st.label, { agentId: ctx.agentId, projectRoot: ctx.projectRoot || undefined });
+    }
     if (!ws) return;
     load(ws);
     prefill(Starters.launchPrompt(st));
+    // a starter's prompt is longer than the composer's max height: show where it STARTS (the caret stays at its end,
+    // so typing still adds to it) instead of leaving the box scrolled to its last lines
+    input.scrollTop = 0; if (typeof requestAnimationFrame === 'function') requestAnimationFrame(() => { input.scrollTop = 0; });
     if (!st.general) StarterStore.prepare(st, ws.id, input.value);
     clearEmptyState(); refreshWorkflowViews();
   }
-  function renderStarterIdeas(d, hint, result) {
+  // ctx: the context `result` was generated for (absent = the loading or generic state, never kept through drift)
+  function renderStarterIdeas(d, hint, result, ctx) {
     const old = d.querySelector('.cmsg-empty-chips'); if (old) old.remove();
     const chips = document.createElement('div'); chips.className = 'cmsg-empty-chips';
     const personalized = result.ideas || [], ideas = personalized.length ? personalized : Starters.defaults();
@@ -1807,6 +2748,7 @@ const Chat = (() => {
       ready: personalized.length ? 'Based on your work and goals. Choose a session to review its brief.' : 'Three substantial starting points. Your own requests will shape future suggestions.'
     };
     hint.textContent = messages[result.status] || messages.ready;
+    d.keptOwner = (result.status === 'ready' && personalized.length && ctx) ? starterOwner(ctx) : '';   // the refresh tick keeps these through drift
     d.retryAt = result.status === 'cooldown' ? result.retryAt : 0;
     for (const st of ideas) {
       if (!st.general) StarterStore.shown(st);
@@ -1817,6 +2759,7 @@ const Chat = (() => {
       const output = document.createElement('span'); output.className = 'cmsg-starter-output'; output.textContent = 'Result: ' + st.deliverable;
       const arrow = document.createElement('span'); arrow.className = 'cmsg-starter-arrow'; arrow.textContent = '›'; arrow.setAttribute('aria-hidden', 'true');
       b.append(title, detail); if (!st.general) b.appendChild(output); b.appendChild(arrow);
+      b.title = st.description + (st.general ? '' : ' Result: ' + st.deliverable);   // cabinet-clean.css shows the title only; the detail is the tip
       b.addEventListener('click', () => openStarter(st, hint));
       const dismiss = document.createElement('button'); dismiss.type = 'button'; dismiss.className = 'choice cmsg-starter-dismiss';
       dismiss.textContent = 'Not relevant'; dismiss.setAttribute('aria-label', 'Not relevant: ' + st.label);
@@ -1840,8 +2783,12 @@ const Chat = (() => {
     const origin = activeWs && activeWs.id, key = JSON.stringify([ctx, options]);
     StarterStore.request(ctx, { ...options, force: !!force }).then(result => {
       if (!d.isConnected || !activeWs || activeWs.id !== origin || activeWs.history.length || isBusy()) return;
-      if (JSON.stringify([starterContext(), starterOptions()]) !== key) { clearEmptyState(); maybeEmptyState(); return; }
-      if (result.status !== 'cancelled') renderStarterIdeas(d, hint, result);
+      // a paid generation of personalized ideas that finished after the context drifted is still shown, for the same owner
+      // (its ideas re-validate on click); anything else re-evaluates against the new context, as before
+      const now = starterContext();
+      const keep = result.status === 'ready' && (result.ideas || []).length && starterOwner(now) === starterOwner(ctx);
+      if (!keep && JSON.stringify([now, starterOptions()]) !== key) { clearEmptyState(); maybeEmptyState(); return; }
+      if (result.status !== 'cancelled') renderStarterIdeas(d, hint, result, ctx);
     });
   }
   function maybeEmptyState() {
@@ -1861,7 +2808,7 @@ const Chat = (() => {
     const ctx = starterContext(), options = starterOptions(), result = StarterStore.peek(ctx, options);
     d.starterKey = JSON.stringify([ctx, options]); d.expiresAt = Date.now() + StarterStore.TTL;
     if (result.status === 'empty' || result.status === 'loading') requestStarterIdeas(d, hint, ctx, options);
-    else renderStarterIdeas(d, hint, result);
+    else renderStarterIdeas(d, hint, result, ctx);
   }
 
   /* THE ONE STEP A HAND-SUMMONED AGENT LEAVES TO THE COMMANDER (2026-08-03).
@@ -1875,7 +2822,7 @@ const Chat = (() => {
      it cannot outlive the desk it asks for, and cannot assert a floor state the station can't prove.
      Anti-nag: it is one system line + the chip row that answers it, in the session that owes the desk, and it is
      silent while that stream is mid-run (the run owns its own DOM; the prompt returns on the next open). */
-  // REFIT can satisfy the prompt while this stream remains open. Its text is a derived floor claim, not history,
+  // BUILD MODE can satisfy the prompt while this stream remains open. Its text is a derived floor claim, not history,
   // so retire both of its DOM rows as soon as the live floor proves the desk now exists. Keep every unrelated
   // system/choice row intact; a broad clearChoices() here would erase whichever real question owns COMMS.
   function retireDeskPrompt() {
@@ -1894,11 +2841,11 @@ const Chat = (() => {
     const prompt = row('system'); prompt.d.classList.add('comms-desk-prompt');
     prompt.body.textContent = who + ' has nowhere to sit yet — it needs a desk of its own before it can take floor work. want to place one?';
     autoscroll();
-    // the chip is the whole point: it opens REFIT already armed on the WORKSTATIONS palette, so the next floor
+    // the chip is the whole point: it opens BUILD MODE already armed on the WORKSTATIONS palette, so the next floor
     // click drops the desk. 'later' just dismisses this view of it — the step is still owed, so the next open
     // of this session says so again (it stops for good the moment the desk exists).
     const chips = choices([{ label: '▤ PLACE ITS DESK', value: 'desk' }, { label: 'later', value: 'later', skip: true }], item => {
-      if (item && item.value === 'desk' && App.openDeskPlacement) App.openDeskPlacement();
+      if (item && item.value === 'desk' && App.openDeskPlacement) App.openDeskPlacement(id);
     });
     if (chips) chips.classList.add('comms-desk-prompt');
   }
@@ -1906,6 +2853,7 @@ const Chat = (() => {
   // opts.live === true marks the streaming reply row, which always pins to the BOTTOM. Every other row (tool
   // ▶/◀ lines, deliverables, consent, turn-in) inserts ABOVE the pinned reply while one is live — so the work
   // log stacks above and the message the agent is actually saying stays at the bottom, never scrolled away.
+  let insertingDelivery = false;
   let renderingHistory = false;   // true only during renderHistory: mark rows .no-anim so a full replay doesn't fire up to 120 entrance animations at once
   /* TRANSCRIPT DOM CAP (2026-08-26 lag fix). HISTORY_CAP bounds only the WIRE payload — the
      rendered #chat-log grew unpruned all session, and every autoscroll() reads scrollHeight
@@ -1917,7 +2865,7 @@ const Chat = (() => {
      belt-and-braces guard (it is always among the newest rows anyway). */
   const LOG_DOM_CAP = 400;
   function pruneLog() {
-    if (!log || !stick) return;
+    if (!log || !stick || insertingDelivery) return;
     while (log.children.length > LOG_DOM_CAP) {
       const n = log.firstElementChild;
       if (!n || n.id === 'comms-presence' || (n.querySelector && n.querySelector('#comms-presence'))) break;
@@ -1933,16 +2881,26 @@ const Chat = (() => {
     // which was true while one agent owned every turn — a work line breaks that: stages 2..N are other agents
     // and labelling their work with the entry dock's name is a fabricated attribution (the same law that
     // stopped the hub writing a downstream stage's reply into the entry dock's transcript).
-    who.textContent = role === 'user' ? 'COMMANDER' : role === 'system' ? 'SYSTEM' : ((opts && opts.who) || name);
+    who.textContent = role === 'user' ? ((opts && opts.brief) || 'COMMANDER') : role === 'system' ? 'SYSTEM' : ((opts && opts.who) || name);
     const body = document.createElement('span'); body.className = 'body';
     // TIMESTAMP TRUTH (P0): opts.stamp is `true` for a row created LIVE (real wall-clock now), a number/Date for a
     // stored turn's REAL recorded time, or falsy for a legacy turn that carries no time — in which case we render
     // NO stamp rather than fabricate the current clock (the module's own rule + truthful telemetry).
     const stampVal = opts && opts.stamp;
-    if (stampVal) {
+    if (stampVal && (stampVal === true || !isNaN(new Date(stampVal).getTime()))) {
+      const at = stampVal === true ? new Date() : new Date(stampVal);
       const head = document.createElement('span'); head.className = 'cmsg-head';
       const ts = document.createElement('span'); ts.className = 'cmsg-ts';
-      ts.textContent = fmtClock(stampVal === true ? null : new Date(stampVal));
+      ts.textContent = fmtClock(at);
+      d.dataset.ts = String(at.getTime());
+      // A CONTINUATION (same speaker, adjacent) whose stamp reads the same as the row right above says nothing new:
+      // CSS drops its slim stamp line so a run of turns reads as one message. A different minute keeps it.
+      const prev = log.lastElementChild;
+      if (prev && prev.classList && prev.classList.contains(role) && prev.classList.contains('cmsg')) {
+        const pts = prev.querySelector(':scope > .cmsg-head > .cmsg-ts');
+        if (pts && pts.textContent === ts.textContent) d.classList.add('ts-repeat');
+      }
+      timeBreak(at);
       head.appendChild(who); head.appendChild(ts);
       d.appendChild(head); d.appendChild(body);
     } else {
@@ -1962,13 +2920,81 @@ const Chat = (() => {
     autoscroll();
     return { d, body };
   }
+  /* TIME BREAKS — "when did I send that?" (Andrew 10-03: hard to see when you sent things). The first stamped turn in
+     the log, a new calendar day, or a silence of TIME_BREAK_MS gets a centered divider naming the day + clock, the way
+     a messenger marks a conversation picking back up. Reads only REAL stamps (data-ts), so a legacy turn with no
+     recorded time never invents one. */
+  const TIME_BREAK_MS = 30 * 60 * 1000;
+  function lastStampMs() {
+    let n = log && log.lastElementChild, hops = 0;
+    while (n && hops++ < 80) { if (n.dataset && n.dataset.ts) return +n.dataset.ts; n = n.previousElementSibling; }
+    return 0;
+  }
+  function fmtBreak(at) {
+    const now = new Date();
+    const day = x => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+    const daysAgo = Math.round((day(now) - day(at)) / 86400000);
+    const h = at.getHours(), m = at.getMinutes();
+    const clock = ((h % 12) || 12) + ':' + (m < 10 ? '0' : '') + m + ' ' + (h < 12 ? 'AM' : 'PM');
+    const dayName = daysAgo === 0 ? 'Today' : daysAgo === 1 ? 'Yesterday'
+      : CLOCK_MONTHS[at.getMonth()] + ' ' + at.getDate() + (at.getFullYear() !== now.getFullYear() ? ', ' + at.getFullYear() : '');
+    return dayName + ' · ' + clock;
+  }
+  function timeBreak(at) {
+    if (!log || insertingDelivery || isNaN(at.getTime())) return;
+    const prev = lastStampMs();
+    const sameDay = prev && new Date(prev).toDateString() === at.toDateString();
+    if (prev && sameDay && at.getTime() - prev < TIME_BREAK_MS) return;
+    const d = document.createElement('div'); d.className = 'cmsg-timebreak'; d.setAttribute('role', 'separator');
+    const t = document.createElement('span'); t.className = 'tb-when'; t.textContent = fmtBreak(at);
+    d.appendChild(t); log.appendChild(d);
+  }
+  // Recovery can insert earlier turns. Recompute separator ownership without replacing message nodes.
+  function syncTimeBreaks() {
+    if (!log) return;
+    let prev = 0;
+    const keep = new Set();
+    for (const n of Array.from(log.children)) {
+      const stamp = Number(n.dataset.ts);
+      if (!stamp) continue;
+      const at = new Date(stamp), sameDay = prev && new Date(prev).toDateString() === at.toDateString();
+      if (!prev || !sameDay || stamp - prev >= TIME_BREAK_MS) {
+        let divider = n.previousElementSibling;
+        if (!divider || !divider.classList.contains('cmsg-timebreak')) {
+          divider = document.createElement('div'); divider.className = 'cmsg-timebreak'; divider.setAttribute('role', 'separator');
+          const label = document.createElement('span'); label.className = 'tb-when'; divider.appendChild(label);
+          log.insertBefore(divider, n);
+        }
+        const label = divider.querySelector('.tb-when'), text = fmtBreak(at);
+        if (label.textContent !== text) label.textContent = text;
+        keep.add(divider);
+      }
+      prev = stamp;
+    }
+    for (const n of Array.from(log.children)) if (n.classList.contains('cmsg-timebreak') && !keep.has(n)) n.remove();
+  }
   // stamp: omitted → live now (real); a number/Date → the turn's stored real time; false → no stamp (replay of a
   // legacy turn that carries no time — never fabricate the current clock).
-  function addUser(t, atts, stamp) {
-    const r = row('user', { stamp: stamp === undefined ? true : stamp });
+  // brief: the agent that delegated this turn (a worker thread's directive) — named as the speaker, never COMMANDER
+  function addUser(t, atts, stamp, brief) {
+    const r = row('user', { stamp: stamp === undefined ? true : stamp, brief: brief ? briefLabel(brief) : '' });
+    if (brief) r.d.classList.add('brief');
     if (t) r.body.textContent = t;
     if (atts && atts.length) renderUserAttachments(r.d, atts);   // ATTACHMENTS: thumbnails/file-chips under the message text
     autoscroll();
+  }
+  function briefLabel(id) {
+    const nm = (typeof App !== 'undefined' && App.agentName && App.agentName(id)) || String(id || 'agent').toUpperCase();
+    return String(nm).toUpperCase() + ' · BRIEF';
+  }
+  /* A NOTE SENT MID-RUN IS THE COMMANDER'S OWN MESSAGE (Andrew 10-26: "[steering] u seem to be adding just new rooms…" sat
+     under ULTRON's name, so the agent read as saying it). The run's '[steering] …' echo is drawn on the Commander's side,
+     labelled MID-RUN, the wire marker stripped. One row for the live echo and every replay of it. */
+  function steerRow(text, stamp) {
+    const r = row('user', { stamp: stamp, brief: 'COMMANDER · MID-RUN' });
+    r.d.classList.add('steer-echo');
+    r.body.textContent = String(text == null ? '' : text).replace(/^\[steering\] /, '');
+    return r;
   }
   // render a SENT user turn's attachments: images as clickable thumbnails, other files as openable chips — both
   // served by the sidecar's jailed /api/file route (so they survive a reload, exactly like agent deliverables).
@@ -2006,7 +3032,27 @@ const Chat = (() => {
   }
   // command / client-side output (/help, /whoami, version, unknown-command, …). A SYSTEM register — dim, no
   // speaker chip, never copyable — so the station's own words are never mistaken for the agent's speech.
-  function localLine(t) { const r = row('system'); r.body.textContent = t; autoscroll(); return r.d; }
+  function localLine(t) {
+    const r = row('system'); r.body.textContent = t; autoscroll();
+    if (typeof Systems !== 'undefined' && Systems.noticeReply) { try { Systems.noticeReply(t); } catch (_) {} }   // door law: a station line naming a system brings it online
+    return r.d;
+  }
+  /* A GOAL STEP IS THE STATION'S WORDS (org P29-sys, 2026-10-14). The goal loop sends each continuation as a user-role turn
+     (GoalLoop.continuationPrompt — that wire text is unchanged), but the Commander never typed it: COMMS shows the step as ONE
+     compact system line naming the goal — live (send) and on every replay (renderHistory) — never the station's internal prompt
+     as the Commander's speech. goalStepOf reads the stored turn's own text — GoalLoop.continuationGoal accepts the current head
+     AND the pre-org-pass "standing goal" head — so history written before this change replays the same way. */
+  function goalStepOf(text) {
+    return (typeof GoalLoop !== 'undefined' && GoalLoop.continuationGoal) ? GoalLoop.continuationGoal(text) : null;
+  }
+  function goalStepLine(goal) {
+    if (!log) return null;
+    const g = String(goal || '').replace(/\s+/g, ' ').trim();
+    const r = row('system'); r.d.classList.add('goal-step');
+    r.body.textContent = '↻ Continuing toward your session goal' + (g ? ' — ' + (g.length > 160 ? g.slice(0, 159) + '…' : g) : '');
+    autoscroll();
+    return r.d;
+  }
   // the history-cap marker ("…N earlier turns trimmed …") as a dim, centered, hairline-flanked system line —
   // a scrollback boundary, not a dropped record. Reuses the broadcast register's chrome (theme tokens only).
   function trimMarkerLine(t) {
@@ -2024,6 +3070,10 @@ const Chat = (() => {
     clearEmptyState();
     opts = opts || {};
     const d = document.createElement('div'); d.className = 'cmsg system syscard';
+    // the SYSTEM tag a plain station line carries (CSS shows it only on the first line of a run), so a run that opens on
+    // a card is headed like any other (org P29-sys, 2026-10-14)
+    const who = document.createElement('span'); who.className = 'who'; who.textContent = 'SYSTEM';
+    d.appendChild(who);
     const head = document.createElement('button'); head.type = 'button'; head.className = 'syscard-head';
     const open0 = !!opts.open;
     head.setAttribute('aria-expanded', open0 ? 'true' : 'false');
@@ -2036,11 +3086,12 @@ const Chat = (() => {
       const open = bodyWrap.hidden; bodyWrap.hidden = !open;
       head.setAttribute('aria-expanded', open ? 'true' : 'false');
       d.classList.toggle('open', open);
-      if (typeof SFX !== 'undefined' && SFX.click) SFX.click();
+      if (typeof SFX !== 'undefined') ((open ? SFX.press : SFX.close) || SFX.press)();   // fold = close(), like a dock going back
     });
     if (open0) d.classList.add('open');
     d.appendChild(head); d.appendChild(bodyWrap);
     log.appendChild(d); autoscroll();
+    return d;
   }
 
   /* ---------- CELEBRATION broadcast: a terse station system line (level-up / quest / trophy) ----------
@@ -2056,6 +3107,14 @@ const Chat = (() => {
   const BROADCAST_COALESCE_MS = 3000;
   const BROADCAST_QUEUE_CAP = 8;   // bounded FIFO: a celebration flood drops the OLDEST queued line, never grows unbounded
   let lastBroadcastAt = 0;
+  let lastTrophyLine = null, lastTrophyAt = 0;   // the moment's trophy line (see ONE MOMENT, ONE TROPHY LINE)
+  let lastQuestLine = null, lastQuestAt = 0;     // the moment's quest line (see ONE MOMENT, ONE QUEST LINE)
+  const QUEST_DONE = 'QUEST COMPLETE · ';
+  // the quest line a new QUEST COMPLETE folds into: one that landed in the last 10s (a different moment opens a new line)
+  function questMoment(raw) {
+    const l = lastQuestLine;
+    return String(raw).indexOf(QUEST_DONE) === 0 && l && l.isConnected && l.dataset && l.dataset.quests && Date.now() - lastQuestAt < 10000 ? l : null;
+  }
   const broadcastQueue = [];       // {text, opts} coalesced inside the window — drained in order, one per window slot
   let broadcastDrainTimer = null;
   function broadcastBlocked() {
@@ -2082,6 +3141,7 @@ const Chat = (() => {
     if (!log) return false;
     opts = opts || {};
     if (broadcastBlocked()) return false;   // blocked (onboarding/interview/offscreen) → dropped, never queued
+    if (questMoment(text)) return renderBroadcast(text, opts);   // it folds into a line already there: no new row to rate-limit
     const now = Date.now();
     // inside the rate-limit window, OR a drain is already in flight: QUEUE (preserving order) rather than drop.
     // Bounded — at the cap the oldest queued line is discarded so the queue can never grow without limit.
@@ -2103,8 +3163,62 @@ const Chat = (() => {
     // COALESCE INTO ONE BLOCK: consecutive station lines share a single broadcast row (a centered stack
     // inside the same hairline chrome) instead of each claiming a full transcript row — four trophies
     // land as one quiet moment, not four rows wedged between the Commander and their agent.
+    const raw = String(text == null ? '' : text);
+    // ONE MOMENT, ONE TROPHY LINE (first-hour walk 2026-09-28: three TROPHY EARNED rows landed back to back after the
+    // first good answer). A trophy that joins a block whose last line is already a trophy line folds into it —
+    // "◆ 3 trophies — FIRST LIGHT · PACK RAT · NIGHT SHIFT (see GROWTH)". Every name still shows; one row, not three.
+    const TROPHY = 'TROPHY EARNED · ';
+    // the moment's trophy line: the last trophy line, if it landed in the last 10s — even when a card (a REMEMBERED
+    // fact landed between them in the walk) started a new block since. An older trophy line is a different moment.
+    const prevLine = (lastTrophyLine && lastTrophyLine.isConnected && Date.now() - lastTrophyAt < 10000) ? lastTrophyLine : null;
+    if (raw.indexOf(TROPHY) === 0 && prevLine && prevLine.dataset && prevLine.dataset.trophies) {
+      let names = [];
+      try { names = JSON.parse(prevLine.dataset.trophies) || []; } catch (_) { names = []; }
+      const nm = raw.slice(TROPHY.length).trim();
+      if (nm && names.indexOf(nm) < 0) names.push(nm);
+      prevLine.dataset.trophies = JSON.stringify(names);
+      prevLine.textContent = '';
+      const g = document.createElement('span'); g.className = 'bc-glyph'; g.textContent = '▸ ';
+      const em = document.createElement('span'); em.className = 'bc-name'; em.textContent = names.join(' · ');
+      prevLine.appendChild(g);
+      prevLine.appendChild(document.createTextNode('◆ ' + names.length + ' trophies — '));
+      prevLine.appendChild(em);
+      prevLine.appendChild(document.createTextNode(' (see GROWTH)'));
+      lastTrophyAt = Date.now();
+      autoscroll();
+      return true;
+    }
+    /* ONE MOMENT, ONE QUEST LINE (Andrew 10-26: five "QUEST COMPLETE · … CAN REACH … NOW" rows stacked mid-run). Placing gear
+       finishes several reach quests at once; they fold into the moment's line the way trophies do — "3 QUESTS COMPLETE ·
+       NOVA CAN REACH WEB NOW · SAM ALTMAN CAN REACH WEB NOW +1 (see QUEST LOG)". Two titles show, the rest are counted; the
+       QUEST LOG lists every one. */
+    const qLine = questMoment(raw);
+    if (qLine) {
+      let names = [];
+      try { names = JSON.parse(qLine.dataset.quests) || []; } catch (_) { names = []; }
+      const nm = raw.slice(QUEST_DONE.length).trim();
+      if (nm && names.indexOf(nm) < 0) names.push(nm);
+      qLine.dataset.quests = JSON.stringify(names);
+      qLine.textContent = '';
+      const g = document.createElement('span'); g.className = 'bc-glyph'; g.textContent = '▸ ';
+      const em = document.createElement('span'); em.className = 'bc-name'; em.textContent = names.slice(0, 2).join(' · ');
+      qLine.appendChild(g);
+      qLine.appendChild(document.createTextNode(names.length + ' QUESTS COMPLETE · '));
+      qLine.appendChild(em);
+      qLine.appendChild(document.createTextNode((names.length > 2 ? ' +' + (names.length - 2) : '') + ' (see QUEST LOG)'));
+      lastQuestAt = Date.now();
+      autoscroll();
+      return true;
+    }
+    // the block is only opened once we KNOW a new line will land in it. It used to be appended before the trophy fold
+    // above, so a second trophy folding into an earlier block left an EMPTY block behind — a blank box in the transcript.
+    // THE LIVE CARD IS NOT A ROW (10-26): while a run is live its working card is pinned as the log's last child, so "the last
+    // row" was always the card and no line ever joined the block above it. Look past the live card, and open a new block
+    // ABOVE it so the card stays pinned at the bottom.
     let d = null, stack = null;
-    const last = log.lastElementChild;
+    const liveCard = log.querySelector('#comms-presence:not(.resolved)');
+    let last = log.lastElementChild;
+    if (last && last === liveCard) last = last.previousElementSibling;
     if (last && last.classList && last.classList.contains('broadcast')) { d = last; stack = d.querySelector('.bc-stack'); }
     if (!d || !stack) {
       d = document.createElement('div');
@@ -2112,11 +3226,12 @@ const Chat = (() => {
       d.setAttribute('role', 'status');   // a live-region system line for AT (it renders no speaker chip)
       stack = document.createElement('span'); stack.className = 'bc-stack';
       d.appendChild(stack);
-      log.appendChild(d);
+      if (liveCard && liveCard === log.lastElementChild) log.insertBefore(d, liveCard); else log.appendChild(d);
     }
     const line = document.createElement('span');
     line.className = 'bc-line' + (opts.tone === 'gold' ? ' bc-gold' : '');   // tone rides the LINE (a shared block can mix tones)
-    const raw = String(text == null ? '' : text);
+    if (raw.indexOf(TROPHY) === 0) { line.dataset.trophies = JSON.stringify([raw.slice(TROPHY.length).trim()]); lastTrophyLine = line; lastTrophyAt = Date.now(); }
+    if (raw.indexOf(QUEST_DONE) === 0) { line.dataset.quests = JSON.stringify([raw.slice(QUEST_DONE.length).trim()]); lastQuestLine = line; lastQuestAt = Date.now(); }
     const hi = opts.highlight ? String(opts.highlight) : '';
     const ix = hi ? raw.indexOf(hi) : -1;
     // prefix glyph
@@ -2149,6 +3264,10 @@ const Chat = (() => {
     r.body.textContent = text; autoscroll();
   }
   function brief(s) { s = String(s || ''); return s.length > 56 ? s.slice(0, 53) + '…' : s; }
+  // NOTIFICATIONS THAT MEAN SOMETHING (10-02): a kept entry names WHO and WHAT, and opens the session it's about.
+  const whoOf = ws => (typeof App !== 'undefined' && App.agentName && App.agentName((ws && ws.agentId) || 'agent')) || (ws && ws.agentId) || 'an agent';
+  const sessionNote = ws => { const t = ws && String(ws.title || '').trim(); return t ? ' — ' + brief(t) : ''; };
+  const notedRuns = new Set();   // a background run that already announced a deliverable doesn't announce 'finished' again
   function fmtMs(ms) { return ms < 1000 ? ms + 'ms' : (ms / 1000).toFixed(1) + 's'; }   // 8423 → '8.4s'
 
   /* ── COMMS-PREMIUM · TOOL CHIPS ──────────────────────────────────────────────────────────────────────
@@ -2163,7 +3282,12 @@ const Chat = (() => {
   const pendingChips = new Map();      // callId -> chip element awaiting its result (for call→result folding)
   const CHIP_CAP = 600;                // cap on stored expand text length — a long run must not bloat the DOM
   const cap = s => { s = String(s == null ? '' : s); return s.length > CHIP_CAP ? s.slice(0, CHIP_CAP) + '…' : s; };
-  const shortName = n => String(n || 'tool').replace(/^mcp__/, '').replace(/_/g, '.');   // mcp__x__y → x.y, readable
+  const shortName = n => {
+    const s = String(n || 'tool');
+    const pm = /^plugin__(.+?)__(.+)$/.exec(s);   // a PLUGIN tool reads as "<plugin> › <tool>" (whose code, then what)
+    if (pm) return pm[1] + ' › ' + pm[2];
+    return s.replace(/^mcp__/, '').replace(/_/g, '.');   // mcp__x__y → x.y, readable
+  };
   // A1: skill-flavored tool beats. The skill.* tools ride the ordinary agent.tool_call chip, but a raw
   // "skill.view {name:…}" reads as noise. Re-label them in the agent's own voice so the Commander SEES the
   // agent consulting/writing its skillbase — pure rendering over the existing event (no new bus traffic).
@@ -2216,9 +3340,18 @@ const Chat = (() => {
     }
     return out;
   }
-  function argDigest(argsSummary) {
+  function argDigest(argsSummary, tool) {
     const raw = String(argsSummary == null ? '' : argsSummary).trim();
     if (!raw) return '';
+    // A HAND-OFF READS AS WHO (review 10-14: the team.dispatch row above the approval card showed
+    // '{"background":true,"workers":[{"agentId":"copywrit…'). Ids by pattern (the summary is capped), shown by name.
+    if (/^team\.dispatch$/.test(shortName(tool))) {
+      const ids = [...new Set([...raw.matchAll(/"agentId"\s*:\s*"([^"]+)"/g)].map(m => m[1]))];
+      // a capped summary may hold more workers than it shows: mark the cut ("LENS …") — never imply LENS was the only one,
+      // and never invent a second one either (", …" read as more workers on a one-worker hand-off, live 10-14)
+      let whole = true; try { JSON.parse(raw); } catch (_) { whole = false; }
+      if (ids.length) return brief(ids.map(id => (typeof App !== 'undefined' && App.agentName && App.agentName(id)) || id).join(', ') + (whole ? '' : ' …') + (/"background"\s*:\s*true/.test(raw) ? ' · background' : ''));
+    }
     const pairs = argPairs(raw);
     for (const k of ARG_KEYS) { const v = pairs.get(k); if (v) return brief(v); }
     if (pairs.size === 1) { const v = pairs.values().next().value; if (v) return brief(v); }
@@ -2231,6 +3364,51 @@ const Chat = (() => {
     runRails.push(toolRail);   // remembered so resolvePresence can fold this run's machinery away
     log.appendChild(toolRail); autoscroll();
     return toolRail;
+  }
+  /* ONE LINE PER BURST OF WORK (Andrew 10-26: "SO many tool calls clutter up the chat and they never disappear"). A rail of
+     two or more calls shows ONE summary row until it is opened: the call it is on while it runs ("▸ 4 steps · fs.read
+     notes.md"), what it used once it is done ("✓ 5 steps · fs.list, fs.read  0.2s"). A single call keeps its own row. Every
+     chip stays in its rail, unchanged: one click on the summary lists them all, and the run-end fold still moves the
+     rails under RUN COMPLETE. Nothing is hidden that a click cannot show; the summary only reads the chips' own state. */
+  function railChips(rail) { return rail ? Array.from(rail.children).filter(n => n.classList && n.classList.contains('tool-chip')) : []; }
+  function syncRail(rail) {
+    if (!rail || !rail.classList || !rail.classList.contains('tool-rail')) return;
+    const chips = railChips(rail);
+    let sum = rail.querySelector(':scope > .tr-sum');
+    if (chips.length < 2) { if (sum) sum.hidden = true; rail.classList.remove('tr-multi'); return; }
+    if (!sum) {
+      sum = document.createElement('button'); sum.type = 'button'; sum.className = 'tr-sum';
+      sum.setAttribute('aria-expanded', 'false');
+      for (const c of ['tr-glyph', 'tr-count', 'tr-names', 'tr-stat', 'tr-exp']) { const s = document.createElement('span'); s.className = c; sum.appendChild(s); }
+      sum.querySelector('.tr-exp').setAttribute('aria-hidden', 'true');
+      sum.addEventListener('click', () => { const open = rail.classList.toggle('open'); sum.setAttribute('aria-expanded', open ? 'true' : 'false'); });
+      rail.insertBefore(sum, rail.firstChild);
+    }
+    sum.hidden = false; rail.classList.add('tr-multi');
+    const text = (c, sel) => { const n = c.querySelector(sel); return n ? n.textContent : ''; };
+    const live = chips.filter(c => c.classList.contains('pending')).pop();
+    const errs = chips.filter(c => c.classList.contains('err')).length;
+    // a burst where SOME steps failed finished all the same: a plain check, and the stat says how many failed. Only a burst
+    // where every step failed wears the red ✗ (an agent probing for a missing file is ordinary work, not an alarm)
+    const allFailed = !live && errs === chips.length;
+    sum.classList.toggle('pending', !!live); sum.classList.toggle('err', allFailed); sum.classList.toggle('mixed', !live && errs > 0 && !allFailed);
+    sum.classList.toggle('ok', !live && !errs);
+    sum.querySelector('.tr-glyph').textContent = live ? '▸' : allFailed ? '✗' : '✓';
+    sum.querySelector('.tr-count').textContent = chips.length + ' steps';
+    let names = '', stat = '';
+    if (live) {
+      names = text(live, '.tc-name') + (text(live, '.tc-args') ? ' ' + text(live, '.tc-args') : '');
+      stat = text(live, '.tc-stat');   // a browser call's "Waiting for browser session…" still shows while the rail is folded
+    } else {
+      const seen = [];
+      for (const c of chips) { const n = text(c, '.tc-name'); if (n && seen.indexOf(n) < 0) seen.push(n); }
+      names = seen.join(', ');
+      const ms = chips.reduce((t, c) => t + (Number(c.dataset && c.dataset.ms) || 0), 0);
+      stat = errs ? errs + ' failed' : ms ? fmtMs(ms) : '';
+    }
+    sum.querySelector('.tr-names').textContent = names;
+    sum.querySelector('.tr-stat').textContent = stat;
+    sum.setAttribute('aria-label', chips.length + ' steps' + (names ? ': ' + names : '') + (stat ? ', ' + stat : ''));
   }
   /* A BREAK CLOSES THE RAIL, IT DOES NOT ORPHAN THE CALLS IN FLIGHT (fixed 2026-08-05).
      This used to also `pendingChips.clear()`, and that quietly double-listed the work trail of every run
@@ -2251,9 +3429,9 @@ const Chat = (() => {
     // disclosure state from the thing it can activate.
     const btn = chip.querySelector('.tc-head'); if (btn) btn.setAttribute('aria-expanded', open ? 'true' : 'false');
   }
-  // render a tool CALL as a chip; returns the chip element. ev: { callId, name, argsSummary }
-  function toolChip(ev) {
-    const rail = ensureToolRail();
+  // the chip's DOM for one tool CALL: head (glyph · name · short args · stat · chevron) + its expandable detail. Shared by the
+  // live one-on-one rail (toolChip) and a transcript this file does not own (toolRailOf — the group chat).
+  function chipNode(ev) {
     const flav = skillFlavor(ev);   // A1: skill.* tools re-labelled in the agent's voice
     const chip = document.createElement('div'); chip.className = 'tool-chip pending' + (flav ? ' skill' : '');
     const head = document.createElement('button'); head.type = 'button'; head.className = 'tc-head';
@@ -2262,21 +3440,8 @@ const Chat = (() => {
     const nm = document.createElement('span'); nm.className = 'tc-name'; nm.textContent = flav ? flav.label : shortName(ev.name);
     // for a flavored skill chip the human phrase already carries the skill name, so the raw args stay in the
     // expand detail only (kept below) — the chip head is clean.
-    const args = document.createElement('span'); args.className = 'tc-args'; args.textContent = flav ? '' : argDigest(ev.argsSummary);
+    const args = document.createElement('span'); args.className = 'tc-args'; args.textContent = flav ? '' : argDigest(ev.argsSummary, ev.name);
     const stat = document.createElement('span'); stat.className = 'tc-stat'; stat.textContent = '';   // filled by resolveChip
-    if (/^browser\./.test(ev.name || '') && ev.runId) {
-      stat.setAttribute('aria-live', 'polite');
-      const checkWait = async () => {
-        if (!chip.isConnected || !chip.classList.contains('pending')) return;
-        try {
-          const j = await Harness.api.get('/api/connectors');
-          if (!chip.isConnected || !chip.classList.contains('pending')) return;
-          stat.textContent = (j.browserSession?.waitingRunIds || []).includes(ev.runId) ? 'Waiting for browser session…' : '';
-        } catch (_) { if (chip.classList.contains('pending')) stat.textContent = ''; }
-        if (chip.isConnected && chip.classList.contains('pending')) setTimeout(checkWait, 1000);
-      };
-      setTimeout(checkWait, 500);
-    }
     const exp = document.createElement('span'); exp.className = 'tc-exp'; exp.setAttribute('aria-hidden', 'true'); exp.textContent = '▸';   // disclosure chevron (rotates when open)
     head.appendChild(glyph); head.appendChild(nm); if (args.textContent) head.appendChild(args); head.appendChild(stat); head.appendChild(exp);
     const detail = document.createElement('div'); detail.className = 'tc-detail';
@@ -2290,12 +3455,69 @@ const Chat = (() => {
       : '(no arguments)';
     detail.appendChild(dArgs);
     chip.appendChild(head); chip.appendChild(detail);
+    return chip;
+  }
+  // render a tool CALL as a chip; returns the chip element. ev: { callId, name, argsSummary }
+  function toolChip(ev) {
+    const rail = ensureToolRail();
+    const chip = chipNode(ev);
+    const stat = chip.querySelector('.tc-stat');
+    if (/^browser\./.test(ev.name || '') && ev.runId) {
+      stat.setAttribute('aria-live', 'polite');
+      /* AN ORPHANED CHIP STOPS ASKING (idle CPU piece 3, 2026-10-20). This loop read /api/connectors every second until
+         the chip resolved or left the DOM. A run that ended without this call's result (stopped, failed) leaves the chip
+         'pending' inside its folded but still connected .run-fold, so it polled once a second until the session was
+         switched. Once the conversation's run is over nothing can still be waiting on this call: the loop ends and the
+         chip keeps the look it has. */
+      const wsId = activeWs && activeWs.id;
+      const runOver = () => typeof Channels === 'undefined' || !Channels.isBusy || !wsId || !Channels.isBusy(wsId);
+      const checkWait = async () => {
+        if (!chip.isConnected || !chip.classList.contains('pending')) return;
+        if (runOver()) { stat.textContent = ''; return; }
+        // nobody is looking (PollGate): keep the beat, skip the read; the first beat back on screen reads again
+        if (typeof PollGate !== 'undefined' && PollGate.away && PollGate.away()) { setTimeout(checkWait, 1000); return; }
+        try {
+          const j = await Harness.api.get('/api/connectors');
+          if (!chip.isConnected || !chip.classList.contains('pending')) return;
+          stat.textContent = (j.browserSession?.waitingRunIds || []).includes(ev.runId) ? 'Waiting for browser session…' : '';
+          syncRail(chip.parentElement);
+        } catch (_) { if (chip.classList.contains('pending')) stat.textContent = ''; }
+        if (chip.isConnected && chip.classList.contains('pending')) setTimeout(checkWait, 1000);
+      };
+      setTimeout(checkWait, 500);
+    }
     rail.appendChild(chip);
+    syncRail(rail);
     if (ev.callId != null) { pendingChips.set(ev.callId, chip); if (pendingChips.size > 200) pendingChips.delete(pendingChips.keys().next().value); }
     autoscroll();
     return chip;
   }
-  // fold a tool RESULT into its paired chip (✓/✗ + duration + result summary). ev: { callId, summary, isError, ms }
+  /* AN APPROVAL NOT GIVEN IS NOT A FAILURE (releases#9, 2026-10-17). The consent broker answers a call nobody approved —
+     a Deny on its card, an unanswered card, an unattended default-deny — with the one summary 'denied' (tools/registry.js).
+     The call did not run and nothing broke: the agent carries on and the run ends on its own terms. It drew the red ✗ and
+     "failed" an error draws, so the Commander's own No read as a fault in COMMS and in the run's history. */
+  const deniedResult = ev => !!(ev && ev.isError && ev.summary === 'denied');
+  // fold a tool RESULT into a chip (✓/✗ + duration + result summary). ev: { summary, isError, ms }
+  function foldChipResult(chip, ev) {
+    chip.classList.remove('pending');
+    // A call the Task Brief gate HELD did not run and did not fail: the model settles the brief and makes it again (a new
+    // chip). Neutral, never the red ✗ "failed" an error draws (rc walk 2026-10-14) — and never a ✓ either.
+    const heldCall = typeof TaskIntent !== 'undefined' && TaskIntent.isGateHeld && TaskIntent.isGateHeld(ev);
+    const deniedCall = !heldCall && deniedResult(ev);   // not approved, so not run: the same neutral, saying "denied"
+    chip.classList.add(heldCall ? 'held' : deniedCall ? 'denied' : ev.isError ? 'err' : 'ok');
+    const glyph = chip.querySelector('.tc-glyph'); if (glyph) glyph.textContent = (heldCall || deniedCall) ? '▸' : ev.isError ? '✗' : '✓';
+    const stat = chip.querySelector('.tc-stat');
+    if (stat) stat.textContent = heldCall ? 'not run yet' : deniedCall ? 'denied' : ev.ms ? fmtMs(ev.ms) : (ev.isError ? 'failed' : '');
+    if (chip.dataset && ev.ms > 0) chip.dataset.ms = String(ev.ms);   // the rail's folded summary adds these up
+    const detail = chip.querySelector('.tc-detail');
+    if (detail) {
+      const dRes = document.createElement('div'); dRes.className = 'tc-d-res' + (heldCall ? ' held' : deniedCall ? ' denied' : ev.isError ? ' err' : '');
+      dRes.textContent = heldCall ? cap(ev.summary) : deniedCall ? 'denied · not run' : (ev.isError ? '✗ ' : '✓ ') + cap(ev.summary || (ev.isError ? 'error' : 'ok'));
+      detail.appendChild(dRes);
+    }
+    return chip;
+  }
+  // fold a tool RESULT into its paired chip. ev: { callId, summary, isError, ms }
   function resolveChip(ev, fallbackName) {
     let chip = (ev.callId != null) ? pendingChips.get(ev.callId) : null;
     if (chip) pendingChips.delete(ev.callId);
@@ -2303,19 +3525,26 @@ const Chat = (() => {
       // ORPHAN result (no paired call — e.g. switched-to mid-run): render a standalone resolved chip
       chip = toolChip({ callId: null, name: fallbackName || 'tool', argsSummary: '' });
     }
-    chip.classList.remove('pending');
-    chip.classList.add(ev.isError ? 'err' : 'ok');
-    const glyph = chip.querySelector('.tc-glyph'); if (glyph) glyph.textContent = ev.isError ? '✗' : '✓';
-    const stat = chip.querySelector('.tc-stat');
-    if (stat) stat.textContent = ev.ms ? fmtMs(ev.ms) : (ev.isError ? 'failed' : '');
-    const detail = chip.querySelector('.tc-detail');
-    if (detail) {
-      const dRes = document.createElement('div'); dRes.className = 'tc-d-res' + (ev.isError ? ' err' : '');
-      dRes.textContent = (ev.isError ? '✗ ' : '✓ ') + cap(ev.summary || (ev.isError ? 'error' : 'ok'));
-      detail.appendChild(dRes);
-    }
+    foldChipResult(chip, ev);
+    syncRail(chip.parentElement);
     autoscroll();
     return chip;
+  }
+  /* THE SAME CHIPS IN THE GROUP CHAT (rc walk 2026-10-14: a group transcript showed none of the lead's calls). One rail of
+     a reply's tool calls — steps: [{ name, args, done, isError, summary, ms }] — built exactly like the one-on-one rail.
+     #gc-log has no delegated chip handler, so each head toggles its own detail. */
+  function toolRailOf(steps) {
+    const rail = document.createElement('div'); rail.className = 'tool-rail';
+    for (const s of (Array.isArray(steps) ? steps : [])) {
+      const chip = chipNode({ name: s && s.name, argsSummary: (s && s.args) || '' });
+      if (s && s.callId) chip.dataset.callId = String(s.callId);   // a re-rendered draft keeps an opened chip open (group-chat renderFlow)
+      if (s && s.done) foldChipResult(chip, { isError: !!s.isError, summary: s.summary || '', ms: s.ms || 0 });
+      const head = chip.querySelector('.tc-head');
+      if (head) head.addEventListener('click', () => toggleChip(head));
+      rail.appendChild(chip);
+    }
+    syncRail(rail);   // the group chat folds a burst to one line too
+    return rail;
   }
   // a clickable COMMS row for a file the agent produced — opens it via the sidecar's jailed /api/file route
   function fileBlobUrl(title, agentId) {
@@ -2335,9 +3564,39 @@ const Chat = (() => {
   // prose-link handler in init), so hand the saved path to the OS default app. If native opening rejects
   // the path or file type, the jailed browser preview remains a safe fallback. stopPropagation prevents
   // the delegated prose-link handler from opening it a second time.
-  function wireFileOpen(a, title, agentId) {
-    a.href = fileUrl(title, agentId);
+  /* THE READABLE DOCUMENT VIEW (live walk 10-14: OPEN on a worker's tagline.md landed on raw text in a white, unstyled
+     tab). A TEXT deliverable opened in a browser asks the jailed file route for its station reading page (?view=doc,
+     sidecar/file-response.js — the same list of formats, locked by test/file-open-readable.test.js). Media keep their
+     players, pages the BROWSER window, binaries the plain bytes; on desktop the OS app opens the file itself. */
+  const TEXT_DOC_RE = /\.(md|markdown|txt|text|csv|tsv|log|json|ya?ml|toml|ini|cfg|conf|py|tsx?|jsx|s?css|sh|ps1|bat|sql|rb|go|rs|java|kt|c|h|cpp|cs|php)$/i;
+  function readableUrl(url, filePath) { return TEXT_DOC_RE.test(String(filePath || '').split(/[?#]/)[0]) ? url + '&view=doc' : url; }
+  function wireFileOpen(a, title, agentId, projectRoot) {
+    a.href = readableUrl(fileUrl(title, agentId, projectRoot), title);
     a.target = '_blank'; a.rel = 'noopener';
+    // the rendered ticket lives minutes, the row lives forever: re-mint right before any use of the href
+    // (capture-phase listeners run before the native navigation / the context menu's copy-link reads it).
+    const refresh = () => { try { a.href = readableUrl(fileUrl(title, agentId, projectRoot), title); } catch (_) {} };
+    a.addEventListener('click', refresh, true); a.addEventListener('auxclick', refresh, true);
+    a.addEventListener('contextmenu', refresh, true); a.addEventListener('focus', refresh, true);
+    // Project-relative worker links use the same canonical project/host routing as their receipt's Open key.
+    if (projectRoot) {
+      a.addEventListener('click', ev => {
+        ev.preventDefault(); ev.stopPropagation();
+        if (window.getSelection && String(window.getSelection())) return;
+        openFile(title, agentId, projectRoot);
+      });
+      return;
+    }
+    // A web page opens RUNNING, in the station's BROWSER window (the window has OPEN OUTSIDE for the OS browser).
+    // /api/file would hand the same .html over as an inert download.
+    if (typeof OutputBrowser !== 'undefined' && OutputBrowser.isHtml && OutputBrowser.isHtml(title)) {
+      a.addEventListener('click', ev => {
+        ev.preventDefault(); ev.stopPropagation();
+        if (window.getSelection && String(window.getSelection())) return;   // a drag-selection release is not an open
+        OutputBrowser.open({ agentId: agentId || 'agent', path: String(title || '') });
+      });
+      return;
+    }
     const core = tauriCore();
     if (core && core.invoke) {
       a.addEventListener('click', ev => {
@@ -2348,7 +3607,7 @@ const Chat = (() => {
             // The host shows a native confirm before any OS launch (renderer clicks are not host
             // gestures). Cancel there is an ANSWER, not a failure — never fall back around it.
             if (/declined at the host/i.test(String(err || ''))) return;
-            return Promise.resolve(core.invoke('open_external_url', { url: a.href }))
+            return Promise.resolve(core.invoke('open_external_url', { url: readableUrl(fileUrl(title, agentId), title) }))
               .catch(() => { if (typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify('could not open that file — use folder or copy path to find it on disk', 'warn'); });
           });
       });
@@ -2367,7 +3626,8 @@ const Chat = (() => {
     // blob URLs fetched FOR the lightbox are freed with it (the decoded thumbnail elsewhere keeps its own)
     if (lb.revokeUrl) { try { URL.revokeObjectURL(lb.revokeUrl); } catch (_) {} }
     lb.root.remove();
-    if (typeof SFX !== 'undefined' && SFX.click) SFX.click();
+    // closing is the docks' close() (the same sample pitched down), so direction still reads
+    if (typeof SFX !== 'undefined') (SFX.close || SFX.press)();
   }
   // `load` -> Promise<objectURL>; opts.revoke says the URL is ours to free on close (false for a staged
   // attachment's localUrl, which renderAttachStrip still owns and revokes on remove/clear).
@@ -2392,7 +3652,7 @@ const Chat = (() => {
     x.focus();
     lightbox = { root, onKey, revokeUrl: '' };
     const mine = lightbox;
-    if (typeof SFX !== 'undefined' && SFX.click) SFX.click();
+    if (typeof SFX !== 'undefined' && SFX.press) SFX.press();
     Promise.resolve().then(load).then(u => {
       if (lightbox !== mine) {   // closed (or replaced) before the bytes arrived — free a URL we now own
         if (opts && opts.revoke) { try { URL.revokeObjectURL(u); } catch (_) {} }
@@ -2425,8 +3685,8 @@ const Chat = (() => {
   function workspaceDir(agentId) {
     const aid = agentId || 'agent';
     if (_wsDirCache.has(aid)) return _wsDirCache.get(aid);
-    const tok = (typeof Harness !== 'undefined' && Harness.apiToken) ? String(Harness.apiToken() || '') : '';
-    const p = fetch('/api/workspace/dir?agent=' + encodeURIComponent(aid) + (tok ? '&token=' + encodeURIComponent(tok) : ''), { cache: 'no-store' })
+    // header auth only: the hardened window.fetch (harness.js) attaches X-StarNet-Token to every /api/ URL
+    const p = fetch('/api/workspace/dir?agent=' + encodeURIComponent(aid), { cache: 'no-store' })
       .then(r => r.ok ? r.json() : null).then(j => (j && j.dir) ? String(j.dir) : '').catch(() => '');
     _wsDirCache.set(aid, p);
     return p;
@@ -2479,8 +3739,9 @@ const Chat = (() => {
   function folderButton(agentId, relPath) {
     const b = document.createElement('button');
     b.type = 'button'; b.className = 'deliverable-folder';
-    b.appendChild(glyphSpan(SVG_FOLDER));
     const desktop = !!tauriCore();
+    // the folder glyph only where the key really opens a folder: a browser's key copies the path, so it wears copy path's ⧉
+    b.appendChild(desktop ? glyphSpan(SVG_FOLDER) : document.createTextNode('⧉'));
     const defaultLabel = desktop ? 'folder' : 'copy path';
     b.setAttribute('data-default-label', defaultLabel);
     const lbl = document.createElement('span'); lbl.className = 'fb-label'; lbl.textContent = defaultLabel; b.appendChild(lbl);
@@ -2499,6 +3760,7 @@ const Chat = (() => {
     return b;
   }
   function deliverableLine(title, agentId) {
+    noteDeliveryLanding();
     const r = row('agent'); r.d.classList.add('tool'); r.d.classList.add('deliverable');
     r.body.appendChild(document.createTextNode('▤ saved '));
     const a = document.createElement('a');
@@ -2515,6 +3777,7 @@ const Chat = (() => {
   // thumbnail (src = the sidecar's jailed /api/file viewer URL, served with an image content-type); clicking
   // opens the full image in a new tab. Built with DOM nodes (never innerHTML) so the title can't inject markup.
   function imageDeliverableLine(title, agentId) {
+    noteDeliveryLanding();
     const r = row('agent'); r.d.classList.add('tool'); r.d.classList.add('deliverable'); r.d.classList.add('image');
     r.body.appendChild(document.createTextNode('▤ made '));
     const a = document.createElement('a');
@@ -2551,20 +3814,40 @@ const Chat = (() => {
     return MEDIA_KIND_BY_EXT[ext] || 'file';
   }
   // The jailed /api/file URL for a workspace file — usable as a REAL href/src, not just inside fetch().
-  // Token: the SYNC injected global (the same value Harness.apiToken() RESOLVES to — apiToken() itself
-  // returns a Promise, and the old String(promise) baked `token=[object Promise]` into the query, a
-  // guaranteed 403 on any native load that can't ride the header shim). Base: on desktop the page runs
+  // Base: on desktop the page runs
   // on the tauri.localhost origin and the shell rewrites ONLY window.fetch to the sidecar — a relative
   // href would navigate into the bundled-asset protocol and vanish (the same trap cloudsave's unload
   // beacon hit), so native loads carry the ABSOLUTE loopback base (window.__STARNET_API__); in a
   // browser the base is '' and the URL stays same-origin relative.
-  function fileUrl(title, agentId) {
-    let base = '', tok = '';
+  // Auth (2026-09-25): a FILE-SCOPED 5-minute ticket (ApiTicket.fileUrl), never the master token — this href reaches
+  // OS-browser history, Referer and copied links. wireFileOpen re-mints it right before any use.
+  /* open a file a run produced from any surface (the delegation card's receipts): the same doors as a COMMS file row —
+     a web page in the station BROWSER, the desktop host's own open (with its confirm), else a ticketed tab. A file a
+     worker wrote into a trusted project is addressed inside that project (&project=, absolute for the host). */
+  function openFile(path, agentId, projectRoot) {
+    const rel = String(path || ''), aid = agentId || 'agent';
+    if (!rel) return;
+    const isAbs = /^([A-Za-z]:[\\/]|[\\/])/.test(rel), root = projectRoot && !isAbs ? String(projectRoot).replace(/[\\/]+$/, '') : '';
+    if (!root && typeof OutputBrowser !== 'undefined' && OutputBrowser.isHtml && OutputBrowser.isHtml(rel)) { OutputBrowser.open({ agentId: aid, path: rel }); return; }
+    const url = readableUrl(fileUrl(rel, aid, root), rel);   // a text deliverable opens as the readable document, never raw text
+    const core = tauriCore();
+    if (core && core.invoke) {
+      Promise.resolve(core.invoke('starnet_open_artifact', { path: root ? root + '/' + rel : rel, agentId: aid }))
+        .catch(err => {
+          if (/declined at the host/i.test(String(err || ''))) return;   // the host's own confirm said no: an answer, not a failure
+          return Promise.resolve(core.invoke('open_external_url', { url }))
+            .catch(() => { if (typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify('could not open that file — use folder or copy path to find it on disk', 'warn'); });
+        });
+      return;
+    }
+    try { window.open(url, '_blank', 'noopener'); } catch (e) { if (typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify('could not open that file: ' + ((e && e.message) || e), 'warn'); }
+  }
+  function fileUrl(title, agentId, projectRoot) {
+    const project = projectRoot && !/^([A-Za-z]:[\\/]|[\\/])/.test(String(title)) ? '&project=' + encodeURIComponent(String(projectRoot).replace(/[\\/]+$/, '')) : '';
+    if (typeof ApiTicket !== 'undefined' && ApiTicket.fileUrl) return ApiTicket.fileUrl(agentId || 'agent', String(title)) + project;
+    let base = '';
     try { base = (typeof window !== 'undefined' && window.__STARNET_API__) ? String(window.__STARNET_API__) : ''; } catch (_) {}
-    try { tok = (typeof window !== 'undefined' && window.__STARNET_API_TOKEN__) ? String(window.__STARNET_API_TOKEN__) : ''; } catch (_) {}
-    return base + '/api/file?agent=' + encodeURIComponent(agentId || 'agent') +
-      '&path=' + encodeURIComponent(title) +
-      (tok ? '&token=' + encodeURIComponent(tok) : '');
+    return base + '/api/file?agent=' + encodeURIComponent(agentId || 'agent') + '&path=' + encodeURIComponent(title) + project;
   }
   // append a small "open in a new tab" fallback link — shown when an inline player can't decode the file
   // (e.g. an .mkv/.avi the browser won't play), mirroring the reference harness's OpenMediaButton.
@@ -2653,7 +3936,10 @@ const Chat = (() => {
       r.body.appendChild(more);
     }
     const foot = document.createElement('div'); foot.className = 'recap-line recap-foot';
-    foot.textContent = [fmtRecapCost(entry), durMs > 0 ? fmtMs(durMs) : '', (entry.model && entry.model !== '(unknown)') ? entry.model : ''].filter(Boolean).join(' · ');
+    // SAY IT ONCE (10-19): the RUN COMPLETE footer right above already tells this run's honest time and its model (its
+    // telemetry hydrates before this card): the foot keeps what the footer does not say, the cost ("907ms" over "922ms")
+    const said = !!(log && Array.from(log.querySelectorAll('.comms-presence.resolved[data-run-id]')).some(c => c.dataset.runId === runId && c.dataset.telemetry === '1'));
+    foot.textContent = [fmtRecapCost(entry), !said && durMs > 0 ? fmtMs(durMs) : '', !said && entry.model && entry.model !== '(unknown)' ? entry.model : ''].filter(Boolean).join(' · ');
     if (foot.textContent) r.body.appendChild(foot);
     autoscroll();
   }
@@ -2672,15 +3958,20 @@ const Chat = (() => {
      always the duplicate — but a fold without chips still gets the full listing rather than losing the
      record. (Do not read this as a reload guarantee: the fold and its telemetry are DOM-only and do not
      survive a reload or a stream switch at all — replayChannel rebuilds the chips, nothing rebuilds these.) */
+  // who ran a recorded run, by NAME (the record holds the id: the hero's is "agent")
+  const runWho = id => (id && typeof App !== 'undefined' && App.agentName && App.agentName(id)) || id || '';
   function telemetryRun(entry, role, skipTools) {
     const wrap = document.createElement('div'); wrap.className = 'rt-run';
     const calls = runCallCount(entry);
     const head = document.createElement('div'); head.className = 'rt-run-head';
-    head.textContent = [role, entry.agentId || '', entry.model && entry.model !== '(unknown)' ? entry.model : '', (entry.reasoningEffort && entry.reasoningEffort !== 'none') ? entry.reasoningEffort : '', Number(entry.durationMs) > 0 ? fmtMs(Number(entry.durationMs)) : '', calls + (calls === 1 ? ' call' : ' calls')].filter(Boolean).join(' · ');
+    head.textContent = [role, runWho(entry.agentId), entry.model && entry.model !== '(unknown)' ? entry.model : '', (entry.reasoningEffort && entry.reasoningEffort !== 'none') ? entry.reasoningEffort : '', Number(entry.durationMs) > 0 ? fmtMs(Number(entry.durationMs)) : '', Number(entry.waitedMs) > 0 ? fmtMs(Number(entry.waitedMs)) + ' waiting on you' : '', calls + (calls === 1 ? ' call' : ' calls')].filter(Boolean).join(' · ');
     wrap.appendChild(head);
     for (const t of (skipTools ? [] : (Array.isArray(entry.toolTrace) ? entry.toolTrace : []))) {
-      const line = document.createElement('div'); line.className = 'rt-tool' + (t.isError ? ' err' : '');
-      line.textContent = '↳ ' + String(t.name || 'unknown') + ' · ' + fmtMs(Math.max(0, Number(t.ms) || 0)) + ' · ' + (t.isError ? 'failed' : 'ok');
+      // a call the Task Brief held did not run: "not run yet", never "failed" (TaskIntent.GATE_HELD on its record)
+      const held = typeof TaskIntent !== 'undefined' && TaskIntent.isGateHeld && TaskIntent.isGateHeld(t);
+      const denied = !held && deniedResult(t);   // an approval not given: "denied", never "failed" (deniedResult above)
+      const line = document.createElement('div'); line.className = 'rt-tool' + (held ? ' held' : denied ? ' denied' : t.isError ? ' err' : '');
+      line.textContent = '↳ ' + String(t.name || 'unknown') + ' · ' + fmtMs(Math.max(0, Number(t.ms) || 0)) + ' · ' + (held ? 'not run yet' : denied ? 'denied' : t.isError ? 'failed' : 'ok');
       if (t.summary) line.title = String(t.summary);
       wrap.appendChild(line);
     }
@@ -2694,11 +3985,17 @@ const Chat = (() => {
     const leadCalls = runCallCount(entry);
     const workerCalls = children.reduce((n, child) => n + runCallCount(child), 0);
     const sum = card.querySelector('.cp-sum');
+    // ONE run, ONE duration (live walkthrough 2026-10-13: "RUN COMPLETE · 89.1s" above a receipt reading 49.3s). The
+    // card shows machine time — approval waits excluded, the same number as the receipt — and names the wait apart.
+    const honest = Number(card.dataset.ms) || 0, wall = Number(entry.durationMs) || 0;
     if (sum) {
       const label = String(sum.textContent || '').split(' · ')[0];
       const bits = [];
-      if (Number(entry.durationMs) > 0) bits.push(fmtMs(Number(entry.durationMs)));
-      bits.push(leadCalls + ' lead ' + (leadCalls === 1 ? 'call' : 'calls'));
+      if (honest > 0) {
+        bits.push(fmtMs(honest));
+        if (wall - honest > 1500) bits.push(fmtMs(wall - honest) + ' waiting on you');
+      } else if (wall > 0) bits.push(fmtMs(wall));
+      bits.push(leadCalls + ' tool ' + (leadCalls === 1 ? 'call' : 'calls'));   // the LEAD's tool calls (runCallCount = toolTrace) — not model calls
       if (children.length) bits.push(workerCalls + ' worker ' + (workerCalls === 1 ? 'call' : 'calls'));
       const identity = [entry.model && entry.model !== '(unknown)' ? entry.model : '', (entry.reasoningEffort && entry.reasoningEffort !== 'none') ? entry.reasoningEffort : ''].filter(Boolean).join(' ');
       if (identity) bits.push(identity);
@@ -2713,7 +4010,9 @@ const Chat = (() => {
     const detail = document.createElement('div'); detail.className = 'run-telemetry';
     // chips for THIS run already in the fold? then the lead's per-tool rows would just repeat them.
     const hasChips = !!fold.querySelector('.tool-chip');
-    detail.appendChild(telemetryRun(entry, 'lead', hasChips));
+    // the lead's line tells the footer's time (its record's durationMs is the wall clock, the approval waits inside it)
+    const leadRow = honest > 0 ? Object.assign({}, entry, { durationMs: honest, waitedMs: wall - honest > 1500 ? wall - honest : 0 }) : entry;
+    detail.appendChild(telemetryRun(leadRow, 'lead', hasChips));
     children.forEach(child => detail.appendChild(telemetryRun(child, 'worker')));
     fold.appendChild(detail);
     if (!card.querySelector('.cp-chev')) {
@@ -2747,10 +4046,106 @@ const Chat = (() => {
   // a live consent prompt: the agent wants to do something that needs approval (a file write today). The run is
   // PAUSED on the sidecar until the Commander answers — once / always (this kind) / full access (everything this
   // session) / deny. Answering resumes the stream automatically.
-  function actionPhrase(ev) {
+  /* THE GLANCE LINE (user report 10-08). argsSummary is the WHOLE request now (consentSummary stopped clipping it at
+     77 chars, which hid a long command's tail), so it never goes into a phrase, a toast or a notification raw: those
+     get one short line, and the card carries the whole thing in INSPECT COMPLETE REQUEST (permissionRow). */
+  // "Show the whole question" shows exactly while the question is clamped — re-measured when COMMS changes size (width,
+  // TEXT SIZE, shown after being hidden); a question that cannot be measured (hidden) keeps its key
+  const wholeFitObserver = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(list => { const hit = list.map(e => e.target); requestAnimationFrame(() => { for (const t of hit) if (t._fitWhole) t._fitWhole(); }); }) : null;
+  function fitWhole(text, key, isOpen) {
+    text._fitWhole = () => { if (isOpen() || !text.isConnected) return; key.hidden = text.clientHeight > 0 && text.scrollHeight <= text.clientHeight + 2; };
+    if (wholeFitObserver) wholeFitObserver.observe(text);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(text._fitWhole);
+  }
+  function glance(s, n) { const one = String(s == null ? '' : s).replace(/\s+/g, ' ').trim(); n = n || 96; return one.length > n ? one.slice(0, n - 1) + '…' : one; }
+  function requestArgs(s) { try { const o = JSON.parse(String(s || '')); return o && typeof o === 'object' && !Array.isArray(o) ? o : null; } catch (_) { return null; } }
+  // what a consent card's INSPECT panel holds: { label, text } or null. A file change shows the mutation, a routine what
+  // it runs each time; any other request shows its arguments in full. Cards the sidecar words itself (station build /
+  // control, folder trust, a login host, a question) and a bare short value the phrase already shows get no panel.
+  function consentInspect(p) {
+    const t = String((p && p.tool) || ''), raw = String((p && p.argsSummary) || '');
+    if (/^fs[._](?:write|append|edit|patch)$/.test(t)) {
+      // read as a file, not as JSON: the path, then the text exactly as it will be written (real line breaks, no \n)
+      const label = 'Inspect the change (secrets redacted)', o = requestArgs(raw);
+      if (!o) return { label, text: raw || '(payload unavailable)' };
+      const heads = { content: '', find: 'Find:\n', replace: 'Replace with:\n', patch: 'Patch:\n' };
+      const parts = typeof o.path === 'string' ? ['File: ' + o.path] : [];
+      for (const k of Object.keys(o)) if (k !== 'path') parts.push((k in heads ? heads[k] : k + ': ') + (typeof o[k] === 'string' ? o[k] : JSON.stringify(o[k], null, 2)));
+      return { label, text: parts.join('\n\n') || raw };
+    }
+    if (/^routine[._](?:create|manage)$/.test(t)) { const o = requestArgs(raw); return { label: 'What it will do each run', text: (o && o.prompt) ? String(o.prompt) : raw || '(payload unavailable)' }; }
+    if (!raw.trim() || /^station[._]/.test(t) || /^(?:path\.trust|browser\.login(?:\.done)?|brief\.ask)$/.test(t)) return null;
+    const o = requestArgs(raw), label = 'Inspect the full request (secrets redacted)';
+    if (!o) return glance(raw) === raw.trim() ? null : { label, text: raw };
+    // read as written, not as JSON: a Windows path shows C:\Users, never C:\\Users, and a command is the exact text
+    // that will run — so COPY COMMAND hands over something you can paste into a terminal
+    const text = Object.keys(o).map(k => k + ': ' + (typeof o[k] === 'string' ? o[k] : JSON.stringify(o[k], null, 2))).join('\n');
+    const command = /^(?:shell|terminal)[._]/.test(t) ? [o.cmd, o.command, o.input, o.data].find(v => typeof v === 'string' && v) : '';
+    return command ? { label, text, copy: command, copyLabel: 'COPY COMMAND' } : { label, text };
+  }
+  // Shared by ordinary approvals and delegated rows; all disclose the same redacted request and build steps.
+  function appendConsentDetails(host, p, part) {   // part: 'inspect' | 'plan' | (both)
+    // INSPECT: an approval carries the request it approves, every character of it, one click away (user report 10-08:
+    // a long shell command showed 77 chars and a "…", and nothing on the card held the rest)
+    const inspect = part === 'plan' ? null : consentInspect(p);
+    if (inspect) {
+      const detail = document.createElement('details'); detail.className = 'consent-payload';
+      const label = document.createElement('summary'); label.textContent = inspect.label;
+      const payload = document.createElement('pre'); payload.textContent = inspect.text;
+      const idle = inspect.copyLabel || 'COPY';
+      const copy = document.createElement('button'); copy.type = 'button'; copy.className = 'consent-btn quiet consent-copy'; copy.textContent = idle;
+      copy.onclick = () => copyText(inspect.copy || inspect.text).then(ok => {
+        copy.textContent = ok ? '✓ COPIED' : 'COPY FAILED: select the text above';
+        clearTimeout(copy.__t); copy.__t = setTimeout(() => { copy.textContent = idle; }, 1400);
+      });
+      detail.appendChild(label); detail.appendChild(payload); detail.appendChild(copy); host.appendChild(detail);
+    }
+    if (part === 'inspect') return;
+    // the station builder's card: every step's instructions, one click away (the summary line is in the phrase above)
+    if (/^station[._]build$/.test(String(p.tool || '')) && String(p.argsSummary || '').indexOf('\n') > 0) {
+      const detail = document.createElement('details'); detail.className = 'consent-payload';
+      const label = document.createElement('summary'); label.textContent = 'What each step will be told';
+      const payload = document.createElement('pre'); payload.textContent = String(p.argsSummary).split('\n').slice(1).join('\n');
+      detail.appendChild(label); detail.appendChild(payload); host.appendChild(detail);
+    }
+    // …and draws the plan: where it goes and what goes where, before anything is built (the page's own parked plan)
+    if (/^station[._]build$/.test(String(p.tool || '')) && typeof StationCommands !== 'undefined' && StationCommands.previewFor && typeof PlanPreview !== 'undefined') {
+      const fig = PlanPreview.el(StationCommands.previewFor(String(p.argsSummary || '').split('\n')[0]));
+      if (fig) host.appendChild(fig);
+    }
+  }
+  function actionPhrase(ev, detail) {   // detail: the approval card itself (room for what each worker is handed)
     const t = ev.tool || 'act';
+    // a PLUGIN tool (plugin__<id>__<tool>): say whose code it is before what it does — checked first, so a plugin
+    // tool that happens to be named like a built-in (edit_*, *notebook*) can never borrow a built-in's phrasing
+    const pm = /^plugin__(.+?)__(.+)$/.exec(t);
+    if (pm) {
+      const host = typeof PluginHost !== 'undefined' ? PluginHost : null;
+      const san = (s) => String(s || '').replace(/[^A-Za-z0-9_-]+/g, '_').replace(/^[_-]+|[_-]+$/g, '');   // plugin-tools.js sanitizePart
+      const p = host && host.list ? host.list().find(x => x.id === pm[1] || san(x.id) === pm[1]) : null;
+      return 'use the ' + ((p && p.name) || pm[1]) + ' plugin tool “' + pm[2] + '”' + leadText(ev.argsSummary, ': ');
+    }
+    // the crew INSTALLING a plugin it wrote: say that it stays off until the Commander's own approval
+    if (/^plugin[._]submit$/.test(t)) {
+      let id = '';
+      try { id = JSON.parse(ev.argsSummary || '{}').id || ''; } catch (_) {}
+      return 'install the plugin it built' + (id ? ' “' + id + '”' : '') + ' — it stays OFF until you approve its code in ABILITIES → EXTENSIONS';
+    }
     if (/notebook/.test(t)) return 'save a note to its memory';
-    if (/summon/.test(t)) return 'summon a new agent onto the crew' + (ev.argsSummary ? ' (' + ev.argsSummary + ')' : '');
+    // a hire reads as a hire: "hire RESEARCH (researcher) onto the crew", never the raw JSON args (live walkthrough 2026-10-13);
+    // anything else it names comes from leadText (a capped summary gives nothing — the card's INSPECT holds every character)
+    if (/summon/.test(t)) {
+      const o = requestArgs(ev.argsSummary) || {};
+      const nm = String(o.name || '').trim(), spec = String(o.specId || o.class || o.role || '').trim();
+      if (nm || spec) return 'hire ' + (nm ? nm.toUpperCase() + (spec && spec.toLowerCase() !== nm.toLowerCase() ? ' (' + spec + ')' : '') : 'a ' + spec) + ' onto the crew';
+      return 'hire a new agent onto the crew' + leadText(ev.argsSummary, ': ');
+    }
+    // a command: name it in words, its text clipped to a glance; the card's inspect panel holds every character of it
+    if (/^(?:shell|terminal)[._]/.test(t)) {
+      const o = requestArgs(ev.argsSummary) || {};
+      const typed = /write$/.test(t), text = o.cmd || o.command || o.input || o.data;
+      return (typed ? 'type into a running process' : 'run a command') + (typeof text === 'string' && text ? ': ' + glance(text) : leadText(ev.argsSummary, ': '));
+    }
     // NS-5 conversational path trust: a file was referenced OUTSIDE the agent's workspace — "Always" blesses
     // the whole project folder for future reads (revocable in Permissions); argsSummary is the proposed root.
     if (t === 'path.trust') return 'work with files in ' + (ev.argsSummary || 'a project folder') + ' (reads; "Always" or "Full access" trusts it for later)';
@@ -2763,9 +4158,102 @@ const Chat = (() => {
       try { target = JSON.parse(target).path || 'a file'; } catch (_) {}
       return 'change ' + target;
     }
-    if (/write|append|edit/.test(t)) return 'write ' + (ev.argsSummary || 'a file');
+    // code the agent runs: name it as the command it is (the card's INSPECT holds every character)
+    if (/^(?:verify[._]run|code[._]run|browser[._]eval)$/.test(t)) {
+      const o = requestArgs(ev.argsSummary) || {}, text = [o.cmd, o.code, o.expression].find(v => typeof v === 'string' && v.trim());
+      return ({ v: 'run a check', c: 'run code', b: 'run a script in the browser page' })[t[0]] + (text ? ': ' + glance(text, 80) : '');
+    }
+    if (/^browser[._]upload$/.test(t)) { const o = requestArgs(ev.argsSummary) || {}, files = Array.isArray(o.paths) ? o.paths.filter(x => typeof x === 'string') : []; return 'upload ' + (files.length ? glance(files.join(', '), 80) : 'files') + ' to the page'; }
+    if (/^channel[._]send$/.test(t)) {
+      const o = requestArgs(ev.argsSummary) || {}, n = Array.isArray(o.files) ? o.files.length : 0;
+      return 'send a message' + (typeof o.target === 'string' && o.target ? ' to ' + glance(o.target, 40) : '') + (n ? ' with ' + n + (n > 1 ? ' files' : ' file') : '') + (typeof o.text === 'string' && o.text ? ': ' + glance(o.text, 70) : '');
+    }
+    // "write a file" only for the tools that write files (a connector's write_values or a credit_* tool never says that)
+    if (!/^mcp__/.test(t) && /(?:^|[._])(?:write|append|edit)(?:$|[._])/.test(t)) { const o = requestArgs(ev.argsSummary); return 'write ' + (o ? (typeof o.path === 'string' && o.path ? glance(o.path, 80) : 'a file') : leadText(ev.argsSummary, '') || 'a file'); }
+    if (t === 'web_request') { const o = requestArgs(ev.argsSummary) || {}; return 'send a ' + String(o.method || 'web').toUpperCase().replace(/^WEB$/, 'web') + ' request' + (typeof o.url === 'string' && o.url ? ' to ' + glance(o.url, 80) : ''); }
+    if (t === 'image_generate') { const o = requestArgs(ev.argsSummary) || {}; return 'make an image' + (typeof o.prompt === 'string' && o.prompt ? ': ' + glance(o.prompt, 80) : ''); }
     if (t === 'brief.ask') return 'ask you a quick question about the task';   // clarify card renders its own body
-    return t.replace(/_/g, '.') + (ev.argsSummary ? ' ' + ev.argsSummary : '');
+    // ROUTINES: say WHAT will run and WHEN, never the raw JSON (argsSummary may be clipped mid-object, so read fields
+    // by pattern rather than JSON.parse). "Always" here lets the agent add and change routines without asking.
+    if (/^routine[._](?:create|manage)$/.test(t)) {
+      const s = String(ev.argsSummary || '');
+      const pick = k => { const m = new RegExp('"' + k + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"').exec(s); return m ? m[1].replace(/\\(["\\\\])/g, '$1') : ''; };
+      const nm = pick('name'), when = pick('schedule');
+      if (/create$/.test(t)) return 'schedule a routine' + (nm ? ' “' + nm + '”' : '') + (when ? ' — ' + when : '') + ' (results come back here)';
+      const act = pick('action'), ref = pick('id');
+      return (act || 'change') + ' the routine' + (ref ? ' “' + ref + '”' : '') + (when ? ' — ' + when : '');
+    }
+    // DELEGATION (2026-10-11): say WHO gets the work, by name, never the raw worker JSON (the inspect panel holds it).
+    // Read the ids by pattern: argsSummary may be clipped mid-object.
+    if (/^team[._](?:dispatch|spawn)$/.test(t)) {
+      const s = String(ev.argsSummary || ''), ids = [...new Set([...s.matchAll(/"agentId"\s*:\s*"([^"]+)"/g)].map(m => m[1]))];
+      const nameOf = id => (typeof App !== 'undefined' && App.agentName && App.agentName(id)) || id;
+      const and = list => list.length > 1 ? list.slice(0, -1).join(', ') + ' and ' + list[list.length - 1] : list[0] || '';
+      const bg = /"background"\s*:\s*true/.test(s) ? ' (in the background)' : '';
+      /* THE CARD SAYS WHO GETS WHAT (rc walk 10-14: "NOVA wants to hand work to COPY and STRATEGY" — the tasks were raw JSON
+         under Inspect). On the card itself (`detail`) each worker's task rides beside its name, its first sentence at a
+         glance — the shorter the more workers; the toast, the bell and NEEDS YOU keep the short line. The whole request is
+         still one click away in INSPECT. A summary that does not parse (capped) falls back to the names. */
+      const o = detail ? requestArgs(s) : null;
+      const jobs = o ? (Array.isArray(o.workers) ? o.workers : Array.isArray(o.tasks) ? o.tasks : []).filter(w => w && typeof w.prompt === 'string' && w.prompt.trim()) : [];
+      if (jobs.length) {
+        const n = Math.max(36, Math.floor(140 / Math.min(jobs.length, 3)));
+        // its first sentence when that fits, else cut at a word (never "statio…")
+        // …and the file a task names is its deliverable: when the cut would lose it, the middle goes instead (review 10-14:
+        // "…into a file called…" lost tagline.md)
+        const FILE = /(?:[\w-]+[\\/])*[\w-][\w.-]*\.(?:md|markdown|txt|html?|css|m?js|cjs|tsx?|jsx|json|ya?ml|csv|tsv|py|rb|go|rs|java|sh|ps1|sql|xml|svg|png|jpe?g|gif|webp|pdf|docx?|xlsx?|pptx?|mp3|wav|mp4|zip)(?![\w-])/i;
+        const task = p => {
+          const one = p.replace(/\s+/g, ' ').trim(), cut = one.search(/[.!?](?:\s|$)/), s = cut > 12 && cut < n ? one.slice(0, cut) : one;
+          if (s.length <= n) return '“' + s + '”';
+          const file = (one.match(FILE) || [''])[0], room = file && file.length < n / 2 ? n - file.length - 2 : n;
+          const sp = s.lastIndexOf(' ', room - 1);
+          const head = s.slice(0, sp > room * 0.6 ? sp : room - 1).replace(/[\s,;:]+$/, '');
+          return '“' + head + (room < n && head.indexOf(file) < 0 ? ' … ' + file : '…') + '”';
+        };
+        const shown = jobs.slice(0, 3), more = jobs.length - shown.length;
+        if (/spawn$/.test(t)) return 'run ' + (jobs.length > 1 ? jobs.length + ' copies' : 'a copy') + ' of itself on ' + and(shown.map(w => task(w.prompt)).concat(more ? [more + ' more'] : [])) + bg;
+        return 'hand ' + and(shown.map(w => nameOf(String(w.agentId || 'the crew')) + ' ' + task(w.prompt)).concat(more ? [more + ' more'] : [])) + bg;
+      }
+      return 'hand work to ' + (and(ids.map(nameOf)) || 'the crew') + bg;
+    }
+    // A GOAL LOOP (rc walk 10-14: the card read "use loop create: Write and refine…"): what it repeats toward, in words
+    if (/^loop[._]create$/.test(t)) {
+      const o = requestArgs(ev.argsSummary) || {}, what = [o.objective, o.name].find(v => typeof v === 'string' && v.trim());
+      return 'start a goal loop' + (typeof o.agentId === 'string' && o.agentId.trim() ? ' for ' + ((typeof App !== 'undefined' && App.agentName && App.agentName(o.agentId)) || o.agentId) : '') + (what ? ': ' + glance(what, 90) : '');
+    }
+    // THE STATION BUILDER (2026-09-29): the card IS the plan — what gets built, where, who works each step. The sidecar
+    // sends the plan's own summary (its dry run on a copy of the station), never the model's words.
+    if (/^station[._]build$/.test(t)) { const plan = String(ev.argsSummary || '').split('\n')[0] || 'a planned change'; return 'build this on your station: ' + plan + (/\bUNDO\b/.test(plan) ? '' : ' One UNDO in Build mode takes it back.'); }
+    // MAKE A PROP (2026-10-01): the card names the object and what it costs in StarNet credits (the sidecar's own words)
+    if (/^station[._]make_prop$/.test(t)) return 'make a new prop: ' + (String(ev.argsSummary || '').split('\n')[0] || 'a new prop');
+    // TEST A LINE (2026-10-01): the card names the line and the job it will send (the sidecar's own words)
+    if (/^station[._]test_line$/.test(t)) return 'test ' + (String(ev.argsSummary || '').split('\n')[0] || 'a workflow line');
+    if (/^station[._]start_line$/.test(t)) return 'set what starts ' + (String(ev.argsSummary || '').split('\n')[0] || 'a workflow line');
+    // STATION CONTROL (2026-10-02): a settings change asked for in chat — the sidecar's catalog sentence, never raw JSON
+    if (/^station[._](?:control|power)$/.test(t)) return String(ev.argsSummary || 'change a station setting').split('\n')[0];
+    // ANY OTHER TOOL: its name in words and the one argument that says what it acts on — never raw JSON on the card or in a
+    // toast (the card's inspect panel holds every character of the request)
+    const mcp = /^mcp__(.+?)__(.+)$/.exec(t);   // a connector tool: say whose (google sheets write values: Sheet1!A1:C3)
+    const words = (mcp ? mcp[1] + ' ' + mcp[2] : t).replace(/[._]+/g, ' ').trim();
+    const o = requestArgs(ev.argsSummary);
+    // a *.manage tool says its action first: "remove task Buy milk", never "use task manage"
+    if (o && typeof o.action === 'string' && o.action.trim() && !mcp && /[._]manage$/.test(t)) return glance(o.action, 30) + ' ' + words.replace(/ manage$/, '') + leadText(Object.assign({}, o, { action: undefined }), ' ');
+    return 'use ' + words + leadText(ev.argsSummary, ': ');
+  }
+  // the one argument that says what a request acts on, in words; else its first one or two short values ("key: value");
+  // a summary that does not parse (a capped one) gives nothing — the card's INSPECT holds every character. A bare value the
+  // sidecar sends whole (consentSummary: a read's path) IS what is approved: it is named, never dropped from the card
+  const LEAD_KEYS = ['url', 'path', 'paths', 'query', 'cmd', 'command', 'code', 'expression', 'prompt', 'objective', 'text', 'task', 'name', 'title', 'to', 'target', 'range', 'key', 'uri', 'id'];
+  function leadText(src, sep) {
+    const o = typeof src === 'string' ? requestArgs(src) : src;
+    if (!o && typeof src === 'string' && src.trim() && !/^\s*[[{]/.test(src)) return sep + glance(src, 80);
+    if (!o || typeof o !== 'object') return '';
+    for (const k of LEAD_KEYS) {
+      const v = Array.isArray(o[k]) ? o[k].filter(x => typeof x === 'string').join(', ') : o[k];
+      if (typeof v === 'string' && v.trim()) return sep + glance(v, 80);
+    }
+    const pairs = Object.keys(o).filter(k => (typeof o[k] === 'string' && o[k].trim()) || typeof o[k] === 'number' || typeof o[k] === 'boolean').slice(0, 2).map(k => k + ': ' + glance(String(o[k]), 40));
+    return pairs.length ? sep + pairs.join(', ') : '';
   }
 
   /* IN-TURN CLARIFY CARD (2026-07-31, Hermes-parity). A brief.ask prompt rides the consent transport but is
@@ -2776,25 +4264,82 @@ const Chat = (() => {
      timer falls back to today's durable end-run question. Joins the consent card's lifecycle contract:
      decided chips vanish into a verdict tag, pending-span bookkeeping excludes the wait from run time, and
      focus is never stolen from a mid-typing Commander. */
+  /* THE COMPOSER ANSWERS THE QUESTION (live walkthrough 2026-10-13). NOVA asked "what are you launching?"; the
+     Commander typed the answer in the COMMS box like any chat — and it became a queued chip, the run sat on
+     "awaiting your answer", and ~15 min later the chip fired as a NEW message that restarted the whole job. While the
+     open conversation waits on exactly ONE of its lead's questions, a composer send is that question's answer.
+     promptId -> { wsId, answer(text) -> Promise<bool> } — registered by clarifyRow, removed once answered. */
+  const askAnswerers = new Map();
+  function pendingAskFor(ws) {
+    if (!ws) return null;
+    const live = [];
+    for (const [id, a] of askAnswerers) { if (a.wsId === ws.id && !(a.isDone && a.isDone())) live.push(id); else if (a.isDone && a.isDone()) askAnswerers.delete(id); }
+    return live.length === 1 ? askAnswerers.get(live[0]) : null;
+  }
+  async function answerPendingAsk(ws, text) {
+    const a = pendingAskFor(ws);
+    if (!a) return false;
+    let ok = false;
+    try { ok = (await a.answer(text)) === true; } catch (e) { ok = false; }
+    return ok;
+  }
   function clarifyRow(p, ws) {
     let q = { question: '', options: [], recommended: '', reason: '', multiSelect: false, ordinal: 0, total: 0 };
     try { q = Object.assign(q, JSON.parse(p.argsSummary || '{}')); } catch (_) {}
     const r = row('agent'); r.d.classList.add('tool'); r.d.classList.add('consent');
+    r.d.dataset.clarifyPrompt = String(p.promptId || ''); r.d.tabIndex = -1; r.d.dataset.liveAsk = '1';
     if(q.mode==='conversation' && typeof TaskConversation!=='undefined') {
-      const rid=ws && Channels.runIdOf(ws.id);
-      TaskConversation.mount(r.body,q,async text=>{
+      // the ask's own run id first, like the choice and approval cards: a background worker's question outlives the reply that started it
+      const rid=p.runId || (ws && Channels.runIdOf(ws.id));
+      let answeredHere=false;
+      const tc=TaskConversation.mount(r.body,Object.assign({},q,{asker:askerName(p,ws)}),async text=>{
         const result=await Harness.consentAnswer(rid,p.promptId,text,true);
         if(!result || !result.ok)return false;
-        if(ws)Channels.clearPending(ws.id,Date.now());
+        answeredHere=true;
+        // the question is answered: say so on the bus like the approval card does, or the CREW card and the world pose stay "needs your OK"
+        // via:'desk': a confirmed local answer names its surface, so no other card reads it as "from your phone"
+        try{if(typeof U!=='undefined'&&U.bus)U.bus.emit('permission.response',{promptId:p.promptId,decision:'once',via:'desk'});}catch(_){}
+        if(ws)Channels.clearPending(ws.id,Date.now(),p.promptId);
         if(isActiveWs(ws)){renderPresence();syncStatus();}
+        releaseCard(r.d);
+        askAnswerers.delete(String(p.promptId||''));
         return true;
       });
-      status('awaiting your context…');autoscroll();return;
+      // a worker's question is answered on its own row; the lead's is answerable from the composer
+      if(ws && p.promptId && !p.workerStreamId && tc && typeof tc.submit==='function')
+        askAnswerers.set(String(p.promptId),{wsId:ws.id,answer:tc.submit,isDone:tc.isDone});
+      // answered from the phone, timed out, or the run stopped: the card says so, stops taking input, and the follow resumes
+      if(typeof U!=='undefined'&&U.bus&&U.bus.on&&U.bus.off){
+        const onElsewhere=(resp)=>{
+          if(!resp||resp.promptId!==p.promptId)return;
+          U.bus.off('permission.response',onElsewhere);
+          askAnswerers.delete(String(p.promptId||''));
+          if(answeredHere){releaseCard(r.d);return;}
+          if(ws&&typeof Channels!=='undefined')Channels.clearPending(ws.id,Date.now(),p.promptId);
+          if(isActiveWs(ws))renderPresence();
+          if(tc&&tc.settle)tc.settle(resp.stopped?askerName(p,ws)+' stopped before an answer':resp.expired?'No answer in time — '+askerName(p,ws)+' used its judgment':resp.decision==='deny'?'Declined'+settledWhere(resp):'Answered'+settledWhere(resp));
+          releaseCard(r.d);syncStatus();
+        };
+        U.bus.on('permission.response',onElsewhere);
+      }
+      status('awaiting your context…');revealCard(r.d);return;
     }
     // A batched ask shows its place ("asks (2 of 3)") so the Commander knows one more tap ends it —
     // three unannounced sequential cards would read as an interrogation with no visible bottom.
     const seq = (Number(q.total) > 1 && Number(q.ordinal) > 0) ? ' (' + q.ordinal + ' of ' + q.total + ')' : '';
-    r.body.appendChild(document.createTextNode('▣ ' + name + ' asks' + seq + ': ' + (q.question || 'which way should this go?') + ' '));
+    // WHO asks on its own line, the question at reading size (Andrew 2026-10-13: "▣ NOVA asks: …" ran the asker into a
+    // long question, and the reason sat open under it as a wall of text)
+    /* READING ORDER (Andrew 2026-10-13: "tiny … unorganized and long"): who asks · the question, three lines at most (the
+       whole of it one tap away) · the answers as keys · one plain line on how to answer · the reason, folded. */
+    const askedBy = askerName(p, ws);
+    const who = document.createElement('div'); who.className = 'cq-who'; who.textContent = askedBy + ' asks' + seq;
+    const qText = document.createElement('p'); qText.className = 'cq-text'; qText.textContent = q.question || 'Which way should this go?';
+    r.body.appendChild(who); r.body.appendChild(qText);
+    const whole = document.createElement('button'); whole.type = 'button'; whole.className = 'cq-whole'; whole.textContent = '▸ Show the whole question';
+    whole.onclick = () => { const open = !r.d.classList.contains('cq-open'); r.d.classList.toggle('cq-open', open); whole.textContent = open ? '▾ Show less' : '▸ Show the whole question'; };
+    r.body.appendChild(whole);
+    // measured after layout and again whenever COMMS changes size: the key shows exactly while the question is clamped
+    fitWhole(qText, whole, () => r.d.classList.contains('cq-open'));
     // TWO KINDS of suggestion, and the same law the end-run card obeys: GROUNDED comes from the
     // Commander's own answered history (>=2 times) and is PROVABLE, so it outranks the model's guess and
     // states its count; `recommended` is a guess with a rationale and stands only when nothing was observed.
@@ -2802,38 +4347,63 @@ const Chat = (() => {
     const gCount = Number(q.grounded && q.grounded.count) || 0;
     const useGrounded = gOpts.length > 0 && gCount >= 2;
     const starred = useGrounded ? gOpts : ((q.recommended && (q.options || []).indexOf(q.recommended) >= 0) ? [q.recommended] : []);
-    if (useGrounded) {
-      const g = document.createElement('div'); g.className = 'tq-reason grounded';
-      g.textContent = gOpts.length > 1
-        ? '★ you usually pick these — ' + gOpts.join(', ') + ' (chosen ' + gCount + '+ times before)'
-        : '★ suggested: ' + gOpts[0] + ' — you chose this ' + gCount + ' times before';
-      r.body.appendChild(g);
-    } else if (q.reason) {
-      const why = document.createElement('div'); why.className = 'dim'; why.textContent = q.reason;
-      r.body.appendChild(why);
-    }
     const isStar = (opt) => starred.indexOf(opt) >= 0;
-    const btns = document.createElement('span'); btns.className = 'consent-btns';
-    let decided = false;
-    function answer(text, doneLabel) {
-      if (decided) return; decided = true;
-      const rid = (ws && typeof Channels !== 'undefined') ? Channels.runIdOf(ws.id) : null;
-      Harness.consentAnswer(rid, p.promptId, text);
-      if (ws && typeof Channels !== 'undefined') Channels.clearPending(ws.id, Date.now());   // the wait never counts as run time
-      if (isActiveWs(ws)) renderPresence();
-      btns.remove();
-      const tag = document.createElement('span'); tag.className = 'consent-result'; tag.textContent = doneLabel;
-      r.body.appendChild(tag);
-      syncStatus();
+    // one plain line on how to answer, and what the ★ is (a grounded ★ states its real count); it goes once answered
+    const hint = document.createElement('div'); hint.className = 'cq-hint';
+    const howTo = ((q.multiSelect === true && (q.options || []).length > 1) ? 'Pick all that apply, then confirm.' : 'Tap an answer.')
+      + (useGrounded ? (gOpts.length > 1 ? ' ★ are your usual picks (chosen ' + gCount + '+ times before).' : ' ★ is your usual pick (chosen ' + gCount + ' times before).')
+        : starred.length ? ' ★ is ' + askedBy + '\'s suggestion.' : '');
+    hint.textContent = howTo;
+    // the model's reason is kept, one tap away — never a paragraph between the question and its answers
+    let why = null;
+    if (q.reason) {
+      why = document.createElement('details'); why.className = 'cq-why';
+      const sum = document.createElement('summary'); sum.textContent = 'Why ' + askedBy + ' is asking';
+      const body = document.createElement('p'); body.textContent = q.reason;
+      why.appendChild(sum); why.appendChild(body);
     }
+    const btns = document.createElement('span'); btns.className = 'consent-btns';
+    let decided = false, submitting = false, received = null, applyElsewhere = null;
+    async function answer(text, doneLabel, key) {
+      if (decided || submitting) return false;
+      submitting = true;
+      const buttons = Array.from(btns.querySelectorAll('button')), disabled = buttons.map(b => b.disabled);
+      buttons.forEach(b => { b.disabled = true; });
+      // the pressed key stays lit and the hint says it is on its way (one answer; a refusal frees the keys again)
+      if (key) key.classList.add('sel'); hint.textContent = 'Sending your answer…';
+      const rid = p.runId || ((ws && typeof Channels !== 'undefined') ? Channels.runIdOf(ws.id) : null);
+      try {
+        const result = await Harness.consentAnswer(rid, p.promptId, text, true);
+        if (!(result && result.ok)) throw new Error('The station did not confirm your answer. Please try again.');
+      } catch (e) {
+        submitting = false;
+        if (received && applyElsewhere) { applyElsewhere(received); return; }
+        if (key) key.classList.remove('sel'); hint.textContent = howTo;
+        buttons.forEach((b, i) => { b.disabled = disabled[i]; });
+        if (typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify('Could not answer: ' + ((e && e.message) || e), 'warn');
+        return false;
+      }
+      submitting = false; decided = true;
+      askAnswerers.delete(String(p.promptId || ''));
+      if (received && applyElsewhere) applyElsewhere(received);
+      if (ws) settlePromptNotice(ws.id, p.promptId);
+      // answered: tell the bus, as the approval card does — the CREW card's "needs your OK" frame and the world's
+      // AWAITING pose clear on permission.response, and a question never emitted one (sweep 2026-10-02)
+      try { if (typeof U !== 'undefined' && U.bus) U.bus.emit('permission.response', { promptId: p.promptId, decision: 'once', via: 'desk' }); } catch (_) {}
+      if (ws && typeof Channels !== 'undefined') Channels.clearPending(ws.id, Date.now(), p.promptId);   // the wait never counts as run time
+      if (isActiveWs(ws)) renderPresence();
+      btns.remove(); hint.remove(); keepFocus(r.d); releaseCard(r.d);
+      const tag = document.createElement('span'); tag.className = 'consent-result'; tag.textContent = doneLabel;
+      r.body.appendChild(tag); if (why) r.body.appendChild(why);
+      syncStatus();
+      return true;
+    }
+    if (ws && p.promptId && !p.workerStreamId) askAnswerers.set(String(p.promptId), { wsId: ws.id, answer: (text) => answer(text, '✓ ' + glance(text, 60)), isDone: () => decided });
     const opts = Array.isArray(q.options) ? q.options.slice(0, 6) : [];
     if (q.multiSelect === true && opts.length > 1) {
       // NON-EXCLUSIVE options: chips toggle, a confirm chip fires. The answer is the Commander's picks
       // joined as plain text — a typed multi-answer was always legal downstream, so the store and the
       // model see exactly what free text would have said.
-      const hint = document.createElement('div'); hint.className = 'dim';
-      hint.textContent = 'pick all that apply, then confirm';
-      r.body.appendChild(hint);
       const picked = new Set();
       const done = document.createElement('button');
       const syncDone = () => { done.textContent = picked.size ? ('✔ confirm ' + picked.size + ' pick' + (picked.size > 1 ? 's' : '')) : '✔ confirm'; done.disabled = !picked.size; };
@@ -2860,15 +4430,15 @@ const Chat = (() => {
     } else {
       for (const opt of opts) {
         const b = document.createElement('button');
-        b.className = 'consent-btn';
+        b.className = 'consent-btn' + (isStar(opt) ? ' primary' : '');   // the suggested answer is the lit key
         b.textContent = (isStar(opt) ? '★ ' : '') + opt;
-        b.onclick = () => answer(opt, '✓ ' + opt);
+        b.onclick = () => answer(opt, '✓ ' + opt, b);
         btns.appendChild(b);
       }
     }
     const skip = document.createElement('button');
-    skip.className = 'consent-btn';
-    skip.textContent = 'use your judgment';
+    skip.className = 'consent-btn quiet';
+    skip.textContent = 'Use your judgment';   // the answer it sends stays 'use your judgment' (the host matches it)
     skip.onclick = () => answer('use your judgment', '✓ your call');
     btns.appendChild(skip);
     // BATCH-WIDE ESCAPE: opting out of a 3-question batch cost 3 taps, which is the wrong ratio for the
@@ -2878,108 +4448,331 @@ const Chat = (() => {
       const rest = document.createElement('button');
       rest.className = 'consent-btn quiet';
       const left = Number(q.total) - Number(q.ordinal) + 1;
-      rest.textContent = 'use your judgment for the rest (' + left + ')';
+      rest.textContent = 'Use your judgment for the rest (' + left + ')';
       rest.title = 'decide this and the remaining ' + (left - 1) + ' yourself — the run keeps going';
       rest.onclick = () => answer('use your judgment for the rest', '✓ your call on all ' + left);
       btns.appendChild(rest);
     }
-    r.body.appendChild(btns);
+    r.body.appendChild(btns); r.body.appendChild(hint); if (why) r.body.appendChild(why);
+    // STARNET REMOTE: a paired phone can answer this question too (the sidecar then puts permission.response on this
+    // run's stream, as for an approval). Settle the card to what happened — it used to keep live options and "awaiting
+    // your answer…" after the run had moved on, and a tap then did nothing while the card claimed it answered.
+    if (typeof U !== 'undefined' && U.bus && U.bus.on && U.bus.off) {
+      const onElsewhere = applyElsewhere = (resp) => {
+        if (!resp || resp.promptId !== p.promptId) return;
+        if (submitting) { received = resp; return; }
+        U.bus.off('permission.response', onElsewhere);
+        if (decided) return;
+        decided = true;
+        if (ws && typeof Channels !== 'undefined') Channels.clearPending(ws.id, Date.now(), p.promptId);
+        if (isActiveWs(ws)) renderPresence();
+        btns.remove(); hint.remove(); releaseCard(r.d);
+        const tag = document.createElement('span');
+        tag.className = 'consent-result' + (resp.decision === 'deny' ? ' err' : '');
+        tag.textContent = resp.stopped ? '■ ' + askerName(p, ws) + ' stopped before an answer' : resp.expired ? '✕ no answer in time — the agent used its judgment' : resp.decision === 'deny' ? '✕ declined' + settledWhere(resp) : '✓ answered' + settledWhere(resp);
+        r.body.appendChild(tag); if (why) r.body.appendChild(why);
+        syncStatus();
+      };
+      U.bus.on('permission.response', onElsewhere);
+    }
     // Esc = "use your judgment": the reflexive dismiss defers the decision rather than silently denying a
     // question (a deny makes no sense here), matching the end-run card's skip chip semantics.
     r.d.tabIndex = -1;
     r.d.addEventListener('keydown', e => { if (e.key === 'Escape') { e.preventDefault(); answer('use your judgment', '✓ your call'); } });
     status('awaiting your answer…');
-    if (typeof StationUI !== 'undefined') StationUI.notify(name + ' has a quick question for you', 'warn', 'needsApproval');
-    autoscroll();
+    const asker = (p && p.workerAgentId) ? askerName(p, ws) : name;   // a delegated worker's question names the worker, like its card
+    if (ws && !announcedPrompt(p.promptId, ws) && typeof StationUI !== 'undefined') StationUI.notify(asker + ' has a quick question for you' + sessionNote(ws), 'warn', 'needsApproval', { kind: 'needs', go: { ws: ws.id }, key: 'needs:' + ws.id, prompt: p.promptId });
+    else if (!ws && typeof StationUI !== 'undefined') StationUI.notify(asker + ' has a quick question for you' + sessionNote(ws), 'warn', 'needsApproval');
+    const waitsItsTurn = revealCard(r.d) === 'queued';   // a card behind a held one takes focus only when its turn comes
     const composerBusy = !!(input && (document.activeElement === input || (input.value && input.value.trim())));
-    if (!composerBusy) { try { r.d.focus({ preventScroll: true }); } catch (_) { try { r.d.focus(); } catch (_) {} } }
+    if (!composerBusy && !waitsItsTurn) { try { r.d.focus({ preventScroll: true }); } catch (_) { try { r.d.focus(); } catch (_) {} } }
   }
   // p = a consent payload { promptId, tool, argsSummary } — works for both a live onPermission event and a
   // Channels snapshot.pending (re-rendered after a switch). ws is the origin stream, so the answer routes to
   // THAT stream's run (per-channel runId), not a single global one.
+  /* ANSWER AN APPROVAL from any surface — this card, a delegated worker's row on its delegation card, the NEEDS YOU list
+     (2026-10-11): one path. The sidecar's consent route (the lead's run is the one that holds the ask, also for a worker's),
+     the bus (every rendered card of that ask settles), the channel (THIS ask only: a crewmate's open ask stays open), NEEDS
+     YOU and the presence card. Returns what the sidecar actually applied (fullSaved: a "full" that really persisted). */
+  const settledPromptNotices = new Set();
+  function settlePromptNotice(wsId, promptId) {
+    if (!wsId || typeof StationUI === 'undefined') return;
+    const id = String(promptId || '');
+    if (id && settledPromptNotices.has(id)) return;
+    if (id) { settledPromptNotices.add(id); if (settledPromptNotices.size > 200) settledPromptNotices.delete(settledPromptNotices.values().next().value); }
+    const pending = typeof Channels !== 'undefined' && Channels.pendingAllOf ? Channels.pendingAllOf(wsId).filter(p => String(p.promptId) !== id) : [];
+    keepNeeds(wsId, pending);
+  }
+  // the conversation's one bell entry moves to the first ask still waiting, or settles once none is left
+  function keepNeeds(wsId, pending) {
+    if (pending.length) {
+      const next = pending[0], ws = (typeof Workstreams !== 'undefined' && Workstreams.get && Workstreams.get(wsId)) || { id: wsId, agentId: next.agentId };
+      // quiet: the sibling was already announced; its bell entry moves to it without a second toast and chime
+      if (StationUI.notify) StationUI.notify(askerName(next, ws) + (next.tool === 'brief.ask' ? ' still needs your answer' : ' still wants to ' + actionPhrase(next)), 'warn', 'needsApproval', { kind: 'needs', go: { ws: wsId }, key: 'needs:' + wsId, prompt: next.promptId, quiet: true });
+    } else if (StationUI.settleNotifs) StationUI.settleNotifs('needs:' + wsId);
+  }
+  /* A RUN'S END SETTLES ITS OWN WAITS, NEVER A BACKGROUND WORKER'S (2026-10-14): such a worker files under the same key, often
+     mid-turn, and the end's blanket settle read "Handled" while NEEDS YOU and its row still waited. Its ask keeps the entry. */
+  function settleRunNeeds(wsId) {
+    if (!wsId || typeof StationUI === 'undefined') return;
+    keepNeeds(wsId, typeof Channels !== 'undefined' && Channels.pendingAllOf ? Channels.pendingAllOf(wsId).filter(p => p && p.background === true) : []);
+  }
+  // what settled a card it did not submit itself, in words. The sidecar's remote answer (a phone) carries no `via`; this
+  // page's other surfaces (a worker's row, NEEDS YOU, voice) answer through answerConsent, which says which on the bus —
+  // and the label names what was APPLIED ('always' is not 'once'; review app-shell-ui-02 / 2026-10-13: a spoken "always
+  // allow" read "approved once from your phone").
+  function settledWhere(resp) { return resp.via === 'voice' ? ' by voice' : resp.via === 'needs-you' ? ' from NEEDS YOU' : resp.via ? '' : ' from your phone'; }
+  // `own` = a card's own receipts (decision -> its done label): a card with no Always key (station.power, plugin.submit,
+  // the login window) grants this one call whatever grade another surface sent, so it settles in its own yes/no words
+  function settledLabel(resp, own) {
+    if (resp.decision === 'deny') return ((own && own.deny) || '✕ denied') + settledWhere(resp);
+    const words = { always: '✓ always allowed', session: '✓ approved for this session', full: '✓ full access' };
+    const grade = own ? own[resp.decision] || (resp.decision === 'session' && own.always ? words.session : own.once) : words[resp.decision];
+    return (grade || '✓ approved once') + settledWhere(resp);
+  }
+  async function answerConsent(p, ws, decision, via) {
+    const rid = (p && p.runId) || ((ws && typeof Channels !== 'undefined') ? Channels.runIdOf(ws.id) : null);
+    const answer = await Harness.consent(rid, p.promptId, decision);
+    if (answer && !answer.ok && answer.gone === true) {
+      letGoneAskGo(p.promptId);
+      const gone = new Error('that approval is no longer waiting, so your answer was not applied'); gone.gone = true;
+      throw gone;
+    }
+    if (!(answer && answer.ok)) throw new Error((answer && answer.error) || 'The station did not confirm that answer. Please try again.');
+    if (ws) settlePromptNotice(ws.id, p.promptId);
+    const appliedDecision = (answer && answer.decision) || 'deny';
+    let fullSaved = true;
+    if (decision === 'full') {
+      const saved = !!(answer && answer.ok && answer.approvalMode === 'full');
+      const adopted = saved && typeof App !== 'undefined' && App.setApproval
+        ? App.setApproval((answer && answer.agentId) || p.agentId || (ws && ws.agentId), 'full', { recorded: true })
+        : false;
+      fullSaved = saved && adopted;
+    }
+    // surface the decision on the bus (schema: permission.response) so listeners — e.g. the first-run tutorial —
+    // can tell an approve from a deny and narrate the consent loop honestly. Additive; the run resumes via Harness.consent.
+    try { if (typeof U !== 'undefined' && U.bus) U.bus.emit('permission.response', { promptId: p.promptId, decision: appliedDecision, via: via || 'desk' }); } catch (_) {}
+    // NS conversational anchor: "Always" — and now "Full access" — on a path.trust card IS the project bless
+    // (a standing path grant + known-projects row land on the sidecar). Stamp the origin session's projectRoot
+    // with the SAME proposed root so the PROJECTS rail lists this session under its project — the identical
+    // anchor "Work here" stamps. Both standing grades, never "once" (it grants nothing standing, so there is
+    // no project row to attach to), and never overwrite an anchor the session already has.
+    if (p.tool === 'path.trust' && (appliedDecision === 'always' || appliedDecision === 'full') && ws && typeof Workstreams !== 'undefined' && Workstreams.setProjectRoot) {
+      try { if (p.argsSummary && !(Workstreams.get(ws.id) || {}).projectRoot) Workstreams.setProjectRoot(ws.id, p.argsSummary); } catch (_) {}
+    }
+    if (ws && typeof Channels !== 'undefined') Channels.clearPending(ws.id, Date.now(), p.promptId);   // closes the paused span once none remain — approval wait never counts as run time
+    if (ws && isActiveWs(ws)) renderPresence();   // drop the paused styling the instant the run resumes
+    syncStatus();
+    return { answer, appliedDecision, fullSaved };
+  }
+  // the channel's record of an ask — a delegated worker's says who asked (sidecar attributeAsks): its row on the
+  // delegation card answers it; askedAt gives the NEEDS YOU list its age
+  function pendingFrom(ev, ws) {
+    return { promptId: ev.promptId, agentId: ev.agentId || ws.agentId, tool: ev.tool, argsSummary: ev.argsSummary, runId: Channels.runIdOf(ws.id),
+      workerAgentId: ev.workerAgentId || '', workerRunId: ev.workerRunId || '', workerStreamId: ev.workerStreamId || '', askedAt: ev.askedAt || Date.now() };
+  }
+  // who is asking: a delegated worker's ask names the worker (the sidecar stamps workerAgentId), never the lead
+  function askerName(p, ws) {
+    const id = (p && p.workerAgentId) || (ws && ws.agentId) || 'agent';
+    return (typeof App !== 'undefined' && App.agentName && App.agentName(id)) || id;
+  }
+  /* A STOPPED RUN TAKES ITS OPEN CARDS WITH IT (live walkthrough 2026-10-13): after STOP the run's approval card kept
+     live Approve once / Always / Full access / Deny keys while NEEDS YOU and the toast had already cleared — a key that
+     answers nothing. promptId -> { wsId, runId, worker, background, retire(text) }; retireOpenConsents runs at the run's
+     end. A BACKGROUND worker's ask (background:true — the station keeps it open past the lead's turn, and its runId IS the
+     lead's) is never retired by a run's end: it settles through its own permission.response, or retireConsentCard when the
+     reconnect snapshot no longer lists it (2026-10-14 review: such a card read "nothing was approved" with the ask live). */
+  const openConsentCards = new Map();
+  /* THE REPEAT-ASK LINE (org P02): on the SECOND ask for the same tool in the same direct chat, the card's keys row carries
+     one quiet line saying what Always does — the only hint an approval card has (no auto-deny line: Andrew 10-14, "the
+     approval key doesn't have to mention the auto denies"). Always is a standing grant across the station (permissions.js
+     grantsPermanent), so the line says "from now on", never "here"; the tool is named in the card title's own words
+     ("fs read", never "fs.read"). A first ask, a worker's ask and a background ask get no line.
+     wsId -> Map(tool -> Set(promptId)): a re-render of the same ask never counts as a second ask. */
+  const askedTools = new Map();
+  // the tool in the card title's words (actionPhrase's ANY OTHER TOOL line): a connector tool says whose
+  const toolWordsOf = t => { const mcp = /^mcp__(.+?)__(.+)$/.exec(t); return (mcp ? mcp[1] + ' ' + mcp[2] : t).replace(/[._]+/g, ' ').trim(); };
+  function consentHintFor(p, ws) {
+    const tool = String((p && p.tool) || '');
+    if (!tool || !ws || !p || p.promptId == null || p.workerAgentId || p.workerRunId || p.background === true) return '';
+    const byTool = askedTools.get(ws.id) || new Map(); askedTools.set(ws.id, byTool);
+    const ids = byTool.get(tool) || new Set(); byTool.set(tool, ids);
+    ids.add(String(p.promptId)); if (ids.size > 20) ids.delete(ids.values().next().value);
+    return ids.size > 1 ? 'Always stops asking for ' + toolWordsOf(tool) + ' from now on' : '';
+  }
+  function retireOpenConsents(wsId, runId) {
+    for (const [id, c] of openConsentCards) {
+      if (c.wsId !== wsId || c.background) continue;
+      // a delegated worker's ask can outlive its lead's run — only this run's own cards (or unattributed lead cards) retire
+      if (c.runId ? c.runId !== runId : c.worker) continue;
+      retireConsentCard(id, '■ the run ended before an answer — nothing was approved');
+    }
+    for (const [id, a] of askAnswerers) if (a.wsId === wsId) askAnswerers.delete(id);   // its questions are gone with it
+  }
+  function retireConsentCard(promptId, text) {
+    const id = String(promptId || ''), c = openConsentCards.get(id);
+    if (!c) return false;
+    openConsentCards.delete(id);
+    try { c.retire(text); } catch (e) { if (typeof console !== 'undefined') console.warn('[comms] retire card failed', e); }
+    return true;
+  }
+  /* AN ASK THE STATION NO LONGER HOLDS (soak 10-15). The consent route says `gone` when no such ask waits anywhere: it was
+     answered on a surface whose word never reached this page, it expired, or it was withdrawn (a restart). Retrying can never
+     land, so this page lets go of it everywhere it shows — its record, its bell entry, its card and the worker's row — in
+     neutral words: nothing is claimed about what settled it. */
+  function letGoneAskGo(promptId) {
+    const id = String(promptId);
+    if (typeof Channels !== 'undefined' && Channels.allPending) {
+      for (const { wsId, p } of Channels.allPending()) {
+        if (!p || String(p.promptId) !== id) continue;
+        Channels.clearPending(wsId, Date.now(), p.promptId);
+        settlePromptNotice(wsId, id);
+        if (typeof Workstreams !== 'undefined' && Workstreams.get && isActiveWs(Workstreams.get(wsId))) renderPresence();
+      }
+    }
+    retireConsentCard(id, '■ no longer waiting on you');
+    if (typeof Delegated !== 'undefined' && Delegated.repaint) Delegated.repaint();
+    if (typeof NeedsYou !== 'undefined' && NeedsYou.render) NeedsYou.render();
+    try { if (typeof App !== 'undefined' && App.refreshRail) App.refreshRail(); } catch (e) { console.warn('[comms] rail refresh after a gone ask failed', e); }
+    syncStatus();
+  }
   function permissionRow(p, ws) {
     if (p && p.tool === 'brief.ask') return clarifyRow(p, ws);   // a question, not a grade — its own card
-    const r = row('agent'); r.d.classList.add('tool'); r.d.classList.add('consent');
-    r.body.appendChild(document.createTextNode('▣ ' + name + ' wants to ' + actionPhrase(p) + ' '));
-    if (/^fs[._](?:write|append|edit|patch)$/.test(String(p.tool || ''))) {
-      const detail = document.createElement('details'); detail.className = 'consent-payload';
-      const label = document.createElement('summary'); label.textContent = 'Inspect proposed change (secret patterns redacted)';
-      const payload = document.createElement('pre'); payload.textContent = p.argsSummary || '(payload unavailable)';
-      detail.appendChild(label); detail.appendChild(payload); r.body.appendChild(detail);
+    // ONE PLACE PER STATUS: a delegated worker's ask is answered on that worker's row of the delegation card
+    if (p && (p.workerStreamId || p.workerRunId) && typeof Delegated !== 'undefined' && Delegated.hosts && Delegated.hosts(p)) {
+      Delegated.repaint();
+      // the same one bell entry the lead's own ask gets, naming the worker (re-renders never re-toast: announcedPrompt)
+      if (ws && !announcedPrompt(p.promptId, ws) && typeof StationUI !== 'undefined') StationUI.notify(askerName(p, ws) + ' wants to ' + actionPhrase(p), 'warn', 'needsApproval', { kind: 'needs', go: { ws: ws.id }, key: 'needs:' + ws.id, prompt: p.promptId });
+      return null;
     }
+    const r = row('agent'); r.d.classList.add('tool'); r.d.classList.add('consent'); r.d.dataset.liveAsk = '1';
+    r.d.dataset.consentPrompt = String((p && p.promptId) || '');   // NEEDS YOU › Review lands here (revealAsk)
+    r.body.appendChild(document.createTextNode('▣ ' + ((p && p.workerAgentId) ? askerName(p, ws) : name) + ' wants to ' + actionPhrase(p, true) + ' '));
     const btns = document.createElement('span'); btns.className = 'consent-btns';
-    let decided = false;
+    let decided = false, submitting = false, received = null, applyElsewhere = null;
     async function decide(decision, doneLabel, isDeny) {
-      if (decided) return; decided = true;
+      if (decided || submitting) return; submitting = true;
       for (const b of btns.querySelectorAll('button')) b.disabled = true;
-      const rid = (ws && typeof Channels !== 'undefined') ? Channels.runIdOf(ws.id) : null;
-      const answer = await Harness.consent(rid, p.promptId, decision);
-      const appliedDecision = (answer && answer.decision) || 'deny';
-      if (decision === 'full') {
-        const saved = !!(answer && answer.ok && answer.approvalMode === 'full');
-        const adopted = saved && typeof App !== 'undefined' && App.setApproval
-          ? App.setApproval((answer && answer.agentId) || p.agentId || (ws && ws.agentId), 'full')
-          : false;
-        if (!saved || !adopted) { doneLabel = '✕ full access was not saved'; isDeny = true; }
-      } else if (appliedDecision === 'deny' && decision !== 'deny') {
-        doneLabel = '✕ approval was not applied'; isDeny = true;
+      let res;
+      try { res = await answerConsent(p, ws, decision); }
+      catch (e) {
+        submitting = false;
+        // the station no longer holds this ask: answerConsent retired this card in neutral words (or this card does it here)
+        if (e && e.gone) {
+          if (!decided) { decided = true; btns.remove(); releaseCard(r.d); const tag = document.createElement('span'); tag.className = 'consent-result err'; tag.textContent = '■ no longer waiting on you'; r.body.appendChild(tag); syncStatus(); }
+          return;
+        }
+        if (received && applyElsewhere) { applyElsewhere(received); return; }
+        for (const b of btns.querySelectorAll('button')) b.disabled = false;
+        if (typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify('Could not answer: ' + ((e && e.message) || e), 'warn');
+        return;
       }
-      // surface the decision on the bus (schema: permission.response) so listeners — e.g. the first-run tutorial —
-      // can tell an approve from a deny and narrate the consent loop honestly. Additive; the run resumes via Harness.consent.
-      try { if (typeof U !== 'undefined' && U.bus) U.bus.emit('permission.response', { promptId: p.promptId, decision: appliedDecision }); } catch (_) {}
-      // NS conversational anchor: "Always" — and now "Full access" — on a path.trust card IS the project bless
-      // (a standing path grant + known-projects row land on the sidecar). Stamp the origin session's projectRoot
-      // with the SAME proposed root so the PROJECTS rail lists this session under its project — the identical
-      // anchor "Work here" stamps. Both standing grades, never "once" (it grants nothing standing, so there is
-      // no project row to attach to), and never overwrite an anchor the session already has.
-      if (p.tool === 'path.trust' && (appliedDecision === 'always' || appliedDecision === 'full') && ws && typeof Workstreams !== 'undefined' && Workstreams.setProjectRoot) {
-        try { if (p.argsSummary && !(Workstreams.get(ws.id) || {}).projectRoot) Workstreams.setProjectRoot(ws.id, p.argsSummary); } catch (_) {}
-      }
-      if (ws && typeof Channels !== 'undefined') Channels.clearPending(ws.id, Date.now());   // closes the paused span — approval wait never counts as run time
-      if (isActiveWs(ws)) renderPresence();   // drop the paused styling the instant the run resumes
-      btns.remove();
+      submitting = false; decided = true;
+      if (received && applyElsewhere) applyElsewhere(received);
+      if (decision === 'full' && !res.fullSaved) { doneLabel = '✕ full access was not saved'; isDeny = true; }
+      else if (decision !== 'full' && res.appliedDecision === 'deny' && decision !== 'deny') { doneLabel = '✕ approval was not applied'; isDeny = true; }
+      btns.remove(); keepFocus(r.d); releaseCard(r.d);
       const tag = document.createElement('span');
       tag.className = 'consent-result' + (isDeny ? ' err' : '');
       tag.textContent = doneLabel;
       r.body.appendChild(tag);
       syncStatus();
     }
-    const mk = (text, decision, cls, doneLabel, isDeny) => {
+    const labels = {};   // decision -> this card's own receipt: an answer from another surface settles in the card's words
+    const mk = (text, decision, cls, doneLabel, isDeny, title) => {
+      labels[decision] = doneLabel;
       const b = document.createElement('button');
       b.className = 'consent-btn' + (cls ? ' ' + cls : '');
       b.textContent = text;
+      if (title) b.title = title;
       b.onclick = () => decide(decision, doneLabel, isDeny);
       btns.appendChild(b); return b;
     };
     // ATTENDED BROWSER LOGIN cards get purpose-built buttons: "Always"/"Full access" make no sense for a
     // one-shot window open, and the done-wait card is a completion signal, not a permission grade.
     if (p.tool === 'browser.login') {
-      mk('Open login window', 'once', '', '✓ window opened', false);
+      mk('Open login window', 'once', 'primary', '✓ window opened', false);
       mk('Deny', 'deny', 'deny', '✕ denied', true);
     } else if (p.tool === 'browser.login.done') {
-      mk('Done — I\'ve logged in', 'once', '', '✓ done', false);
+      mk('Done — I\'ve logged in', 'once', 'primary', '✓ done', false);
       mk('Cancel', 'deny', 'deny', '✕ cancelled', true);
-    } else {
-      mk('Approve once', 'once', '', '✓ approved once', false);
-      mk('Always', 'always', '', '✓ always allowed', false);
-      mk('Full access', 'full', 'danger', '✓ full access', false);
+    } else if (p.tool === 'station.power' || p.tool === 'plugin.submit') {
+      // widening the station's leash and installing a plugin are answered fresh every time (freshConsent tools,
+      // permissions.js tier 1.5): the station grants any yes once, so no Always and no Full access
+      mk('Approve once', 'once', 'primary', '✓ approved once', false);
       mk('Deny', 'deny', 'deny', '✕ denied', true);
+    } else {
+      const agentName = (p && p.workerAgentId) ? askerName(p, ws) : name;
+      mk('Approve once', 'once', 'primary', '✓ approved once', false, 'Allow just this one');
+      mk('Always', 'always', '', '✓ always allowed', false, 'Allow this kind of action from now on, without asking');
+      mk('Full access', 'full', 'danger', '✓ full access', false, 'Give ' + agentName + ' full access: it stops asking before most actions, until you change it back');
+      mk('Deny', 'deny', 'deny', '✕ denied', true);
+      // a repeat ask's one line (what Always does), inside the keys' row so it leaves with them once the card is answered
+      const hintText = consentHintFor(p, ws);
+      if (hintText) { const hint = document.createElement('span'); hint.className = 'consent-hint'; hint.textContent = hintText; btns.appendChild(hint); }
     }
+    appendConsentDetails(r.body, p, 'plan');   // a station build's steps and drawing are read before deciding
     r.body.appendChild(btns);
+    appendConsentDetails(r.body, p, 'inspect');
+    // STARNET REMOTE: a paired phone can answer this same prompt. The sidecar then puts permission.response on
+    // this run's own stream (harness re-emits it on U.bus). Settle the card to what actually happened, so the
+    // desk never keeps live buttons on a question that was already answered elsewhere. The desk's own answer
+    // also emits permission.response, but by then `decided` is set and this listener just unsubscribes. An answer from
+    // another surface on this page (voice, a worker's row, NEEDS YOU) arrives the same way, its surface named in `via`
+    // by answerConsent.
+    if (typeof U !== 'undefined' && U.bus && U.bus.on && U.bus.off) {
+      const onElsewhere = applyElsewhere = (resp) => {
+        if (!resp || resp.promptId !== p.promptId) return;
+        if (submitting) { received = resp; return; }
+        U.bus.off('permission.response', onElsewhere);
+        if (decided) return;
+        decided = true;
+        const denied = resp.decision === 'deny';
+        if (ws && typeof Channels !== 'undefined') Channels.clearPending(ws.id, Date.now(), p.promptId);
+        if (isActiveWs(ws)) renderPresence();
+        btns.remove(); releaseCard(r.d);
+        const tag = document.createElement('span');
+        tag.className = 'consent-result' + (denied ? ' err' : '');
+        // the grade the station applied, in this card's own words: a card with no Always key (station.power,
+        // plugin.submit, the login window) grants this one call whatever grade another surface sent. An answer given
+        // on this page (voice, a worker's row, NEEDS YOU) names its own surface, not the phone
+        // stopped: a background worker stopped while its ask waited (the station says so) — it was never left unanswered
+        tag.textContent = resp.stopped ? '■ ' + askerName(p, ws) + ' stopped before an answer — nothing was approved' : resp.expired ? '✕ no answer in time — denied' : settledLabel(resp, labels);
+        r.body.appendChild(tag);
+        syncStatus();
+      };
+      U.bus.on('permission.response', onElsewhere);
+    }
+    if (ws && p && p.promptId) openConsentCards.set(String(p.promptId), { wsId: ws.id, runId: String(p.runId || ''), worker: !!(p.workerAgentId || p.workerRunId), background: p.background === true,
+      retire: (text) => {
+        if (decided) return;
+        decided = true;
+        try { if (applyElsewhere && typeof U !== 'undefined' && U.bus && U.bus.off) U.bus.off('permission.response', applyElsewhere); } catch (e) { applyElsewhere = null; }
+        btns.remove(); releaseCard(r.d);   // no longer a live ask: a held card lets the follow (and the next card) go
+        const tag = document.createElement('span'); tag.className = 'consent-result err'; tag.textContent = text;
+        r.body.appendChild(tag);
+      } });
     // a blocking, run-pausing prompt: make it keyboard-operable. Esc on the focused CONTAINER = Deny (the row,
     // not a button — so a reflexive Enter never lands on Approve and greenlights a write the user didn't read).
     r.d.tabIndex = -1;
     r.d.addEventListener('keydown', e => { if (e.key === 'Escape') { e.preventDefault(); decide('deny', '✕ denied', true); } });
     status('awaiting your approval…');
-    if (typeof StationUI !== 'undefined') StationUI.notify(name + ' needs approval to ' + actionPhrase(p), 'warn', 'needsApproval');   // P1-8 category: consent prompt
+    const asker = (p && p.workerAgentId) ? askerName(p, ws) : name;   // a delegated worker's ask names the worker
+    // ONE APPROVAL, ONE PLACE YOU ARE LOOKING (live walkthrough 2026-10-13: one file write was announced in 7 places). The
+    // Commander already has this card in front of them when its conversation is open and the page is visible: the bell
+    // still files it (NEEDS YOU, the SYSTEM badge) but quietly — no corner toast, no chime. BUILD MODE hides COMMS, so
+    // there (and in any other conversation, or a hidden window) it still toasts.
+    const seenHere = !!(ws && isActiveWs(ws) && typeof document !== 'undefined' && !document.hidden && log && log.getClientRects && log.getClientRects().length);
+    if (ws && !announcedPrompt(p.promptId, ws) && typeof StationUI !== 'undefined') StationUI.notify(asker + ' wants to ' + actionPhrase(p), 'warn', 'needsApproval', { kind: 'needs', go: { ws: ws.id }, key: 'needs:' + ws.id, prompt: p.promptId, quiet: seenHere });
+    else if (!ws && typeof StationUI !== 'undefined') StationUI.notify(asker + ' wants to ' + actionPhrase(p), 'warn', 'needsApproval');   // P1-8 category: consent prompt
     // FOCUS-STEAL GUARD (P0): a consent prompt must NEVER hijack focus from a Commander who is mid-typing or holds
     // a draft — a stolen focus + a reflexive Enter could approve a file write they never read. Only follow the
     // scroll when they were already at the bottom (honor stick), and only take focus (onto the row CONTAINER, so
     // Esc=deny works but Enter can't approve) when the composer is idle. Esc still denies either way: an idle
     // composer gets the row's Esc handler; a busy composer's own Esc handler stops the paused run (also a deny).
-    autoscroll();   // honors stick — never yanks a reader who scrolled up
+    const waitsItsTurn = revealCard(r.d) === 'queued';   // honors stick; a tall card shows from its top; one card held at a time
     const composerBusy = !!(input && (document.activeElement === input || (input.value && input.value.trim())));
-    if (!composerBusy) { try { r.d.focus({ preventScroll: true }); } catch (_) { try { r.d.focus(); } catch (_) {} } }
+    if (!composerBusy && !waitsItsTurn) { try { r.d.focus({ preventScroll: true }); } catch (_) { try { r.d.focus(); } catch (_) {} } }
   }
 
   // EL-11 FIX 1a: a consent prompt on a NON-displayed session used to be invisible — permissionRow (and its
@@ -2988,13 +4781,107 @@ const Chat = (() => {
   // session gains a pending consent, fire a clickable toast naming the AGENT + the action; clicking it opens THAT
   // session via the same restore path as a rail-row click (Chat.load re-renders the consent card from the Channels
   // snapshot). Also refresh the rail immediately so the row's NEEDS-YOU marker lands without waiting for the ticker.
+  /* ONE bell entry per prompt, settled wherever the prompt is answered. The desk card settled its own entry, but an answer
+     from the phone, Telegram or voice (permission.response on the bus) left NEEDS YOU "waiting" for good; and re-rendering a
+     pending card (reopening the session) toasted and re-filed the same prompt every time. */
+  const promptNeeds = new Map();   // promptId -> the bell key it was filed under
+  function announcedPrompt(promptId, ws) {
+    if (!promptId || !ws) return false;
+    const id = String(promptId);
+    if (promptNeeds.has(id)) return true;
+    promptNeeds.set(id, 'needs:' + ws.id);
+    if (promptNeeds.size > 200) promptNeeds.delete(promptNeeds.keys().next().value);
+    return false;
+  }
+  if (typeof U !== 'undefined' && U.bus && U.bus.on) U.bus.on('permission.response', (resp) => {
+    const key = resp && resp.promptId != null ? promptNeeds.get(String(resp.promptId)) : null;
+    if (!key) return; // an unknown response cannot claim another conversation's pending state
+    const wsId = key.slice('needs:'.length);
+    // Background/delegated asks may have no mounted card to clear their channel record.
+    // Remove only this confirmed response before choosing the sibling that still needs attention.
+    if (typeof Channels !== 'undefined' && Channels.clearPending) Channels.clearPending(wsId, Date.now(), resp.promptId);
+    settlePromptNotice(wsId, resp.promptId);
+  });
   function backgroundPermissionNotify(ev, ws) {
-    const who = (typeof App !== 'undefined' && App.agentName && App.agentName(ws.agentId || 'agent')) || ws.agentId || 'an agent';
-    if (typeof StationUI !== 'undefined' && StationUI.notify) {
-      StationUI.notify(who + ' needs approval to ' + actionPhrase(ev) + ' — click here to answer', 'warn', 'needsApproval',
-        { onClick: () => { try { if (typeof App !== 'undefined' && App.openWorkstream) App.openWorkstream(ws.id); } catch (_) {} } });
+    // the AGENT that asks — a delegated worker's ask names the worker, never the lead it rode in on
+    const who = (typeof App !== 'undefined' && App.agentName && App.agentName((ev && ev.workerAgentId) || ws.agentId || 'agent')) || ws.agentId || 'an agent';
+    if (!announcedPrompt(ev && ev.promptId, ws) && typeof StationUI !== 'undefined' && StationUI.notify) {
+      StationUI.notify(who + ' wants to ' + actionPhrase(ev) + sessionNote(ws), 'warn', 'needsApproval',
+        { kind: 'needs', go: { ws: ws.id }, key: 'needs:' + ws.id, prompt: ev && ev.promptId });
     }
     try { if (typeof App !== 'undefined' && App.refreshRail) App.refreshRail(); } catch (_) {}
+  }
+
+  /* A BACKGROUND WORKER'S ASK (2026-10-13). A worker handed off in the background (team.dispatch background:true) runs on
+     after the reply that started it ended, so its approvals can never ride that reply's stream: the sidecar announces them
+     on the station bus (background:true, stamped with the conversation that handed the work off and the run id to answer
+     with — index.js askHuman), and the reconnect snapshot lists them while they wait. File each one under that
+     conversation exactly like a live run's own ask (Channels → its worker row's Approve once / Deny + Inspect, NEEDS YOU,
+     the bell) and attest it is on screen (consentAck → the one bounded extension). The answer goes through answerConsent
+     → POST /api/consent with that runId; its permission.response (here or from any other surface) clears it. */
+  function backgroundAskHome(ev) {
+    if (typeof Workstreams === 'undefined' || !Workstreams.get) return null;
+    const direct = ev.streamId ? Workstreams.get(ev.streamId) : null;
+    if (direct) return direct;
+    const thread = ev.workerStreamId ? Workstreams.get(ev.workerStreamId) : null;
+    return (thread && thread.parentStreamId && Workstreams.get(thread.parentStreamId)) || null;
+  }
+  function fileBackgroundAsk(ev) {
+    if (!ev || ev.background !== true || !ev.promptId || !ev.runId || typeof Channels === 'undefined') return false;
+    const ws = backgroundAskHome(ev);
+    if (!ws) return false;   // no conversation on this page handed this work off: the surface that did answers it
+    if (Channels.pendingAllOf(ws.id).some(x => x && String(x.promptId) === String(ev.promptId))) return true;   // already filed
+    Channels.setPending(ws.id, Object.assign(pendingFrom(ev, ws), { runId: String(ev.runId), agentId: ev.leadAgentId || ev.agentId || ws.agentId, background: true }));
+    if (isActiveWs(ws)) { permissionRow(ev, ws); syncStatus(); } else backgroundPermissionNotify(ev, ws);
+    try { if (typeof App !== 'undefined' && App.refreshRail) App.refreshRail(); } catch (e) { console.warn('[comms] rail refresh after a background ask failed', e); }
+    try {
+      Promise.resolve(Harness.consentAck(ev.runId, ev.promptId)).then(v => { if (!(v && v.ok)) consentAckFailed(ws, ev, v); },
+        e => consentAckFailed(ws, ev, { ok: false, error: (e && e.message) || String(e) }));
+    } catch (e) { consentAckFailed(ws, ev, { ok: false, error: (e && e.message) || String(e) }); }
+    return true;
+  }
+  if (typeof U !== 'undefined' && U.bus && U.bus.on) U.bus.on('permission.prompt', fileBackgroundAsk);
+  /* The reconnect snapshot (world.js fetchSnapshot: every bridge (re)open, then every 30 s) is the station's own list of
+     open asks. A background ask this page never heard (it reloaded, or the bridge was down) is announced on the page bus
+     the way the bridge would have — so the worker's row, NEEDS YOU, the bell, CREW and the floor all learn it at once. A
+     filed background ask the station no longer lists, and that is older than the snapshot, was settled while this page
+     was not listening: it is withdrawn here (no decision is claimed for it — its fallback card says only that it no longer
+     waits). Each ask is announced ONCE per page life (`reannounced`, pruned when the station stops listing it): one this
+     page cannot file (its conversation is not here yet) is filed quietly by a later snapshot once it can be, never
+     re-announced to every listener every 30 s. An ask this page already settled is never revived by a snapshot taken
+     just before that answer landed. */
+  const reannounced = new Set();
+  function reconcileBackgroundAsks(snap) {
+    if (!snap || !Array.isArray(snap.prompts) || typeof Channels === 'undefined' || !Channels.allPending) return;
+    const open = new Set();
+    let filedLate = 0;
+    for (const row of snap.prompts) {
+      if (!row || row.background !== true || !row.promptId) continue;
+      const id = String(row.promptId);
+      open.add(id);
+      if (settledPromptNotices.has(id) || Channels.allPending().some(x => x.p && String(x.p.promptId) === id)) continue;
+      const ev = { promptId: row.promptId, agentId: row.leadAgentId || 'agent', tool: row.tool, scope: row.scope, argsSummary: row.argsSummary || '',
+        workerAgentId: row.workerAgentId || '', workerRunId: row.workerRunId || '', workerStreamId: row.workerStreamId || '', askedAt: row.askedAt || Date.now(),
+        background: true, runId: row.runId, streamId: row.streamId || '' };
+      if (reannounced.has(id)) { if (fileBackgroundAsk(ev)) filedLate++; continue; }
+      reannounced.add(id);
+      if (typeof U !== 'undefined' && U.bus && U.bus.emit) U.bus.emit('permission.prompt', ev); else fileBackgroundAsk(ev);
+    }
+    for (const id of reannounced) if (!open.has(id)) reannounced.delete(id);
+    const asOf = Number(snap.ts) || 0;
+    let withdrawn = 0;
+    for (const { wsId, p } of Channels.allPending()) {
+      if (!p || p.background !== true || open.has(String(p.promptId)) || !asOf || !(Number(p.askedAt) < asOf - 5000)) continue;
+      Channels.clearPending(wsId, Date.now(), p.promptId);
+      settlePromptNotice(wsId, p.promptId);
+      retireConsentCard(p.promptId, '■ no longer waiting on you');
+      withdrawn++;
+    }
+    if (!withdrawn && !filedLate) return;
+    if (typeof Delegated !== 'undefined' && Delegated.repaint) Delegated.repaint();
+    if (typeof NeedsYou !== 'undefined' && NeedsYou.render) NeedsYou.render();
+    try { if (typeof App !== 'undefined' && App.refreshRail) App.refreshRail(); } catch (e) { console.warn('[comms] rail refresh after a settled background ask failed', e); }
+    syncStatus();
   }
 
   // ── "RATE THE WORK" — the PRIMARY leveling beat. After a run that actually DID work, the Commander gives a
@@ -3099,10 +4986,11 @@ const Chat = (() => {
     // CORRECTION CAPTURE (consistency loop, slice 2): a short-of-the-mark verdict opens a window in which the
     // Commander's next message to this agent is treated as the CORRECTION of that run and handed to the held
     // skill review in their own words (POST /api/growth/ratings/correction). Praise opens nothing.
-    if (saved && saved.ok && !saved.duplicate && (verdict === 'ok' || verdict === 'miss')) lastShortVerdict = { runId: runId, agentId: agentId || 'agent', at: Date.now() };
+    if (saved && saved.ok && !saved.duplicate && (verdict === 'ok' || verdict === 'miss')) lastShortVerdict = { runId: runId, agentId: agentId || 'agent', streamId: ((runMeta(runId) || {}).streamId) || awayStreams.get(runId) || null, at: Date.now() };
     return saved;
   }
-  let lastShortVerdict = null;   // { runId, agentId, at } — the run whose next message is its correction
+  let lastShortVerdict = null;   // { runId, agentId, streamId, at } — the run whose next message (in ITS session) is its correction
+  const awayStreams = new Map();   // runId -> streamId for runs this page did not start (seedAwayWork)
   const CORRECTION_WINDOW_MS = 10 * 60 * 1000;
   function postCorrection(runId, text, final, source) {
     try {
@@ -3119,14 +5007,8 @@ const Chat = (() => {
     // meter, never XP, never a penalty — see xp.js scoreEvent/verdictQuality). Retired permanently after one
     // render via the house one-shot pattern (cf. navcoach.seen / modeldock.seen). Fail-open — a storage
     // block just shows the line again next time, never breaks the control.
-    let coached = false;
-    try { coached = localStorage.getItem(WORKRATE_COACH_KEY) === '1'; } catch (_) {}
-    if (!coached) {
-      const hint = document.createElement('span'); hint.className = 'work-rate-hint';
-      hint.textContent = 'rating trains your agent — the top mark earns XP and builds trust';
-      host.appendChild(hint);
-      try { localStorage.setItem(WORKRATE_COACH_KEY, '1'); } catch (_) {}
-    }
+    // (2026-10-02, Andrew: "we dont want it to be an eye sore") the explainer no longer prints as a line; it is the
+    // thumbs-up's tooltip on every render, so the card stays one summary line + one row of two thumbs.
     const lbl = document.createElement('span'); lbl.className = 'work-rate-label';
     // name the RUN's agent, not whoever the active chat happens to be bound to — the OUTBOX window
     // (and any multi-agent surface) rates crew runs while a different agent is on screen. The verdict
@@ -3136,10 +5018,15 @@ const Chat = (() => {
     const ratedMeta = runMeta(runId);
     const ratedWork = runWork.get(runId);
     const ratedTask = String((ratedMeta && ratedMeta.directive) || (ratedWork && ratedWork.title) || '').replace(/\s+/g, ' ').trim();
-    lbl.textContent = '◈ rate ' + ratee + '’s work — ';
-    const ref = document.createElement('div'); ref.className = 'work-rate-reference';
-    ref.textContent = (ratedTask ? ratedTask.slice(0, 240) + (ratedTask.length > 240 ? '…' : '') + ' · ' : '') + 'run ' + runId;
-    host.appendChild(ref);
+    lbl.textContent = 'rate ' + ratee + '’s work';
+    // one short line: what was asked + a short, stable run reference (the full task and run id are its tooltip).
+    // (org D1) no task text → no line: a bare 'run 3f9a2c1b' tells the reader nothing, so the id rides the label's tip.
+    if (ratedTask) {
+      const ref = document.createElement('div'); ref.className = 'work-rate-reference';
+      ref.textContent = ratedTask.slice(0, 90) + (ratedTask.length > 90 ? '…' : '') + ' · run ' + String(runId).slice(0, 8);
+      ref.title = ratedTask + ' · run ' + runId;
+      host.appendChild(ref);
+    } else lbl.title = 'run ' + runId;
     const btns = document.createElement('span'); btns.className = 'consent-btns';
     host.appendChild(lbl); host.appendChild(btns);
     let done = false;
@@ -3164,14 +5051,22 @@ const Chat = (() => {
       // Rejoin the same arbiter after the rating fades; do not bank work twice or rerun other offers.
       if (verdict === 'great') setTimeout(() => { recommendPass({ agentId, runId }, 'takeover'); }, 2200);
     }
-    function mk(label, cls, verdict, flash, isDeny) {
-      const b = document.createElement('button'); b.className = 'consent-btn' + (cls ? ' ' + cls : ''); b.textContent = label;
+    function mk(label, cls, verdict, flash, isDeny, icon, tip) {
+      const b = document.createElement('button'); b.className = 'consent-btn' + (cls ? ' ' + cls : '');
+      if (icon) { b.innerHTML = icon; b.setAttribute('aria-label', label); b.title = tip || label; }
+      else b.textContent = label;
       b.onclick = () => settle(verdict, flash, isDeny); btns.appendChild(b);
     }
-    // CRT glyphs, not color emoji: ▲ nailed it · ◆ close · ▼ missed (semantics preserved, phosphor-themed)
-    mk('▲ nailed it', 'primary', 'great', '★ +XP', false);
-    mk('◆ close', '', 'ok', 'noted', false);
-    mk('▼ missed', 'deny', 'miss', 'noted', true);
+    // THUMBS (2026-10-02, Andrew: "it should just be thumbs up or thumbs down but with the terminal ASCII style"):
+    // two pixel-grid thumbs drawn on a 16-cell grid (crisp edges, phosphor via currentColor). Up = the top mark
+    // (verdict 'great': size-weighted XP + trust), down = 'miss'. The middle 'ok' verdict is no longer offered here;
+    // the server and XpStore still accept it, so older ratings and other callers are unaffected.
+    const THUMB = '<svg class="thumb-px" viewBox="0 0 16 16" width="18" height="18" shape-rendering="crispEdges" aria-hidden="true" fill="currentColor">'
+      + '<rect x="7" y="1" width="2" height="5"/><rect x="6" y="4" width="1" height="2"/>'
+      + '<rect x="6" y="6" width="8" height="2"/><rect x="6" y="9" width="7" height="2"/><rect x="6" y="12" width="6" height="2"/>'
+      + '<rect x="2" y="6" width="3" height="8"/></svg>';
+    mk('nailed it', 'primary thumb thumb-up', 'great', '★ +XP', false, THUMB, 'nailed it — earns XP and builds trust');
+    mk('missed', 'deny thumb thumb-down', 'miss', 'noted', true, THUMB, 'missed — tell me what to fix next time');
   }
   // STANDALONE rate-the-work beat (when a run produced NO memory proposal) — its own gold-inset row in the ONE
   // post-run slot. Hero-only, mirroring the curiosity/suggestion beats.
@@ -3193,6 +5088,12 @@ const Chat = (() => {
     const beat = beatCards && beatCards.claim({ kind: 'rate', runId: runId, node: r.d });
     if (!beat) { if (r.d && r.d.parentNode) r.d.remove(); return false; }
     workRateControl(r.body, agentId, runId, () => { beat.decide(); beat.finish(); });
+    // INLINE (Andrew 10-03: "i dont like that its big and centered, shouldnt even pop up in such a big box make it
+    // smaller"): the standalone ask is one slim row under the run it rates — label + two small thumbs. It lands right
+    // under that run's footer, so the "task · run id" line moves into the row's hover tip instead of printing.
+    r.d.classList.add('rate-inline');
+    const ref = r.body.querySelector('.work-rate-reference');
+    if (ref && ref.title) r.body.setAttribute('data-tip', ref.title);
     autoscroll();
     return true;
   }
@@ -3287,6 +5188,9 @@ const Chat = (() => {
   // size derives from real recorded turns/spend (turns-1 ≈ tool rounds: each loop turn past the
   // first was a tool round; conservative, never farmable — the row is server-recorded).
   function seedAwayWork(rw) {
+    // an away run's SESSION (OUTBOX rows, routines, runs from before a reload): runMeta only knows this page's own runs,
+    // so a thumbs-down here must still know which session its correction belongs to (sweep 2026-10-02)
+    if (rw && rw.runId && rw.streamId) { awayStreams.set(rw.runId, String(rw.streamId)); if (awayStreams.size > 120) awayStreams.delete(awayStreams.keys().next().value); }
     if (!rw || !rw.runId || runWork.has(rw.runId)) return;
     runWork.set(rw.runId, { toolsOk: Math.max(0, (rw.turns | 0) - 1), delivered: 0, cost: Math.max(0, +rw.usd || 0), agentId: rw.agentId || 'agent' });
     if (runWork.size > 60) runWork.delete(runWork.keys().next().value);
@@ -3368,16 +5272,17 @@ const Chat = (() => {
     // the ONE door that always works, prop or no prop on the floor: open the OUTBOX window — every listed
     // run readable + rateable in one place (2026-07-16; a floor with no OUTBOX placed had no other path).
     if (typeof StationUI !== 'undefined' && StationUI.openTerm) {
-      const ob = document.createElement('button'); ob.className = 'consent-btn'; ob.textContent = '▸ open the OUTBOX';
+      const ob = document.createElement('button'); ob.className = 'consent-btn'; ob.textContent = '▸ open TO REVIEW';
       ob.onclick = () => StationUI.openTerm('outbox');
       foot.appendChild(ob);
     }
     const dis = document.createElement('button'); dis.className = 'consent-btn deny'; dis.textContent = 'dismiss';
     dis.onclick = () => vanish(r.d);
     foot.appendChild(dis);
-    // ADOPTION (Lane F): a dim line so dismissing doesn't read as LOSING the runs — they wait on the OUTBOX crate.
+    // ADOPTION (Lane F): a dim line so dismissing doesn't read as LOSING the runs — they wait in TO REVIEW. A plain aside on a
+    // line of its own (org pass 10-14, P12 polish): boxed as a .turnin-queue chip it read as one more key beside the real ones.
     if (typeof ReturnStore !== 'undefined' && ReturnStore.outboxLine) {
-      const keep = document.createElement('span'); keep.className = 'turnin-queue'; keep.textContent = ReturnStore.outboxLine();
+      const keep = document.createElement('span'); keep.className = 'turnin-evidence turnin-keep'; keep.textContent = ReturnStore.outboxLine();
       foot.appendChild(keep);
     }
     r.body.appendChild(foot);
@@ -3405,7 +5310,7 @@ const Chat = (() => {
     if (workRatedRuns.has(rw.runId)) { try { onRated(rw.runId); } catch (_) {} return; }   // already judged — just clear the crate
     const r = row('agent'); r.d.classList.add('tool'); r.d.classList.add('turnin'); r.d.classList.add('work-rate');
     const title = document.createElement('span'); title.className = 'turnin-title';
-    title.textContent = '◈ OUTBOX crate — this run finished while you were away:';
+    title.textContent = '◈ finished while you were away:';
     r.body.appendChild(title);
     const item = document.createElement('div'); item.className = 'turnin-item';
     const text = document.createElement('span'); text.className = 'turnin-text'; text.textContent = awayRowLabel(rw);
@@ -3435,28 +5340,59 @@ const Chat = (() => {
      opts.fed === false (world feedState, server-proven) adds the CHANNELS door, so the NO-FEED nag's promised
      click-through survives this card owning the intake click. */
   let sampleCardEl = null;
+  /* the glance of a reply quoted on a card: plain words, the library's own markdown → one line (Deliverables.plainLine) — walk
+     10-14: the delivered card quoted '“## Findings - **Item one:** … `code`”' while every other place reads the reply rendered */
+  function plainQuote(raw, max) {
+    const t = (typeof Deliverables !== 'undefined' && Deliverables.plainLine) ? Deliverables.plainLine(raw) : String(raw == null ? '' : raw).replace(/\s+/g, ' ').trim();
+    return t ? '“' + (t.length > max ? t.slice(0, max).trimEnd() + '…' : t) + '”' : '';
+  }
   function sampleCard(opts) {
     opts = opts || {};
     if (!log) return;
-    if (sampleCardEl && sampleCardEl.isConnected) { autoscroll(); return; }   // one live card at a time
+    // the Commander asked for this card by clicking the INBOX: a quick tour covering COMMS steps aside so it is not posted unseen
+    try { if (typeof Dialogue !== 'undefined' && Dialogue.yieldTour && Dialogue.isOpen && Dialogue.isOpen()) Dialogue.yieldTour(); } catch (_) {}
+    /* …any OTHER open conversation is the Commander's to answer — never answered for them (its "not now" is a real decline
+       the learning loop records). The card still posts below it, so SAY where it went: a silent click read as a dead INBOX
+       (2026-09-28 retest, the goal-path question covering COMMS). */
+    const covered = () => { try { return typeof Dialogue !== 'undefined' && Dialogue.isOpen && Dialogue.isOpen(); } catch (_) { return false; } };
+    const sayCovered = () => { if (covered() && typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify('The INBOX card is in COMMS, under the question your agent is asking. Answer it, and the card is right there.', 'info', undefined, { transient: true }); };
+    if (sampleCardEl && sampleCardEl.isConnected) { autoscroll(); sayCovered(); return; }   // one live card at a time
     const r = row('agent'); r.d.classList.add('tool'); r.d.classList.add('turnin'); r.d.classList.add('sample-card');
     sampleCardEl = r.d;
     const title = document.createElement('span'); title.className = 'turnin-title';
-    title.textContent = '◈ INBOX — prove the line: run one small, real job through it, end to end.';
+    title.textContent = '◈ INBOX — prove the line: send one small, real job through it, end to end.';   // (org D6) 'send', like its ▸ SEND A REAL JOB key
     r.body.appendChild(title);
     const item = document.createElement('div'); item.className = 'turnin-item';
     const text = document.createElement('span'); text.className = 'turnin-text';
-    text.textContent = 'a labeled test crate (“SAMPLE JOB…”) rides the real belts — the router picks the dock, the run spends real budget, and the reply lands on the OUTBOX.';
+    const job = (typeof Build !== 'undefined' && Build.testJobForProp) ? Build.testJobForProp(opts.propId) : null;
+    text.textContent = (job && job.text
+      ? 'your test job (“' + (job.text.length > 70 ? job.text.slice(0, 70) + '…' : job.text) + '”) rides the real belts'
+      : 'a labeled test crate (“SAMPLE JOB…”) rides the real belts — write your own test job in the INBOX’s Workflow panel —')
+      + ' — the router picks the dock, the run spends real budget, and the reply lands in this line’s OUTBOX and is also filed in DELIVERABLES.';
     const btns = document.createElement('span'); btns.className = 'consent-btns';
     item.appendChild(text); item.appendChild(btns);
     r.body.appendChild(item);
     const note = document.createElement('div');   // refusal / result area (below the action row)
     r.body.appendChild(note);
-    const run = document.createElement('button'); run.className = 'consent-btn primary'; run.textContent = '▸ RUN A SAMPLE JOB';
+    const run = document.createElement('button'); run.className = 'consent-btn primary'; run.textContent = '▸ SEND A REAL JOB';
     const later = document.createElement('button'); later.className = 'consent-btn deny'; later.textContent = 'not now';
     later.onclick = () => vanish(r.d);
     btns.appendChild(run); btns.appendChild(later);
-    if (opts.fed === false && typeof StationUI !== 'undefined' && StationUI.openTerm) {
+    if (opts.schedOff) {
+      // a schedule IS saved; the station's scheduling is off — the fix is one click, right here (R3)
+      const arm = document.createElement('button'); arm.className = 'consent-btn'; arm.textContent = '▶ TURN SCHEDULING ON';
+      arm.onclick = () => {
+        arm.disabled = true; arm.textContent = '… turning on';
+        Harness.api.post('/api/cron/arm', { enabled: true }).then(res => {
+          const ok = !!(res && res.ok && res.j && res.j.ok);
+          arm.textContent = ok ? '✓ scheduling is on' : 'could not turn scheduling on';
+          if (!ok) arm.disabled = false;
+          if (ok && typeof World !== 'undefined' && World.pollFeed) { try { World.pollFeed(); } catch (_) {} }
+        }).catch(() => { arm.disabled = false; arm.textContent = '▶ TURN SCHEDULING ON'; });
+      };
+      btns.appendChild(arm);
+    }
+    if (opts.fed === false && !opts.schedOff && typeof StationUI !== 'undefined' && StationUI.openTerm) {
       // the floor PROVABLY has no feed wired (server-answered, never guessed) — keep the promised door here
       const feed = document.createElement('button'); feed.className = 'consent-btn'; feed.textContent = '▸ WIRE A REAL FEED — CHANNELS';
       feed.onclick = () => StationUI.openTerm('messaging');
@@ -3466,14 +5402,14 @@ const Chat = (() => {
       const err = document.createElement('span'); err.className = 'consent-result err';
       err.textContent = msg;
       note.textContent = ''; note.appendChild(err);
-      run.disabled = false; later.disabled = false; run.textContent = '▸ RUN A SAMPLE JOB';
+      run.disabled = false; later.disabled = false; run.textContent = '▸ SEND A REAL JOB';
       autoscroll();
     };
     run.onclick = () => {
       run.disabled = true; later.disabled = true;
-      run.textContent = '⌛ the sample is riding the line…';   // honest: the POST is genuinely open until the line delivers
+      run.textContent = '⌛ the job is riding the line…';   // honest: the POST is genuinely open until the line delivers
       note.textContent = '';
-      Harness.api.post('/api/routing/sample', {}).then(res => {
+      Harness.api.post('/api/routing/sample', job ? Object.assign({}, job.text ? { text: job.text } : {}, job.line ? { line: job.line } : {}) : {}).then(res => {
         if (!res.ok) return fail(String((res.j && res.j.error) || ('the station refused (http ' + res.status + ')')));   // the server's reason, VERBATIM
         const j = res.j || {};
         btns.remove();
@@ -3484,20 +5420,27 @@ const Chat = (() => {
         const clean = !!(j.delivered && j.delivered.reason === 'done');
         let folded = false;
         if (clean) { try { if (typeof ReturnStore !== 'undefined' && ReturnStore.foldRow) folded = ReturnStore.foldRow(j.delivered); } catch (_) {} }
-        const who = (j.delivered && j.delivered.agentId) || j.agentId || 'agent';
+        const whoId = (j.delivered && j.delivered.agentId) || j.agentId || 'agent';
+        // the agent's NAME, not its internal id (the seeded hero's id is literally "agent")
+        const whoRec = (typeof App !== 'undefined' && App.agents) ? (App.agents() || []).find(a => a && a.id === whoId) : null;
+        const who = String((whoRec && whoRec.name) || whoId).toUpperCase();
         const cost = (+j.totalUsd > 0 && typeof U !== 'undefined' && U.usd) ? (' · ' + U.usd(+j.totalUsd)) : '';
         text.textContent = clean
-          ? ('✔ sample delivered — ' + who + ' shipped it' + cost + '.' + (folded ? ' the crate is on the OUTBOX.' : ''))
-          : ('⚠ the sample rode the line, but the run did not finish clean — the reply below says why.');
-        const reply = (j.replies && j.replies.length) ? String(j.replies[j.replies.length - 1]).replace(/\s+/g, ' ').trim() : '';
+          ? ('✔ job delivered — ' + who + ' finished the last step' + cost + '.' + (folded ? ' the result waits in TO REVIEW.' : ''))
+          : ('⚠ the job rode the line, but the run did not finish clean — the reply below says why.');
+        // a long answer reaches the line's channel in chunks: a clean job is quoted from its OPENING words (where TO REVIEW's glance
+        // starts), never whichever chunk came last ('“All done.”' for a 5k answer, review 10-14); a job that did not finish clean
+        // is quoted by its last word — the reason the text above promises
+        const said = (j.replies && j.replies.length) ? (clean ? j.replies.join('\n') : j.replies[j.replies.length - 1]) : '';
+        const reply = said ? plainQuote(said, 220) : '';
         if (reply) {
           const out = document.createElement('div'); out.className = 'turnin-text';
-          out.textContent = '“' + (reply.length > 220 ? reply.slice(0, 220).trimEnd() + '…' : reply) + '”';
+          out.textContent = reply;
           note.appendChild(out);
         }
         const acts = document.createElement('div'); acts.className = 'turnin-rate';
         if (folded && typeof StationUI !== 'undefined' && StationUI.openTerm) {
-          const ob = document.createElement('button'); ob.className = 'consent-btn'; ob.textContent = '▸ open the OUTBOX — read it all';
+          const ob = document.createElement('button'); ob.className = 'consent-btn'; ob.textContent = '▸ open TO REVIEW';
           ob.onclick = () => StationUI.openTerm('outbox');
           acts.appendChild(ob);
         }
@@ -3509,6 +5452,7 @@ const Chat = (() => {
       }).catch(() => fail('the station didn’t answer — is the sidecar running?'));
     };
     autoscroll();
+    sayCovered();
   }
 
   /* W3 — THE DELIVERY CARD (reshaped 2026-07-15). WorkshopStore adopts one SESSION per idle-work
@@ -3561,6 +5505,11 @@ const Chat = (() => {
       ? ((htmlFiles.find(f => /(^|\/)index\.html?$/i.test(f.path)) || htmlFiles[0]).path)
       : '';
     const openRunTab = (relPath) => {
+      // a web page runs in the station's BROWSER window (same sandboxed /workshop-run/ bytes, OPEN OUTSIDE there)
+      if (typeof OutputBrowser !== 'undefined' && OutputBrowser.isHtml && OutputBrowser.isHtml(relPath)) {
+        OutputBrowser.open({ agentId, runId: m.runId, path: relPath, source: 'workshop' });
+        return;
+      }
       const url = opts.runUrl ? opts.runUrl(relPath) : '';
       const warn = (msg) => { if (typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify(msg, 'warn'); };
       if (!url) { warn('could not open that — the station may be unreachable'); return; }
@@ -4122,7 +6071,11 @@ const Chat = (() => {
       const text = document.createElement('span'); text.className = 'turnin-text';
       text.textContent = prop.replaceId ? 'Update remembered preference: “' + prop.previousBody + '” → “' + prop.content + '”' : prop.content;
       const btns = document.createElement('span'); btns.className = 'consent-btns';
-      item.appendChild(kind); item.appendChild(text); item.appendChild(btns);
+      item.appendChild(kind); item.appendChild(text);
+      // releases#7: a proposal says when the run that raised it FAILED (the sidecar carries the run's outcome). The deck's own
+      // evidence line (a full grid row under the belief), never a third pill in the kind/text grid: that crushes the text column
+      if (prop.outcome === 'failed') { const f = document.createElement('div'); f.className = 'turnin-evidence'; f.textContent = '↳ ⚠ from a failed run'; item.appendChild(f); }
+      item.appendChild(btns);
       slot.appendChild(item);
 
       let decided = false;
@@ -4189,15 +6142,15 @@ const Chat = (() => {
     });
     U.bus.on('memory.write', p => {
       const runId = p && p.runId; const agentId = (p && p.agentId) || 'agent';
-      // dedup vs BOTH the deck path (proposalRunsSeen, set by memory.proposed) and this receipt path. Deliberately
+      // the deck path owns a run once memory.proposed claimed it (it renders receipts + deck together). Deliberately
       // NOT added to proposalRunsSeen: a passive receipt is not a review DECK, so it must not suppress the run's
       // curiosity/suggestion nudge (the wireCuriosity guard keys on proposalRunsSeen = "a deck owns the moment").
-      if (!runId || (beatCards && beatCards.hasSeen('memory', runId)) || receiptRunsSeen.has(runId)) return;
-      receiptRunsSeen.add(runId);
-      if (receiptRunsSeen.size > 200) receiptRunsSeen.delete(receiptRunsSeen.values().next().value);
-      // NO slot reservation — receipts are passive log lines. A tiny debounce lets the per-record memory.write
-      // events + the server-side batch stash settle before the single fetch (mirrors the proposed path's 350ms).
-      setTimeout(() => routeProposalBatch(runId, agentId, false), 350);
+      if (!runId || (beatCards && beatCards.hasSeen('memory', runId)) || receiptFetching.has(runId)) return;
+      receiptFetching.add(runId);
+      // NO slot reservation — receipts are passive log lines. A tiny debounce lets a burst of memory.write events
+      // + the server-side batch settle into ONE fetch; a save after that fetch schedules the next one, and only
+      // the saves not yet shown for the run render (unshownReceipts) — a later save is never swallowed.
+      setTimeout(() => { receiptFetching.delete(runId); routeProposalBatch(runId, agentId, false); }, 350);
     });
   }
 
@@ -4212,7 +6165,7 @@ const Chat = (() => {
     const lifecycle = beatCards, lifecycleGeneration = lifecycle && lifecycle.generation();
     const items = await Harness.memoryProposals(runId, agentId);
     if (!lifecycle || beatCards !== lifecycle || lifecycle.generation() !== lifecycleGeneration) return;
-    const saved = items.filter(p => p && p.saved);
+    const saved = unshownReceipts(runId, items.filter(p => p && p.saved));   // only this run's saves not shown yet
     const pending = items.filter(p => p && !p.saved);
     // route to the ORIGIN stream (many streams share agentId 'agent', so agentId-gating can drop the card into
     // the wrong COMMS after a mid-window switch).
@@ -4253,13 +6206,29 @@ const Chat = (() => {
     const head = row('agent'); head.d.classList.add('tool'); head.d.classList.add('turnin'); head.d.classList.add('receipts');
     // ONE header owns the "remembered" claim; each line below is just the memory itself (repeating
     // "◈ remembered:" per line + a bordered box per line is what made the post-run feed read as stacked popups).
-    const cap = document.createElement('div'); cap.className = 'receipt-head';
-    cap.textContent = '◈ remembered · ' + batch.proposals.length;
+    // (2026-10-02, Andrew: "remembered should just show up collapsed") — a toggle header; the list opens on click.
+    const cap = document.createElement('button'); cap.type = 'button'; cap.className = 'receipt-head';
+    cap.setAttribute('aria-expanded', 'false');
+    // the count is what is STILL remembered: a forgotten line leaves it (QA 2026-10-02 — "remembered · 3" stood after a forget)
+    let forgotten = 0;
+    const capText = () => { const kept = batch.proposals.length - forgotten; cap.textContent = 'remembered · ' + kept + (forgotten ? ' (' + forgotten + ' forgotten)' : ''); };
+    capText();
+    const list = document.createElement('div'); list.className = 'receipt-items'; list.hidden = true;
+    cap.onclick = () => { const open = list.hidden; list.hidden = !open; cap.setAttribute('aria-expanded', String(open)); head.d.classList.toggle('open', open); };
     head.body.appendChild(cap);
+    head.body.appendChild(list);
     for (const prop of batch.proposals) {
       const item = document.createElement('div'); item.className = 'receipt-item';
       const kind = document.createElement('span'); kind.className = 'turnin-kind'; kind.textContent = KIND_TAG[prop.kind] || 'NOTE';
       const text = document.createElement('span'); text.className = 'receipt-text'; text.textContent = prop.content;
+      // an UPDATE replaced an existing memory's text (its old text is archived): say so, and offer no ✕ — forgetting
+      // would delete the whole memory, not undo the update (Memory Core edits it)
+      // a SUPERSESSION names what it retired (memory-truth-1027): the older belief left active recall, so the receipt says which
+      if (prop.revised) {
+        const was = (Array.isArray(prop.superseded) ? prop.superseded : []).map(s => '“' + String((s && s.previous) || '').replace(/\s+/g, ' ').slice(0, 120) + '”').filter(t => t.length > 2);
+        text.textContent = 'updated: ' + prop.content + (was.length ? ' (replaced ' + was.join(', ') + ')' : '');
+        item.appendChild(kind); item.appendChild(text); list.appendChild(item); continue;
+      }
       const veto = document.createElement('button'); veto.className = 'receipt-veto'; veto.type = 'button';
       veto.textContent = '✕'; veto.title = 'forget this — undo the save';
       veto.setAttribute('aria-label', 'forget this memory');
@@ -4271,13 +6240,14 @@ const Chat = (() => {
           veto.remove();
           item.classList.add('vetoed');
           text.textContent = 'forgotten: ' + prop.content;   // muted state; stays denylisted (Memory Core Restore is the undo)
+          forgotten += 1; capText();
         } else {
           busy = false; veto.disabled = false;
           if (typeof StationUI !== 'undefined') StationUI.notify('could not forget that ' + (prop.kind === 'skill' ? 'skill' : 'memory') + ' - try again', 'warn');
         }
       };
       item.appendChild(kind); item.appendChild(text); item.appendChild(veto);
-      head.body.appendChild(item);
+      list.appendChild(item);
     }
     autoscroll();
   }
@@ -4287,12 +6257,13 @@ const Chat = (() => {
   // context, about a real decision, immediately acted on; + the R4 receipt proves it stuck) AND continues
   // the conversation as the Commander's next message so the task proceeds with it. "you decide" banks
   // nothing and hands the choice back. One fork per reply by construction (parse reads the first marker).
-  function offerFork(fk) {
+  function offerFork(fk, runId) {
     clearNudge();   // same law as offerTaskQuestion: the fork claims the moment; a live nudge leaves WITH its chips
     const items = fk.options.map(o => ({ label: o, value: o }));
     items.push({ label: 'you decide', value: '', skip: true });
     const q = row('agent'); q.d.classList.add('nudge');
     q.body.textContent = '⌖ ' + fk.question;
+    taskQuestionDoor(q.body, runId);   // the fork's chips replace this run's connect chip in the one slot — the card carries the door
     autoscroll();
     choices(items, item => {
       vanish(q.d);
@@ -4325,6 +6296,7 @@ const Chat = (() => {
     return !!(pendingTaskQuestion && activeWs && pendingTaskQuestion.streamId === activeWs.id);
   }
   function offerTaskQuestion(tq) {
+    noteAskLanding();   // …and an offer panel over COMMS steps aside, so the question's answer chips are never under it
     clearNudge();   // the question CLAIMS the moment: a live gentle nudge leaves whole (prompt + chips) — its chip
                     // row would be wiped by choices() below anyway, and a stuck activeNudge would mute beats forever
     pendingTaskQuestion = Object.assign({}, tq, { streamId: activeWs && activeWs.id });
@@ -4336,6 +6308,7 @@ const Chat = (() => {
         // send() routes this whole answer back into the same durable brief.
         send(text);vanish(r.d);return true;
       });
+      taskQuestionDoor(r.body, tq.runId);
       autoscroll();return;
     }
     // TWO KINDS of suggestion, and they must never be confused. GROUNDED comes from the Commander's own
@@ -4386,6 +6359,7 @@ const Chat = (() => {
       ? 'these aren\'t exclusive — tap all that apply, then confirm; or type your own answer'
       : 'or ignore these and type your own answer — more than one is fine';
     q.body.appendChild(hint);
+    taskQuestionDoor(q.body, tq.runId);
     autoscroll();
     choices(items, item => {
       vanish(q.d);
@@ -4702,7 +6676,7 @@ const Chat = (() => {
     text.textContent = String(spec.proposal == null ? '' : spec.proposal);
     const btns = document.createElement('span'); btns.className = 'consent-btns';
     item.appendChild(text);
-    // the note is CONSEQUENCE, not evidence ("raises the dial to FREE") — a dim aside between the
+    // the note is CONSEQUENCE, not evidence ("raises ON ITS OWN to FREE") — a dim aside between the
     // proposal and the buttons, so the card still ENDS on the two taps.
     const note = String(spec.note == null ? '' : spec.note).trim();
     if (note) { const n = document.createElement('div'); n.className = 'turnin-evidence'; n.textContent = '↳ ' + note; item.appendChild(n); }
@@ -4839,6 +6813,34 @@ const Chat = (() => {
       if (beatCards) beatCards.scheduleExpire('study', 900);
       setTimeout(flushStudyPending, 900);
     });
+    // USER-STUDY LOOP — WHAT THE STATION LEARNED WHILE YOU WERE AWAY. Study also runs after cron, channel and
+    // night-shift runs, but this lane only ever asked about the run it had just watched end, so those batches
+    // were never offered and aged out of the stash. On open and on return, queue every undecided batch through
+    // the SAME consent card (FIFO, deduped by run, one card per moment, the session cap still binds): nothing
+    // reaches the dossier without the Commander's Keep.
+    setTimeout(lookForAwayStudy, AWAY_STUDY_FIRST_LOOK_MS);
+    try {
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState !== 'visible') return;
+        lookForAwayStudy();
+      });
+    } catch (_) {}
+  }
+  const AWAY_STUDY_FIRST_LOOK_MS = 8000;     // after boot settles (the return digest takes the first beat)
+  const AWAY_STUDY_LOOK_GAP_MS = 10 * 60000; // a tab flicker is not a return — at most one look per 10 minutes
+  let awayStudyLookAt = 0;
+  async function lookForAwayStudy() {
+    const t = Date.now();
+    if (awayStudyLookAt && t - awayStudyLookAt < AWAY_STUDY_LOOK_GAP_MS) return;
+    awayStudyLookAt = t;
+    if (typeof Harness === 'undefined' || !Harness.studyPending || !beatCards) return;
+    const batches = await Harness.studyPending();
+    let queued = 0;
+    for (const b of batches) {
+      if (!b || !b.runId || beatCards.hasSeen('study', b.runId)) continue;
+      queueStudy(b.runId, b.agentId || 'agent'); queued++;
+    }
+    if (queued) flushStudyPending();
   }
 
   /* GROWTH Tier 2 — THE GOAL-ARC CONFIRM BEAT (understanding → direction). When a goals-dim belief exists with no
@@ -4850,10 +6852,56 @@ const Chat = (() => {
      the paid decomposition call happens only after the arc has actually won the moment. Confirm persists the tree (GoalStore.confirm); Not-now re-offers only when the belief
      changes (GoalStore.declineDecomposition). One confirm per task end, never stacked (the shared arbiter). */
   function arcBlocked() {
+    if (askWaiting()) return true;   // the panel would stand over that ask's keys (soak 2026-10-15)
     // the SAME stand-down set the study beat honors (a confirm panel must never render mid-awakening/interview/
     // tutorial-panel or while the next run streams). Reuses studyBlocked for one home for the guard set.
     if (typeof studyBlocked === 'function') return studyBlocked();
     return isBusy() || interview;
+  }
+  // does an ask wait on the Commander — an approval / question card live in COMMS, a run that ended on a question, or any ask
+  // the station holds open (a background worker's approval outlives the run that handed the work off)?
+  function askWaiting() {
+    if (taskQuestionLive()) return true;
+    if (log && log.querySelector && log.querySelector('[data-live-ask]')) return true;
+    return !!(typeof Channels !== 'undefined' && Channels.allPending && Channels.allPending().length);
+  }
+  /* AN ASK OWNS COMMS OVER AN OFFER PANEL (soak 2026-10-15). The goal-path panel opened over COMMS at a run end and stayed: the
+     Commander's next message went out from the box it covered, the run asked for a team.dispatch approval, and the card landed
+     UNDER the panel — 19 approve clicks hit the panel's line. An offer panel (Dialogue.open({ offer })) now steps aside,
+     unanswered, the moment an approval or question reaches the Commander — asked-for or not, since a paused run is waiting on
+     them — and when they send a turn of their own (its reply would stream under it). Never a decline: it is offered again. */
+  // the arbiter (Dialogue.preempt / OWNER_RULES) decides who yields: an offer always does, the quick tour yields a session pick,
+  // the awakening never — COMMS never decides that per call site
+  function stepOfferAside(why) {
+    if (typeof Dialogue === 'undefined') return false;
+    if (Dialogue.preempt) return !!Dialogue.preempt(why);
+    return !!(Dialogue.stepAside && Dialogue.stepAside(why));
+  }
+  function noteAskLanding() { return stepOfferAside('ask'); }
+  /* A TASK THE COMMANDER TYPED COMPLETES A PENDING FIRST-TASK HAND-OFF (gh#158), on the composer paths that never reach send()'s
+     own check: a group conversation (GroupChat.sendText) and the busy type-ahead queue. Same classifier as send() (the agent's
+     last reply as context), and PitchStore.noteCommsTask keeps the first task pending on a station that cannot run it. */
+  function typedTaskCompletesHandoff(t, ws) {
+    if (!t || typeof PitchStore === 'undefined' || !PitchStore.noteCommsTask || !PitchStore.handoffPending || !PitchStore.handoffPending()) return false;
+    const h = (ws && Array.isArray(ws.history)) ? ws.history : [];
+    let prior = '';
+    for (let i = h.length - 1; i >= 0; i--) { const m = h[i]; if (m && m.role === 'assistant') { prior = typeof m.content === 'string' ? m.content : ''; break; } if (m && m.role === 'user') break; }
+    if (!(typeof Classify !== 'undefined' && Classify.isTaskDirective && Classify.isTaskDirective(t, { priorAgentTurn: prior }))) return false;
+    try { return !!PitchStore.noteCommsTask(t); } catch (_) { return false; }
+  }
+  // ANY approval or question raised for the Commander (a run's own, a delegated worker's, a group's, a background one) steps an
+  // offer panel aside before its card draws: "defer while an ask waits" (askWaiting keeps it from re-opening meanwhile)
+  if (typeof U !== 'undefined' && U.bus && U.bus.on) U.bus.on('permission.prompt', noteAskLanding);
+  /* A DELIVERY LANDING OWNS COMMS OVER THE ARC (rc review 2026-10-14). deliveryLanding() stands the arc down at offer time, but
+     the offer then waits seconds on the decomposition call, and the panel stays up until it is answered: a worker's hand-back
+     (deliverTurns) or a saved file that lands in that window was hidden behind it. Every landing bumps deliveryLandSeq; an
+     offer in flight stands down when it moved, and an open panel steps aside — unanswered, never a decline, so the arc is
+     offered again at a later run end. A panel the Commander opened themselves (PLAN A PATH) stays until they answer it. */
+  let deliveryLandSeq = 0, arcYield = null;
+  const STEPPED_ASIDE = { steppedAside: true }, NOT_NOW = { notNow: true };
+  function noteDeliveryLanding() {
+    deliveryLandSeq++;
+    if (arcYield) arcYield();
   }
   async function offerArc(runId) {
     let opened = false;
@@ -4862,6 +6910,7 @@ const Chat = (() => {
     if (slotCanArc() !== 'free' || arcBlocked()) return;   // the LOWEST priority: a taken/blocked moment just drops (re-offers next run end)
     if (GoalStore.isFiring && GoalStore.isFiring()) return;
     const lifecycle = beatCards, lifecycleGeneration = lifecycle && lifecycle.generation();
+    const askedFor = /^manual:/.test(String(runId || '')), landSeq = deliveryLandSeq;
     GoalStore.setFiring && GoalStore.setFiring(true);
     try {
       const res = await GoalStore.proposeDecomposition();   // the aux model call (reason-only) + parse
@@ -4869,6 +6918,7 @@ const Chat = (() => {
       if (!res || !res.belief || !Array.isArray(res.texts) || res.texts.length < 3) return;   // no usable path — stay un-offered so a later belief change retries
       // re-check the moment after the async model round-trip — memory/study may have claimed it meanwhile.
       if (slotCanArc() !== 'free' || arcBlocked()) return;
+      if (!askedFor && deliveryLandSeq !== landSeq) return;   // a delivery landed during the call: it owns COMMS now
       clearNudge();                 // claim the one post-run beat, retiring any gentle nudge
       const arcBeat = beatCards && beatCards.claim({
         kind: 'arc', runId: runId,
@@ -4877,19 +6927,30 @@ const Chat = (() => {
       });
       if (!arcBeat) return;
       let path = res.texts.slice();
+      /* the panel's ways out besides its own keys — `left` resolves the wait it is in: it STEPS ASIDE, unanswered, for an ask
+         reaching the Commander or their own turn (Dialogue.stepAside, see noteAskLanding) and — an unasked panel only — for a
+         delivery landing (noteDeliveryLanding); Esc answers it NOT NOW, exactly like its key. It is an offer, so it ends above
+         the message box (Dialogue armOffer). */
+      let leave = null;
+      const left = new Promise(r => { leave = r; });
+      const unlessLeft = p => Promise.race([p, left]);
+      if (!askedFor) arcYield = () => leave(STEPPED_ASIDE);
       try {
-        Dialogue.open({ name: (name || 'AGENT') });
+        Dialogue.open({ name: (name || 'AGENT'), offer: { notNow: () => leave(NOT_NOW), stepAside: () => leave(STEPPED_ASIDE) } });
         opened = true;
-        await Dialogue.say('i think i see the path to that goal — here’s how i’d break it down. does this look right?');
+        const heard = await unlessLeft(Dialogue.say('i think i see the path to that goal — here’s how i’d break it down. does this look right?'));
+        if (heard === STEPPED_ASIDE) return opened;
         const linesOf = ts => ts.map((t, i) => (i + 1) + '. ' + t).join('\n');
         // Confirm / Not-now + an ✎ EDIT custom path (allowCustom): typing a revised path (steps separated by a
         // newline OR a semicolon) replaces it, then re-applies the pure floor/cap on Confirm. The custom text is
         // user-typed (never model markup); Dialogue renders it via textContent only.
-        const choice = await Dialogue.node({
+        let choice = heard === NOT_NOW ? NOT_NOW : await unlessLeft(Dialogue.node({
           lines: linesOf(path),
           options: [ { label: 'confirm the path', value: 'confirm' }, { label: 'not now', value: 'other', skip: true } ],
-          allowCustom: true, customLabel: '✎ edit the milestones', customPlaceholder: 'your milestones, separated by ; …'
-        });
+          allowCustom: true, customLabel: 'edit the milestones', customPlaceholder: 'your milestones, separated by ; …'   // Dialogue draws the ✎ itself (it read "✎✎")
+        }));
+        if (choice === STEPPED_ASIDE) return opened;   // unanswered: no confirm, no decline, no learning signal
+        if (choice === NOT_NOW) choice = { value: 'other', label: 'not now', skip: true };   // Esc = the panel's own NOT NOW key
         if (Dialogue.isOpen && Dialogue.isOpen()) Dialogue.close();
         // route the choice through the PURE resolver (Goals.resolveConfirmChoice, behaviorally tested): an explicit
         // Confirm or a VALID edit (≥3 steps) persists; a too-short edit is a REJECTION of the model tree and
@@ -4922,6 +6983,7 @@ const Chat = (() => {
         // release the moment — and if a memory deck QUEUED behind this panel (a late memory.proposed during a
         // minutes-long confirm), HAND it the slot and render it now (mirrors studyCard's done()): the consent deck
         // must never sit invisible while its pendingMemory claim freezes the study/arc lanes.
+        arcYield = null;
         arcBeat.decide();
         arcBeat.finish();
         try { if (Dialogue.isOpen && Dialogue.isOpen()) Dialogue.close(); } catch (_) {}
@@ -4936,6 +6998,17 @@ const Chat = (() => {
   // one arc confirm per run: the collection pass consults this before staging the arc candidate (the offer
   // itself, including the paid decomposition call, only happens if the arc actually WINS the moment).
   function arcSeen(runId) { return !!runId && arcRunsSeen.has(runId); }
+  /* THE ARC NEVER TAKES OVER COMMS WHILE A DELIVERY LANDS (rc walk 2026-10-14). The goal-arc Dialogue replaces the whole COMMS
+     panel; it opened right as a background worker's file landed ("COPY finished: tagline.md is saved…") and hid it. A run end
+     carries a delivery when this page did not start the run (a worker's hand-back, a channel or routine run lands its result
+     now), when the run delivered a file, or when it handed work to crew and got their results back. The arc stands down for
+     that run end WITHOUT spending its once-token, so it is offered again at the next run end that has nothing new to show. */
+  function deliveryLanding(runId) {
+    const meta = runMeta(runId);
+    if (!meta) return true;
+    const w = runWork.get(runId);
+    return !!(meta.delegated || (w && (w.delivered || 0) > 0));
+  }
   function arcOnce(runId) {
     if (!runId) return true;
     if (arcRunsSeen.has(runId)) return false;
@@ -4964,6 +7037,8 @@ const Chat = (() => {
     if (typeof TrustStore.markShown === 'function') TrustStore.markShown();   // spend the one session-cap slot
     // the ask, composed from the REAL track record (task count + satisfaction %) — never fabricated.
     const pv = offer.provenance || {};
+    // the rung by the name the ON ITS OWN dial renders (SMALL JOBS, FREE…), never the stored id ('leash') — call #57
+    const rung = (typeof StationUI !== 'undefined' && StationUI.initiativeLabel) ? StationUI.initiativeLabel(offer.to) : String(offer.to || '').toUpperCase();
     const ask = offer.kind === 'grant'
       ? 'trust me to write files on my own?'
       : 'grant me free rein on small jobs?';
@@ -4976,7 +7051,7 @@ const Chat = (() => {
       kind: 'trust', evidence: evLine,
       label: offer.kind === 'grant' ? 'GRANT' : 'AUTONOMY',
       proposal: ask,
-      note: offer.kind === 'grant' ? 'writes stay jailed + reversible' : 'raises the dial to ' + String(offer.to).toUpperCase()
+      note: offer.kind === 'grant' ? 'writes stay jailed + reversible' : 'raises ON ITS OWN to ' + rung
     });
     if (!card0) return false;
     const r = { d: card0.row };
@@ -5005,10 +7080,10 @@ const Chat = (() => {
         Promise.resolve(TrustStore.accept(offer)).then(ok => {
           if (!card.isCurrent()) return;
           if (!ok) { settle('✕ couldn’t apply', true); return; }   // honest: never flash "✓ granted" on a failed/unverified apply
-          settle(offer.kind === 'grant' ? '✓ granted' : '✓ ' + String(offer.to).toLowerCase(), false);
+          settle(offer.kind === 'grant' ? '✓ granted' : '✓ raised to ' + rung.toLowerCase(), false);
           recAccept('trust', '', false);   // recorded only on the VERIFIED apply — never on an attempt
           if (typeof SFX !== 'undefined' && SFX.level) { try { SFX.level(); } catch (_) {} }
-          if (typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify(offer.kind === 'grant' ? '◈ earned — it may write files on its own now (revoke any time in Settings)' : '◈ earned — autonomy raised to ' + String(offer.to).toUpperCase() + ' (adjust any time in Settings)', 'gold');
+          if (typeof StationUI !== 'undefined' && StationUI.notify) StationUI.notify(offer.kind === 'grant' ? '◈ earned — it may write files on its own now (revoke any time in Settings)' : '◈ ON ITS OWN raised to ' + rung + ' (adjust any time in SETTINGS › AUTONOMY)', 'gold');
           // if the Settings AUTONOMY panel is open, repaint its EARNED badge live (fail-open no-op otherwise).
           if (typeof StationUI !== 'undefined' && StationUI.repaintAutonomy) { try { StationUI.repaintAutonomy(); } catch (_) {} }
         }).catch(() => { if (card.isCurrent()) settle('✕ couldn’t apply', true); });
@@ -5074,7 +7149,7 @@ const Chat = (() => {
     const card0 = recCard({
       kind: 'thread', evidence: prop.spec ? recWhy(recCite(prop.spec, threadCiteKind(prop))) : '',
       label: 'THREAD', proposal: prop.title,
-      note: 'kept threads feed the night shift'
+      note: 'kept threads feed autonomy'
     });
     if (!card0) return false;
     const r = { d: card0.row };
@@ -6055,6 +8130,8 @@ const Chat = (() => {
       return { kind: 'arc', dim: 'goals', reconfirm: true, why: recCite(text, beliefCiteKind(belief)), title: text,
                fire: () => { if (arcOnce(runId)) reconfirmCard(belief, 'goals', weeks, fp, runId); } };
     }
+    // A DELIVERY IS LANDING: the confirm panel takes over the whole COMMS panel, so it waits for a moment with nothing new on it.
+    if (deliveryLanding(runId)) return null;
     // STRENGTH: the cited goal belief's OWN freshness × how well the goals dimension is corroborated. A goal the
     // Commander stated last season, with nothing since to confirm it, is a weaker thing to build an arc on.
     return { kind: 'arc', dim: 'goals', why: recCite(text, beliefCiteKind(belief)), strength: recStrengthOfBelief(belief, 'goals'),
@@ -6414,11 +8491,11 @@ const Chat = (() => {
     else if (mk === 'video' || mk === 'audio') mediaPlayerLine(d.title, agentId, mk);
     else deliverableLine(d.title, agentId);
   }
-  function renderHistory() {
-    const h = activeWs ? activeWs.history : [];
+  function renderHistory(onlyTurns) {
+    const h = onlyTurns || (activeWs ? activeWs.history : []);
     let lastReal = null;   // the trailing dialogue turn (for the error-recovery re-offer below)
     renderingHistory = true;   // suppress the per-row entrance animation across this bulk replay (restored below)
-    const delivs = replayableDeliverables(activeWs);
+    const delivs = onlyTurns ? [] : replayableDeliverables(activeWs);
     const delivAgent = (activeWs && activeWs.agentId) || 'agent';
     let di = 0;
     // every recorded deliverable stamped at/before `ts` lands now (ts == null flushes the rest)
@@ -6432,19 +8509,39 @@ const Chat = (() => {
       // TIMESTAMP TRUTH (P0): pass the turn's STORED real time (m.ts), or `false` when a legacy turn carries none —
       // never `true` here (that would re-stamp replayed history with the current clock, the fabrication we're killing).
       const stamp = (m && m.ts != null) ? m.ts : false;
-      if (m.role === 'user') { addUser(m.content, m.attachments, stamp); lastReal = m; continue; }
+      if (m.role === 'user') {
+        const step = m.from ? null : goalStepOf(m.content);   // a goal-loop continuation replays as the station's line, not the Commander's
+        if (step != null) goalStepLine(step); else addUser(m.content, m.attachments, stamp, m.from);
+        lastReal = m; continue;
+      }
       // a SYSTEM STATUS marker (sys — e.g. an autosessions run-outcome framing line) renders as a system-styled
       // line, NOT as agent speech; it never seeds the model (historyWindow drops it) and it stays visible in-thread.
+      // a SEND NOW line the station says its run read, filed after a reload lost the reply that showed it (showSentNowRead):
+      // the same mid-run Commander row the live stream drew
+      if (m && m.sys && m.steerEcho) { steerRow(m.content, stamp); continue; }
       if (m && m.sys) { if ((m.content || '').trim()) toolLine(m.content, !!m.error); continue; }
       if (m.role !== 'assistant') continue;   // only dialogue turns render (a stray system marker never shows as an agent reply)
-      if (!(m.content || '').trim()) { if (m.stopped) lastReal = m; continue; }   // zero-token stop: durable recovery truth, never a blank speech row
+      if (!(m.content || '').trim()) { if (m.stopped) { lastReal = m; if (m.stopNote) toolLine('⏹ ' + m.stopNote); } continue; }   // zero-token stop: durable recovery truth, never a blank speech row (its reason line survives the reload)
+      // rows re-synced from the server transcript still carry their FORK:/TASK_QUESTION: machine lines — they are
+      // chip data, never speech (a reload used to print them raw, first-hour walk 2026-09-28)
+      const shownText = (typeof Fork !== 'undefined' && Fork.stripMarkers) ? Fork.stripMarkers(m.content) : m.content;
+      if (!shownText.trim()) { lastReal = m; continue; }   // a reply that was ONLY a marker has no prose to show
       // a turn produced by a WORK LINE stage carries its own agentId — replay names that agent, not the focused
       // one, or a reload would silently re-attribute two other agents' work to whoever owns the stream now.
       const spoke = (m && m.agentId && typeof App !== 'undefined' && App.agentName) ? App.agentName(m.agentId) : null;
       if (stamp !== false) flushDeliverablesBefore(stamp);   // the files this reply's run produced were shown BEFORE the reply landed
-      const r = row('agent', { stamp: stamp, who: spoke });   // past turns render as plain GROUPED messages; only the LIVE reply is the lit headline
-      if (m.error) r.d.classList.add('err');
-      renderProse(r.body, m.content);   // same linkify path as live tokens, so replayed history matches
+      // a steering note folded mid-run is saved inside the reply as a '[steering] …' line (the token stream carried it):
+      // replay it as the same mid-run Commander row the live stream drew, never as a line of the agent's own prose
+      const parts = /(^|\n)\[steering\] /.test(shownText) ? shownText.split(/(?:^|\n)\[steering\] ([^\n]*)\n?/) : [shownText];
+      const files = turnFileRefs(m);   // one resolver per reply, like the live stream: every paragraph came from the same run
+      for (let pi = 0; pi < parts.length; pi++) {
+        if (pi % 2 === 1) { steerRow(parts[pi], stamp); continue; }
+        if (!parts[pi].trim()) continue;
+        const r = row('agent', { stamp: stamp, who: spoke });   // past turns render as plain GROUPED messages; only the LIVE reply is the lit headline
+        if (m.error) r.d.classList.add('err');
+        renderProse(r.body, parts[pi], { files });   // same linkify path as live tokens, so replayed history matches
+      }
+      if (m.stopped && m.stopNote) toolLine('⏹ ' + m.stopNote);   // WHY it stopped survives the reload
       lastReal = m;
     }
     flushDeliverablesBefore(null);   // files newer than the last stored turn (or from turns without a stamp)
@@ -6452,10 +8549,37 @@ const Chat = (() => {
     // STRANDED-USER LAW: a reload/switch onto a stream whose LAST turn failed (error:true) must not leave the
     // Commander with a dead thread and no way out — load() wiped the live recovery chips. Re-offer a plain retry
     // (offerRetry's context-aware verdict isn't stored per-turn, so the safe universal recovery is a re-run).
-    if (lastReal && lastReal.role === 'assistant' && (lastReal.error || lastReal.stopped) && !isBusy()) {
+    if (!onlyTurns && lastReal && lastReal.role === 'assistant' && (lastReal.error || lastReal.stopped) && !isBusy()) {
       if (lastReal.stopped) offerTryAgain();
       else offerRetry(null);
     }
+  }
+
+  // A delivered/recovered answer updates this conversation in place. Existing disclosures, selection,
+  // live channels and the composer remain mounted; a reader above the bottom keeps the same visible row.
+  function deliverTurns(ws, turns) {
+    if (!log || !isActiveWs(ws) || ws.conversationMode === 'group' || !Array.isArray(turns) || !turns.length) return false;
+    const pinned = stick, top = log.scrollTop;
+    const viewport = log.getBoundingClientRect();
+    const scale = viewport.height / log.offsetHeight || 1;
+    const anchor = !pinned && Array.from(log.children).find(n => !n.classList.contains('cmsg-timebreak') && n.getBoundingClientRect().bottom > viewport.top);
+    const anchorTop = anchor && anchor.getBoundingClientRect().top;
+    if (!pinned) cancelHistoryPin();
+    insertingDelivery = true;
+    try { for (const turn of turns) {
+      const existing = new Set(log.children);
+      const before = Number(turn.ts) > 0 && Array.from(log.children).find(n => Number(n.dataset.ts) > Number(turn.ts));
+      renderHistory([turn]);
+      if (before) for (const n of Array.from(log.children)) if (!existing.has(n)) {
+        n.classList.remove('ts-repeat'); log.insertBefore(n, before);
+      }
+    } } finally { insertingDelivery = false; }
+    syncTimeBreaks();
+    pruneLog();
+    if (!pinned) log.scrollTop = anchor && log.contains(anchor) ? log.scrollTop + (anchor.getBoundingClientRect().top - anchorTop) / scale : top;
+    autoscroll();
+    noteDeliveryLanding();   // a hand-back just landed in the open conversation: a goal-arc panel steps aside for it
+    return true;
   }
 
   // SWITCH-SURVIVAL: re-render whatever in-flight run we left on the now-displayed stream — its streamed
@@ -6486,10 +8610,10 @@ const Chat = (() => {
       for (const t of s.tools) toolLine(t.text, t.isErr);
     }
     if (s.busy || s.acc) {
-      const o = streamingAgent(); if (s.acc) o.append(s.acc);
+      const o = streamingAgent(undefined, undefined, liveRunRoots.get(activeWs.id)); if (s.acc) o.append(s.acc);
       if (s.busy) activeLiveRow = o; else o.done();   // a still-running stream keeps its live row so new tokens flow into it
     }
-    if (s.pending) permissionRow(s.pending, activeWs);
+    for (const p of (s.pendings && s.pendings.length ? s.pendings : (s.pending ? [s.pending] : []))) permissionRow(p, activeWs);
   }
 
   // A streaming turn's PROSE controller. The agent's text streams into an open paragraph row with a blinking
@@ -6498,8 +8622,14 @@ const Chat = (() => {
   // so a turn reads top-to-bottom as "said this → did that → said this", classic-harness style.
   // whoName (optional) = the speaker to stamp on every row this controller opens. Passed by a WORK LINE stage so
   // the transcript names the agent that actually produced the text; omitted everywhere else = the focused agent.
-  function streamingAgent(whoName) {
+  // whoAgentId (optional) = that stage agent's id, so its file links resolve in ITS workspace (turnFileRefs).
+  // runRoot (optional) = the project root this reply's run was sent with (null = none, as for every work-line stage);
+  // omitted = the session's current root for the session's own reply (a scripted line, or a run this page did not start).
+  function streamingAgent(whoName, whoAgentId, runRoot) {
     let seg = null, caret = null, raw = '';   // seg: the currently-open agent row; raw: its accumulated prose (so URLs can be linkified as they complete)
+    // one resolver per reply: every paragraph of it came from the same run
+    const files = turnFileRefs({ agentId: whoAgentId || undefined,
+      projectRoot: runRoot !== undefined ? runRoot : whoAgentId ? undefined : ((activeWs && activeWs.projectRoot) || null) });
     /* PER-FRAME RENDER COALESCING (2026-08-26 lag fix). Once a paragraph contains any markdown
        marker or URL, renderProse re-parses and rebuilds the WHOLE accumulated paragraph — doing
        that on every streamed token is O(n²) per answer and is a real "COMMS gets slower the
@@ -6508,33 +8638,56 @@ const Chat = (() => {
        the DOM current RIGHT NOW (closeSeg's empty-stub check, error, cleanTaskIntent, a hidden
        tab where rAF never fires) goes through flushProse() synchronously. */
     let renderQueued = false;
-    function flushProse() { renderQueued = false; if (seg) renderProse(seg.body, raw); }
+    // a still-open paragraph renders its LIVE text (Fork.liveText: no choice marker — complete or still being typed — ever
+    // shows raw); a paragraph that is closing renders its final text (complete markers removed, every prose line kept).
+    function shownProse(final) {
+      if (typeof Fork === 'undefined') return raw;
+      return final ? (Fork.stripMarkers ? Fork.stripMarkers(raw) : raw) : (Fork.liveText ? Fork.liveText(raw) : raw);
+    }
+    let lastShown = null;   // the text the open paragraph last rendered (a close re-renders only when its final text differs)
+    // a still-open paragraph redraws only its open end (renderProseLive); the closing render frees that state
+    function flushProse(final) { renderQueued = false; if (seg) { lastShown = shownProse(final); renderProse(seg.body, lastShown, { files, live: !final }); } }
     function queueProse() {
       if (renderQueued) return;
       if (typeof requestAnimationFrame !== 'function' || (typeof document !== 'undefined' && document.hidden)) { flushProse(); autoscroll(); return; }
       renderQueued = true;
-      requestAnimationFrame(() => { if (!renderQueued) return; flushProse(); autoscroll(); });
+      requestAnimationFrame(() => { if (!renderQueued || held) return; flushProse(); autoscroll(); });
+    }
+    /* A POINTER DOWN ON THE LIVE REPLY HOLDS ITS RE-RENDER (QA 2026-10-02). Every frame rebuilt the paragraph, replacing the
+       <a> between mousedown and mouseup — the click landed on .body and a link in a still-streaming reply never opened (and a
+       text selection inside it was wiped). Held until the click has been dispatched, then the queued text lands at once. */
+    let held = false;
+    function holdWhilePressed() {
+      held = true;
+      let safety = null;   // a release outside the window never strands the live reply: the text comes back after 4 s
+      const up = () => {
+        clearTimeout(safety);
+        document.removeEventListener('pointerup', up, true); document.removeEventListener('pointercancel', up, true);
+        setTimeout(() => { held = false; if (renderQueued) { flushProse(); autoscroll(); } }, 0);   // after the click event, never before it
+      };
+      document.addEventListener('pointerup', up, true); document.addEventListener('pointercancel', up, true);
+      safety = setTimeout(up, 4000);
     }
     function open() {
       endToolRail();   // a fresh prose paragraph opening below a rail closes it, so the next tool call starts a NEW rail under this prose (keeps chronological "said → did → said → did")
-      seg = row('agent', { stamp: true, who: whoName || null }); raw = '';
+      seg = row('agent', { stamp: true, who: whoName || null }); raw = ''; lastShown = null;
+      if (seg.body && seg.body.addEventListener) seg.body.addEventListener('pointerdown', holdWhilePressed);
       caret = document.createElement('span'); caret.className = 'caret'; caret.textContent = '▮';
       seg.d.appendChild(caret);   // caret is a sibling of .body, so re-rendering .body's content never disturbs it
     }
     function closeSeg() {   // drop the caret, discard an empty stub, and arm the next token to start fresh
-      if (renderQueued) flushProse();   // pending tokens must land before the empty-stub check reads textContent
+      if (seg && (renderQueued || shownProse(true) !== lastShown)) flushProse(true);   // pending tokens land — and a line the live render held back shows — before the empty-stub check reads textContent
+      if (seg && seg.body) seg.body.__mdLive = null;   // a closed paragraph never redraws: free its live parse
       if (caret) { caret.remove(); caret = null; }
       if (seg && !seg.body.textContent.trim()) seg.d.remove();
       seg = null; raw = '';
     }
     // A folded /steer note echoes back from the sidecar as a '\n[steering] …\n' token delta. It is the
-    // Commander's note, not agent prose — render it as its own dim note row and CLOSE the paragraph around
-    // it, so it never sits in a caret'd row that reads as the agent typing it.
+    // Commander's note, not agent prose — render it as the Commander's own mid-run row and CLOSE the paragraph
+    // around it, so it never sits in a caret'd row that reads as the agent typing it.
     function steerNote(text) {
       endToolRail();
-      const r = row('agent', { stamp: true, who: whoName || null });
-      r.d.classList.add('tool', 'steer-echo');
-      r.body.textContent = '[steering] ' + text;
+      steerRow(text, true);
       autoscroll();
     }
     function plain(t) { if (!t) return; if (!seg) open(); raw += t; queueProse(); }
@@ -6550,14 +8703,18 @@ const Chat = (() => {
         }
       },
       breakSeg() { closeSeg(); },   // an inline action is about to render below — end this paragraph
-      cleanTaskIntent() { if (seg && typeof TaskIntent !== 'undefined' && TaskIntent.strip) { raw = TaskIntent.strip(raw); flushProse(); } },
+      cleanTaskIntent() {   // every choice marker (FORK + TASK_QUESTION) leaves the live row once the chips take over
+        if (!seg) return;
+        if (typeof Fork !== 'undefined' && Fork.stripMarkers) { raw = Fork.stripMarkers(raw); flushProse(); }
+        else if (typeof TaskIntent !== 'undefined' && TaskIntent.strip) { raw = TaskIntent.strip(raw); flushProse(); }
+      },
       done() { closeSeg(); },
       // m = the plain-language headline to LEAD with; rawDetail (optional) = the original technical text, kept
       // accessible as a dim sub-line + a title tooltip so debugging info isn't lost, just de-emphasized.
       error(m, rawDetail) {
         if (!seg) open();
         seg.d.classList.add('err');
-        raw += (raw ? '\n' : '') + '⚠ ' + m; flushProse();
+        raw += (raw ? '\n' : '') + '⚠ ' + m; flushProse(true);
         if (rawDetail && String(rawDetail).trim() && String(rawDetail).trim() !== String(m).trim()) {
           const sub = document.createElement('span'); sub.className = 'err-detail dim';
           sub.textContent = String(rawDetail).trim();
@@ -6589,9 +8746,9 @@ const Chat = (() => {
   // INTERRUPT — a per-stream stop. It cancels
   // only the DISPLAYED stream's in-flight run; the plumbing already exists (each stream owns an AbortController
   // here + a server runId) so this just exposes a ⏹ button / Esc for it. Flag the stream interrupted so send()'s
-  // catch keeps what already streamed instead of logging an error, and drop that stream's type-ahead queue — a
-  // deliberate stop means "I'm taking over", not "now run my backlog".
-  function stopActive() {
+  // catch keeps what already streamed instead of logging an error, and take that stream's type-ahead queue off the
+  // belt — a deliberate stop means "I'm taking over", not "now run my backlog" — and back into the box (restoreQueued).
+  function stopActive(how) {
     if (activeWs?.conversationMode === 'group' && typeof GroupChat !== 'undefined') return GroupChat.stop();
     // /loop: Stop ends the interval watcher too, or the next tick fires a run the user just said they didn't
     // want. Checked BEFORE the isBusy() guard on purpose — a loop is usually WAITING between ticks when you
@@ -6606,14 +8763,20 @@ const Chat = (() => {
     }
     const id = activeWs.id;
     interrupted.add(id);
-    queued.delete(id);
+    // how: 'esc' from the composer key; the STOP button passes its click event, voice barge-in passes nothing — all YOU
+    stopSource.set(id, how === 'esc' ? 'esc' : 'you');
+    restoreQueued(id);
     // GOAL LOOP: a deliberate Stop means "I'm taking over" — pause any active loop so the teardown's judge doesn't
     // fire the next continuation. (The user resumes it explicitly with /goal resume.)
     if (typeof GoalLoop !== 'undefined') { const g = goalOf(activeWs); if (g && GoalLoop.isActive(g)) { GoalLoop.pause(g, 'you stopped the run'); persistGoal(); } }
+    // what this run itself is paused on, read before the bulk clear (a background worker's ask outlives the run: not one of them)
+    const ownAsks = (typeof Channels !== 'undefined' && Channels.pendingAllOf) ? Channels.pendingAllOf(id).filter(p => p && p.promptId && p.background !== true) : [];
     if (typeof Channels !== 'undefined' && Channels.clearPending) Channels.clearPending(id, Date.now());   // a pending approval is moot once stopped
     status('stopping…'); updateControls();
-    if (typeof SFX !== 'undefined' && SFX.click) SFX.click();
-    const localAbort = () => { const ac = aborters.get(id); if (ac) { try { ac.abort(); } catch (_) {} } };   // aborts the fetch → reader throws → send()'s catch
+    if (typeof SFX !== 'undefined') (SFX.close || SFX.press)();   // STOP winds a run down: the docks' close() cue
+    // runs only once the stop is CONFIRMED (or there was no run id to kill): the run's open approval cards go dead with it,
+    // and every other surface holding one of its asks (the bell, CREW, the floor) is told it is over
+    const localAbort = () => { retireOpenConsents(id, (typeof Channels !== 'undefined' && Channels.runIdOf(id)) || ''); settleStoppedAsks(ownAsks); if (rid) restoreSentNow(id, rid); const ac = aborters.get(id); if (ac) { try { ac.abort(); } catch (_) {} } };   // aborts the fetch → reader throws → send()'s catch
     const rid = (typeof Channels !== 'undefined') ? Channels.runIdOf(id) : null;
     // STOP MEANS STOP (2026-09-04): the local fetch is torn down only AFTER the sidecar confirmed the kill. A
     // swallowed /api/cancel failure used to render a clean "RUN STOPPED" while the run kept burning server-side;
@@ -6621,7 +8784,47 @@ const Chat = (() => {
     // yet (the run.start beat has not landed) = nothing to kill server-side, so the local abort stands alone.
     if (rid && typeof Harness !== 'undefined' && Harness.cancel) {
       Promise.resolve(Harness.cancel(rid)).then(v => { if (v && v.ok) localAbort(); else stopFailed(id, v); }, e => stopFailed(id, { ok: false, error: (e && e.message) || String(e), transport: true }));
-    } else localAbort();
+    } else { if (!rid) stopReportHolding(id); localAbort(); }
+  }
+  /* A SEND STILL WAITING FOR ITS TURN IS NEVER LEFT ON "CONNECTING" (stall report 2026-10-13). A message with no run id yet
+     waits in the station behind whatever holds this conversation, and the one holder this page never started is the
+     overseer's automatic report on delegated work (it takes the same per-conversation turn). STOP never reached that
+     report, so every new message sat on "connecting" until it finished. STOP on such a send now also stops it, by the run
+     id the station lists for it (read fresh, never from a stale poll), and says so only when the station answers that a
+     live report was there to stop (stopped:true): a report that finished in between, or a row left from a restart, says nothing. */
+  function stopReportHolding(id) {
+    if (typeof Harness === 'undefined' || !Harness.cancel || !Harness.api || !Harness.api.get) return;
+    Promise.resolve(Harness.api.get('/api/overseer')).then(j => {
+      const holding = ((j && j.reviews) || []).filter(r => r && r.status === 'reviewing' && r.parentStreamId === id && r.reviewRunId);
+      return Promise.all(holding.map(r => Harness.cancel(r.reviewRunId)));   // Harness.cancel answers { ok, stopped? }, never throws
+    }).then(answers => {
+      // said only for a stop the STATION proves: /api/cancel answers 200 even for a report that already finished
+      if ((answers || []).some(v => v && v.ok && v.stopped === true) && activeWs && activeWs.id === id) localLine('STOP also ended the report on your delegated work that was holding this conversation.');
+    }, e => console.warn('[stop] could not read the station\'s reports to stop:', (e && e.message) || e));   // this send is stopped either way
+  }
+  /* QUEUED WORDS ARE NEVER LOST ON STOP (live walk 2026-10-14): a message typed while the run worked became a queued pill,
+     and STOP deleted it — not sent, not in the box, no notice. The stop still takes the backlog off the belt (nothing
+     auto-sends behind your back), but the words go back into the message box, ahead of whatever is typed there, unsent,
+     and one line says so — the same "give the typed text back" a refused /skill command does. */
+  function restoreQueued(id) {
+    const arr = queued.get(id) || [];
+    queued.delete(id);
+    renderQueued();
+    if (!arr.length || !input) return;
+    const typed = String(input.value || '').trim();
+    input.value = arr.concat(typed ? [typed] : []).join('\n');
+    autoGrowInput();
+    localLine(arr.length === 1 ? 'Your queued message was not sent — it is back in the message box.'
+      : 'Your ' + arr.length + ' queued messages were not sent — they are back in the message box.');
+  }
+  /* A STOPPED RUN'S ASKS LEAVE EVERY SURFACE (live walk 2026-10-14). The station denies a killed run's open prompts, but the
+     page drops the stream right after the kill is confirmed, so that permission.response never arrived: the bell kept
+     "NEEDS YOU — 2 waiting" while the rail said 1, CREW kept its gold "needs your OK" and the floor kept AWAITING APPROVAL
+     over an idle agent, until a reload. Once the stop is CONFIRMED each of the run's own asks is announced settled in the
+     station's own words for a stopped wait — decision 'deny', stopped:true: nothing was approved. */
+  function settleStoppedAsks(asks) {
+    if (typeof U === 'undefined' || !U.bus) return;
+    for (const p of asks) U.bus.emit('permission.response', { promptId: p.promptId, decision: 'deny', stopped: true });
   }
 
   // The sidecar did NOT confirm the stop: un-flag the stream (never mark it stopped on a claim the harness can't
@@ -6630,6 +8833,7 @@ const Chat = (() => {
   // its status. STOP stays available — the Commander can press it again.
   function stopFailed(id, v) {
     interrupted.delete(id);
+    stopSource.delete(id);
     const alive = (typeof Harness !== 'undefined' && Harness.pingEngine) ? Promise.resolve(Harness.pingEngine()).catch(() => null) : Promise.resolve(null);
     alive.then(engineAlive => {
       const reason = (v && v.error) || 'no answer from the station';
@@ -6659,7 +8863,7 @@ const Chat = (() => {
     const id = activeWs.id;
     const arr = queued.get(id) || []; arr.push(text); queued.set(id, arr);
     renderQueued();
-    if (typeof SFX !== 'undefined' && SFX.type) SFX.type();
+    if (typeof SFX !== 'undefined' && SFX.press) SFX.press();
   }
   function sendOrQueue(text) {
     const value = String(text == null ? '' : text).trim();
@@ -6667,6 +8871,11 @@ const Chat = (() => {
     if (activeWs.conversationMode === 'group' && typeof GroupChat !== 'undefined') {
       send(value);
       return { ok: true, state: 'started', workstreamId: activeWs.id };
+    }
+    if (isBusy() && pendingAskFor(activeWs)) {
+      const ws = activeWs;
+      answerPendingAsk(ws, value).then(ok => { if (!ok) enqueue(value); });
+      return { ok: true, state: 'answered', workstreamId: ws.id };
     }
     if (isBusy()) {
       enqueue(value);
@@ -6677,17 +8886,392 @@ const Chat = (() => {
   }
   function renderQueued() {
     const strip = el('chat-queued'); if (!strip) return;
+    /* THE QUEUE NEVER HIDES THE LIVE LINE (live walk 2026-10-14): the strip sits between the log and the message box, so a
+       new pill shrinks the log from its bottom — and with an approval card held (no follow) the presence line under it was
+       cut in half. A log showing its end keeps showing it: it moves up by what the strip grew (never past a held card's top). */
+    const atEnd = !!log && nearBottom(), h0 = strip.offsetHeight;
     const arr = (activeWs && queued.get(activeWs.id)) || [];
     strip.innerHTML = '';
     arr.forEach((t, i) => {
-      const pill = document.createElement('span'); pill.className = 'queued-pill'; pill.title = t;
+      const pill = document.createElement('span'); pill.className = 'queued-pill';
+      // the pill clips the text (.queued-text max-width), so its tip carries the whole message — then what the pill DOES: it
+      // sends after this run, or its send now key hands it to the run working now. The tip card keeps 400 chars (tooltip.js
+      // MAX_LEN): the message gives way, the hint never does. (Same shape as the org pass P27 tip, naming SEND NOW.)
+      const QHINT = 'sends after this run · send now hands it to the running task', room = 400 - QHINT.length - 5;
+      pill.setAttribute('data-tip', '“' + (t.length > room ? t.slice(0, room - 1) + '…' : t) + '” · ' + QHINT);
       const label = document.createElement('span'); label.className = 'queued-text'; label.textContent = t;
       const x = document.createElement('button'); x.className = 'queued-x'; x.type = 'button'; x.textContent = '✕';
       x.setAttribute('aria-label', 'Cancel queued message');
       x.onclick = () => { const a = queued.get(activeWs.id) || []; a.splice(i, 1); a.length ? queued.set(activeWs.id, a) : queued.delete(activeWs.id); renderQueued(); };
-      pill.appendChild(document.createTextNode('⤷ ')); pill.appendChild(label); pill.appendChild(x);
+      const now = document.createElement('button'); now.className = 'queued-now'; now.type = 'button'; now.textContent = 'send now';
+      now.setAttribute('data-tip', 'Hand this to the run that is working now: the agent reads it before its next step, instead of after the run finishes');
+      now.onclick = () => sendQueuedNow(activeWs.id, i, t);
+      const tag = document.createElement('span'); tag.className = 'queued-tag'; tag.textContent = 'next';
+      pill.appendChild(tag); pill.appendChild(label); pill.appendChild(now); pill.appendChild(x);
       strip.appendChild(pill);
     });
+    /* SENT, NOT READ YET (Andrew 10-26: a SYSTEM line announced every send-now, then the note showed up under the agent's
+       name). A line the run holds stays in the strip, keyless, until the run's echo shows the agent read it; the transcript
+       then shows it as the Commander's own MID-RUN message. A 200 proves only that the run holds it, so that is all it says. */
+    const held = (typeof sentNow !== 'undefined' && activeWs && sentNow.get(activeWs.id)) || [];
+    for (const n of held) {
+      if (!n.accepted || n.landed) continue;
+      const pill = document.createElement('span'); pill.className = 'queued-pill sent';
+      pill.setAttribute('data-tip', 'Sent into the live run — the agent reads it before its next step');
+      const tag = document.createElement('span'); tag.className = 'queued-tag'; tag.textContent = 'sent';
+      const label = document.createElement('span'); label.className = 'queued-text'; label.textContent = n.text;
+      const when = document.createElement('span'); when.className = 'queued-when'; when.textContent = 'read at its next step';
+      pill.appendChild(tag); pill.appendChild(label); pill.appendChild(when);
+      strip.appendChild(pill);
+    }
+    const grew = strip.offsetHeight - h0;
+    if (atEnd && grew > 0) log.scrollTop += (heldCard && log.contains(heldCard)) ? Math.min(grew, Math.max(0, topInLog(heldCard) - 8)) : grew;
+  }
+  /* SEND NOW — a queued follow-up STEERS the live run instead of waiting for it to end (Andrew 2026-10-14). The
+     pill leaves the queue while the POST is in flight (so flushQueued can't also send it as a new turn); it goes
+     back to the FRONT of the queue on any refusal — run not confirmed yet (no runId), the loop already closed its
+     buffer (409), buffer full (429), network — and the line says why. A 200 only means the sidecar holds it: the
+     transcript's own '[steering] …' row is the proof it landed, so the strip shows it SENT ("read at its next step") and
+     nothing more — no SYSTEM line (Andrew 10-26: the success line cluttered the chat above a note it then repeated).
+     STOP OUTRANKS IT (0.13.5 merge): the line stays in sentNow until its run ends; a STOP the station confirms gives back
+     every one the transcript never showed landing (restoreSentNow), and an answer arriving after that changes nothing —
+     no "sent" line, and never a re-queue that would auto-send it behind the stop.
+     ONE LINE ON THE WIRE (0.13.5 review): the loop echoes a note as '\n[steering] <note>\n', and every reader of that echo
+     (the live row, renderHistory, both history merges, markSentNowLanded) reads ONE line — a second line rendered as the
+     agent's own prose and doubled the reply on reload. The run gets the note on one line (steerWire); a STOP gives back
+     what was typed. A pill past the sidecar's 2,000-char note clamp is never posted: the buffer would cut it and still
+     say ok. Every line it prints goes to ITS session's log only — an answer can land after you switched away. */
+  function sendQueuedNow(id, i, text) {
+    let note = null;   // this line's sentNow entry, once it is handed to the run
+    const say = t => { if (activeWs && activeWs.id === id) localLine(t); };
+    const requeue = () => { const q = queued.get(id) || []; q.unshift(text); queued.set(id, q); renderQueued(); };
+    const back = (why) => {
+      if (note && !forgetSentNow(id, note)) return;   // STOP already gave it back to the message box
+      requeue();
+      say(why + ' — it stays queued as your next message.');
+      flushQueued(id);   // the run may have ended while we asked → the queue drains now
+    };
+    const a = queued.get(id) || [];
+    const at = a[i] === text ? i : a.indexOf(text);
+    if (at < 0) return;   // already sent / cancelled
+    a.splice(at, 1); a.length ? queued.set(id, a) : queued.delete(id); renderQueued();
+    const wire = steerWire(text);
+    if (wire.length > 2000) return back('It is longer than a steering note can carry (2,000 characters)');   // sidecar/steer-buffer.js maxNoteChars
+    const rid = (typeof Channels !== 'undefined' && Channels.runIdOf) ? Channels.runIdOf(id) : null;
+    if (!rid && typeof Channels !== 'undefined' && Channels.isBusy && !Channels.isBusy(id)) {
+      // the run just ended: its teardown's deferred flush (which waits for crew joining first) sends the queue — not this click
+      requeue();
+      return say('The run just finished — it goes as your next message.');
+    }
+    if (!rid || typeof fetch === 'undefined') return back('The run has not started yet, so there is nothing to steer');
+    note = { id: 'sn' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10), text: text, wire: wire, runId: rid, accepted: false, landed: false };
+    sentNow.set(id, (sentNow.get(id) || []).concat([note]));
+    keepSentNow(id, note);   // on disk from the moment it is posted: a reload mid-POST still finds it (the station knows it by noteId)
+    fetch('/api/run/steer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ runId: rid, text: wire, noteId: note.id }) })
+      .then(r => r.json().catch(() => null).then(j => ({ status: r.status, j: j })))
+      .then(({ status, j }) => {
+        if (j && j.ok) {
+          if (!(sentNow.get(id) || []).includes(note)) return;   // a STOP already gave it back to the message box
+          note.accepted = true;
+          if (Channels.runIdOf(id) === rid) return renderQueued();   // the strip shows it SENT until the run reads it — no SYSTEM line
+          // its run ended while we asked: read = settled; never read = it goes as the next message (the loop said NOT applied)
+          forgetSentNow(id, note);
+          if (note.landed) return;
+          requeue();
+          say('The run ended before the agent read your send-now message — it goes as your next message.');
+          flushQueued(id);
+          return;
+        }
+        back(status === 409 || status === 404 ? 'The run had already finished its work' : status === 429 ? 'The run is holding too many notes already' : 'The station did not take it');
+      })
+      .catch(() => back('The station did not answer'));
+  }
+  // take one sent-now line off its stream's list; false = it was no longer there (a STOP gave it back already, or the page let
+  // go of it — then its disk copy is the station's to decide). true = this page decides it now (a queued pill again, or read).
+  function forgetSentNow(id, note) {
+    const list = sentNow.get(id) || [], k = list.indexOf(note);
+    if (k < 0) return false;
+    list.splice(k, 1); list.length ? sentNow.set(id, list) : sentNow.delete(id);
+    dropSentNow(id, [note.id]);
+    return true;
+  }
+  /* A SEND-NOW LINE OUTLIVES THE PAGE (live walk on the 0.13.5 candidate, 2026-10-14). sentNow is page memory: a line the
+     station accepted while the lead was inside a ~35 s hand-off was gone after a page reload (which also cancels the run) —
+     not in the message box, not in the history. So every line handed to a run is ALSO kept in this browser (localStorage,
+     per conversation) from the moment it is posted until the page settles it: read, given back into the message box, or
+     a queued pill again. Whatever is still there after the page lost its memory — a reload, a closed window, a crash,
+     DISCONNECT and re-entry, a stream that died — is decided by the STATION on that conversation's next load
+     (reconcileSentNow → GET /api/run/steer, which knows which noteIds the run read), never guessed. Storage that throws
+     (a private window, blocked or cleared site data) leaves SEND NOW exactly as it was: memory only. */
+  function sentNowDisk(edit) {
+    let all = {};
+    try { const raw = typeof localStorage !== 'undefined' && localStorage ? localStorage.getItem('starnet.sentNow.v1') : null; all = raw ? JSON.parse(raw) : {}; } catch (_) { all = {}; }
+    if (!all || typeof all !== 'object' || Array.isArray(all)) all = {};
+    if (!edit) return all;
+    edit(all);
+    for (const k of Object.keys(all)) if (!Array.isArray(all[k]) || !all[k].length) delete all[k];
+    try { if (typeof localStorage !== 'undefined' && localStorage) localStorage.setItem('starnet.sentNow.v1', JSON.stringify(all)); } catch (_) { /* memory still holds it: SEND NOW works as it did before */ }
+    return all;
+  }
+  function keepSentNow(id, note) {
+    sentNowDisk(all => {
+      const list = (Array.isArray(all[id]) ? all[id] : []).filter(e => e && e.id !== note.id);
+      list.push({ id: note.id, runId: note.runId, text: note.text, wire: note.wire, at: Date.now() });
+      all[id] = list;   // never trimmed here: a line past the cap goes back in the message box (sentNowOverdue)
+    });
+    sentNowOverdue(id);
+  }
+  /* A BOUNDED DISK, NOTHING DROPPED UNSEEN (SEND NOW review, 2026-10-15). A conversation keeps at most 16 undecided lines on
+     disk. Past that, the oldest ones this page is not holding itself (a live run's own lines are never pushed out) go back
+     in the message box — and so does a line the station still cannot decide a day after it was sent (`stale`, from
+     askSentNow) — with a line that says only what is known: no answer came. A line is never deleted unseen. */
+  function sentNowOverdue(id, stale) {
+    const held = new Set();
+    for (const n of sentNow.get(id) || []) held.add(n.id);
+    for (const h of heldBack.get(id) || []) for (const k of h.ids || []) held.add(k);
+    const disk = (sentNowDisk()[id] || []).filter(e => e && e.id);
+    const loose = disk.filter(e => !held.has(e.id));   // oldest first: the disk keeps send order
+    const out = new Set((stale || []).map(e => e && e.id).filter(k => loose.some(e => e.id === k)));
+    let over = disk.length - out.size - 16;            // still past the cap once the stale ones leave
+    for (const e of loose) { if (over <= 0) break; if (!out.has(e.id)) { out.add(e.id); over--; } }
+    const back = loose.filter(e => out.has(e.id));
+    if (!back.length) return;
+    const texts = back.map(e => (typeof e.text === 'string' ? e.text : '')).filter(t => t.trim()), n = texts.length;
+    if (!n) return dropSentNow(id, back.map(e => e.id));   // no words to give back (a damaged entry): nothing a person typed is lost
+    giveBack(id, texts, n === 1 ? 'The station never said whether the agent read your send-now message — it is back in the message box.'
+      : 'The station never said whether the agent read ' + n + ' of your send-now messages — they are back in the message box.', back.map(e => e.id));
+  }
+  function dropSentNow(id, ids) {
+    const gone = new Set((ids || []).filter(Boolean));
+    if (!gone.size) return;
+    sentNowDisk(all => { if (Array.isArray(all[id])) all[id] = all[id].filter(e => e && !gone.has(e.id)); });
+  }
+  /* the page lets go of lines WITHOUT settling them: the run's stream died (network) or the page is tearing down (DISCONNECT
+     → re-entry wipes the queue). It cannot know what the run read — and a re-queue would auto-send behind the reconnect, or
+     be wiped by it — so the station decides each one (reconcileSentNow). A line whose echo this page saw IS read: off the
+     disk now. runId omitted = every run's lines on that stream. */
+  function releaseSentNow(id, runId, acc) {
+    const list = sentNow.get(id) || [], ran = String(acc || '');
+    const mine = list.filter(n => runId == null || n.runId === runId), rest = list.filter(n => mine.indexOf(n) < 0);
+    rest.length ? sentNow.set(id, rest) : sentNow.delete(id);
+    if (mine.length && activeWs && activeWs.id === id) renderQueued();   // the page let go of them: no SENT pill stays behind
+    dropSentNow(id, mine.filter(n => n.landed || ran.indexOf('[steering] ' + n.wire + '\n') >= 0).map(n => n.id));
+  }
+  // the note as the run gets it: one line (the loop echoes it as '\n[steering] <note>\n' and the page reads one line back)
+  function steerWire(text) { return String(text == null ? '' : text).replace(/\s*\r?\n\s*/g, ' ').trim(); }
+  // every steering line a token delta carries ('\n[steering] <note>\n' → '<note>')
+  function steerEchoesOf(delta) {
+    const out = [], re = /(?:^|\n)\[steering\] ([^\n]*)/g;
+    let m;
+    while ((m = re.exec(String(delta || '')))) if (m[1].trim()) out.push(m[1]);
+    return out;
+  }
+  /* A NOTE THE RUN READ STAYS IN THE CONVERSATION (Andrew 10-26: the MID-RUN line was gone after a reload). Its echo rides
+     the token stream, but the page saves only the reply's last stretch (every tool call starts it over) and the station's
+     transcript never records the note (the loop hands it to the model as a system line). So when the run ends, each note it
+     streamed is filed as ONE station row — the shape showSentNowRead files after a reload, which never seeds the model —
+     unless the saved reply already shows it. placeSteerNotes puts it back after the turn it followed, by time. */
+  function fileRunSteers(ws, notes, runId, savedText) {
+    if (!ws || !runId || !Array.isArray(notes) || !notes.length) return 0;
+    const h = Array.isArray(ws.history) ? ws.history : (ws.history = []);
+    const shown = '\n' + String(savedText || '') + '\n';
+    let added = 0;
+    for (const n of notes) {
+      const echo = '[steering] ' + n.text;
+      if (shown.indexOf('\n' + echo + '\n') >= 0) continue;   // the saved reply shows it: renderHistory draws it from there
+      if (h.some(m => m && m.steerEcho && String(m.sourceRunId || '') === String(runId) && String(m.content || '') === echo)) continue;
+      h.push({ role: 'system', sys: true, steerEcho: true, content: echo, sourceRunId: runId, ts: n.ts });
+      added++;
+    }
+    return added;
+  }
+  /* A NOTE SITS WHERE THE AGENT READ IT. A filed note lands at its run's end, ahead of the turns the station's transcript
+     adds when the conversation is read back, so the merge leaves it after the agent's reply to it. Each note moves to just
+     after the last row of its own run stamped no later than the note (the run's middle turns carry the station's time of
+     writing, the note the time it was read). A run with no stamped row before it leaves it where it is. Pure. */
+  function placeSteerNotes(rows) {
+    const list = Array.isArray(rows) ? rows.slice() : [];
+    const tsOf = r => Number(r && r.ts) || 0;
+    for (const note of list.filter(r => r && r.steerEcho && r.sourceRunId && tsOf(r) > 0)) {
+      const from = list.indexOf(note);
+      list.splice(from, 1);
+      let at = -1;
+      for (let j = 0; j < list.length; j++) {
+        const r = list[j];
+        if (r && String(r.sourceRunId || '') === String(note.sourceRunId) && tsOf(r) > 0 && tsOf(r) <= tsOf(note)) at = j;
+      }
+      list.splice(at >= 0 ? at + 1 : from, 0, note);
+    }
+    return list;
+  }
+  // that echo on this stream's own run is the proof the agent has it — a STOP no longer gives it back
+  function markSentNowLanded(id, runId, delta) {
+    const list = sentNow.get(id); if (!list || !list.length) return;
+    const re = /(?:^|\n)\[steering\] ([^\n]*)/g; let m, read = false;
+    while ((m = re.exec(String(delta || '')))) {
+      const n = list.find(x => !x.landed && x.runId === runId && x.wire === m[1]);
+      if (n) { n.landed = true; read = true; }
+    }
+    if (read && activeWs && activeWs.id === id) renderQueued();   // its SENT pill leaves: the transcript shows it now
+  }
+  /* A SENT-NOW LINE IS NEVER LOST ON STOP EITHER. The station took it (200) but the run was stopped before its next step
+     folded it in: the note died with the run. Once the stop is CONFIRMED, every sent-now line of that run whose
+     '[steering]' echo never showed goes back into the message box — ahead of what is there, unsent — with one line. */
+  function restoreSentNow(id, runId) {
+    const list = sentNow.get(id) || [];
+    const acc = (typeof Channels !== 'undefined' && Channels.peek && Channels.peek(id)) ? String(Channels.peek(id).acc || '') : '';
+    const mine = list.filter(n => n.runId === runId);
+    const lost = mine.filter(n => !n.landed && acc.indexOf('[steering] ' + n.wire + '\n') < 0);
+    const rest = list.filter(n => n.runId !== runId);
+    rest.length ? sentNow.set(id, rest) : sentNow.delete(id);
+    if (activeWs && activeWs.id === id) renderQueued();   // its SENT pills leave the strip with the run
+    dropSentNow(id, mine.filter(n => lost.indexOf(n) < 0).map(n => n.id));   // read: settled with the stopped turn
+    if (!lost.length) return;
+    giveBack(id, lost.map(n => n.text), lost.length === 1 ? 'The run stopped before the agent read your send-now message — it is back in the message box.'
+      : 'The run stopped before the agent read ' + lost.length + ' of your send-now messages — they are back in the message box.', lost.map(n => n.id));
+  }
+  // words a stop gives back go into THEIR session's message box: now if it is on screen, else when you return (returnHeld).
+  // Never into the queue — a return would auto-send them behind the stop. ids = their sent-now lines: on disk until they
+  // land in the box (an unsent draft from there on), so a reload before you return still gives them back — once.
+  function giveBack(id, texts, line, ids) {
+    if (!(activeWs && activeWs.id === id)) { heldBack.set(id, (heldBack.get(id) || []).concat([{ texts: texts, line: line, ids: ids || [] }])); return; }
+    if (!input) return;
+    const typed = String(input.value || '').trim();
+    input.value = texts.concat(typed ? [typed] : []).join('\n');
+    autoGrowInput();
+    localLine(line);
+    dropSentNow(id, ids);
+  }
+  function returnHeld(id) {
+    const held = heldBack.get(id); if (!held || !held.length) return;
+    heldBack.delete(id);
+    for (const h of held.slice().reverse()) giveBack(id, h.texts, h.line, h.ids);   // oldest ends up first in the box
+  }
+  /* the run is over: a sent-now line it showed landing is settled; one the station took that the run never read (a run
+     error, a budget or loop-guard stop, a phone STOP, the gap after the loop's last drain — its own line says "NOT applied,
+     send it as a new message") goes back to the FRONT of the queue and the teardown's deferred flush sends it, as a refusal
+     would. One still in flight stays until its answer. (A desktop STOP the station confirmed already settled its run.) */
+  function settleSentNow(id, runId, acc) {
+    const list = sentNow.get(id) || [], ran = String(acc || '');
+    const unread = list.filter(n => n.runId === runId && n.accepted && !n.landed && ran.indexOf('[steering] ' + n.wire + '\n') < 0);
+    const rest = list.filter(n => n.runId !== runId || !n.accepted);
+    rest.length ? sentNow.set(id, rest) : sentNow.delete(id);
+    dropSentNow(id, list.filter(n => rest.indexOf(n) < 0).map(n => n.id));   // settled here: read, or a queued pill again
+    if (activeWs && activeWs.id === id) renderQueued();   // a SENT pill of the ended run never outlives it
+    if (!unread.length) return;
+    queued.set(id, unread.map(n => n.text).concat(queued.get(id) || []));
+    renderQueued();
+    if (activeWs && activeWs.id === id) localLine(unread.length === 1 ? 'The run ended before the agent read your send-now message — it goes as your next message.'
+      : 'The run ended before the agent read ' + unread.length + ' of your send-now messages — they go as your next messages.');
+  }
+  /* THE STATION DECIDES WHAT THE PAGE COULD NOT (live walk 2026-10-14). On a conversation's load (once its history merged)
+     and when a run whose stream died ends, every line still on disk that this page is not holding itself is asked about:
+       · read (the run folded it in)            → shown as read: one steer-echo row after that run's dialogue (showSentNowRead),
+                                                   unless the saved history already shows its echo
+       · never read (the run ended first, or the station never took it) → back in THIS conversation's message box, ahead of
+                                                   what is typed, unsent, with one line
+       · no record (a restart lost the run and no run record was written) → read only if this run's saved reply shows its
+                                                   echo; else back in the box with a line that says the station cannot tell
+       · the run is still going / no answer      → asked again later (bounded); never dropped, never guessed.
+     Never auto-sent. Each line is decided once: the disk is re-read after the answer (this page's own flow or another page
+     may have settled one meanwhile) and a line leaves the disk as it lands. */
+  function reconcileSentNow(ws, attempt) {
+    const id = ws && ws.id;
+    if (!id || typeof fetch === 'undefined') return Promise.resolve();
+    if (sentNowChecks.has(id)) return sentNowChecks.get(id);
+    const p = askSentNow(ws, attempt || 0).catch(() => {}).then(() => { sentNowChecks.delete(id); });
+    sentNowChecks.set(id, p);
+    return p;
+  }
+  async function askSentNow(ws, attempt) {
+    const id = ws.id;
+    const pick = () => {
+      const own = new Set();
+      for (const n of sentNow.get(id) || []) own.add(n.id);
+      for (const h of heldBack.get(id) || []) for (const k of h.ids || []) own.add(k);
+      const liveRun = (typeof Channels !== 'undefined' && Channels.isBusy && Channels.isBusy(id) && Channels.runIdOf) ? Channels.runIdOf(id) : null;
+      return (sentNowDisk()[id] || []).filter(e => e && e.id && e.runId && !own.has(e.id) && e.runId !== liveRun);
+    };
+    const lines = pick();
+    if (!lines.length) return;
+    const answers = new Map();
+    for (const rid of new Set(lines.map(e => e.runId))) {
+      let st = null;
+      try {
+        const r = await fetch('/api/run/steer?runId=' + encodeURIComponent(rid), { cache: 'no-store' });
+        st = r && r.ok ? await r.json() : null;
+      } catch (_) { st = null; }   // no answer is not an answer: the line waits
+      answers.set(rid, st);
+    }
+    const cur = (typeof Workstreams !== 'undefined' && Workstreams.get && Workstreams.get(id)) || ws;
+    const still = new Set(pick().map(e => e.id));
+    const by = { read: [], back: [], unsure: [], wait: [] };
+    for (const e of lines) if (still.has(e.id)) by[sentNowVerdict(e, answers.get(e.runId), cur.history)].push(e);
+    if (by.read.length) { dropSentNow(id, by.read.map(e => e.id)); showSentNowRead(cur, by.read); }
+    const n = by.back.length, u = by.unsure.length;
+    if (n) giveBack(id, by.back.map(e => e.text), n === 1 ? 'The run ended before the agent read your send-now message — it is back in the message box.'
+      : 'The run ended before the agent read ' + n + ' of your send-now messages — they are back in the message box.', by.back.map(e => e.id));
+    if (u) giveBack(id, by.unsure.map(e => e.text), u === 1 ? 'The station has no record that the agent read your send-now message before its run ended — it is back in the message box.'
+      : 'The station has no record that the agent read ' + u + ' of your send-now messages before their run ended — they are back in the message box.', by.unsure.map(e => e.id));
+    // a line the station still cannot decide a day after it was sent stops waiting: back in the box, saying no answer came
+    const stale = by.wait.filter(e => Date.now() - Number(e.at) > 24 * 3600 * 1000);
+    if (stale.length) sentNowOverdue(id, stale);
+    // ONE retry chain per line (SEND NOW review, 2026-10-15): a load or a run's end that finds a line still waiting while its
+    // retry is already armed arms no second one — only the in-flight ask was de-duped before, so every ask added a chain
+    const unarmed = by.wait.filter(e => stale.indexOf(e) < 0 && !sentNowRetry.has(e.id));
+    if (unarmed.length && attempt < 40) {
+      const armed = {};
+      for (const e of unarmed) sentNowRetry.set(e.id, armed);
+      setTimeout(() => {
+        for (const e of unarmed) if (sentNowRetry.get(e.id) === armed) sentNowRetry.delete(e.id);
+        return reconcileSentNow((typeof Workstreams !== 'undefined' && Workstreams.get && Workstreams.get(id)) || ws, attempt + 1);
+      }, Math.min(15000, Math.round(1500 * Math.pow(1.4, attempt))));
+    }
+  }
+  // one line's fate from the station's answer (GET /api/run/steer → { live, ended, source, notes: { noteId: state } })
+  function sentNowVerdict(e, st, history) {
+    if (!st || typeof st !== 'object' || !st.notes || typeof st.notes !== 'object') return 'wait';
+    const s = st.notes[e.id];
+    if (s === 'applied') return 'read';
+    if (s === 'unapplied') return 'back';
+    if (st.source === 'none') return st.live ? 'wait' : (shownSteer(history, e, true) ? 'read' : 'unsure');
+    // still pending, or a line the station never took (refused, or its POST never arrived): decided once the run can no
+    // longer read it — an aborted loop never drains again, so a run that is not in flight reads nothing more
+    return (st.ended || !st.live) ? 'back' : 'wait';
+  }
+  // does the saved history show this line's echo? strict = only a row of ITS run proves it (an older run may have read the
+  // same words); loose (dedupe before filing a row) also counts a row saved without its run id (a stopped partial) — but
+  // never a row of ANOTHER run, a filed echo row included: the same words read by an earlier run are not this line's proof
+  function shownSteer(history, e, strict) {
+    const echo = '[steering] ' + e.wire;
+    const ofRun = m => (strict ? m.sourceRunId === e.runId : (!m.sourceRunId || m.sourceRunId === e.runId));
+    return (Array.isArray(history) ? history : []).some(m => m && ofRun(m) && (
+      (m.steerEcho && String(m.content || '') === echo)
+      || (m.role === 'assistant' && !m.sys && ('\n' + String(m.content || '') + '\n').indexOf('\n' + echo + '\n') >= 0)));
+  }
+  // a line the run read, filed as ONE station row after that run's dialogue (before the station's own lines about it);
+  // renderHistory draws it as the live stream's steer-echo row. The station-row shape every other station row uses (role
+  // 'system' + sys): it never seeds the model (historyWindow drops sys rows), and nothing that reads the agent's last turn
+  // (copy last reply, the next send's prior-turn hint, /history, the starter suggestions) takes the Commander's note for the agent's words.
+  function showSentNowRead(ws, read) {
+    if (!ws) return;
+    const h = Array.isArray(ws.history) ? ws.history : (ws.history = []);
+    let added = 0;
+    for (const e of read) {
+      if (shownSteer(h, e, false)) continue;   // the saved reply already shows it: never twice
+      let at = -1;
+      for (let i = h.length - 1; i >= 0 && at < 0; i--) if (h[i] && !h[i].sys && String(h[i].sourceRunId || '') === e.runId) at = i + 1;
+      if (at < 0) { at = h.findIndex(m => m && m.sys && String(m.sourceRunId || '') === e.runId); if (at < 0) at = h.length; }
+      // after the lines of the same run filed before it: several read lines keep the order they were sent in
+      while (at < h.length && h[at] && h[at].steerEcho && String(h[at].sourceRunId || '') === e.runId) at++;
+      h.splice(at, 0, { role: 'system', sys: true, steerEcho: true, content: '[steering] ' + e.wire, sourceRunId: e.runId, ts: Number(e.at) || Date.now() });
+      added++;
+    }
+    if (!added) return;
+    try { if (typeof App !== 'undefined' && App.persist) App.persist(); } catch (_) { /* the row is in memory; the next save writes it */ }
+    if (log && activeWs && activeWs.id === ws.id && !(typeof Channels !== 'undefined' && Channels.isBusy && Channels.isBusy(ws.id))) {
+      log.innerHTML = ''; renderHistory(); replayChannel(); syncStatus();
+    }
   }
   // a stream just freed (or was switched back to while idle) — send its next queued follow-up. Guarded to the
   // DISPLAYED stream so send()'s DOM writes always target the visible log; a backgrounded queue waits for return.
@@ -6710,7 +9294,20 @@ const Chat = (() => {
       last.stopped = true;
       return;
     }
-    ws.history.push({ role: 'assistant', content: text, stopped: true, ts: Date.now() });
+    ws.history.push({ role: 'assistant', content: text, stopped: true, ts: Date.now(), projectRoot: liveRunRoots.get(ws.id) });   // the in-flight run's root (persistPartial)
+  }
+  // WHY it stopped, kept on the stopped turn itself (2026-10-11): the ⏹ work-log line was DOM-only, so after a reload the
+  // thread showed a cut-off reply with no reason. renderHistory replays it as the same ⏹ line. Metadata only — the
+  // model's wire carries role/content, never this field.
+  function stoppedByLine(by) { return by === 'esc' ? 'stopped by you (Esc)' : by ? 'stopped by you' : ''; }
+  // The run id settles the STREAM's outcome too: a stopped run is neither FINISHED nor FAILED (task-board truth — with
+  // nothing recorded the board read it as done). A deliberate Stop is 'stopped'; an in-band stop keeps its own reason.
+  function noteStopReason(ws, note, runId, reason) {
+    if (runId && ws && typeof Workstreams !== 'undefined' && Workstreams.noteRunEnd) Workstreams.noteRunEnd(ws.id, runId, null, reason && reason !== 'cancelled' ? reason : 'stopped');
+    const n = String(note || '').trim();
+    if (!n || !ws || !Array.isArray(ws.history)) return;
+    const last = ws.history[ws.history.length - 1];
+    if (last && last.role === 'assistant' && last.stopped) last.stopNote = n.slice(0, 400);
   }
   // RETRY — re-run the last turn after an outage / connection drop / in-band error. Discard the trailing failed
   // reply, re-render the thread (dropping the ⚠ row), then resend the last user message WITHOUT echoing it again.
@@ -6720,7 +9317,13 @@ const Chat = (() => {
     if (!activeWs) return localLine('No active workstream to retry in.');
     if (isBusy()) return localLine('This stream is still running — stop it first, then /retry.');
     const h = activeWs.history;
-    if (h.length && h[h.length - 1].role === 'assistant' && (h[h.length - 1].error || h[h.length - 1].stopped)) h.pop();   // drop the failed/stopped partial reply
+    /* A retry re-runs the LAST user turn, so every row after it is the attempt being replaced — drop all of them,
+       not just the ⚠ row. A failed run that streamed several replies ("The tool needs the required objective
+       field." …) used to leave them after the user turn, the retry request then ENDED ON AN ASSISTANT MESSAGE, and
+       current Claude models refuse that outright ("This model does not support assistant message prefill") — every
+       Try again failed in ~1.5s with "Provider returned error" (first-hour walk 2026-09-28). */
+    const lastUser = h.map(m => m && m.role).lastIndexOf('user');
+    if (lastUser >= 0) h.length = lastUser + 1;
     let text = null;
     for (let i = h.length - 1; i >= 0; i--) { if (h[i].role === 'user') { text = h[i].content; break; } }
     if (text == null) return localLine('Nothing to retry yet — send a message first.');
@@ -6747,6 +9350,97 @@ const Chat = (() => {
       if (CONNECTOR_NEEDED.size > 40) CONNECTOR_NEEDED.delete(CONNECTOR_NEEDED.keys().next().value);
     });
   }
+  /* A KEY PASTED INTO CHAT, SAVED (keys.save, 2026-10-25). The agent stored a key the Commander pasted here in KEYS. The
+     page holds the paste in two places the sidecar's redaction never reaches: the bubble on screen and this
+     workstream's history (the desk save, and what the next turn re-sends to the model). On keys.save's OK result (the
+     contract's own agent.tool_call + agent.tool_result, paired by callId — no new event) the sidecar swaps every saved
+     key for its placeholder (POST /api/servicekeys/scrub), and only a turn that came back changed is rewritten, so
+     nothing is claimed for a paste the sidecar did not find. */
+  const KEY_SAVE_CALLS = new Map();   // callId -> runId of an in-flight keys.save (bounded)
+  let keySavedWired = false;
+  function wireKeySaved() {
+    if (keySavedWired || typeof U === 'undefined' || !U.bus) return;
+    keySavedWired = true;
+    U.bus.on('agent.tool_call', p => {
+      if (!p || !p.callId || !p.runId || !/^keys[._]save$/.test(String(p.name || ''))) return;
+      KEY_SAVE_CALLS.set(p.callId, p.runId);
+      if (KEY_SAVE_CALLS.size > 40) KEY_SAVE_CALLS.delete(KEY_SAVE_CALLS.keys().next().value);
+    });
+    U.bus.on('agent.tool_result', p => {
+      const runId = p && p.callId ? KEY_SAVE_CALLS.get(p.callId) : null;
+      if (!runId) return;
+      KEY_SAVE_CALLS.delete(p.callId);
+      if (p.ok && !p.isError) scrubSavedKeys(runId).catch(() => {});
+    });
+  }
+  // returns how many of the Commander's turns now show the placeholder (the number aids testing)
+  async function scrubSavedKeys(runId) {
+    let ws = null;
+    if (typeof Workstreams !== 'undefined' && Workstreams.all) { try { ws = Workstreams.all().find(w => (w.runIds || []).indexOf(runId) >= 0) || null; } catch (_) {} }
+    ws = ws || activeWs;
+    const turns = ws && Array.isArray(ws.history) ? ws.history.filter(m => m && m.role === 'user' && typeof m.content === 'string' && m.content) : [];
+    if (!turns.length || typeof Harness === 'undefined' || !Harness.api) return 0;
+    const raw = turns.map(m => m.content);
+    const r = await Harness.api.post('/api/servicekeys/scrub', { texts: raw });
+    const out = r && r.ok && r.j && Array.isArray(r.j.texts) && r.j.texts.length === raw.length ? r.j.texts : null;
+    if (!out) return 0;
+    const keys = [];
+    out.forEach((t, i) => {
+      if (typeof t !== 'string' || t === raw[i]) return;
+      turns[i].content = t;
+      for (const k of swappedKeys(raw[i], t)) if (!keys.some(x => x.value === k.value)) keys.push(k);
+    });
+    if (!keys.length) return 0;
+    // the run's directive also rides RUN_META (the rate card's reference line) and may have titled the thread
+    for (const meta of RUN_META.values()) { if (meta && typeof meta.directive === 'string') meta.directive = nameKeys(meta.directive, keys); }
+    if (typeof ws.title === 'string') ws.title = nameKeys(ws.title, keys);
+    try { App.persist(); } catch (_) {}
+    if (log && isActiveWs(ws)) {
+      const walker = document.createTreeWalker(log, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+      for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+        if (n.nodeType === 3) { const v = nameKeys(n.nodeValue, keys); if (v !== n.nodeValue) n.nodeValue = v; continue; }
+        for (const a of ['title', 'data-tip', 'aria-label']) {
+          const v = n.getAttribute(a);
+          if (v) { const s = nameKeys(v, keys); if (s !== v) n.setAttribute(a, s); }
+        }
+      }
+    }
+    return keys.length;
+  }
+  // The values the sidecar swapped, read back out of one (raw, scrubbed) pair: the scrubbed text is the raw text with
+  // each saved key replaced by its placeholder, so the raw text between the literal pieces IS the key. The page
+  // already held these values (the Commander typed them); nothing secret comes back from the sidecar. [] on any doubt.
+  function swappedKeys(raw, scrubbed) {
+    const re = /\[[A-Z][A-Z0-9_]* saved in (?:API )?KEYS\]/g;   // "API KEYS" since R15; the older "KEYS" still reads back
+    const names = scrubbed.match(re) || [], parts = scrubbed.split(re), out = [];
+    let at = 0;
+    for (let i = 0; i < names.length; i++) {
+      const s = raw.indexOf(parts[i], at); if (s < 0) return [];
+      const start = s + parts[i].length;
+      const last = i === names.length - 1;
+      if (!last && !parts[i + 1]) return [];   // two placeholders side by side: no seam to cut at
+      const end = last && !parts[i + 1] ? raw.length : raw.indexOf(parts[i + 1], start);
+      if (end <= start) return [];
+      out.push({ value: raw.slice(start, end), placeholder: names[i] });
+      at = end;
+    }
+    return out;
+  }
+  // every whole saved key -> its placeholder; a key cut short by a clipped label ("4e7b2c9d1a0f…") too
+  function nameKeys(text, keys) {
+    let s = String(text == null ? '' : text);
+    for (const k of keys) {
+      if (k.value.length < 16) continue;
+      if (s.indexOf(k.value) >= 0) s = s.split(k.value).join(k.placeholder);
+      const head = k.value.slice(0, 12);
+      for (let at = s.indexOf(head); at >= 0; at = s.indexOf(head, at + 1)) {
+        let end = at + head.length;
+        while (end < s.length && k.value.charAt(end - at) === s.charAt(end)) end++;
+        if (s.charAt(end) === '…') { s = s.slice(0, at) + k.placeholder + s.slice(end); }
+      }
+    }
+    return s;
+  }
   // returns true iff a chip was rendered (the bool aids testing)
   function offerConnectorDoor(runId, originWs) {
     if (!runId) return false;
@@ -6763,12 +9457,49 @@ const Chat = (() => {
     choices([{ label: door.label, value: 'connect' }], () => door.run());
     return true;
   }
+  /* A run that ends on a TASK_QUESTION owns the one post-run slot, so the connect chip cannot take a row of its own —
+     but connectors.list has already told the model "the Commander now has a ⇄ CONNECT chip", and the model tells
+     the Commander to tap it (first-hour walk 2026-09-28: said three times, no chip anywhere). Record the handoff
+     exactly as offerConnectorDoor would; offerTaskQuestion then draws the door INSIDE the question card. */
+  function holdConnectorDoor(runId, originWs) {
+    const ev = runId ? CONNECTOR_NEEDED.get(runId) : null;
+    if (!ev) return false;
+    CONNECTOR_NEEDED.delete(runId);
+    const ws = originWs || activeWs;
+    if (!ws || typeof Workstreams === 'undefined') return false;
+    // awaitingAnswer: the question is still open, so ABILITIES offers RETURN TO TASK, never CONTINUE TASK — that
+    // sends a continuation prompt, which send() would route in as the question's ANSWER (review 2026-09-28).
+    Workstreams.setConnectorHandoff(ws.id, Object.assign({}, ev, { agentId: ws.agentId || 'agent', awaitingAnswer: true }));
+    App.persist();
+    return true;
+  }
+  // The door for the displayed stream's durable connector handoff, drawn inside a question card — a task question
+  // or a FORK, fresh or restored after a reload. Opening the connect screen does NOT answer the question. A fresh
+  // card passes its runId so an older run's handoff never rides along on every later question in the stream.
+  function taskQuestionDoor(body, runId) {
+    const h = (activeWs && typeof Workstreams !== 'undefined') ? Workstreams.connectorHandoff(activeWs.id) : null;
+    if (h && runId && h.runId && h.runId !== runId) return null;
+    const door = (h && typeof Friendly !== 'undefined' && Friendly.connectorDoor) ? Friendly.connectorDoor(h) : null;
+    if (!door || !body) return null;
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'choice tq-door'; b.textContent = door.label;
+    b.onclick = () => door.run();
+    body.appendChild(b);
+    return b;
+  }
   // An explicit continuation carries existing history, unlike retryLast(), which repeats the user turn.
   // The connector is re-read on click; no OAuth callback can start work or change the originating agent.
   const connectorContinuing = new Set();
   async function continueConnectorTask(streamId) {
     const ws = Workstreams.get(streamId), h = Workstreams.connectorHandoff(streamId);
     if (!ws || !h || connectorContinuing.has(streamId) || Channels.isBusy(streamId)) return false;
+    // The run that raised this door ended on a question that is still open: a continuation prompt would be taken
+    // as its answer. Take the Commander back to the question instead; answering it continues with the connection.
+    if (h.awaitingAnswer) {
+      App.openWorkstream(streamId);
+      if (typeof StationUI !== 'undefined') StationUI.notify('Answer the open question in this task to continue with ' + h.connectorId + '.', 'info');
+      return false;
+    }
     const continuationFocusVersion = focusVersion;
     connectorContinuing.add(streamId);
     try {
@@ -6805,31 +9536,82 @@ const Chat = (() => {
       return false;
     } finally { connectorContinuing.delete(streamId); }
   }
+  // The ⚠ row a failed run leaves in the transcript (it survives a reload; historyWindowFrom keeps error rows off the
+  // model's wire). A specific verdict already names the cause; the generic "Something went wrong" keeps the real
+  // reason beside it, so a reload never loses WHY the run stopped (2026-10-11).
+  function errorHistoryLine(v) {
+    const msg = String((v && v.userMessage) || 'Something went wrong on that turn.');
+    const raw = String((v && v.raw) || '').replace(/\s+/g, ' ').trim();
+    const keepRaw = !!(v && v.kind === 'unknown' && raw && raw !== msg);
+    return '⚠ ' + msg + (keepRaw ? ' (' + (raw.length > 240 ? raw.slice(0, 237) + '…' : raw) + ')' : '');
+  }
   function offerTryAgain() {
     choices([{ label: '↻ Try again', value: 'retry' }], () => retryLast());
   }
   // Budget-stop legibility (2026-07-23): a 'budget' stop names WHICH spend cap fired and how big it is, in money
   // words — the old "reached this run's limit" read as a runtime setting and sent users hunting in the wrong
   // panel. Scope/cap ride the additive agent.run.end fields; an old sidecar omits them and gets the generic line.
-  function budgetStopLine(scope, capUsd) {
+  // Issue #135: the unpriced ceiling's own lever is its Runtime limits row; a save applies from the next run.
+  function budgetStopLine(scope, capUsd, atBalance, unpriced, subscription, projected) {
+    /* THE UNPRICED-MODEL TOKEN CEILING IS NOT A $ CAP (2026-10-11). A model with no known price is bounded per run in
+       TOKENS (loop.js maxUnpricedTokens, 2,000,000 by default); the $ settings never read it, so "hit the per-run spend
+       cap — raise it" sent the user to a lever that changes nothing. unpriced = { model, capTokens } from the additive
+       agent.run.end fields. Name the real limit and the real ways out. */
+    if (unpriced && unpriced.model) {
+      const n = Number(unpriced.capTokens) > 0 ? Number(unpriced.capTokens).toLocaleString('en-US') + '-token' : 'token';
+      return 'hit the ' + n + ' safety ceiling for ' + unpriced.model + ', a model StarNet has no price for — raising the $ spending limit does not change this; raise UNPRICED MODEL TOKEN CEILING in SETTINGS › APP & BACKUP › Runtime limits (0 = no ceiling), or pick a priced model to keep going';
+    }
+    // nor is the SUBSCRIPTION-token ceiling (loop.js maxSubscriptionTokens): a Claude Code sign-in books $0 per turn
+    if (subscription && subscription.model) {
+      const n = Number(subscription.capTokens) > 0 ? Number(subscription.capTokens).toLocaleString('en-US') + '-token' : 'token';
+      return 'used the ' + n + ' per-run ceiling on your Claude subscription (' + subscription.model + ') — say "continue" to keep going, or change the ceiling in SETTINGS › APP & BACKUP › Runtime limits';
+    }
     // only show the $ figure when it renders honestly at cent precision (a sub-cent test cap would read "$0.00")
     const cap = (typeof capUsd === 'number' && isFinite(capUsd) && capUsd >= 0.01) ? '$' + capUsd.toFixed(2).replace(/\.00$/, '') + ' ' : '';
+    // projected (agent.run.end budgetProjected): a run and its workers share one PER RUN cap; this run stopped BEFORE it
+    // (calls in flight took what was left) — never "hit" a cap it did not reach (d3a76db3)
+    if (scope === 'run' && projected === true) {
+      if (atBalance === true) return (cap ? 'stopped before it would spend more than the ' + cap + 'left on your StarNet balance' : 'stopped before it would spend more than what is left on your StarNet balance') + ' — add credits under SETTINGS → AI & MODELS to keep going';
+      return 'stopped before it would pass the ' + cap + 'per-run spend cap — raise it in SETTINGS › SPENDING LIMITS';
+    }
+    // atBalance (agent.run.end budgetCapIsBalance, additive): admission clamped this StarNet run's ceiling to the
+    // reported balance, so the run spent the wallet, not a cap the user chose — raising PER RUN would do nothing.
+    if (scope === 'run' && atBalance === true) return (cap ? 'used the ' + cap + 'left on your StarNet balance' : 'used what was left on your StarNet balance') + ' — add credits under SETTINGS → AI & MODELS to keep going';
     const what = scope === 'run' ? 'hit the ' + cap + 'per-run spend cap'
       : scope === 'agent' ? 'this agent hit its ' + cap + 'lifetime spend cap'
       : scope === 'day' ? 'hit the ' + cap + 'daily spend cap'
       : scope === 'global' ? 'hit the ' + cap + 'all-time spend cap'
       : 'hit a spend cap';
-    return what + ' — raise or remove it in MISSION CONTROL → BUDGET';
+    // A per-RUN stop says "raise", never "remove": a StarNet-credit run with PER RUN at 0 still stops at the
+    // managed default (issue #53), so "remove it" would be an instruction that does nothing there.
+    // the caps live in SETTINGS › SPENDING LIMITS (MISSION CONTROL is only a room label; there is no BUDGET tab)
+    return what + (scope === 'run' ? ' — raise it' : ' — raise or remove it') + ' in SETTINGS › SPENDING LIMITS';
   }
-  // the budget stop's door: open SETTINGS straight on the BUDGET section (the same openTerm(key, section)
-  // mechanism friendlyerror's doors use), with retry alongside for after the user has raised the cap.
-  function offerBudgetDoor() {
+  // the budget stop's door: open SETTINGS straight on the SPENDING LIMITS section (the same openTerm(key, section)
+  // mechanism friendlyerror's doors use), with retry alongside for after the user has raised the cap. A stop at the
+  // StarNet balance gets the top-up door instead — Friendly's 'store' door, the one managed_credit already opens.
+  function offerBudgetDoor(atBalance) {
+    const topUp = (atBalance === true && typeof Friendly !== 'undefined' && Friendly.actionButton) ? Friendly.actionButton({ action: 'store' }) : null;
     choices([
-      { label: '$ OPEN BUDGET SETTINGS', value: 'budget' },
+      topUp ? { label: topUp.label, value: 'store' } : { label: '$ OPEN SPENDING LIMITS', value: 'budget' },
       { label: '↻ Try again', value: 'retry', quiet: true }
     ], it => {
       if (it && it.value === 'retry') { retryLast(); return; }
+      if (topUp) { topUp.run(); return; }
       try { if (typeof StationUI !== 'undefined' && StationUI.openTerm) StationUI.openTerm('settings', 'budget'); } catch (_) {}
+    });
+  }
+  // the unpriced-model token ceiling's door: a DIFFERENT (priced) model — the model dock, the same ▸ PICK A MODEL door
+  // friendlyerror owns — never SPENDING LIMITS, where no setting governs this ceiling. Retry rides alongside.
+  function offerUnpricedDoor() {
+    const pick = (typeof Friendly !== 'undefined' && Friendly.actionButton) ? Friendly.actionButton({ action: 'settings', kind: 'model_not_found' }) : null;
+    if (!pick) { offerTryAgain(); return; }
+    choices([
+      { label: pick.label, value: 'model' },
+      { label: '↻ Try again', value: 'retry', quiet: true }
+    ], it => {
+      if (it && it.value === 'retry') { retryLast(); return; }
+      pick.run();
     });
   }
   // a one-tap recovery chip dropped under a failed turn (reuses the suggestion-pill row, which self-removes on
@@ -6841,7 +9623,7 @@ const Chat = (() => {
     if (!log) return;
     if (!verdict) { offerTryAgain(); diagAffordance(); return; }
     // ADOPTION (Lane A): every error names its DOOR and opens the exact one. Friendly.actionButton maps the
-    // verdict to { label, run } — capdenied -> REFIT (with the named capability), auth/no-key -> the real key
+    // verdict to { label, run } — capdenied -> BUILD MODE (with the named capability), auth/no-key -> the real key
     // field or "reconnect ChatGPT", model-not-found -> models. One source of truth; no local per-action ladder.
     const btn = (typeof Friendly !== 'undefined' && Friendly.actionButton) ? Friendly.actionButton(verdict) : null;
     if (btn) { choices([{ label: btn.label, value: verdict.action }], () => btn.run()); diagAffordance(verdict); return; }
@@ -6866,12 +9648,16 @@ const Chat = (() => {
     b.textContent = '⧉ copy diagnostics for a bug report';   // ⧉ = the house copy glyph (not the 📋 emoji)
     b.addEventListener('click', () => {
       b.disabled = true;
-      Diag.copy({ notify: false, context: context }).then(ok => {
-        b.textContent = ok ? '✓ diagnostics copied — paste into your report' : 'copy failed — try again';
-        if (!ok) { b.disabled = false; return; }
-        if (typeof SFX !== 'undefined' && SFX.click) SFX.click();
+      // onDone carries the report text: when the clipboard refuses (WebKit after the fetch), the report renders
+      // in this row as selectable text with its own in-gesture "copy again" — a retry of this button would only
+      // repeat the refusal, so it stays disabled and says where the report went.
+      Diag.copy({ notify: false, context: context, onDone: (ok, text) => {
+        b.textContent = ok ? '✓ diagnostics copied — paste into your report' : (text ? 'copy blocked — report shown below' : 'could not read diagnostics');
+        if (!ok && !text) { b.disabled = false; return; }   // nothing was read — a later retry can still succeed
+        if (!ok) { if (Diag.showBlock) { Diag.showBlock(rowEl, { text: text }); autoscroll(); } return; }
+        if (typeof SFX !== 'undefined' && SFX.press) SFX.press();
         setTimeout(() => { try { rowEl.remove(); } catch (_) {} }, 2600);
-      });
+      } });
     });
     rowEl.appendChild(b);
     log.appendChild(rowEl); autoscroll();
@@ -6880,12 +9666,19 @@ const Chat = (() => {
   // show the Stop control + the queued pills for whatever stream is on screen. Called from syncStatus (covers
   // switch + turn-end) and at send() start (status goes 'thinking…' without a syncStatus).
   function updateControls() {
-    const stop = el('chat-stop'); if (stop) stop.hidden = !isBusy();
+    const stop = el('chat-stop');
+    if (stop) {
+      stop.hidden = !isBusy();
+      // in a group ■ is stop-all (GroupChat.stop), so its tip says it stops every agent, not one turn
+      const groupStop = activeWs?.conversationMode === 'group';
+      stop.setAttribute('data-tip', groupStop ? 'Stop every agent in this chat (Esc)' : 'Stop the running turn (Esc)');
+      stop.setAttribute('aria-label', groupStop ? 'Stop every agent in this chat' : 'Stop the running turn');
+    }
     // CONCURRENT SESSIONS: a peer run on this agent no longer disables the composer — the backend admits
     // concurrent same-agent runs (workspace lease guards the real collision). The peer surfaces as the soft
     // status row + a tooltip; send stays live.
     const peer = !isBusy() ? busyPeerFor(activeWs) : null;
-    if (input) { input.disabled = false; input.title = peer ? ('This agent is also running in ' + streamLabel(peer)) : ''; }
+    if (input) { input.disabled = false; input.title = peer ? ('This agent is also running in ' + shownName(peer)) : ''; }
     const sendBtn = el('chat-send'); if (sendBtn) sendBtn.disabled = false;
     const attachBtn = el('chat-attach'); if (attachBtn) attachBtn.disabled = false;
     renderQueued();
@@ -6941,8 +9734,8 @@ const Chat = (() => {
     Object.freeze({ name: 'away', aliases: ['build-away', 'buildaway'], desc: 'queue work for this agent to build on its own away shift', argsHint: '[<what to build> | list | on | off | now]', action: 'away' }),
     Object.freeze({ name: 'routine', aliases: ['routines'], desc: 'list, create, preview, pause or delete a scheduled routine', argsHint: '[list | add <schedule> | <task> | preview <schedule> | pause N | resume N | rm N]', action: 'routine' }),
     Object.freeze({ name: 'loop', desc: 'repeat a prompt on an interval in this workstream', argsHint: '<interval> <prompt> | status | off', action: 'loop' }),
-    Object.freeze({ name: 'goal', desc: 'set an autonomous standing goal (status/pause/resume/clear)', argsHint: '[text|status|pause|resume|clear]', action: 'goal' }),
-    Object.freeze({ name: 'subgoal', desc: 'add a criterion the goal loop must also satisfy', argsHint: '[text|remove N|clear]', action: 'subgoal' }),
+    Object.freeze({ name: 'goal', desc: 'set a goal this session works toward (status/pause/resume/clear)', argsHint: '[text|status|pause|resume|clear]', action: 'goal' }),
+    Object.freeze({ name: 'subgoal', desc: 'add a criterion the session goal must also satisfy', argsHint: '[text|remove N|clear]', action: 'subgoal' }),
     Object.freeze({ name: 'model', desc: 'show or set the active model', argsHint: '[model-id]', action: 'model' }),
     Object.freeze({ name: 'personality', desc: 'show or set the active personality', argsHint: '[personality]', action: 'personality' }),
     Object.freeze({ name: 'yolo', desc: 'toggle full-access approval mode', argsHint: '[on|off]', action: 'yolo' }),
@@ -6979,7 +9772,7 @@ const Chat = (() => {
     try { if (typeof App !== 'undefined' && App.refreshRail) App.refreshRail(); } catch (_) {}
     try { if (typeof App !== 'undefined' && App.persist) App.persist(); } catch (_) {}
   }
-  function streamLabel(w) { return (w && (w.title || (w.id === (typeof Workstreams !== 'undefined' && Workstreams.generalId && Workstreams.generalId()) ? 'General' : 'Untitled'))) || 'current stream'; }
+  function streamLabel(w) { return (w && (typeof Workstreams !== 'undefined' && Workstreams.titleOf ? Workstreams.titleOf(w) : (w.title || 'New session'))) || 'current stream'; }
   function workstreamList() {
     try { return (typeof Workstreams !== 'undefined' && Workstreams.list) ? Workstreams.list() : []; } catch (_) { return []; }
   }
@@ -7065,31 +9858,46 @@ const Chat = (() => {
   function goalCommand(args) {
     const raw = String(args || '').trim();
     const low = raw.toLowerCase();
-    if (typeof GoalLoop === 'undefined') return localLine('The goal loop is not available in this build.');
+    if (typeof GoalLoop === 'undefined') return localLine('Session goals are not available in this build.');
     if (!activeWs) return localLine('Open a workstream first.');
     const cur = goalOf(activeWs);
     if (!raw || low === 'status') return localLine(GoalLoop.statusLine(cur));
     if (low === 'pause') {
-      if (!cur || cur.status === 'cleared') return localLine('No goal loop to pause.');
+      if (!cur || cur.status === 'cleared') return localLine('No session goal to pause.');
       GoalLoop.pause(cur, 'you paused it'); persistGoal();
-      return localLine('⏸ goal loop paused. /goal resume to continue.');
+      return localLine((typeof isBusy === 'function' && isBusy())
+        ? '⏸ session goal paused — the step already running finishes, and no next step starts. /goal resume to continue.'
+        : '⏸ session goal paused. /goal resume to continue.');
     }
     if (low === 'resume') {
-      if (!cur || cur.status !== 'paused') return localLine('No paused goal loop to resume.');
+      if (!cur || cur.status !== 'paused') return localLine('No paused session goal to resume.');
       GoalLoop.resume(cur); persistGoal();
-      localLine('▶ goal loop resumed (' + cur.turnsUsed + '/' + cur.maxTurns + '). Kicking off the next step…');
+      localLine('▶ session goal resumed (' + cur.turnsUsed + '/' + cur.maxTurns + '). Kicking off the next step…');
       return kickGoal(activeWs);   // resume immediately fires the next continuation if the stream is free
     }
     if (low === 'clear') {
-      if (!cur || cur.status === 'cleared') return localLine('No goal loop to clear.');
+      if (!cur || cur.status === 'cleared') return localLine('No session goal to clear.');
       GoalLoop.clear(cur); activeWs.goalLoop = undefined; persistGoal();
-      return localLine('Cleared the goal loop.');
+      return localLine('Cleared the session goal.');
     }
     // /goal <text> — set (or replace) the standing goal and start working toward it
     const s = GoalLoop.create(raw, { now: Date.now() });
     if (!s) return localLine('Usage: /goal <what you want done>');
     activeWs.goalLoop = s; persistGoal();
-    localLine('⊙ goal loop set: ' + s.goal + '  (budget ' + s.maxTurns + ' turns). Working toward it…');
+    /* ONE MEANING FOR 'GOAL LOOP' (org pass 10-14, P29): /goal is a loop on THIS session only — not an AUTOMATE › GOAL LOOPS
+       entry. Say so, and hand over a real door key (never a menu path) to where lasting goal loops live. A reload does not end
+       the session, so the line says the goal stays WITH this session through one (P29 polish 2: 'session only … a reload keeps it'
+       read as a contradiction). */
+    const set = localLine('⊙ goal set for this session only: ' + s.goal + ' (budget ' + s.maxTurns + ' turns). It works while StarNet is open and stays with this session through a reload. Working toward it…');
+    if (set && typeof StationUI !== 'undefined' && StationUI.openTerm) {
+      systemDoor(set, '▸ AUTOMATE › GOAL LOOPS', () => StationUI.openTerm('automation', 'loops'), { cls: 'goal-loops-door', lead: 'Lasting goal loops:', dest: 'automation:loops' });
+    }
+    // an untitled session is named from its goal NOW (no-op when it already has a name): the first step may wait on a busy
+    // stream or a pending card, and the rail row + COMMS title must never wear the continuation prompt meanwhile
+    if (typeof Workstreams !== 'undefined' && Workstreams.autoTitle && Workstreams.autoTitle(activeWs.id, s.goal)) {
+      if (typeof App !== 'undefined' && App.refreshRail) App.refreshRail();
+      paintTitle();
+    }
     kickGoal(activeWs);
   }
   // /subgoal <text>          — append a criterion the loop must ALSO satisfy before it's done
@@ -7097,11 +9905,11 @@ const Chat = (() => {
   function subgoalCommand(args) {
     const raw = String(args || '').trim();
     const low = raw.toLowerCase();
-    if (typeof GoalLoop === 'undefined') return localLine('The goal loop is not available in this build.');
+    if (typeof GoalLoop === 'undefined') return localLine('Session goals are not available in this build.');
     const cur = activeWs && goalOf(activeWs);
     if (!raw) {
       const subs = (cur && cur.subgoals) || [];
-      return localLine(subs.length ? ('Subgoals: ' + subs.map((t, i) => (i + 1) + '. ' + t).join(' | ')) : 'No subgoals set. Use /subgoal <text> once a goal loop is running.');
+      return localLine(subs.length ? ('Subgoals: ' + subs.map((t, i) => (i + 1) + '. ' + t).join(' | ')) : 'No subgoals set. Use /subgoal <text> once a session goal is set.');
     }
     if (!cur || !GoalLoop.hasGoal(cur)) return localLine('Set a goal first with /goal <text>, then add criteria with /subgoal.');
     if (low === 'clear') { cur.subgoals = []; persistGoal(); return localLine('Cleared subgoals.'); }
@@ -7119,27 +9927,38 @@ const Chat = (() => {
      goalBlocked() — never drive a continuation while a beat / consent card is pending approval (the one-beat
      discipline) or while an interview owns the input; the continuation waits for a free moment (it re-fires from
      the next send() teardown, or from /goal resume). A pending permission approval on THIS stream also blocks —
-     the human must decide the tool call before we pile on the next turn. */
-  function goalBlocked(ws) {
-    if (interview) return true;
-    if (activeTurnin || activeNudge || studyBusy() || threadBusy()) return true;   // a visible review/beat is up
-    if (taskQuestionLive()) return true;   // an unanswered task question is up — the human decides it before the loop piles on
-    if (typeof Dialogue !== 'undefined' && Dialogue.isOpen && Dialogue.isOpen()) return true;
-    if (ws && typeof Channels !== 'undefined' && Channels.pendingOf && Channels.pendingOf(ws.id)) return true;   // a tool approval is pending
-    return false;
+     the human must decide the tool call before we pile on the next turn.
+     A GENTLE NUDGE IS NOT A DECISION (live walk 10-14): an optional curiosity/suggestion aside ('✦ one curious thing … SURE /
+     NOT NOW') owes no answer and never takes typed text, so it no longer holds the loop — /goal said 'Working toward it…' and
+     then sat silent for as long as the aside stayed up. Only a nudge that must be decided (keepUntilDecision) still waits.
+     goalWaitReason() names what the loop waits for, so a wait is SAID (kickGoal), never a silent stall. */
+  function goalWaitReason(ws) {
+    if (interview) return 'the interview to finish';
+    if (activeTurnin) return 'your decision on the memory card above';
+    if (activeNudge && activeNudge.keepUntilDecision) return 'your choice on the card above';
+    if (studyBusy() || threadBusy()) return 'your decision on the card above';
+    if (taskQuestionLive()) return 'your answer to the question above';   // the human decides it before the loop piles on
+    if (typeof Dialogue !== 'undefined' && Dialogue.isOpen && Dialogue.isOpen()) return 'the open dialogue to close';
+    if (ws && typeof Channels !== 'undefined' && Channels.pendingOf && Channels.pendingOf(ws.id)) return 'your approval on the card above';
+    return '';
   }
+  function goalBlocked(ws) { return !!goalWaitReason(ws); }
   // kick the loop forward on `ws`: if the stream is free + unblocked and the loop is active, send the next
   // continuation as a real turn (routed through send(), so it walks the desk / bills / streams like any turn).
   // Called after a set/resume and after each judged turn. Idempotent + safe when there's no active loop.
   const goalRetry = new Set();   // wsIds with a blocked-moment retry armed (one pending re-check per stream, never stacked)
+  const goalWaitSaid = new WeakMap();   // goal object → the wait reasons already said for it (each said once per goal, never repeated)
   function kickGoal(ws) {
     const s = goalOf(ws);
     if (!s || !GoalLoop.isActive(s)) return;
     if (!isActiveWs(ws)) return;                 // the continuation drives the DISPLAYED stream (send()'s DOM writes)
     if (isBusy()) return;                        // a run is already in flight — the teardown judge re-drives the loop
-    if (goalBlocked(ws)) {
+    const wait = goalWaitReason(ws);
+    if (wait) {
       // a beat/consent card owns the moment — "deferred" must not become "stalled": re-check on a slow cadence
-      // (one armed retry per stream; gives up silently when the loop is paused/cleared meanwhile).
+      // (one armed retry per stream; gives up silently when the loop is paused/cleared meanwhile) and SAY what it waits for
+      const said = goalWaitSaid.get(s) || new Set();
+      if (!said.has(wait)) { said.add(wait); goalWaitSaid.set(s, said); localLine('⏸ session goal waiting for ' + wait + ' — the next step starts once that is settled.'); }
       if (!goalRetry.has(ws.id)) { goalRetry.add(ws.id); setTimeout(() => { goalRetry.delete(ws.id); kickGoal(ws); }, 7000); }
       return;
     }
@@ -7151,7 +9970,7 @@ const Chat = (() => {
   // `wasContinuation` = this turn WAS a loop-driven continuation (vs a real user message). A real user message
   // PREEMPTS: it pauses the loop for this turn (their message wins) — we don't judge, we don't queue. reply is the
   // agent's last assistant text (what the judge evaluates).
-  async function judgeGoalTurn(ws, reply, wasContinuation) {
+  async function judgeGoalTurn(ws, reply, wasContinuation, stall) {
     const s = goalOf(ws);
     if (!s || !GoalLoop.isActive(s)) return;
     // a REAL user message mid-loop preempts: pause, judge nothing, queue nothing (they took over). Checked BEFORE
@@ -7165,7 +9984,15 @@ const Chat = (() => {
     if (goalJudging.has(ws.id)) return;          // a judge is already deciding this stream — don't double-fire
     // a continuation turn that produced NO clean reply (errored / stopped mid-thought) is not judgeable — leave the
     // loop as-is (it advances no turn); a later free moment or /goal resume continues it. Don't claim done on nothing.
-    if (!reply || !String(reply).trim()) return;
+    if (!reply || !String(reply).trim()) {
+      /* NO SILENT STALL (2026-10-11). This step stopped, failed, was cut short or asked a question, so there is nothing
+         to judge — and the loop used to stay "active" with nothing ever firing the next step. Pause it and SAY why;
+         /goal resume (the existing control) picks it up once the cause is handled. */
+      const why = String(stall || 'the last step ended without a reply').trim();
+      GoalLoop.pause(s, why); persistGoal();
+      if (isActiveWs(ws)) localLine('⏸ session goal paused: ' + why + ' — /goal resume to continue.');
+      return;
+    }
     goalJudging.add(ws.id);
     let judged;
     try {
@@ -7176,7 +10003,8 @@ const Chat = (() => {
       try {
         const sys = GoalLoop.judgeSystem();
         const usr = GoalLoop.judgeUser(s, reply, { now: new Date().toISOString() });
-        const res = await Harness.chat({ system: sys, messages: [{ role: 'user', content: usr }], agentId: ws.agentId || 'agent', isTask: false, placed: [], internal: true });
+        // keepEffort: a verdict that ends the Commander's loop runs on their reasoning effort, never the cheap aux one
+        const res = await Harness.chat({ system: sys, messages: [{ role: 'user', content: usr }], agentId: ws.agentId || 'agent', isTask: false, placed: [], internal: true, keepEffort: true });
         raw = (res && !res.error) ? (res.text || '') : '';
       } catch (_) { raw = ''; }
       judged = GoalLoop.parseVerdict(raw);
@@ -7201,7 +10029,7 @@ const Chat = (() => {
   function branchWorkstreamCommand(args) {
     if (!activeWs || typeof Workstreams === 'undefined' || !Workstreams.create) return localLine('No active workstream to branch.');
     const src = activeWs;
-    const title = String(args || '').trim() || ((src.title || 'General') + ' branch');
+    const title = String(args || '').trim() || (Workstreams.titleOf(src) + ' branch');
     const ws = Workstreams.create(title, { agentId: src.agentId || 'agent', kind: src.kind === 'task' ? 'task' : 'chat' });   // a branch inherits the SOURCE stream's kind
     ws.history = (src.history || []).map(m => Object.assign({}, m));
     ws.lane = 'todo';
@@ -7335,9 +10163,11 @@ const Chat = (() => {
         if (ended) { loopEnded.delete(wsId); return localLine(ended + ' /loop <interval> <prompt> to start another.'); }
         return localLine('No loop in this workstream. /loop <interval> <prompt> — e.g. /loop 5m check whether the build went green.');
       }
-      return localLine('Loop: every ' + cur.label + ', ' + cur.fired + '/' + LOOP_MAX_ITERS + ' runs done'
+      const st = localLine('Loop: every ' + cur.label + ', ' + cur.fired + '/' + LOOP_MAX_ITERS + ' runs done'
         + (cur.skipped ? ', ' + cur.skipped + ' tick' + (cur.skipped === 1 ? '' : 's') + ' skipped (a run, a question or another stream had the floor)' : '')
         + ' — "' + String(cur.prompt).slice(0, 60) + '". It stops if you close StarNet; /routine makes it permanent.');
+      automateDoor(st, '▸ AUTOMATE › SCHEDULES › NEW', 'routines-create');   // org P19: the lasting form of a loop is a schedule (its own label: it opens the New schedule form, not the list)
+      return st;
     }
 
     const sp = raw.search(/\s/);
@@ -7410,8 +10240,15 @@ const Chat = (() => {
     // persistent server-side context to fold on demand between runs. Auto-compaction runs INSIDE a run when the
     // live prompt crosses the threshold. This is the honest status; see the slash-parity report for the rationale.
     if (cs && cs.limit) {
-      const pct = Math.round(((cs.used || 0) / cs.limit) * 100);
-      localLine('Chat memory: ' + (cs.used || 0) + ' / ' + cs.limit + ' tokens used (' + pct + '% — a token is roughly ¾ of a word). When it nears full, older turns are folded into a summary automatically during the next run; there is nothing you need to do.');
+      // a run on a model that bills a dearer rate past a prompt size works in a window stopped at it (the sidecar's
+      // runWindow, context-cost-1023): measure against THAT window, the one a run folds in, never the 1M it could hold
+      const run = (typeof Harness !== 'undefined' && Harness.runWindowOf) ? (Number(Harness.runWindowOf(cs.model)) || 0) : 0;
+      const tier = run > 0 && run < cs.limit;
+      const win = tier ? run : cs.limit;
+      const pct = Math.round(((cs.used || 0) / win) * 100);
+      localLine('Chat memory: ' + (cs.used || 0) + ' / ' + win + ' tokens used (' + pct + '% — a token is roughly ¾ of a word). '
+        + (tier ? 'The model can hold ' + cs.limit + ', but it bills a higher rate for a prompt over ' + run + ' tokens, so a run works in ' + run + '. ' : '')
+        + 'When it nears full, older turns are folded into a summary automatically during the next run; there is nothing you need to do.');
     } else {
       localLine('Chat memory is managed automatically: when a conversation grows past what the model can hold, older turns are folded into a summary during the next run. There is nothing you need to do.');
     }
@@ -7435,7 +10272,11 @@ const Chat = (() => {
     n = Math.min(n, 30);
     const slice = h.slice(-n);
     // ONE collapsed card instead of up to 31 flooding rows — click to expand the turns.
-    const lines = slice.map(m => (m.role === 'user' ? 'You' : 'Agent') + ': ' + String(m.content).replace(/\s+/g, ' ').slice(0, 160));
+    const lines = slice.map(m => {
+      const step = m.role === 'user' && !m.from ? goalStepOf(m.content) : null;   // a goal-loop step is the station's, not "You"
+      return step != null ? ('Goal step: ' + step.replace(/\s+/g, ' ')).slice(0, 166)
+        : (m.role === 'user' ? 'You' : 'Agent') + ': ' + String(m.content).replace(/\s+/g, ' ').slice(0, 160);
+    });
     systemCard('History — last ' + slice.length + ' of ' + h.length + ' turn' + (h.length === 1 ? '' : 's') + ' (click to expand)', lines);
   }
   // /whoami — the current agent identity: id/name, role/class, level + XP (Xp.compute), model + provider, and the
@@ -7464,10 +10305,13 @@ const Chat = (() => {
       const r = await fetch('/api/insights?agent=' + encodeURIComponent(agentId), { cache: 'no-store' });
       const j = r.ok ? await r.json() : null;
       if (j && (j.totalRuns != null)) {
-        const models = Array.isArray(j.byModel) ? j.byModel.slice(0, 3).map(m => (m.model || '?') + ' (' + U.usd(m.usd || 0) + ')') : [];
+        // a subscription or unpriced model has no proven $: its fold label, never a bare "$0.00" (sweep/providers 2026-10-20)
+        const models = Array.isArray(j.byModel) ? j.byModel.slice(0, 3).map(m => (m.model || '?') + ' (' + (m.spendLabel && !(m.usd > 0) ? m.spendLabel : U.usd(m.usd || 0) + (m.spendLabel ? ', ' + m.spendLabel : '')) + ')') : [];
         const succ = (j.successPct == null) ? '' : ', ' + j.successPct + '% completed';
         return localLine('Insights (lifetime run history for ' + agentId + '): ' + (j.totalRuns || 0) + ' run' + (j.totalRuns === 1 ? '' : 's')
-          + ', ' + U.usd(j.totalUsd || 0) + ', ' + (j.totalTokens || 0) + ' tokens'
+          + ', ' + (j.usageMissingRuns ? 'at least ' : '') + U.usd(j.totalUsd || 0) + (j.unpricedRuns ? ' (+ ' + j.unpricedRuns + ' run' + (j.unpricedRuns === 1 ? '' : 's') + ' with no published price)' : '')
+          + (j.usageMissingRuns ? ' (' + j.usageMissingRuns + ' run' + (j.usageMissingRuns === 1 ? '' : 's') + ' stopped mid-answer before usage arrived)' : '')
+          + (j.spendUnknownRuns ? ' (+ ' + j.spendUnknownRuns + ' run' + (j.spendUnknownRuns === 1 ? '' : 's') + ' with spend unknown)' : '') + ', ' + (j.totalTokens || 0) + ' tokens'
           + (j.avgUsdPerRun ? ', ' + U.usd(j.avgUsdPerRun) + '/run' : '') + succ
           + (models.length ? '. Top models: ' + models.join(', ') : '') + '.');
       }
@@ -7752,23 +10596,25 @@ const Chat = (() => {
   }
   async function cronCommand(args) {
     const raw = String(args || '').trim().toLowerCase();
+    // org P19: /cron runs HERE (a client action, not a server 'say'), so its reply carries the SCHEDULES door itself
+    const reply = t => { const n = localLine(t); automateDoor(n, '▸ AUTOMATE › SCHEDULES', 'routines'); return n; };
     try {
       if (/^(on|enable|enabled|arm)$/.test(raw) || /^(off|disable|disabled|disarm)$/.test(raw)) {
         const want = /^(on|enable|enabled|arm)$/.test(raw);
         const r = await fetch('/api/cron/arm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: want }) });
         const j = await r.json().catch(() => null);
-        return localLine(r.ok && j ? ('Routines scheduler ' + (j.enabled ? 'enabled' : 'disabled') + '.') : 'Could not update the routines scheduler.');
+        return reply(r.ok && j ? ('Routines scheduler ' + (j.enabled ? 'enabled' : 'disabled') + '.') : 'Could not update the routines scheduler.');
       }
       const r = await fetch('/api/cron', { cache: 'no-store' });
       // an errored read is NOT "scheduler off, 0 jobs" — that reassuring line is exactly the lie to avoid.
-      if (!r.ok) return localLine('Could not read the routines scheduler (HTTP ' + r.status + ') — its real state is unknown.');
+      if (!r.ok) return reply('Could not read the routines scheduler (HTTP ' + r.status + ') — its real state is unknown.');
       const j = await r.json();
       const jobs = (j && Array.isArray(j.jobs)) ? j.jobs : [];
       const bits = jobs.slice(0, 5).map((job, i) => (i + 1) + '. ' + (job.name || job.id || 'routine') + (job.enabled === false ? ' [paused]' : ''));
       const schedulerLine = j && j.halted ? 'stopped (E-STOP)' : (j && j.enabled ? 'on' : 'off');
-      localLine('Routines: scheduler ' + schedulerLine + ', ' + jobs.length + ' job' + (jobs.length === 1 ? '' : 's')
+      reply('Routines: scheduler ' + schedulerLine + ', ' + jobs.length + ' job' + (jobs.length === 1 ? '' : 's')
         + (bits.length ? ' - ' + bits.join(' | ') : '.') + (j && j.halted ? ' Use /cron on to resume.' : ' Use /cron on or /cron off to arm/disarm.'));
-    } catch (_) { localLine('Could not load routines from the sidecar.'); }
+    } catch (_) { reply('Could not load routines from the sidecar.'); }
   }
   async function reloadMcpCommand(args) {
     const target = String(args || '').trim();
@@ -7850,7 +10696,10 @@ const Chat = (() => {
   function slashPlacedTypes() {
     try {
       if (typeof World === 'undefined' || !World.heroCaps) return [];
-      const caps = World.heroCaps((activeWs && activeWs.agentId) || 'agent') || [];
+      // the agent's own room PLUS shared station gear — the same reading SKILL LIBRARY makes, so a skill that
+      // library shows READY is also offered here (profile / Full Access grants still need /api/toolsets)
+      const caps = (World.heroCaps((activeWs && activeWs.agentId) || 'agent') || [])
+        .concat(World.stationCaps ? (World.stationCaps() || []) : []);
       const out = [], seen = {};
       for (const c of caps) {
         const t = String((c && c.objectType) || c || '').trim();
@@ -7864,12 +10713,15 @@ const Chat = (() => {
   function slashCatalogKey() {
     return slashPlacedTypes().join(',');
   }
+  // the palette's list depends on the gear AND the agent (its profile / Full Access grants count as gear server-side)
+  function slashAgentId() { return (activeWs && activeWs.agentId) || 'agent'; }
   function warmSlashCatalog() {
-    const key = slashCatalogKey();
+    const placedKey = slashCatalogKey();
+    const key = slashAgentId() + '|' + placedKey;
     if (slashCatalogLoaded === key) return;
     if (slashCatalogLoading === key || typeof fetch === 'undefined') return;
     slashCatalogLoading = key;
-    fetch('/api/slash/catalog?placed=' + encodeURIComponent(key), { cache: 'no-store' })
+    fetch('/api/slash/catalog?placed=' + encodeURIComponent(placedKey) + '&agent=' + encodeURIComponent(slashAgentId()), { cache: 'no-store' })
       .then(r => r.ok ? r.json() : null)
       .then(j => {
         slashServerCommands = (j && Array.isArray(j.commands)) ? j.commands : null;
@@ -8100,7 +10952,10 @@ const Chat = (() => {
     const directive = String(text || '');
     input.value = directive; input.focus();
     if (select === 'first-placeholder') {
-      const m = /\{[^}]+\}/.exec(directive);
+      // a skill draft ends "Task: {task}" AFTER the recipe body, and a recipe body can contain braces of its own
+      // (a JSON example); select the draft's own {task} slot so typing never overwrites the recipe
+      const task = directive.lastIndexOf('{task}');
+      const m = task >= 0 ? { index: task, 0: '{task}' } : /\{[^}]+\}/.exec(directive);
       try { if (m) input.setSelectionRange(m.index, m.index + m[0].length); else input.setSelectionRange(directive.length, directive.length); } catch (_) {}
     }
     autoGrowInput();   // COMPOSER: match the box to the inserted directive's height
@@ -8120,13 +10975,55 @@ const Chat = (() => {
     // line. Nothing here re-derives or re-formats state, so this surface cannot disagree with the sidecar's.
     if (directive.type === 'say') {
       const lines = Array.isArray(directive.lines) ? directive.lines.filter(s => String(s || '').trim()) : [];
-      if (lines.length) systemCard(directive.title || 'Result', lines);
-      else localLine(String(directive.text || '').trim() || 'Done.');
+      lastSaid = lines.length ? systemCard(directive.title || 'Result', lines) : localLine(String(directive.text || '').trim() || 'Done.');
       return true;
     }
     return false;
   }
+  /* SYSTEM-LINE DOORS (org P29-sys, 2026-10-14 — Andrew: system messages "look ugly and unaligned"). A station line's door keys
+     sit in ONE compact row under that line's own text (.sys-doors), on the same text edge, in the approval cards' glass key —
+     never a key bigger than the message it belongs to. A run of consecutive system lines never shows the same door twice: the
+     key moves down to the newest line that offers it, so it sits under the last thing it answers.
+     node = a system row (localLine / systemCard); onOpen = what the key opens; opts.cls = an extra class (automate-door …);
+     opts.lead = a short label in front of the key ("Lasting goal loops:"); opts.dest = where the key goes ('automation:routines').
+     A door is the SAME door only when it goes to the same place (live walk 10-14: /loop status's key to New schedule and
+     /routine's key to Scheduled jobs shared one label, and the label-only match dropped the loop's door): the de-dupe reads
+     the destination, never the label alone. */
+  function systemDoor(node, label, onOpen, opts) {
+    if (!node || !node.appendChild) return null;
+    opts = opts || {};
+    const dest = opts.dest || ('label:' + label);
+    for (let p = node.previousElementSibling; p && p.classList && p.classList.contains('system'); p = p.previousElementSibling) {
+      const dup = Array.from(p.querySelectorAll('.sys-door')).find(k => k.dataset && k.dataset.door === dest);
+      if (!dup) continue;
+      const was = dup.parentNode; dup.remove();
+      if (was && !was.querySelector('.sys-door')) was.remove();   // its lead label leaves with it
+      break;
+    }
+    let doors = Array.from(node.children || []).find(c => c.classList && c.classList.contains('sys-doors'));
+    if (!doors) { doors = document.createElement('div'); doors.className = 'sys-doors'; node.appendChild(doors); }
+    if (opts.lead) { const k = document.createElement('span'); k.className = 'sys-doors-lead'; k.textContent = opts.lead; doors.appendChild(k); }
+    const key = document.createElement('button'); key.type = 'button';
+    key.className = 'sys-door' + (opts.cls ? ' ' + opts.cls : ''); key.textContent = label;
+    key.dataset.door = dest;
+    key.onclick = onOpen;
+    doors.appendChild(key);
+    return key;
+  }
+  /* ONE DOOR KEY on an automation slash reply (org P19, 2026-10-14): a key on the reply itself — never a new card — into the
+     AUTOMATE tab where that command's lasting form lives. section = the AUTOMATE console section (automation.js: routines /
+     routines-create / loops / away). */
+  function automateDoor(node, label, section) {
+    if (!node || typeof StationUI === 'undefined' || !StationUI.openTerm) return null;
+    return systemDoor(node, label, () => StationUI.openTerm('automation', section), { cls: 'automate-door', dest: 'automation:' + section });
+  }
+  // the server ran /routine or /away and printed its reply: the reply carries the door to the tab that holds that work
+  // (/cron is a CLIENT action — cronCommand attaches its own door)
+  // (client-side only — sidecar/slash.js and its reply text are unchanged)
+  const SERVER_SLASH_DOORS = { routine: ['▸ AUTOMATE › SCHEDULES', 'routines'], away: ['▸ AUTOMATE › AWAY WORK', 'away'] };
+  let lastSaid = null;
   async function dispatchSlash(item, rawInput) {
+    lastSaid = null;
     try {
       const r = await fetch('/api/slash/dispatch', {
         method: 'POST',
@@ -8140,20 +11037,41 @@ const Chat = (() => {
         })
       });
       const j = await r.json().catch(() => null);
-      return !!(r.ok && j && j.ok && applySlashDirective(j.directive));
-    } catch (_) { return false; }
+      // the station ANSWERED no (a skill that was removed or pulled, gear not placed): remember its words, so the
+      // caller reports what the station said instead of blaming the connection
+      slashDispatchRefusal = (!r.ok || !j || !j.ok) && j && j.error ? { status: r.status, error: String(j.error) } : null;
+      const ok = !!(r.ok && j && j.ok && applySlashDirective(j.directive));
+      const door = ok && lastSaid && item && Object.prototype.hasOwnProperty.call(SERVER_SLASH_DOORS, item.name) ? SERVER_SLASH_DOORS[item.name] : null;
+      if (door) automateDoor(lastSaid, door[0], door[1]);
+      lastSaid = null;
+      return ok;
+    } catch (_) { slashDispatchRefusal = null; return false; }
   }
+  let slashDispatchRefusal = null;
+  // the palette's command list is cached per gear set; installing, removing or switching a skill changes it, so the
+  // ABILITIES window announces the change and the next "/" re-reads the station
+  function invalidateSlashCatalog() { slashServerCommands = null; slashCatalogLoaded = null; slashCatalogLoading = null; }
+  try { window.addEventListener('starnet:skills-changed', () => { invalidateSlashCatalog(); warmSlashCatalog(); }); } catch (_) {}
   async function runSlash(item) {
     if (!item) { closeSlash(); return; }
     const rawInput = input ? input.value : '';
     input.value = ''; closeSlash(); autoGrowInput();   // consume the "/query"; a recipe's run() then refills the input
-    if (typeof SFX !== 'undefined' && SFX.click) SFX.click();
+    if (typeof SFX !== 'undefined' && SFX.press) SFX.press();
     // Try the sidecar for anything server-backed OR anything with no local action at all. The second half
     // matters on a cold start: before the catalog fetch lands, /away and /routine are only known from the
     // FALLBACK list (serverBacked === false) and have no handler — without this they would refuse without ever
     // having asked the station, which is a claim the browser cannot make honestly.
     const needsServer = item.serverBacked || typeof item.run !== 'function';
     if (needsServer && await dispatchSlash(item, rawInput)) return;
+    if (needsServer && slashDispatchRefusal && item.source === 'skill') {
+      // a skill command the station no longer offers: it was removed, pulled, or its gear isn't placed. Say that,
+      // give the typed text back, and refresh the palette so the stale entry disappears.
+      const why = slashDispatchRefusal.status === 409 ? 'its gear isn\'t placed for this agent right now' : 'that skill is no longer installed on this station';
+      localLine('/' + item.name + ' can\'t be used: ' + why + '. Type "/" to see the skills you have.');
+      if (input && rawInput) { input.value = rawInput; autoGrowInput(); }
+      invalidateSlashCatalog(); warmSlashCatalog();
+      return;
+    }
     // FALLBACK path (command not resolved by the server dispatcher): parse the trailing text off the raw
     // "/name rest…" input and hand it to the local action, so an arg-taking builtin still gets its argument
     // even when the server slash catalog doesn't know it. Arg-less actions ignore it.
@@ -8190,17 +11108,19 @@ const Chat = (() => {
   // drawing, but the SIDECAR's plan is the one that authorizes spend, so it is the one that decides. Returns
   // { next, brief } — `brief` is the NEXT dock's standing job brief (step editor; the same router fact the
   // sidecar's chain runner injects), so both surfaces compose one handoff turn. null = terminal stage.
-  async function nextStageOf(agentId, tag, lineId) {
+  // (multi-bay, 2026-09-22) dockId = WHICH bay the asking stage ran at; the answer names the next bay (nextDock)
+  async function nextStageOf(agentId, tag, lineId, dockId) {
     try {
       const h = {}, tok = (typeof window !== 'undefined' && window.__STARNET_API_TOKEN__) || '';
       if (tok) h['X-StarNet-Token'] = String(tok);
       // `lineId` = the line this work ENTERED on (work belongs to a line, 2026-08-07). The sidecar's plan is
       // still the decider — it refuses any id that is not this dock's own line — so this only ever narrows.
       const r = await fetch('/api/routing/chain?agentId=' + encodeURIComponent(agentId) + '&tag=' + encodeURIComponent(tag || '')
-        + '&lineId=' + encodeURIComponent(lineId || ''), { cache: 'no-store', headers: h });
+        + '&lineId=' + encodeURIComponent(lineId || '') + (dockId ? '&dockId=' + encodeURIComponent(dockId) : ''), { cache: 'no-store', headers: h });
       if (!r || !r.ok) return null;
       const j = await r.json();
-      return (j && j.next) ? { next: String(j.next), brief: (typeof j.brief === 'string' && j.brief) ? j.brief : null } : null;
+      return (j && j.next) ? { next: String(j.next), nextDock: (typeof j.nextDock === 'string' && j.nextDock) ? j.nextDock : null, brief: (typeof j.brief === 'string' && j.brief) ? j.brief : null,
+        verdict: (typeof j.verdict === 'string' && j.verdict) ? j.verdict : '', last: j.last === true } : null;
     } catch (_) { return null; }   // no floor, no sidecar, no line — the single-stage reply already stands
   }
 
@@ -8213,8 +11133,10 @@ const Chat = (() => {
     // WORK BELONGS TO A LINE (2026-08-07): a line advances only for work that entered through ITS OWN
     // trigger. `seed.lineId` is that origin; without one this dock is terminal and nothing downstream runs.
     if (!seed.lineId) return out;
-    const visited = {}; visited[seed.fromAgentId] = true;
-    let cur = seed.fromAgentId;
+    // NEVER RUN A DOCK TWICE (multi-bay): visited keys on the bay when the sidecar names one — a writer crewing
+    // two bays of this line runs at each — else on the agent (an older sidecar answers no nextDock)
+    const visited = {}; visited[seed.fromDock || seed.fromAgentId] = true;
+    let cur = seed.fromAgentId, curDock = seed.fromDock || null;
     // LINE BUDGET (2026-08-21): the sidecar answers each /api/routing/chain ask with the EFFECTIVE ceilings
     // for this line (its INBOX's limits, clamped to the global pool) — the browser bounds itself by the same
     // numbers the sidecar executor would. An older sidecar answers none: the mirrored constants hold.
@@ -8222,9 +11144,9 @@ const Chat = (() => {
     for (let hop = 1; hop <= maxHops + 1; hop++) {   // +1 so a stage PAST the ceiling is named, as the sidecar names it
       if (seed.signal && seed.signal.aborted) return out;
       if (interrupted.has(ws.id)) return out;                       // the Commander pressed Stop — the line stops
-      const nxr = await nextStageOf(cur, lineTag(out.text), seed.lineId);
-      const nx = nxr && nxr.next;
-      if (!nx || visited[nx]) return out;                           // terminal stage, or a loop the plan let through
+      const nxr = await nextStageOf(cur, lineTag(out.text), seed.lineId, curDock);
+      const nx = nxr && nxr.next, nxDock = (nxr && nxr.nextDock) || null;
+      if (!nx || visited[nxDock || nx]) return out;                 // terminal stage, or a loop the plan let through
       const lim = nxr && nxr.limits;
       if (lim && typeof lim === 'object') {
         if (typeof lim.maxHops === 'number' && lim.maxHops >= 0) maxHops = lim.maxHops;
@@ -8233,7 +11155,7 @@ const Chat = (() => {
         spentToday = (typeof lim.spentToday === 'number' && lim.spentToday > 0) ? lim.spentToday : 0;
       }
       if (hop > maxHops) {
-        if (isActiveWs(ws)) toolLine('⚠ the work line stopped early — the line is longer than ' + maxHops + ' stages.', true);
+        if (isActiveWs(ws)) toolLine('⚠ the work line stopped early — the line is longer than ' + maxHops + ' stages — raise max stages in the INBOX’s LINE BUDGET.', true);
         return out;
       }
       // THE LINE'S SPEND CEILING — the same pre-hop check as the sidecar executor (chain.js: out.usd >= maxUsd
@@ -8251,7 +11173,7 @@ const Chat = (() => {
       }
       const sys = (typeof App !== 'undefined' && App.systemFor) ? App.systemFor(nx) : null;
       if (!sys) return out;                                         // a dock bound to an agent this roster doesn't have
-      visited[nx] = true;
+      visited[nxDock || nx] = true;
 
       const who = (typeof App !== 'undefined' && App.agentName && App.agentName(nx)) || nx;
       const wiHop = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : ('wi-' + Date.now() + '-' + (++wiSeq));
@@ -8259,14 +11181,17 @@ const Chat = (() => {
       // the floor draws the handoff exactly like a channel line's: a crate leaves this dock for the next.
       // `from` = the PRODUCER dock (mirrors chain.js's placed event — must not drift): world.js spawns the
       // crate at THIS dock instead of guessing the upstream dock from the compiled plan.
-      wiEmit('workitem.placed', { workitemId: wiHop, queueId: nx, agentId: nx, kind: 'chain', from: cur, lineId: seed.lineId, preview: String(out.text).replace(/\s+/g, ' ').slice(0, 40), ts: hopStart });
+      const placed = { workitemId: wiHop, queueId: nx, agentId: nx, kind: 'chain', from: cur, lineId: seed.lineId, preview: String(out.text).replace(/\s+/g, ' ').slice(0, 40), ts: hopStart };
+      if (nxDock) placed.dockId = nxDock;          // additive (multi-bay): the bay the crate lands at…
+      if (curDock) placed.fromDock = curDock;      // …and the bay it left
+      wiEmit('workitem.placed', placed);
       if (isActiveWs(ws)) { breakLive(); toolLine('▸ ' + who + ' — stage ' + (hop + 1) + ' of the work line'); }
 
       // the RECEIVING dock's standing brief rides the shared handoff turn — the same 5th param the sidecar's
       // chain runner passes (sidecar/routing/chain.js) — so the same floor composes the same run here too.
       const prompt = (typeof Pipeline !== 'undefined' && Pipeline.handoffPrompt)
-        ? Pipeline.handoffPrompt(seed.originalText, cur, out.text, hop, nxr.brief) : out.text;
-      const hopRow = isActiveWs(ws) ? streamingAgent(who) : null;
+        ? Pipeline.handoffPrompt(seed.originalText, cur, out.text, hop, nxr.brief, nxr.verdict, nxr.last) : out.text;   // + the VERDICT / LAST-stage parts hopTurn adds (sweep 2026-10-01)
+      const hopRow = isActiveWs(ws) ? streamingAgent(who, nx, null) : null;   // null: the hop runs without the project root, even as the session's own agent
       if (hopRow) activeLiveRow = hopRow;
       let hopAcc = '';
       let res = null;
@@ -8301,10 +11226,10 @@ const Chat = (() => {
         return out;
       }
       wiEmit('workitem.delivered', { workitemId: wiHop, finalQueueId: nx, agentId: nx, box: '', ms: Date.now() - hopStart, ts: Date.now() });
-      ws.history.push({ role: 'assistant', content: hopText, agentId: nx, ts: Date.now() });   // agentId = the ACTUAL speaker (renderHistory names it)
+      ws.history.push({ role: 'assistant', content: hopText, agentId: nx, projectRoot: null, ts: Date.now() });   // agentId = the ACTUAL speaker (renderHistory names it); projectRoot null = its files are in nx's workspace
       capHistory(ws);
       out.text = hopText; out.agentId = nx; out.hops++;
-      cur = nx;
+      cur = nx; curDock = nxDock;
     }
     return out;
   }
@@ -8332,6 +11257,9 @@ const Chat = (() => {
     // own triggering turn — that loop simply wasn't running yet when the turn started.
     const goalActiveAtStart = !goalContinuation && typeof GoalLoop !== 'undefined' && (() => { const g = goalOf(activeWs); return !!(g && GoalLoop.isActive(g)); })();
     if (interview) { clearChoices(); interview(text); return; }   // THE AWAKENING owns the input: typed answers retire any stale chip row
+    // STATION SYSTEMS: asking for something on a schedule, or to be reached on a phone/chat app, is the moment
+    // AUTOMATION / CHANNELS join a growing dock (a real user turn only — never a retry or a loop continuation)
+    if (!retry && !goalContinuation && typeof Systems !== 'undefined' && Systems.noticeText) { try { Systems.noticeText(text); } catch (_) {} }
     const runFocusVersion = focusVersion;
     const ws = activeWs;   // CAPTURE the origin stream now — a mid-run switch must not cross-post its cost/files
     if (!ws) return;
@@ -8356,24 +11284,37 @@ const Chat = (() => {
     const wiId = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : ('wi-' + Date.now() + '-' + (++wiSeq));
     const wiPlacedTs = Date.now();
     let wiPlaced = false;   // set below iff a crate actually rode — every wi* beat downstream gates on it
+    stepOfferAside('turn');   // the Commander's own turn: an offer panel over COMMS steps aside so the exchange shows
     stick = true;   // sending a message means you want to watch the exchange — re-follow the bottom
     // TIMESTAMP TRUTH (P0): stamp the turn with its REAL wall-clock time at push, and render the same instant on
     // screen — so a later replay/switch shows this turn's actual time, never the reload clock.
-    if (!retry) { const uts = Date.now(); addUser(text, attsIn, uts); ws.history.push(attsIn.length ? { role: 'user', content: text, attachments: attsIn, ts: uts } : { role: 'user', content: text, ts: uts }); capHistory(ws); }   // on RETRY the user turn is already in the thread + on screen
+    // a goal-loop continuation shows as ONE station line (goalStepLine); its history turn — what the model receives — is unchanged
+    if (!retry) { const uts = Date.now(); if (goalContinuation) goalStepLine(goalStepOf(text) || ((goalOf(ws) || {}).goal) || ''); else addUser(text, attsIn, uts); ws.history.push(attsIn.length ? { role: 'user', content: text, attachments: attsIn, ts: uts } : { role: 'user', content: text, ts: uts }); capHistory(ws); }   // on RETRY the user turn is already in the thread + on screen
     const retryDirectiveTurn = ws.history.slice().reverse().find(m => m.role === 'user');
-    // name an untitled stream from its first real message (no-op on General / already-titled)
-    if (typeof Workstreams !== 'undefined' && Workstreams.autoTitle(ws.id, text)) {
+    // name an untitled stream from its first real message (no-op on General / already-titled) — a goal step names it from
+    // its GOAL, never the station's continuation prompt (the rail row and the COMMS title both show this name)
+    if (typeof Workstreams !== 'undefined' && Workstreams.autoTitle(ws.id, goalContinuation ? (goalStepOf(text) || (goalOf(ws) || {}).goal || '') : text)) {
       if (typeof App !== 'undefined' && App.refreshRail) App.refreshRail();
     }
 
-    const isTask = recoveryResume || !!pending || Classify.isTaskDirective(text);
+    // "YES" TO AN OFFER IS A GO: when the agent's last reply offered to do work ("want me to draft it?") a bare
+    // "yes" / "sure" / "do it" is the directive itself — classified as chat it ran tool-less and could only promise.
+    const priorAgentTurn = (() => { for (let i = ws.history.length - 2; i >= 0; i--) { const m = ws.history[i]; if (m && m.role === 'assistant') return typeof m.content === 'string' ? m.content : ''; if (m && m.role === 'user') return ''; } return ''; })();
+    const isTask = recoveryResume || !!pending || Classify.isTaskDirective(text, { priorAgentTurn });
+    // the WORDS of a "yes" are not the work: the task is the agent's offer it accepted. So an accepted offer runs WITH
+    // tools, but never feeds what reads the Commander's own wording (the profile, the recurring-job miner, the intent
+    // offer) — two "yes please" acceptances must not look like a recurring job called "yes please".
+    const acceptedOffer = !!(isTask && Classify.isAffirmation && Classify.isAffirmation(text));
+    // a task the Commander typed into the message box completes a pending first-task hand-off (gh#158). Never a retry, a goal
+    // step, or a send made for them (the tour's file example, a recipe launch, a hand-off Start): those carry no `composer`.
+    if (opts && opts.composer && isTask && !retry && !goalContinuation && typeof PitchStore !== 'undefined' && PitchStore.noteCommsTask) { try { PitchStore.noteCommsTask(text); } catch (_) {} }
     // INTENT OFFER: a real, fresh directive is the one moment the Commander has stated what they want in their
     // own words — the only honest place to say "there is a class built for exactly this". Gated to genuine new
     // work: never a retry (already offered on the original), never a recipe launch (they came FROM the library),
     // never a goal-loop continuation (the station wrote that text, not the Commander), never a reply to a
     // pending task question. Stage it on this run's metadata so concurrent sessions can never consume each
     // other's offer; the slow post-run arm reads and clears it after the answer and its own choice rows settle.
-    const intentOfferText = (isTask && !retry && !fromRecipe && !goalContinuation && !pending) ? String(text || '') : null;
+    const intentOfferText = (isTask && !acceptedOffer && !retry && !fromRecipe && !goalContinuation && !pending) ? String(text || '') : null;
     // P1 + BELT IS WORK-ONLY (Andrew's ruling 2026-07-05): only a real TASK directive drops an INTAKE ore box
     // on the belt / bumps the queue gauge (mirrors the Telegram admit shape — the sidecar gates on the SAME
     // classifier). Pure chat ("hello") gets its reply with NOTHING on the floor.
@@ -8388,21 +11329,23 @@ const Chat = (() => {
     // count — never the message text. Gated on the user's learning flag inside the store.
     // observe ONLY a genuine new directive — never on RETRY (re-running the same text must not double-count the
     // shape, which would inflate the recurrence signal and let a true one-off wrongly fire the memory beat).
-    if (!retry && isTask && !pending && typeof ProfileStore !== 'undefined') ProfileStore.observeMessage(text);
-    if (!retry && isTask && !pending && typeof MintStore !== 'undefined') MintStore.observe(text);   // notice recurring jobs → propose minting them as one-tap missions
+    if (!retry && isTask && !acceptedOffer && !pending && typeof ProfileStore !== 'undefined') ProfileStore.observeMessage(text);
+    if (!retry && isTask && !acceptedOffer && !pending && typeof MintStore !== 'undefined') MintStore.observe(text);   // notice recurring jobs → propose minting them as one-tap missions
     // CORRECTION CAPTURE (slice 2): the first message to this agent after a short-of-the-mark verdict IS the
     // correction of that run — hand it to the held skill review in the Commander's words (final: fires now) and
     // stamp the new run as correctionOf so the runs ledger can relate them. One message per verdict; a stale
     // window (>10 min) is just a new task. Never on retry (the same text re-sent is not a second correction).
     let correctionOf = null;
-    if (!retry && !pending && lastShortVerdict && (ws.agentId || 'agent') === lastShortVerdict.agentId && Date.now() - lastShortVerdict.at < CORRECTION_WINDOW_MS) {
+    // the correction is the next message IN THE RATED RUN'S SESSION: matched by agent alone, a new request typed in
+    // another session to that agent within the window was saved station-wide as a DISLIKED correction (sweep 2026-10-02)
+    if (!retry && !pending && lastShortVerdict && (ws.agentId || 'agent') === lastShortVerdict.agentId && lastShortVerdict.streamId && lastShortVerdict.streamId === ws.id && Date.now() - lastShortVerdict.at < CORRECTION_WINDOW_MS) {
       correctionOf = lastShortVerdict.runId; lastShortVerdict = null;
       postCorrection(correctionOf, text, true, 'message');
     }
     // SALIENCE (decision 3): has this task SHAPE recurred? Read AFTER observe so it counts this run (the read itself is
     // safe on retry — it doesn't mutate the count). Passed to the run so the server fires the memory turn-in on
     // recurring work even when a terse exchange otherwise wouldn't, while a basic one-off is left to reflect()'s floor.
-    const recurring = !!(isTask && typeof MintStore !== 'undefined' && MintStore.recurringNow && MintStore.recurringNow(text));
+    const recurring = !!(isTask && !acceptedOffer && typeof MintStore !== 'undefined' && MintStore.recurringNow && MintStore.recurringNow(text));
     // VOICE: the speaker toggle (🔊) controls whether the agent SPEAKS its reply (and in the short,
     // spoken style — voiceModeRules appended below). It does NOT control the desk trip: the walk is driven
     // by REAL tool use (walkToDesk, below), so the speaker setting can't suppress it. When voice is on, a
@@ -8447,6 +11390,8 @@ const Chat = (() => {
     // wins on format; it's never baked into the saved prompt.
     const sys = system
       + (isTask ? ' If this needs real work — searching the web, reading or writing files, running a tool — do it and report the result clearly. If you can answer it directly from what you already know, just answer; don\'t reach for tools you don\'t need.' : '')
+      // agents told users "this chat can't show my workspace images" and linked them instead (user reports 10-20): say how
+      + (willSpeak ? '' : ' To show the Commander an image file (a PNG, JPG, GIF, WebP or SVG you saved), put ![short caption](path) in your reply, using the relative path you saved it under — this chat shows it as the picture.')
       + (willSpeak ? voiceModeRules() : '');
 
     const before = Object.assign({}, Harness.totals());   // COPY (totals is a mutated singleton) so the per-stream diff is real
@@ -8454,10 +11399,18 @@ const Chat = (() => {
     aborters.set(ws.id, ac);
     const callNames = {};   // callId -> tool name (the frozen agent.tool_result has no name field)
     const seenDeliv = {};   // title -> true (one openable row per produced file)
-    let runToolsOk = 0, runDeliv = 0, thisRunId = null;   // per-run work tally → the "rate the work" beat's size + delivery gate
+    let runToolsOk = 0, runDeliv = 0, thisRunId = null, streamLost = false;   // streamLost: the reply stream threw without a STOP — this page never saw its run end   // per-run work tally → the "rate the work" beat's size + delivery gate
+    // this run's own station.control estop.engage came back OK (its result names the action): the halt it scheduled is what
+    // cancels it a moment later, so its stop line says so and offers no TRY AGAIN (a retry would press the E-STOP again)
+    let runPressedEstop = false;
     let runStartedAt = 0;   // P3.2: this lead run's start wall-clock → the window claimCrew uses to attribute forwarded worker spend
-    activeLiveRow = streamingAgent();
+    // the project root THIS run is sent with, captured once: the body, the live reply and every turn it persists use the
+    // same value, so a session that joins a project mid-run (path.trust ALWAYS) never re-homes this run's files
+    const runRoot = ws.projectRoot || null;
+    liveRunRoots.set(ws.id, runRoot);
+    activeLiveRow = streamingAgent(undefined, undefined, runRoot);
     let acc = '';
+    const runSteers = [];   // every '[steering] …' note this run streamed, with when it arrived (fileRunSteers)
     // the model the SIDECAR reported for this run's usage — captured from the usage payload rather than
     // read off the agent's config, so the SESSIONS rail's INBOX receipt names what actually answered.
     // Last write wins: a run that hopped models is honestly labelled by the one that finished it.
@@ -8469,12 +11422,16 @@ const Chat = (() => {
     let voiceQuestion = '';   // VOICE-AWARE CHOICES: the parsed FORK/TASK_QUESTION question — spoken naturally at reply end (options stay on-screen chips, never read aloud)
     let busyRefusal = null;   // race-time server mutex refusal: restore the directive instead of minting failed turns
     let goalJudgeReply = null;   // GOAL LOOP: set to the clean assistant reply when a turn should be judged; fired in finally
+    let goalStall = null;        // GOAL LOOP: WHY this step is not judgeable (stopped/failed/cut short/asked) — the loop pauses and says it
+    let presenceStoppedBy = null;   // 'esc' | 'you' when the Commander's own Stop ended this run cleanly (the card names it)
     // VOICE-AWARE CHOICES: never let TTS read the FORK:/TASK_QUESTION: choice markers (they render as
     // one-tap chips; spoken aloud they come out as "TASK QUESTION … pipe pipe …" + every option verbatim).
     // speakSafe truncates the spoken view at the first marker LINE, and holds back a still-streaming
     // partial prefix at the buffer tail ("TASK_QU…" hasn't matched yet but must not be flushed).
     const SPEAK_MARKER = /(^|\n)\s*(?:FORK|TASK_QUESTION)\s*:/i;
+    const SPEAK_STEER = /(?:^|\n)\[steering\] [^\n]*/g;   // a folded steering note's echo is the Commander's words, never the agent's (it arrives whole, so offsets hold)
     const speakSafe = (s) => {
+      s = String(s == null ? '' : s).replace(SPEAK_STEER, '');
       const m = SPEAK_MARKER.exec(s);
       if (m) return s.slice(0, m.index);
       const nl = s.lastIndexOf('\n');
@@ -8484,13 +11441,29 @@ const Chat = (() => {
     };
     const speechToken = typeof Voice !== 'undefined' && Voice.replyToken ? Voice.replyToken() : undefined;
     const speechOpts = { replyToken: speechToken, agentId: ws.agentId };
+    speechOpts.owner = speechOpts;   // Voice closes a reply only for the producer that owns it
+    // Close THIS run's spoken reply exactly once. If the Commander switches sessions mid-reply, the run stops
+    // feeding speech — but the reply it opened must still close, or Voice reads "speaking" forever (hands-free
+    // never re-opens, the next reply inherits its failures).
+    let speechClosed = false;
+    const closeSpeech = () => {
+      if (speechClosed || !willSpeak || typeof Voice === 'undefined' || !Voice.endReply) return;
+      speechClosed = true; Voice.endReply(undefined, speechOpts);
+    };
     let speechTimer = null, speechPendingSince = 0;
     const pushSpeech = (finalize, finalText) => {
       clearTimeout(speechTimer); speechTimer = null;
       // Ownership is checked again for every chunk. A voice-commanded rebind can happen while an
       // older run is still streaming; none of its late words may leak into the new call owner.
-      if (typeof Voice === 'undefined' || !willSpeak || !speechOwner() || !Voice.speakChunk) return;
-      const src = speakSafe(finalize ? (finalText || acc) : acc);
+      if (typeof Voice === 'undefined' || !willSpeak || !Voice.speakChunk) return;
+      if (!speechOwner()) { closeSpeech(); return; }
+      // Once closed (the Commander switched away mid-reply), this run never re-opens speech — coming back would
+      // re-open a reply nothing closes again (the finally skips a closed reply), wedging hands-free on 'speaking'.
+      if (speechClosed) return;
+      // spokenIdx is an offset into what was STREAMED. A final text that isn't a continuation of it (a work line's
+      // result replaced the reply) would be sliced mid-word — finish the streamed reply instead.
+      const fin = finalize && finalText && speakSafe(finalText).startsWith(speakSafe(acc).slice(0, spokenIdx)) ? finalText : acc;
+      const src = speakSafe(finalize ? fin : acc);
       const pending = src.slice(spokenIdx);
       if (!pending) return;
       if (finalize) { if (pending.trim()) { Voice.speakChunk(pending, name, speechOpts); spokenIdx = src.length; } return; }
@@ -8525,21 +11498,24 @@ const Chat = (() => {
       if (historyRead.repaint && isActiveWs(ws)) {
         if (log) log.innerHTML = '';
         renderHistory(); syncStatus();
-        activeLiveRow = streamingAgent(); historyRead.repaint = false;
+        activeLiveRow = streamingAgent(undefined, undefined, runRoot); historyRead.repaint = false;
       }
-      const { text: reply, error, endReason, finishReason, completionVerdict, effectVerdict, budgetScope, budgetCapUsd } = await Harness.chat({
-        system: sys, messages: historyWindow(ws), agentId: ws.agentId || 'agent', isTask, recurring, signal: ac.signal, streamId: ws.id,
+      const { text: reply, error, endReason, finishReason, completionVerdict, effectVerdict, budgetScope, budgetCapUsd, budgetCapIsBalance, unpricedModel, unpricedCapTokens, subscriptionModel, subscriptionCapTokens, budgetProjected } = await Harness.chat({
+        system: sys, messages: retry ? endOnUserTurn(historyWindow(ws)) : historyWindow(ws), agentId: ws.agentId || 'agent', isTask, recurring, signal: ac.signal, streamId: ws.id,
+        // a SPOKEN reply may run on SETTINGS › Models › VOICE CHAT MODEL — never a live call's delegated work, which the
+        // live voice layer already answers fast and hands to the agent's own model on purpose
+        voiceTurn: (willSpeak && !liveVoiceCall()) || undefined,
         taskAction: taskAction || undefined,
         postconditions: opts && opts.postconditions != null ? opts.postconditions : undefined,
         recovery: recoveryResume ? opts.recovery : undefined,
         retryUserRunId: retry ? ((opts && opts.retryUserRunId) || (retryDirectiveTurn && retryDirectiveTurn.sourceRunId)) : undefined,
         connectorContinuationOf: opts && opts.connectorContinuationOf,
         recipeId: recipeId || undefined,   // provenance spine: the launching recipe rides to the durable run row (undefined for non-recipe runs)
-        projectRoot: ws.projectRoot || undefined,   // project-anchored session: the sidecar injects the folder context ONLY if the root is still a standing blessed grant (truthful)
+        projectRoot: runRoot || undefined,   // project-anchored session: the sidecar injects the folder context ONLY if the root is still a standing blessed grant (truthful)
         placed: (typeof World !== 'undefined' && World.heroCaps) ? World.heroCaps(ws.agentId || 'agent') : [],   // THE MOAT: this run's TOOL reach = the agent's REAL placed props (dish→web · cabinet→files · workbench→terminal · …); compute is the freebie
         stationPlaced: (typeof World !== 'undefined' && World.stationCaps) ? World.stationCaps() : [],   // Class Loadouts (shared-gear): station-wide gear for SKILL availability — a desk-only specialist still gets its class skills when the STATION has the gear (tools stay room-scoped via `placed`)
         onRunId: id => { retirePriorRatings(ws.id); thisRunId = id; if (retryDirectiveTurn && !retryDirectiveTurn.sourceRunId) retryDirectiveTurn.sourceRunId = id; if (starterId) StarterStore.started(starterId, id); runStartedAt = Date.now(); try { RUN_META.set(id, { streamId: ws.id, focusVersion: runFocusVersion, isTask: !!isTask, title: (ws && ws.title) || '', directive: String(text || ''), correctionOf: correctionOf, intentOfferText: intentOfferText, fromRecipe: fromRecipe, recipeId: recipeId, agentId: ws.agentId || 'agent', rec: recClaimRun(id, ws.agentId || 'agent') }); if (RUN_META.size > 60) RUN_META.delete(RUN_META.keys().next().value); } catch (_) {} Channels.setRunId(ws.id, id, Date.now()); if (walkedToDesk && Channels.setStatus) Channels.setStatus(ws.id, 'working…'); if (isActiveWs(ws)) { syncStatus(); renderPresence(); } if (typeof Workstreams !== 'undefined') { Workstreams.appendRun(ws.id, id); if (typeof App !== 'undefined' && App.refreshRail) App.refreshRail(); } },
-        onToken: d => { acc += d; Channels.appendToken(ws.id, d); if (isActiveWs(ws)) { if (activeLiveRow) activeLiveRow.append(d); if (!isTask) World.say(acc); } if (willSpeak) pushSpeech(false); App.refreshUsage(); },
+        onToken: d => { acc += d; Channels.appendToken(ws.id, d); if (d && d.indexOf('[steering] ') >= 0) { for (const t of steerEchoesOf(d)) runSteers.push({ text: t, ts: Date.now() }); if (thisRunId) markSentNowLanded(ws.id, thisRunId, d); } if (isActiveWs(ws)) { if (activeLiveRow) activeLiveRow.append(d); if (!isTask) World.say(acc); } if (willSpeak) pushSpeech(false); App.refreshUsage(); },
         onTerminalReset: () => { clearTimeout(speechTimer); speechTimer = null; speechPendingSince = 0; acc = ''; spokenIdx = 0; Channels.setAcc(ws.id, ''); },
         onUsage: (u) => { if (u && u.model) ranModel = u.model; App.refreshUsage(); },
         // COMMS-PREMIUM: the Channels store still records the pre-formatted STRING (replay/switch-survival is
@@ -8558,8 +11534,11 @@ const Chat = (() => {
         // sse.js:runTeeView — so the in-band stream stays the richest source for the page that started the run.)
         // callId joins it to its tool_call; isError drives the success-vs-failure surge. `summary`/`ms` ride
         // along per the frozen event shape so any consumer sees the result's own words, never a bare 'error'.
-        onToolResult: ev => { if (!ev.isError) runToolsOk++; const nm = callNames[ev.callId] || 'tool'; Channels.addToolResult(ws.id, { callId: ev.callId, name: nm, summary: ev.summary, isError: ev.isError, ms: ev.ms }); presenceToolResult(ws); if (isActiveWs(ws)) resolveChip(ev, nm); if (typeof U !== 'undefined' && U.bus && ev.callId) U.bus.emit('agent.tool_result', { name: nm, agentId: ws.agentId, runId: ev.runId, callId: ev.callId, ok: !ev.isError, isError: !!ev.isError, summary: ev.summary, ms: ev.ms }); },   // runId rides along: a runId-less copy reset xp.js's per-run buffer (freshRun(undefined)) and wiped buffered memory-reuse credit
+        onToolResult: ev => { if (!ev.isError) runToolsOk++; const nm = callNames[ev.callId] || 'tool'; if (!ev.isError && /^(?:team[._]dispatch|group[._]handoff)$/.test(nm)) { const rm = runMeta(thisRunId); if (rm) rm.delegated = true; } /* crew results land in this run (deliveryLanding) */ if (!ev.isError && /^station[._]control$/.test(nm) && ev.summary === 'estop.engage') runPressedEstop = true; Channels.addToolResult(ws.id, { callId: ev.callId, name: nm, summary: ev.summary, isError: ev.isError, ms: ev.ms }); presenceToolResult(ws); if (isActiveWs(ws)) resolveChip(ev, nm); if (typeof U !== 'undefined' && U.bus && ev.callId) U.bus.emit('agent.tool_result', { name: nm, agentId: ws.agentId, runId: ev.runId, callId: ev.callId, ok: !ev.isError, isError: !!ev.isError, held: !!(typeof TaskIntent !== 'undefined' && TaskIntent.isGateHeld && TaskIntent.isGateHeld(ev)), summary: ev.summary, ms: ev.ms }); },   // runId rides along: a runId-less copy reset xp.js's per-run buffer (freshRun(undefined)) and wiped buffered memory-reuse credit
         onDeliverable: ev => {
+          // BROWSER window: every write (not just the first per run) — it live-reloads the page on screen and, with
+          // FOLLOW on, shows a new web page as it's made. Before the per-run dedupe on purpose.
+          if (typeof OutputBrowser !== 'undefined' && OutputBrowser.noteOutput) { try { OutputBrowser.noteOutput(ev); } catch (_) {} }
           // Any produced file is an openable product (image_generate emits kind:'image', fs.write emits
           // kind:'file'). How we RENDER it is decided client-side from the EXTENSION (the reference harness's model), not
           // from the backend's kind — so a .mp4/.webm the agent writes becomes an inline player and a .png a
@@ -8581,14 +11560,14 @@ const Chat = (() => {
             // visible in the on-screen transcript (inline row above + recap card below), the toast is a third
             // copy that also parks over the composer — suppress it. A BACKGROUND-stream deliverable isn't shown
             // anywhere on screen, so its toast is the only signal → keep it.
-            if (!isActiveWs(ws) && typeof StationUI !== 'undefined') StationUI.notify((mk === 'file' ? 'saved ' : 'made ') + ev.title, 'gold', 'runComplete');   // P1-8 category: run produced a deliverable
+            if (!isActiveWs(ws) && typeof StationUI !== 'undefined') { if (thisRunId) notedRuns.add(thisRunId); StationUI.notify(whoOf(ws) + (mk === 'file' ? ' saved ' : ' made ') + ev.title, 'gold', 'runComplete', { kind: 'result', go: { ws: ws.id } }); }   // P1-8 category: run produced a deliverable
           }
         },
         // EL-11: EVERY prompt now reaches a human surface — the active stream renders the inline consent card;
         // a background stream fires the global clickable toast + rail marker (backgroundPermissionNotify). Both
         // paths then ACK the sidecar (consentAck) that the prompt is human-visible, earning the paused run its
         // one bounded extension of the fail-closed auto-deny timer.
-        onPermission: ev => { Channels.setPending(ws.id, { promptId: ev.promptId, agentId: ev.agentId || ws.agentId, tool: ev.tool, argsSummary: ev.argsSummary, runId: Channels.runIdOf(ws.id) }, Date.now()); walkToDesk(); if (isActiveWs(ws)) { breakLive(); permissionRow(ev, ws); renderPresence(); } else { backgroundPermissionNotify(ev, ws); } try { Promise.resolve(Harness.consentAck(Channels.runIdOf(ws.id), ev.promptId)).then(v => { if (!(v && v.ok)) consentAckFailed(ws, ev, v); }, e => consentAckFailed(ws, ev, { ok: false, error: (e && e.message) || String(e) })); } catch (e) { consentAckFailed(ws, ev, { ok: false, error: (e && e.message) || String(e) }); } },
+        onPermission: ev => { Channels.setPending(ws.id, { ...pendingFrom(ev, ws) }, Date.now()); walkToDesk(); if (isActiveWs(ws)) { breakLive(); permissionRow(ev, ws); renderPresence(); } else { backgroundPermissionNotify(ev, ws); } try { Promise.resolve(Harness.consentAck(Channels.runIdOf(ws.id), ev.promptId)).then(v => { if (!(v && v.ok)) consentAckFailed(ws, ev, v); }, e => consentAckFailed(ws, ev, { ok: false, error: (e && e.message) || String(e) })); } catch (e) { consentAckFailed(ws, ev, { ok: false, error: (e && e.message) || String(e) }); } },
         // the lead's team.summon tool asked the station to create a worker: run the REAL summon (App.summonForRequest
         // → the Recruitment Bay's own summonAgent), then ack with the new id so the lead can delegate to it. The id
         // resolves only after the roster POST lands (App awaits it), so the lead's next team.dispatch finds the worker.
@@ -8601,6 +11580,8 @@ const Chat = (() => {
             .catch(() => Harness.summonAck(rid, ev.requestId, null));
         }
       });
+      // the run is over: every note it read is filed before its reply (a note the saved reply already shows stays in it)
+      fileRunSteers(ws, runSteers, thisRunId, error ? '' : (reply || acc));
       if (error) {
         // PLAIN-LANGUAGE: lead with the beginner-facing message, keep the raw error as a dim sub-line; persist
         // the friendly text (not the plumbing) so a switch-back / replay shows the same readable failure.
@@ -8619,16 +11600,20 @@ const Chat = (() => {
             if (isActiveWs(ws) && input) { input.value = text; autoGrowInput(); }
           }
         } else {
-        // A network-kind failure means this response stream died. The durable journal—not this transport error—
-        // decides whether the task resumes safely or pauses for mutation review after the sidecar reconnects.
-        if (v.kind === 'network' && thisRunId) { interruptedStreams.add(ws.id); armReconnectWatch(); }
+        // NO RECONNECT WATCH HERE, whatever the words (night N2, 2026-10-15). This error is IN-BAND: the sidecar
+        // composed and streamed it, so this page's connection never dropped, and the run's journal was retired on
+        // this end. A provider's "terminated"/"network error" used to read as network, arm the probe, and print
+        // "connection restored" about a connection that was never lost. A real drop THROWS (marked at Harness's
+        // transport throw site) and the catch below arms the watch on verdict.transport.
         persistPartial(ws, acc);
         if (isActiveWs(ws)) { if (activeLiveRow) activeLiveRow.error(v.userMessage, v.raw); }
-        ws.history.push({ role: 'assistant', content: '⚠ ' + v.userMessage, error: true, ts: Date.now() });   // so the failure survives a switch-back, not just a transient notify
+        ws.history.push({ role: 'assistant', content: errorHistoryLine(v), error: true, ts: Date.now(), projectRoot: runRoot });   // so the failure (and its real reason) survives a switch-back/reload — error:true keeps it off the model's wire
+        goalStall = v.userMessage;
         // the run DIED in flight — settle its outcome (task-board truth: a dead run can never wear the DONE
         // chip). Guarded on thisRunId: no run started → nothing was filed, nothing to settle.
         if (thisRunId && typeof Workstreams !== 'undefined' && Workstreams.noteRunEnd) Workstreams.noteRunEnd(ws.id, thisRunId, false);
-        if (typeof StationUI !== 'undefined') StationUI.notify(brief(v.userMessage), 'warn');
+        if (typeof StationUI !== 'undefined') StationUI.notify(isActiveWs(ws) ? brief(v.userMessage) : whoOf(ws) + ' hit a problem' + sessionNote(ws) + ': ' + brief(v.userMessage), 'warn', undefined, isActiveWs(ws) ? undefined : { kind: 'alert', go: { ws: ws.id } });
+        settleRunNeeds(ws.id);   // the run is over: its own asks are no longer waiting on you (a background worker's still is)
         if (isActiveWs(ws)) resolvePresence(ws, { error: true });   // COMMS-PREMIUM: presence card resolves red
         if (isActiveWs(ws)) offerRetry(v);   // RETRY: context-aware recovery chip (retry / Settings / SKILLS / none)
         }
@@ -8646,10 +11631,21 @@ const Chat = (() => {
           replyText = TaskIntent.strip(replyText);
           if (taskQuestion.question) voiceQuestion = taskQuestion.question;   // spoken (question only, no options) at reply end
           if (isActiveWs(ws) && activeLiveRow && activeLiveRow.cleanTaskIntent) activeLiveRow.cleanTaskIntent();
+          goalStall = 'it asked you a question — answer it first';
+        }
+        // FORK is parsed from the RAW reply, then every choice marker (FORK and any leftover TASK_QUESTION) leaves the
+        // displayed + saved text: nothing used to strip a FORK line, so it always printed raw under its own chips.
+        const forkAsked = (replyText && typeof Fork !== 'undefined' && Fork.parse) ? Fork.parse(replyText) : null;
+        if (typeof Fork !== 'undefined' && Fork.stripMarkers) {
+          const shown = Fork.stripMarkers(replyText);
+          if (shown !== replyText) {
+            replyText = shown;
+            if (isActiveWs(ws) && activeLiveRow && activeLiveRow.cleanTaskIntent) activeLiveRow.cleanTaskIntent();
+          }
         }
         finalReply = replyText;
         titleOk = !!replyText.trim();   // a real, non-empty reply landed → this stream is eligible for a summary title
-        if (replyText.trim()) ws.history.push({ role: 'assistant', content: replyText, ts: Date.now(), sourceRunId: thisRunId || undefined });   // never persist an empty turn
+        if (replyText.trim()) ws.history.push({ role: 'assistant', content: replyText, ts: Date.now(), sourceRunId: thisRunId || undefined, projectRoot: runRoot });   // never persist an empty turn
         // Lane 5 (truthful telemetry): a reply the PROVIDER cut off — finishReason 'length' (hit max_tokens
         // mid-thought) or 'content_filter' (output filtered) — is an AMPUTATED turn even though endReason==='done'.
         // It must NOT ship a "◈ delivered" crate / XP / workitem.delivered as if it were complete. Treat it like a
@@ -8666,29 +11662,55 @@ const Chat = (() => {
           // of these reasons, so a work-log line that only says "stopped" restated the card verbatim one row
           // below it. Emit this line only when it carries something the card can't: what to do next (step limit,
           // budget door) or a reason the label doesn't name. Your own interrupt → the card alone tells the truth.
-          const stopLine = endReason === 'max_iters' ? 'reached the step limit — say "continue" to keep going'
-            : endReason === 'budget' ? budgetStopLine(budgetScope, budgetCapUsd)
-            : endReason === 'cancelled' ? (interrupted.has(ws.id) ? '' : 'run cancelled')
+          // EVERY STOP SAYS WHY (2026-10-11): "stopped (empty)" / "run cancelled" / "run stopped: empty" read as the run
+          // quitting for no reason. Friendly.stopLine names what happened + the next step; your own Stop says it was you.
+          const unpriced = (endReason === 'budget' && unpricedModel) ? { model: unpricedModel, capTokens: unpricedCapTokens } : null;
+          const subscription = (endReason === 'budget' && subscriptionModel) ? { model: subscriptionModel, capTokens: subscriptionCapTokens } : null;
+          const stoppedBy = (endReason === 'cancelled' && interrupted.has(ws.id)) ? (stopSource.get(ws.id) || 'you') : null;
+          const stopLine = endReason === 'budget' ? budgetStopLine(budgetScope, budgetCapUsd, budgetCapIsBalance, unpriced, subscription, budgetProjected)
+            : stoppedBy ? stoppedByLine(stoppedBy)
+            // toolsRan: this run's tool calls (callNames), so an empty end after real steps never reads "nothing was done"
+            : (typeof Friendly !== 'undefined' && Friendly.stopLine) ? Friendly.stopLine(endReason, { cancelSource: runPressedEstop ? 'estop_by_run' : '', toolsRan: Object.keys(callNames).length })
             : 'stopped (' + endReason + ')';
-          if (isActiveWs(ws)) { breakLive(); if (stopLine) toolLine('⏹ ' + stopLine); }
+          // the card already says STOPPED BY YOU — the work log only repeats a reason the card can't carry
+          if (isActiveWs(ws)) { breakLive(); if (stopLine && !stoppedBy) toolLine('⏹ ' + stopLine); }
           markStoppedTurn(ws, replyText);
-          // a budget stop's honest door is the BUDGET settings section, not a doomed retry (the same cap fires
-          // again immediately); every other stop keeps the plain retry chip.
-          if (isActiveWs(ws)) { if (endReason === 'budget') offerBudgetDoor(); else offerTryAgain(); }
-          if (typeof StationUI !== 'undefined') StationUI.notify('run stopped: ' + endReason, 'warn');
+          noteStopReason(ws, stopLine, thisRunId, endReason);
+          if (stoppedBy) presenceStoppedBy = stoppedBy;
+          // GOAL LOOP: a stopped step is not judgeable — the loop pauses and SAYS why (judgeGoalTurn), never stalls silently
+          goalStall = stopLine || ('the step stopped (' + endReason + ')');
+          // a budget stop's honest door is SETTINGS › SPENDING LIMITS (the top-up door when the ceiling was the StarNet
+          // balance), not a doomed retry (the same cap fires again immediately); every other stop keeps the plain retry chip.
+          // The UNPRICED-model token ceiling is not a $ cap at all: its door is a different model (raising $ does nothing).
+          if (isActiveWs(ws) && !(endReason === 'cancelled' && runPressedEstop)) { if (endReason === 'budget' && unpriced) offerUnpricedDoor(); else if (endReason === 'budget' && !subscription) offerBudgetDoor(budgetCapIsBalance); else offerTryAgain(); }
+          if (typeof StationUI !== 'undefined') StationUI.notify(isActiveWs(ws) ? (stoppedBy ? 'stopped by you' : 'run stopped: ' + brief(stopLine || endReason))
+            : whoOf(ws) + ' stopped' + sessionNote(ws) + ' — ' + (endReason === 'budget' ? (unpriced ? 'hit the token ceiling for a model with no price' : subscription ? 'used its per-run Claude subscription ceiling; say "continue" to keep going' : budgetProjected === true ? (budgetCapIsBalance === true ? 'stopped before it would spend the rest of your StarNet balance' : 'stopped before it would pass a spending limit') : budgetCapIsBalance === true ? 'used the rest of your StarNet balance' : 'hit a spending limit') : endReason === 'max_iters' ? 'reached the step limit; say "continue" to keep going' : brief(stopLine || endReason)),
+            'warn', undefined, isActiveWs(ws) || endReason === 'cancelled' ? undefined : { kind: 'alert', go: { ws: ws.id } });
         } else if (cutShort) {
           // distinct honest "cut short" recap: the reply is truncated/filtered, not a clean delivery.
+          goalStall = finishReason === 'content_filter' ? 'the model’s output was filtered' : 'the reply was cut short by the output limit';
           if (isActiveWs(ws)) breakLive(), toolLine('⏹ ' + (finishReason === 'content_filter'
             ? 'reply cut short — the model\'s output was filtered'
             : 'reply cut short — hit the response length limit; say "continue" for the rest'));
           if (typeof StationUI !== 'undefined') StationUI.notify('reply cut short: ' + finishReason, 'warn');
         } else if (postconditionUnmet) {
+          goalStall = 'completion was not proven';
           if (isActiveWs(ws)) breakLive(), toolLine('⚠ completion was not proven — typed postconditions returned ' + (completionVerdict || 'not_assessed') + ' (' + (effectVerdict || 'no effect evidence') + ')');
-          if (typeof StationUI !== 'undefined') StationUI.notify('completion needs verification', 'warn');
+          if (typeof StationUI !== 'undefined') StationUI.notify(isActiveWs(ws) ? 'completion needs verification' : whoOf(ws) + ' finished but couldn’t prove it worked' + sessionNote(ws) + ' — check it', 'warn', undefined, isActiveWs(ws) ? undefined : { kind: 'alert', go: { ws: ws.id } });
+        // (a run that already announced a file still says it has a QUESTION: "made X" alone never told you it waits on you)
+        } else if (!isActiveWs(ws) && (!endReason || endReason === 'done' || endReason === 'clarifying') && replyText.trim() && !(thisRunId && notedRuns.has(thisRunId) && !taskQuestion && endReason !== 'clarifying') && typeof StationUI !== 'undefined') {
+          const asks = !!taskQuestion || endReason === 'clarifying';
+          // a BACKGROUND session finished (you were elsewhere) — the one beat you'd otherwise miss; the entry opens it
+          StationUI.notify(whoOf(ws) + (asks ? ' has a question for you' : ' finished') + sessionNote(ws), asks ? 'warn' : 'good', asks ? 'needsApproval' : 'runComplete',
+            asks ? { kind: 'needs', go: { ws: ws.id }, key: 'needs:' + ws.id } : { kind: 'result', go: { ws: ws.id } });
         }
         // a CLEAN end that hit an unwired connector mid-run: the reply already says "not connected" — the chip is
         // the door. Only on a clean end: a stopped run owns the slot with its retry/budget chip above.
+        if (thisRunId) notedRuns.delete(thisRunId);
+        if (!taskQuestion && endReason !== 'clarifying') settleRunNeeds(ws.id);   // the run is over: its approvals/questions are no longer waiting (a background worker's still is)
+        retireOpenConsents(ws.id, thisRunId || '');   // ...and its open approval cards say so instead of keeping live keys
         if (!taskQuestion && (!endReason || endReason === 'done')) offerConnectorDoor(thisRunId, ws);
+        if (taskQuestion || endReason === 'clarifying') holdConnectorDoor(thisRunId, ws);   // the question owns the slot (parsed here, or restored from the store below); its card carries the door
         // GOLDEN-RUN DRIFT (2026-08-22): a recipe-launched run is compared by the sidecar against that recipe's own
         // good history; a drifted run is a failure class, so it earns the bell ONCE (keyed by the run). The durable
         // row lands a beat after run end, so the read waits; it is advisory and never blocks the turn.
@@ -8705,13 +11727,13 @@ const Chat = (() => {
                 seen.push(drift.latestRunId); try { localStorage.setItem('starnet.recipeDrift.notified', JSON.stringify(seen.slice(-50))); } catch (_) {}
                 const name = (typeof Recipes !== 'undefined' && Recipes.get && Recipes.get(rid)) ? Recipes.get(rid).name : rid;
                 const first = drift.signals[0];
-                StationUI.notify('⚠ recipe drift: ' + name + ' — ' + (first ? first.detail : 'this run differs from its last ' + drift.baselineRuns), 'bad');
+                StationUI.notify('⚠ recipe drift: ' + name + ' — ' + (first ? first.detail : 'this run differs from its last ' + drift.baselineRuns), 'bad', undefined, { kind: 'alert', go: { ws: ws.id } });
               })
               .catch(() => {});
           }, 1500);
         }
         if (isActiveWs(ws) && activeLiveRow) activeLiveRow.done();
-        if (isActiveWs(ws) && taskQuestion) presentTaskQuestion(ws, taskQuestion);   // enriches with the stored recommendation, then renders
+        if (isActiveWs(ws) && taskQuestion) presentTaskQuestion(ws, Object.assign({ runId: thisRunId }, taskQuestion));   // enriches with the stored recommendation, then renders
         // Belt-and-braces (live-caught 2026-07-16): a run can end 'clarifying' with the marker unparseable
         // client-side (e.g. a malformed/glued reply line) while the DURABLE brief holds the real validated
         // question — re-present from the store so the Commander is never left with a question-less pause.
@@ -8719,9 +11741,9 @@ const Chat = (() => {
         // R1 MID-TASK FORK: the agent may have ended this reply with one FORK marker (earned only while the
         // style model's confidence is low — the directive isn't even in the prompt otherwise). Render the
         // one-tap chips at the run boundary; a malformed marker parses null and stays plain text.
-        if (isActiveWs(ws) && replyText && typeof Fork !== 'undefined' && Fork.parse) {
-          const fk = Fork.parse(replyText);
-          if (fk) { offerFork(fk); if (!voiceQuestion && fk.question) voiceQuestion = fk.question; }
+        if (isActiveWs(ws) && forkAsked) {
+          const fk = forkAsked;   // parsed before the marker left the displayed text (above)
+          offerFork(fk, thisRunId); if (!voiceQuestion && fk.question) voiceQuestion = fk.question;
         }
         /* THE WORK LINE. This dock has answered; if the Commander drew stages past it, run them now — still
            INSIDE the run's try, so the stream stays busy and Stop/E-STOP reach the whole line rather than a
@@ -8765,7 +11787,7 @@ const Chat = (() => {
         if (thisRunId && (ws.agentId || 'agent') === 'agent') { const crew = claimCrew(runStartedAt); if (crew.length) { runCrew.set(thisRunId, crew); if (runCrew.size > 60) runCrew.delete(runCrew.keys().next().value); } }
         // COMMS-PREMIUM: resolve the presence card into a compact summary. steps = real successful tool rounds,
         // cost = this run's REAL usd delta — both truthful (shown only when > 0), never fabricated.
-        if (isActiveWs(ws)) resolvePresence(ws, { endReason: taskQuestion ? 'done' : endReason, cutShort: cutShort, verificationRequired: postconditionUnmet, steps: runToolsOk, cost: runCost });
+        if (isActiveWs(ws)) resolvePresence(ws, { endReason: taskQuestion ? 'done' : endReason, cutShort: cutShort, verificationRequired: postconditionUnmet, steps: runToolsOk, cost: runCost, stoppedBy: presenceStoppedBy });
         // WORK VISIBILITY: a passive recap of what this run PRODUCED, fetched from the run's recorded
         // artifacts ledger. A report, not an ask — it never claims the post-run beat slot. Fire-and-forget.
         // DURATION HONESTY (2026-07-19): the recap's "RUN COMPLETE · M:SS" reads Channels.elapsedOf — the
@@ -8783,8 +11805,10 @@ const Chat = (() => {
       if (stopped) {
         // keep whatever already streamed, mark it stopped, and log NO error (the stop was intentional).
         // No toolLine (2026-07-27): resolvePresence already prints "■ RUN STOPPED · …" — `⏹ stopped` echoed it.
-        if (isActiveWs(ws)) { if (activeLiveRow) activeLiveRow.done(); resolvePresence(ws, { stopped: true, steps: runToolsOk }); }
+        const by = stopSource.get(ws.id);
+        if (isActiveWs(ws)) { if (activeLiveRow) activeLiveRow.done(); resolvePresence(ws, { stopped: true, steps: runToolsOk, stoppedBy: by }); }
         markStoppedTurn(ws, acc);
+        noteStopReason(ws, stoppedByLine(by), thisRunId);
         if (isActiveWs(ws)) offerTryAgain();
         if (!isTask && isActiveWs(ws) && acc.trim()) World.say(acc);
       } else {
@@ -8794,6 +11818,7 @@ const Chat = (() => {
         // app" copy onto every abort, including a dead PROVIDER stream on a healthy install. Say only what we
         // witnessed and let Harness.pingEngine measure the rest — full rationale in harness.js + friendlyerror.js.
         persistPartial(ws, acc);
+        streamLost = true;   // its run's end never arrived (see finally)
         let engineAlive = null;
         if (typeof Harness !== 'undefined' && Harness.pingEngine) {
           try { engineAlive = await Harness.pingEngine(); } catch (_) { engineAlive = null; }
@@ -8804,8 +11829,13 @@ const Chat = (() => {
           ? Friendly.friendlyError(aborted ? new Error('connection dropped mid-reply') : e, null, { engineAlive: engineAlive })
           : { userMessage: aborted ? 'Lost the connection — try again.' : (e.message || String(e)), retryable: true, action: null, raw: (e && e.message) || String(e) };
         if (isActiveWs(ws)) { if (activeLiveRow) activeLiveRow.error(v.userMessage, v.raw); resolvePresence(ws, { error: true }); }
-        ws.history.push({ role: 'assistant', content: '⚠ ' + v.userMessage, error: true, ts: Date.now() });   // keep a readable trace of the failure
-        if (v.kind === 'network' && thisRunId) { interruptedStreams.add(ws.id); armReconnectWatch(); }
+        ws.history.push({ role: 'assistant', content: errorHistoryLine(v), error: true, ts: Date.now(), projectRoot: runRoot });   // keep a readable trace of the failure (never replayed to the model)
+        goalStall = v.userMessage;
+        // This response stream died: the durable journal — not this error — decides whether the task resumes safely
+        // or pauses for mutation review once the sidecar answers again. Armed on PROVENANCE (verdict.transport: the
+        // error was marked at Harness's own transport throw site), never on words — Chromium/WebView2's bare
+        // "network error" body-read rejection now arms it, and a sidecar-written "sidecar HTTP 502 — … terminated" does not.
+        if (v.transport === true && thisRunId) { interruptedStreams.add(ws.id); armReconnectWatch(); }
         if (thisRunId && typeof Workstreams !== 'undefined' && Workstreams.noteRunEnd) Workstreams.noteRunEnd(ws.id, thisRunId, false);
         if (isActiveWs(ws)) offerRetry(v);   // RETRY: context-aware recovery chip (a dropped connection is retryable)
       }
@@ -8813,10 +11843,18 @@ const Chat = (() => {
       // crew HUD would stick at WORKING — clear this run's count here. Normal + in-band-error completions deliver
       // run.end (decremented by the bus listener), so we must NOT clear there or a concurrent sibling under-counts.
       if (typeof StationUI !== 'undefined' && StationUI.clearRunning) StationUI.clearRunning(ws.agentId || 'agent');
+      // ...and its waits on you end with it, exactly as an in-band end settles them: the bell drops this run's asks
+      // (a background worker's keeps its entry), so it never reads "NEEDS YOU — 2 waiting" beside a rail that says 1
+      settleRunNeeds(ws.id);
     } finally {
       aborters.delete(ws.id);
+      liveRunRoots.delete(ws.id);
+      const stoppedHere = interrupted.has(ws.id);   // read before it is consumed: a join this reply asked for is dropped on a stop
       interrupted.delete(ws.id);   // consume the stop flag (whether or not it fired)
+      stopSource.delete(ws.id);
       Channels.end(ws.id);
+      if (thisRunId) { if (streamLost || interruptedStreams.has(ws.id)) releaseSentNow(ws.id, thisRunId, acc); else settleSentNow(ws.id, thisRunId, acc); }   // SEND NOW lines this run took are settled with it; one it never read goes next (a STOP already gave back the unread ones). A stream that DIED cannot know what its run read: it lets go of them and the station decides
+      reconcileSentNow(ws);   // any line on disk this page no longer holds (released just now, or by a teardown) is asked about now
       // P1: drain this directive from the QUEUE gauge on ANY teardown (shipped, in-band error, or abort) —
       // the backlog is "runs in flight", independent of whether the work shipped.
       if (wiPlaced) { const depth = wiBump(wiAid, -1); wiEmit('queue.status', { queueId: wiAid, depth: depth, maxCapacity: 64, nextAdvanceAt: 0 }); }
@@ -8876,17 +11914,20 @@ const Chat = (() => {
       // flush any trailing spoken text and CLOSE the speech stream — the last chunk's end re-arms the
       // hands-free mic (this is the heartbeat for spoken turns; onTurnEnd covers silent/no-speech turns).
       clearTimeout(speechTimer); speechTimer = null;
-      if (willSpeak && speechOwner() && typeof Voice !== 'undefined' && Voice.endReply) {
+      if (willSpeak && speechOwner() && !speechClosed && typeof Voice !== 'undefined' && Voice.endReply) {
         pushSpeech(true, finalReply);
         // VOICE-AWARE CHOICES: the choice itself is spoken as a natural question — question text only;
         // the 2-3 options are on-screen chips (reading them out was the "reads every option" glitch).
         if (voiceQuestion && Voice.speakChunk) Voice.speakChunk('Quick question. ' + voiceQuestion, name, speechOpts);
-        Voice.endReply();
       }
+      closeSpeech();
       // hands-free voice mode: the run is done — let Voice re-open the mic for the next turn.
       if ((!liveVoiceCall() || liveVoiceOwns(ws)) && typeof Voice !== 'undefined' && Voice.onTurnEnd) Voice.onTurnEnd();
+      // CREW THIS REPLY ASKED FOR (station.control group.add): they join now — the reply is saved in the history and the
+      // channel has ended — and BEFORE a queued follow-up is sent, so that message goes to the new group, not a new reply
+      const joining = typeof GroupChat !== 'undefined' && GroupChat.drainAfterRun ? GroupChat.drainAfterRun(ws.id, thisRunId, { stopped: stoppedHere }) : null;
       // TYPE-AHEAD: the stream just freed — send its next queued follow-up (after this call fully unwinds).
-      setTimeout(() => flushQueued(ws.id), 0);
+      setTimeout(() => { Promise.resolve(joining).catch(() => null).then(() => flushQueued(ws.id)); }, 0);
       // GOAL LOOP: after the teardown, judge this turn against the standing goal and maybe fire the next continuation.
       // A QUEUED user follow-up wins first — it's the human steering, so let it drain (it will preempt/pause the loop
       // when IT is judged as a non-continuation). Only judge when nothing is queued. Deferred (setTimeout) so it runs
@@ -8896,7 +11937,8 @@ const Chat = (() => {
         const reply = goalJudgeReply, wasCont = goalContinuation;
         if (wasCont || goalActiveAtStart) {
           // a continuation turn → judge it; a REAL user turn that ran while the loop was already active → preempt.
-          setTimeout(() => { judgeGoalTurn(ws, reply, wasCont); }, 0);
+          const stall = goalStall;
+          setTimeout(() => { judgeGoalTurn(ws, reply, wasCont, stall); }, 0);
         } else {
           // the loop was SET during this very turn (/goal <text> while the stream was busy): this turn isn't a
           // preemption — it's the turn that triggered the loop. Kick the first continuation now the stream freed.
@@ -8961,12 +12003,17 @@ const Chat = (() => {
   /* DISCONNECT (or any teardown) cancels the in-flight billable run: abort the fetch (the sidecar's
      req.on('close') then stops the loop) AND tell the sidecar to kill the run by id — belt-and-suspenders. */
   function abort() {
-    if (typeof Voice !== 'undefined' && Voice.stopConvo) Voice.stopConvo();   // drop hands-free on disconnect
+    // drop hands-free on disconnect — Live Voice included (its own microphone loop stayed hot behind DISCONNECT)
+    if (typeof VoiceLive !== 'undefined' && VoiceLive.isActive && VoiceLive.isActive() && VoiceLive.end) VoiceLive.end();
+    if (typeof Voice !== 'undefined' && Voice.stopConvo) Voice.stopConvo();
     // teardown is a DELIBERATE interrupt, not a dropped connection: flag every in-flight stream interrupted BEFORE
     // aborting so send()'s catch reads `stopped` and stays silent — otherwise the AbortError gets reclassified as a
     // network fault and a spurious "can't reach the sidecar" row is pushed into ws.history + persisted. (A reader
     // that aborts WITHOUT going through here = a genuine dropped connection → still a network error + retry.)
     for (const id of aborters.keys()) interrupted.add(id);
+    // the re-entry wipes the queue, so a SEND NOW line must not be re-queued by the aborted run's teardown: let go of every
+    // one — on disk, the station decides each on the conversation's next load (reconcileSentNow)
+    for (const id of Array.from(sentNow.keys())) releaseSentNow(id);
     // cancel EVERY in-flight run (not just one global): abort each fetch + tell the sidecar to kill the run by id
     for (const ac of aborters.values()) { try { ac.abort(); } catch (_) {} }
     if (typeof Channels !== 'undefined') for (const id of Channels.busyIds()) { const rid = Channels.runIdOf(id); if (rid) Harness.cancel(rid); }
@@ -9045,11 +12092,11 @@ const Chat = (() => {
           if (on) picked.add(it.value); else picked.delete(it.value);
           b.classList.toggle('sel', on); b.setAttribute('aria-pressed', on ? 'true' : 'false');
           b.textContent = (on ? '✓ ' : '') + it.label;   // the fill alone does not read as ON
-          if (typeof SFX !== 'undefined') SFX.click();
+          if (typeof SFX !== 'undefined') SFX.press();
           syncConfirm();
           return;
         }
-        done = true; activeChoiceRows.delete(rowEl); rowEl.remove(); if (typeof SFX !== 'undefined') SFX.click();
+        done = true; activeChoiceRows.delete(rowEl); rowEl.remove(); if (typeof SFX !== 'undefined') SFX.press();
         onPick(it.confirm ? Object.assign({}, it, { values: (items || []).filter(x => !x.skip && !x.confirm && picked.has(x.value)).map(x => x.value) }) : it);
       };
       if (multi && it.confirm) { confirmBtn = b; b.classList.add('confirm'); syncConfirm(); }
@@ -9086,6 +12133,9 @@ const Chat = (() => {
     const silent = !!(opts && opts.silent);
     if (typeof segments === 'string') segments = [{ text: segments }];
     if (!log || !Array.isArray(segments)) { if (onDone) onDone(); return () => {}; }
+    // DOOR LAW (systems.js): a scripted station line (the tour, the awakening) that names a dock system in capitals
+    // brings it online as it is said — the station never tells a newcomer to open a button it is still hiding
+    if (typeof Systems !== 'undefined' && Systems.noticeReply) { try { Systems.noticeReply(segments.map(s => (s && s.text) || '').join(' ')); } catch (_) {} }
     const out = streamingAgent();
     let si = 0, ci = 0, finished = false, killed = false;
     function finish() {
@@ -9129,5 +12179,7 @@ const Chat = (() => {
   // only" gate maybeStandaloneRate uses — so a pure-chat run is never bottle-offered. Used by App.runBottleInfo (R5).
   function runDidWork(id) { const w = id ? runWork.get(id) : null; return !!(w && ((w.toolsOk || 0) >= 1 || (w.delivered || 0) >= 1)); }
 
-  return { init, load, send, continuityDiagnostics, refreshStarters, sendOrQueue, continueConnectorTask, stopActive, status, localLine, broadcast, renderProse, setSystem, getHistory, contextRef, abort, isBusy, beatBusy: skillBeatBusy, beginInterview, endInterview, echoUser, prefill, autoGrowInput, choices, clearChoices, retireDeskPrompt, typeLine, nudge, clearNudge, offerCuriosity, offerFork, planGoalPath, briefingReceipt, isComposerEngaged, canFocusSession, runMeta, runDidWork, awayDigest, awayReview, awayRate, sampleCard, workshopReturn, refreshIdBar: renderIdBar, refreshGroupControls: updateControls, refreshAgentIdentity, setRosterStatus, askBudgetSpent, spendAsk };
+  return { init, load, paintTitle, deliverTurns, send, consentInspect, appendConsentDetails, revealHistory, revealAsk, copyText, continuityDiagnostics, refreshStarters, sendOrQueue, continueConnectorTask, stopActive, status, localLine, broadcast, renderProse, toolRailOf, openFile, answerConsent, consentPhrase: actionPhrase, reconcileBackgroundAsks, setSystem, getHistory, contextRef, abort, isBusy, beatBusy: skillBeatBusy, beginInterview, endInterview, echoUser, prefill, rememberSent: recordSent, autoGrowInput, choices, clearChoices, retireDeskPrompt, typeLine, nudge, clearNudge, offerCuriosity, offerFork, planGoalPath, briefingReceipt, isComposerEngaged, canFocusSession, runMeta, runDidWork, awayDigest, awayReview, awayRate, sampleCard, workshopReturn, refreshIdBar: renderIdBar, refreshGroupControls: updateControls, refreshAgentIdentity, setRosterStatus, askBudgetSpent, spendAsk, clockLabel: fmtClock, breakLabel: fmtBreak, workspaceFileRefs, imageBlobUrl, readableUrl,
+    // the COMMS '▤ saved' row's folder / copy-path keys and their path resolver, shared with MY WORK › DELIVERABLES' FILES rows (org pass 10-14, P24)
+    folderButton, copyPathButton, fullSavedPath: absoluteArtifactPath };
 })();
