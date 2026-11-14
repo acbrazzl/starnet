@@ -238,6 +238,10 @@ only: no channel, no connector, no SEND TO.
   replaced that CTA with a Play CTA because the job states no pricing. The PACKAGE bay's posting note carried the
   posting log's lesson: real ATAK footage from frame 0, title-card openers averaged about 4 s watch.
 - `skill-off`: `claude.skill_agent` was denied, nothing was bound, and the line still delivered with plain bays.
+- Page need, measured on the `skill` arm's kept workspace after a station RESTART: with no page, a `starnet -p` asking for
+  `station.test_line` was refused ("no station page answered") and no job was recorded. With `dev/station-page.mjs`
+  attached, the same request delivered a second job, including the `writer` skill step, so the binding survived the
+  restart.
 
 The lead staffs a bay with a crew agent by its roster name or id, and binding the lead itself is refused. Recruited bay
 specialists follow the station default (here `claude-cli`).
