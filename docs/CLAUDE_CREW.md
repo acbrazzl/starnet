@@ -152,6 +152,96 @@ adds two things so the Overseer session can drive it in plain words:
 station tab open anywhere, `station.map`, `station.plan` and `station.build` fail visibly with a reason instead of
 pretending. Routines (`routine.*`, server-side cron store) do not need a page.
 
+## Workflow lines that run on the Claude login (base building, 2026-11-14)
+
+The lead builds rooms **and working workflow lines** from plain words, and the line's steps run on the Commander's own
+`claude` login. Proof: `SKYNET_CHROME=~/.local/bin/chrome-nosandbox node dev/social-line-proof.mjs` (see below).
+
+**A line's bays run on the STATION DEFAULT.** A bay staffed by an agent with no model pin (the lead, or a recruited
+specialist) follows the hero's OWN roster pin, provider and model together (`channelRunConfigFor` →
+`stationDefaultFor`). So the station default must be `claude-cli` plus a model, or every test job fails at $0 before any
+step: "target agent agent has no roster model" (no model pin) or "connect a OPENROUTER API key for target agent agent"
+(the fixture's `prov: "openrouter"`). The UI paths (model dock, WAKE, resume) set provider and model together. Setting
+only the page's wire (`Harness.setProv/setModel`) or `App.applyConfig({ model })` leaves the provider pin where it was.
+`starnet -p --provider claude-cli --model …` sets **only the lead's own run**, not the bays. The live station's roster is
+`claudecode` (= `claude-cli`) on every agent.
+
+### Crew-skill bays: a step that uses the crew's own skill and memory
+
+A bay's ordinary step is a stateless StarNet agent turn: it knows its brief, nothing else. A **crew-skill agent** instead
+hands each of its steps to one of the Commander's Claude Code skills:
+
+- `claude.skill_agent { agent, skill, dir }` (lead-only) binds a crew agent to a skill. `{ agent, clear: true }` unbinds
+  it, and `{}` lists the bindings and installed skills. The binding is sidecar-owned in
+  `WORKSPACES/claude-skill-agents.json`, because the page-owned roster would drop a field it does not know.
+- **Refused unless** the skill is a plain name installed at `~/.claude/skills/<skill>/SKILL.md` (plus
+  `STARNET_CLAUDE_SKILL_DIRS`) **and** `dir` is an absolute folder Claude Code **already trusts** (it or an ancestor has
+  `hasTrustDialogAccepted: true` in `~/.claude.json`; never `~/.claude`). StarNet never accepts a trust prompt. Both are
+  re-checked at every step: a withdrawn trust or a removed skill makes the step refuse with its reason.
+- Each step of a bound agent is ONE `claude -p` run IN `dir`, with stdin `/<skill>\n\n<the hand-off>`. It uses the user's
+  own settings, so the skill, the project's `CLAUDE.md` and its auto-memory load. StarNet's stage brief rides
+  `--append-system-prompt-file`, so Claude Code keeps its own system prompt.
+- **Read-only:** `--tools Read,Grep,Glob`, `--strict-mcp-config` with no servers (no connector can post), and
+  `--no-session-persistence`. StarNet's tools are never offered. The step cannot post, write files or run commands, so a
+  skill's "append to the posting log" stays a human step.
+- A bound agent's run must resolve to `claude-cli`; otherwise it is refused (`runOnce`, `skillBinding`).
+- **`STARNET_AUTO_BUILD_CREW=1`** is OFF by default and needs `STARNET_AUTO_BUILD=1`. It lets the lead use `team.summon`
+  and `claude.skill_agent` with no approval card. It is a SEPARATE switch, so the Commander's 11-02 AUTO-BUILD list is not
+  widened. Neither tool can spend: a summon is the page's local `summonAgent()`, and a binding only routes later steps
+  onto the Claude login. Without the switch both ask, and a `starnet -p` run (no one to ask) is refused.
+- `team.summon` answers only on a run whose stream reaches a page. A `starnet -p` lead recruits a bay's specialist with
+  `station.plan { staff: { line, steps: [{ step, agent: "new" }] } }` + `station.build`, which is already AUTO-BUILD.
+
+### How Proxima (or any Claude Code session) builds through the lead
+
+1. The station runs with `STARNET_AUTO_BUILD=1` (and `STARNET_AUTO_BUILD_CREW=1` for crew-skill bays). Its station
+   default is `claude-cli` plus a model.
+2. **A build or a line test needs an attached station page.** `station.map/plan/build` are page-owned, and
+   `station.test_line` asks the page for the line too: with no page, it was refused after the bridge's 6 s wait with "no
+   station page answered — open StarNet to run station commands" (measured 2026-11-14). `claude.skill_agent` and
+   `routine.*` need no page. With no browser tab open, keep
+   a headless one attached for the build:
+   `SKYNET_CHROME=~/.local/bin/chrome-nosandbox node dev/station-page.mjs --port <port>` (prints `PAGE READY`, stays
+   until SIGTERM). ⚠ The page is a WRITER (roster + save). On the live station, attach it only while no other station
+   tab is open, and close it after.
+3. Hand the work to the lead: `node ~/code/starnet/bin/starnet.js --port <port> --json -p "<plain words>"`. Never
+   `--yes`. Anything outside AUTO-BUILD is refused, and the receipt's `toolCalls` say which.
+4. Read the result from the station's records, not the lead's account. A line test's job is in `WORKSPACES/line-jobs.json`
+   (status + output), and each step is a `runs.jsonl` row with `streamId` = the job's sample stream, bay (`dockId`),
+   `provider`, `model`, `tokens` and `reason`. A step's own reply is the assistant row with that `sourceRunId` in
+   `transcript-history-v2/`. `node dev/social-line-proof.mjs --report <workspace> <out.md>` writes all of it as one file.
+
+### The proof (`dev/social-line-proof.mjs`)
+
+A throwaway station: a scratch copy of `dev/fixtures/seed-workspace`, an OS-assigned port, Full Access OFF and
+`STARNET_AUTO_BUILD=1`. It attaches a headless page and runs ONE `starnet -p` that builds room SOCIAL STUDIO and line
+SOCIAL POST (intake → PLAN → CAPTION → CLAIMS CHECK → PACKAGE → outbox), then sends a `station.test_line` job. Drafts
+only: no channel, no connector, no SEND TO.
+
+| Arm (`PROOF_ARM`) | Setup | Must show |
+|---|---|---|
+| *(default)* | station default `claude-cli` | job `delivered`; four `runs.jsonl` rows at four distinct bays, all `done`, all `claude-cli` |
+| `fixture` | the fixture's own default (openrouter, no model) | the job FAILS at $0 with "has no roster model" / "connect a OPENROUTER API key" (the 2026-11-13 trial) |
+| `skill` | + `STARNET_AUTO_BUILD_CREW=1`; bay 2 = a new specialist bound to `meshflow-social` in `~/code/meshFlow` | the binding on disk; that agent's row is `claude-cli`/`done`; its OWN reply names the skill's standing CTA "Join the free alpha — link in bio.", a line only the skill knows (the plain line wrote "Grab MeshFlow 0.1.23 on Google Play (link in bio)") |
+| `skill-off` | the same prompt, crew switch off | `claude.skill_agent` denied, nothing bound |
+
+**Results, 2026-11-14, all four arms PASS** (model `claude-sonnet-5-5`, every step $0 on the subscription):
+
+- default: one `starnet -p` (52 s) built the room and line. Job `job-467493b55ad6` was delivered (1,526 chars) with four
+  steps at bays p35–p38, 24–28k tokens each.
+- `fixture`: the job failed at $0 with "target agent agent has no roster model". The lead then tried `station.control`
+  to fix the pin, which was denied.
+- `skill`: the lead built the line, recruited bay 2's specialist (SCRIPTWRITER, id `writer`) with `station.plan` staff
+  "new", and bound it with `claude.skill_agent` (no approval card). Job `job-620ffb6cd28d` was delivered. The `writer`
+  step (bay p36, `claude-cli`, `done`) quoted skill-only rules: the Commander's 2026-10-30 caption format, the hashtag
+  rotation, "never a store link until it exists", and "the standing CTA is 'Join the free alpha, link in bio.'". It
+  replaced that CTA with a Play CTA because the job states no pricing. The PACKAGE bay's posting note carried the
+  posting log's lesson: real ATAK footage from frame 0, title-card openers averaged about 4 s watch.
+- `skill-off`: `claude.skill_agent` was denied, nothing was bound, and the line still delivered with plain bays.
+
+The lead staffs a bay with a crew agent by its roster name or id, and binding the lead itself is refused. Recruited bay
+specialists follow the station default (here `claude-cli`).
+
 ## Remote access to the station (phone)
 
 The sidecar binds loopback only, and the API pins `Host` to loopback as its DNS-rebinding defense.
@@ -183,4 +273,7 @@ Chrome adds a shortcut rather than an installed app).
 - `sidecar/apiauth.js` — `parseRemoteHosts`, `isAllowedHost(host, remoteHosts)`, `isAllowedApiOrigin(origin, port, remoteHosts)`
 - `frontend/app/claude-crew.js` — floor bodies (`cc-<sessionId>`), the list, session and new-session cards
 - `dev/overlay-forward.js`, `dev/remote-station-zerotier.sh`, `dev/remote-station.sh` — phone access
-- `test/claude-crew.test.js`, `test/claude-cli-provider.test.js`, `test/apiauth.test.js` — unit coverage
+- `sidecar/claude-skill-agents.js`, `sidecar/tools/builtin/claude-skill-agent.js` — crew-skill bindings + `claude.skill_agent`
+- `dev/social-line-proof.mjs` (base-building proof, all arms), `dev/station-page.mjs` (a headless station page for builds)
+- `test/claude-crew.test.js`, `test/claude-cli-provider.test.js`, `test/apiauth.test.js`, `test/claude-skill-bay.test.js`,
+  `test/auto-build.test.js` — unit coverage
