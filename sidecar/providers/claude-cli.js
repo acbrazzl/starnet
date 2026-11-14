@@ -811,17 +811,22 @@
       return args;
     }
     const textOf = c => typeof c === 'string' ? c : Array.isArray(c) ? c.map(b => (b && typeof b.text === 'string') ? b.text : '').filter(Boolean).join('\n') : '';
-    /* the step's prompt: TWO stream-json user messages — `/<skill>` ALONE, then the conversation the bay received (one
-       hand-off, usually). NEVER "/<skill> <hand-off>": Claude Code substitutes $1/$2/$ARGUMENTS in a skill's body with the
-       command's arguments, so the posting log's "under $1,000/yr" read "under HANDOFF,000/yr" in every step (live 11-14).
-       The first turn (the skill loading) is not the step's answer: oneShotStream skips it to its result line. */
+    /* the step's prompt: ONE stream-json user message, `/<skill>` ALONE, and the hand-off in the APPENDED system prompt.
+       - never "/<skill> <hand-off>": Claude Code substitutes $1/$2/$ARGUMENTS in a skill's body with the command's arguments,
+         so the posting log's "under $1,000/yr" read "under HANDOFF,000/yr" in every step (live 11-14);
+       - never a second user message for the hand-off: whether the CLI runs two queued messages as two turns or merges them
+         into one is not fixed (Sonnet: two results; Opus: one), so a reader that skips "the load turn" dropped Opus's answer.
+       One message is one turn and one result on every model (measured 11-14, Sonnet and Opus). */
     function skillPrompt(req) {
       const msgs = (Array.isArray(req.messages) ? req.messages : []).filter(m => m && m.role !== 'system');
       const body = msgs.length === 1 ? textOf(msgs[0].content).trim()
         : msgs.map(m => '<' + (m.role === 'assistant' ? 'assistant' : 'user') + '>\n' + textOf(m.content).trim() + '\n</' + (m.role === 'assistant' ? 'assistant' : 'user') + '>').join('\n\n');
-      return { system: (Array.isArray(req.messages) ? req.messages : []).filter(m => m && m.role === 'system').map(m => textOf(m.content).trim()).filter(Boolean).join('\n\n'),
-        input: JSON.stringify({ type: 'user', message: { role: 'user', content: '/' + String(req.claudeSkill).replace(/^\//, '') } }) + '\n'
-          + JSON.stringify({ type: 'user', message: { role: 'user', content: body } }) + '\n' };
+      const stage = (Array.isArray(req.messages) ? req.messages : []).filter(m => m && m.role === 'system').map(m => textOf(m.content).trim()).filter(Boolean).join('\n\n');
+      const skill = String(req.claudeSkill).replace(/^\//, '');
+      return {
+        system: (stage ? stage + '\n\n' : '') + 'THE JOB HANDED TO THIS STEP — do it now with the /' + skill + ' skill that was just invoked; your reply is this step\'s answer:\n\n' + body,
+        input: JSON.stringify({ type: 'user', message: { role: 'user', content: '/' + skill } }) + '\n'
+      };
     }
 
     function cliArgs(cmd, req, sysFile) {
@@ -1058,7 +1063,7 @@
 
       const T = makeTurn(req, turn);
       if (box) box.turn = T;
-      let endedOnResult = false, skillLoadTurn = skillStep;
+      let endedOnResult = false;
       try {
         for (;;) {
           if (signal && signal.aborted) return;
@@ -1076,8 +1081,6 @@
           }
           let j;
           try { j = JSON.parse(line); } catch (_) { continue; }
-          // a skill step's first turn only loads the skill: keep its init line (billing/auth facts), drop the rest
-          if (skillLoadTurn) { if (j.type === 'result') skillLoadTurn = false; else if (j.type === 'system' && j.subtype === 'init') yield* T.line(j); continue; }
           yield* T.line(j);
           if (T.blockDone) break;   // `finally` ends the child: the rest of this generation is a guess at results
           /* THE RESULT LINE ENDS THE TURN (stall report 2026-10-13). The turn used to end on the child's close, which comes

@@ -37,7 +37,7 @@ const flag = (args, f) => args.indexOf(f) >= 0 ? args[args.indexOf(f) + 1] : und
   // A. THE PROVIDER BRANCH: a request carrying claudeSkill + claudeDir runs the skill, read-only, in that directory.
   {
     // the CLI answers the skill-load turn first ("The skill is loaded…", its own result line), then the hand-off turn
-    const f = fakeSpawn([init, delta('The meshflow-social skill is loaded. What would you like?'), Object.assign({}, result, { result: 'loaded' }), delta('Join the free alpha'), delta(' — link in bio.'), result]);
+    const f = fakeSpawn([init, delta('Join the free alpha'), delta(' — link in bio.'), result]);
     // persistence ON and tools offered: the skill turn must still be one-shot and must not offer StarNet's tools
     const p = makeClaudeCliProvider({ spawn: f.spawn, fs: fakeFs, bin: 'claude', env: { PATH: '' }, platform: 'linux' });
     const evs = await collect(p, {
@@ -58,15 +58,17 @@ const flag = (args, f) => args.indexOf(f) >= 0 ? args[args.indexOf(f) + 1] : und
     A.eq(flag(args, '--model'), 'claude-sonnet-5-5', 'the bay\'s model');
     /* NO SKILL ARGUMENTS (2026-11-14, live): Claude Code substitutes $1/$2/$ARGUMENTS in a skill's body with the slash
        command's arguments, so "/<skill>\n\n<hand-off>" turned the posting log's "under $1,000/yr" into "under HANDOFF,000/yr"
-       in every step (and every step then reported a garbled log). The skill is invoked ALONE, with no arguments, as the first
-       stream-json message; the hand-off is the second message. */
-    A.eq(flag(args, '--input-format'), 'stream-json', 'two user messages on stdin (stream-json)');
+       in every step. And a second user message for the hand-off is NOT a reliable second turn: Opus merged the two queued
+       messages into ONE turn (one result line), so skipping "the load turn" dropped the answer ("exited before answering").
+       So: ONE message, the slash command ALONE; the hand-off rides the appended system prompt; exactly one turn. */
+    A.eq(flag(args, '--input-format'), 'stream-json', 'the message goes as stream-json');
     const msgs = stdin.trim().split('\n').map(l => JSON.parse(l));
-    A.eq(msgs.length, 2, 'two messages: the skill, then the hand-off');
-    A.eq(msgs[0].message.content, '/meshflow-social', 'the first is the slash command ALONE — no arguments to substitute into the skill');
-    A.ok(String(msgs[1].message.content).includes('PIPELINE HANDOFF — draft the caption.'), 'the second is the hand-off the bay received');
+    A.eq(msgs.length, 1, 'ONE message: one turn, one result, on every model');
+    A.eq(msgs[0].message.content, '/meshflow-social', 'the slash command ALONE — no arguments to substitute into the skill');
+    const appended = Object.values(written).find(t => t.includes('The line only drafts')) || '';
+    A.ok(appended.includes('PIPELINE HANDOFF — draft the caption.'), 'the hand-off rides the appended system prompt, with the stage brief');
     A.ok(!stdin.includes('station.map'), 'StarNet\'s tools are never offered to a skill step');
-    A.eq(evs.filter(e => e.type === 'text').map(e => e.delta).join(''), 'Join the free alpha — link in bio.', 'only the hand-off turn\'s reply streams back (the skill-load turn is not the step\'s answer)');
+    A.eq(evs.filter(e => e.type === 'text').map(e => e.delta).join(''), 'Join the free alpha — link in bio.', 'the one turn\'s reply is the step\'s answer');
     A.eq(evs.filter(e => e.type === 'done').length, 1, 'one done');
   }
   // A2. without claudeSkill nothing changes: the stateless no-tools turn (the default claude-cli path)
