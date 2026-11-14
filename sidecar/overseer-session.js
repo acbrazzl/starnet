@@ -103,10 +103,13 @@ function makeOverseerSession(o) {
   function transcriptPath() {
     return state.sessionId ? path.join(claudeHome, 'projects', cwdSlug(cwd), state.sessionId + '.jsonl') : null;
   }
-  async function isRunning(id) {
+  /* WHO HOLDS THE CONVERSATION (2026-11-14). The live sessions, or null when they cannot be read. start() resumes the saved
+     conversation ONLY on a readable list that shows nobody holding it: a failed/slow `claude agents` used to read as "not
+     running", and the resume then started a SECOND copy of the Overseer next to the live one. */
+  async function liveSessions() {
     const r = await run(['agents', '--json']);
-    if (r.err) return false;
-    try { return JSON.parse(r.stdout).some(s => s && s.id === id); } catch (_) { return false; }
+    if (r.err) return null;
+    try { const list = JSON.parse(r.stdout); return Array.isArray(list) ? list : null; } catch (_) { return null; }
   }
 
   /* start() — reuse a still-running session, resume the saved one, or start fresh. Idempotent. */
@@ -115,7 +118,15 @@ function makeOverseerSession(o) {
     if (starting) return starting;
     starting = (async () => {
       readState();
-      if (state.shortId && await isRunning(state.shortId)) { await afterStart(); return { ok: true, reused: true, id: state.shortId }; }
+      if (state.shortId || (state.sessionId && !fresh)) {
+        const live = await liveSessions();
+        if (!live) { starting = null; return { ok: false, error: 'could not read `claude agents`, so the Overseer was not launched: a resume could start a second copy of ' + (state.shortId || state.sessionId) }; }
+        if (state.shortId && live.some(s => s && s.id === state.shortId)) { await afterStart(); return { ok: true, reused: true, id: state.shortId }; }
+        const holder = state.sessionId ? live.find(s => s && s.sessionId === state.sessionId) : null;
+        if (holder && holder.id) { state.shortId = String(holder.id); saveState(); await afterStart(); return { ok: true, reused: true, id: state.shortId }; }
+        // open in a terminal (no job id): resuming it in the background would make two Overseers on one conversation
+        if (holder && !fresh) { starting = null; return { ok: false, error: 'the Overseer conversation ' + String(state.sessionId).slice(0, 8) + ' is open in another session (no job id, e.g. a terminal); not starting a second copy — exit that one first' }; }
+      }
       const name = nameNow();
       const model = typeof o.model === 'function' ? o.model() : o.model;
       const args = ['--bg', '--remote-control', name, '--name', name, '--permission-mode', mode];
