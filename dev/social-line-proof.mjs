@@ -36,6 +36,10 @@ import { launchChrome, connectCDP, evalJS, sleep } from '../scripts/lib/cdp.mjs'
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const MODEL = process.env.PROOF_MODEL || 'claude-sonnet-5-5';
+// the STATION DEFAULT (the hero's pin, which unpinned bays and recruits follow) and the LEAD's own run can differ:
+// PROOF_STEP_MODEL picks what the line's steps run on, PROOF_LEAD_MODEL what the building lead runs on (both default MODEL)
+const STEP_MODEL = process.env.PROOF_STEP_MODEL || MODEL;
+const LEAD_MODEL = process.env.PROOF_LEAD_MODEL || MODEL;
 const LINE = 'SOCIAL POST';
 const ASK = process.env.PROOF_ASK || ('Build a new room named "SOCIAL STUDIO" beside the main room, joined by a hallway, and in it ONE workflow line named "SOCIAL POST" for making a social media post draft. '
   + 'The line: an intake, then four bays in order, then an outbox. Staff every bay with yourself (the lead); recruit no one. '
@@ -66,11 +70,11 @@ function seedClaudeLogin(ws) {
   const save = JSON.parse(readFileSync(saveFile, 'utf8'));
   save.doc.prov = 'claude-cli';
   save.doc.agent.provider = 'claude-cli';
-  save.doc.agent.model = MODEL;
+  save.doc.agent.model = STEP_MODEL;
   writeFileSync(saveFile, JSON.stringify(save, null, 2));
   const rosterFile = join(ws, 'agent.roster.json');
   const roster = JSON.parse(readFileSync(rosterFile, 'utf8'));
-  for (const a of roster.agents) { a.provider = 'claude-cli'; a.model = MODEL; }
+  for (const a of roster.agents) { a.provider = 'claude-cli'; a.model = STEP_MODEL; }
   writeFileSync(rosterFile, JSON.stringify(roster, null, 2));
 }
 
@@ -119,7 +123,7 @@ async function main() {
     if (!fixtureArm && (hero.provider !== 'claude-cli' || !hero.model)) throw new Error('the page did not keep the hero on claude-cli — the test job would not run on the Claude login');
 
     const t0 = Date.now();
-    const cli = spawnSync(process.execPath, [join(REPO, 'bin', 'starnet.js'), '--port', String(port), '--no-spawn', '--json', '--provider', 'claude-cli', '--model', MODEL, '--timeout', '2400', '-p', skillArm ? SKILL_ASK : ASK],
+    const cli = spawnSync(process.execPath, [join(REPO, 'bin', 'starnet.js'), '--port', String(port), '--no-spawn', '--json', '--provider', 'claude-cli', '--model', LEAD_MODEL, '--timeout', '2400', '-p', skillArm ? SKILL_ASK : ASK],
       { env, encoding: 'utf8', timeout: 2500000, cwd: REPO, maxBuffer: 64 << 20 });
     writeFileSync(join(out, 'cli-stdout.txt'), String(cli.stdout || '')); writeFileSync(join(out, 'cli-stderr.txt'), String(cli.stderr || ''));
     console.log('starnet -p exit ' + cli.status + ' after ' + Math.round((Date.now() - t0) / 1000) + 's');
@@ -157,7 +161,11 @@ async function main() {
         const said = r => trows.filter(t => t.sourceRunId === r.runId && t.role === 'assistant').map(t => String(t.content || '')).join('\n');
         const cta = /join the free alpha/i;
         for (const r of skillSteps) console.log('skill step: bay=' + r.dockId + ' agent=' + r.agentId + ' provider=' + r.provider + ' reason=' + r.reason + ' · its reply names the skill\'s standing CTA: ' + cta.test(said(r)));
-        const loaded = skillSteps.length > 0 && skillSteps.every(r => r.provider === 'claude-cli' && r.reason === 'done' && cta.test(said(r)));
+        // the $1 corruption signature (Claude Code substitutes $1 in a skill body with the slash command's arguments): the
+        // posting log's "under $1,000/yr" arrived as "under HANDOFF,000/yr" when the hand-off rode as arguments (11-14)
+        const corrupted = steps.filter(r => /HANDOFF,000|\b[A-Za-z]+,000\/yr/.test(said(r)) && !/\$1,000/.test(said(r)));
+        console.log('skill steps on model(s): ' + JSON.stringify([...new Set(skillSteps.map(r => r.model))]) + ' · steps whose reply shows the $1 corruption: ' + corrupted.length);
+        const loaded = skillSteps.length > 0 && corrupted.length === 0 && skillSteps.every(r => r.provider === 'claude-cli' && r.reason === 'done' && cta.test(said(r)));
         console.log('the delivered draft mentions the skill CTA (used or cited, not required): ' + cta.test(String(job.output)));
         pass = ARM === 'skill' ? (pass && loaded) : false;
       }
