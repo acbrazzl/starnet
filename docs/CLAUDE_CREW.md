@@ -287,6 +287,9 @@ words. The scripts are in `~/code/starnet-worktrees/cutover/`.
   from before a restart that the station refuses with "forbidden token".
 - A fresh page counts only after the first keep-alive (~25 s), so `page-up.sh` waits for the guard.
 - Run the guard UNPIPED: `pageguard.sh | tail` takes `tail`'s exit status.
+- **Stop the page when no build or line test is running.** The station UI renders continuously: the headless page's
+  renderer held about 85% CPU and 1.5 GB on the shared box. `kill -TERM $(cat page.pid)`, then `page-up.sh` when
+  needed.
 - A page reload clears the lead's one-step UNDO record. A build from before the reload is then removed with an ordinary
   refit delete; the undo is refused with "nothing of the lead's to undo".
 
@@ -305,7 +308,7 @@ words. The scripts are in `~/code/starnet-worktrees/cutover/`.
   `/<skill> <hand-off>` turned meshflow-social's "under $1,000/yr" into "under HANDOFF,000/yr" in every step.
 - A second user message for the hand-off is not reliable either: Opus merged the two queued messages into one turn.
 - Since `b9c95a737` a step is ONE message, `/<skill>` alone; the hand-off rides `--append-system-prompt-file`.
-- **A step-level bug becomes memory.** StarNet's learning loop saved the corrupted output as FACTS in two bay agents'
+- **A step-level bug becomes memory, so sweep the bay notebooks after fixing one.** StarNet's learning loop saved the corrupted output as FACTS in two bay agents'
   notebooks. After fixing one, sweep the bay agents' `<id>.notebook.json` and remove the false notes with
   `station.control memory.forget`.
 - A skill step reads only inside its folder; a `Read` outside it is refused in `-p`. So a bay's folder must hold what
@@ -317,7 +320,7 @@ words. The scripts are in `~/code/starnet-worktrees/cutover/`.
 | Area · line | Steps (agent · model) | Skill · folder | Cost per job (11-14) | Proof |
 |---|---|---|---|---|
 | SOCIAL · SOCIAL POST | DRAFT (SOCIAL-DRAFT · Opus) → CHECK + PACKAGE (SOCIAL · Sonnet) | meshflow-social · `~/code/meshFlow` | 366k tokens, 74 s | `job-2602b2a42e18` delivered |
-| BRIEFING · MORNING BRIEF | READ (BRIEFING · Sonnet) → BRIEF (BRIEFING-WRITER · Opus) → CHECK (BRIEFING · Sonnet) | meshflow-overseer · `~/code/meshFlow-office` (the ledger only) | 599k, 141 s (READ ingests the whole ledger) | `job-f93e2366fb54` delivered |
+| BRIEFING · MORNING BRIEF | READ (BRIEFING · Sonnet) → BRIEF (BRIEFING-WRITER · Opus) → CHECK (BRIEFING · Sonnet) | meshflow-overseer · `~/code/meshFlow-office` (the ledger only) | 322k, 119 s since READ was trimmed (newest brief + Waiting + entries since; was 599k with the whole ledger) | `job-f3bb88f815fe` delivered |
 | RELEASE · RELEASE READINESS | COLLECT (RELEASE-CHECK · Sonnet) → VERDICT (RELEASE-JUDGE · Opus) → CHECK + PACKAGE (RELEASE-CHECK · Sonnet) | meshflow-dev · `~/code/meshFlow-dev-snapshot` | 1.46M, 146 s | `job-20fcfb80ea46` delivered |
 
 - **Release readiness reads a SNAPSHOT.** The main `~/code/meshFlow` checkout is stale (`release/0.1.14`) and a skill
