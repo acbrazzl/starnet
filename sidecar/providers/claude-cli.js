@@ -802,7 +802,7 @@
        session file. StarNet's stage brief is APPENDED to Claude Code's own system prompt, never replacing it (that prompt
        is what carries memory and the skill list). StarNet's tools are never offered: the step answers in text. */
     function skillArgs(cmd, req, appendFile) {
-      const args = cmd.pre.concat(['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages',
+      const args = cmd.pre.concat(['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--input-format', 'stream-json',
         '--tools', 'Read,Grep,Glob', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--no-session-persistence']);
       if (req.model) args.push('--model', String(req.model));
       const effort = effortOf(req);
@@ -811,13 +811,17 @@
       return args;
     }
     const textOf = c => typeof c === 'string' ? c : Array.isArray(c) ? c.map(b => (b && typeof b.text === 'string') ? b.text : '').filter(Boolean).join('\n') : '';
-    // the step's prompt: /<skill>, then the conversation the bay received (one hand-off, usually), as plain text on stdin
+    /* the step's prompt: TWO stream-json user messages — `/<skill>` ALONE, then the conversation the bay received (one
+       hand-off, usually). NEVER "/<skill> <hand-off>": Claude Code substitutes $1/$2/$ARGUMENTS in a skill's body with the
+       command's arguments, so the posting log's "under $1,000/yr" read "under HANDOFF,000/yr" in every step (live 11-14).
+       The first turn (the skill loading) is not the step's answer: oneShotStream skips it to its result line. */
     function skillPrompt(req) {
       const msgs = (Array.isArray(req.messages) ? req.messages : []).filter(m => m && m.role !== 'system');
       const body = msgs.length === 1 ? textOf(msgs[0].content).trim()
         : msgs.map(m => '<' + (m.role === 'assistant' ? 'assistant' : 'user') + '>\n' + textOf(m.content).trim() + '\n</' + (m.role === 'assistant' ? 'assistant' : 'user') + '>').join('\n\n');
       return { system: (Array.isArray(req.messages) ? req.messages : []).filter(m => m && m.role === 'system').map(m => textOf(m.content).trim()).filter(Boolean).join('\n\n'),
-        input: '/' + String(req.claudeSkill).replace(/^\//, '') + '\n\n' + body };
+        input: JSON.stringify({ type: 'user', message: { role: 'user', content: '/' + String(req.claudeSkill).replace(/^\//, '') } }) + '\n'
+          + JSON.stringify({ type: 'user', message: { role: 'user', content: body } }) + '\n' };
     }
 
     function cliArgs(cmd, req, sysFile) {
@@ -1054,7 +1058,7 @@
 
       const T = makeTurn(req, turn);
       if (box) box.turn = T;
-      let endedOnResult = false;
+      let endedOnResult = false, skillLoadTurn = skillStep;
       try {
         for (;;) {
           if (signal && signal.aborted) return;
@@ -1072,6 +1076,8 @@
           }
           let j;
           try { j = JSON.parse(line); } catch (_) { continue; }
+          // a skill step's first turn only loads the skill: keep its init line (billing/auth facts), drop the rest
+          if (skillLoadTurn) { if (j.type === 'result') skillLoadTurn = false; else if (j.type === 'system' && j.subtype === 'init') yield* T.line(j); continue; }
           yield* T.line(j);
           if (T.blockDone) break;   // `finally` ends the child: the rest of this generation is a guess at results
           /* THE RESULT LINE ENDS THE TURN (stall report 2026-10-13). The turn used to end on the child's close, which comes
