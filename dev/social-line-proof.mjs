@@ -123,7 +123,7 @@ async function main() {
     if (!fixtureArm && (hero.provider !== 'claude-cli' || !hero.model)) throw new Error('the page did not keep the hero on claude-cli — the test job would not run on the Claude login');
 
     const t0 = Date.now();
-    const cli = spawnSync(process.execPath, [join(REPO, 'bin', 'starnet.js'), '--port', String(port), '--no-spawn', '--json', '--provider', 'claude-cli', '--model', LEAD_MODEL, '--timeout', '2400', '-p', skillArm ? SKILL_ASK : ASK],
+    const cli = spawnSync(process.execPath, [join(REPO, 'bin', 'starnet.js'), '--port', String(port), '--no-spawn', '--json', '--provider', 'claude-cli', '--model', LEAD_MODEL, '--timeout', '2400', '-p', (skillArm && process.env.PROOF_ASK) ? process.env.PROOF_ASK : skillArm ? SKILL_ASK : ASK],
       { env, encoding: 'utf8', timeout: 2500000, cwd: REPO, maxBuffer: 64 << 20 });
     writeFileSync(join(out, 'cli-stdout.txt'), String(cli.stdout || '')); writeFileSync(join(out, 'cli-stderr.txt'), String(cli.stderr || ''));
     console.log('starnet -p exit ' + cli.status + ' after ' + Math.round((Date.now() - t0) / 1000) + 's');
@@ -168,6 +168,8 @@ async function main() {
         const loaded = skillSteps.length > 0 && corrupted.length === 0 && skillSteps.every(r => r.provider === 'claude-cli' && r.reason === 'done' && cta.test(said(r)));
         console.log('the delivered draft mentions the skill CTA (used or cited, not required): ' + cta.test(String(job.output)));
         pass = ARM === 'skill' ? (pass && loaded) : false;
+        // a CUSTOM build prompt (PROOF_ASK) is not the social line: its oracle is the report, read by a person
+        if (ARM === 'skill' && process.env.PROOF_ASK) { pass = allDone || steps.every(r => r.reason === 'done'); console.log('custom PROOF_ASK: the social CTA oracle does not apply — read ' + join(out, 'proof-report.md')); }
       }
       writeFileSync(join(out, 'proof-report.md'), stepReport(ws, job, steps));
       console.log('per-step report: ' + join(out, 'proof-report.md'));

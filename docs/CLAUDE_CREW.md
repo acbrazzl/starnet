@@ -246,6 +246,93 @@ only: no channel, no connector, no SEND TO.
 The lead staffs a bay with a crew agent by its roster name or id, and binding the lead itself is refused. Recruited bay
 specialists follow the station default (here `claude-cli`).
 
+## The live base (2026-11-14): cut-over, operating rules, workflows
+
+The Commander's live station (:8787) has run this branch since **2026-11-14 15:40Z**, with `STARNET_AUTO_BUILD=1`
+and `STARNET_AUTO_BUILD_CREW=1` in `~/.config/starnet/remote.env`. The lead built every area and line below from plain
+words. The scripts are in `~/code/starnet-worktrees/cutover/`.
+
+### Cut-over, restart, rollback
+
+- **Cut-over** (`cutover.sh`; ran 15:40Z):
+  - It requires exactly one holder of the Overseer's conversation (`claude agents --json`), then TERMs the old station
+    and waits for :8787 to be free.
+  - It checks that the Overseer only DETACHED (keep-alive) and still has one holder.
+  - It backs up the workspace, `remote.env` and `station.log` to `~/.local/share/StarNet/backup-cutover-<UTC>/`,
+    verified with `diff -rq`.
+  - It adds the two AUTO lines and starts this tree with the same env.
+  - It passes only on `online <job> (reused)` with one holder.
+  - Backup of the 15:40 cut-over: `~/.local/share/StarNet/backup-cutover-20261114T154001Z`.
+- **Restart on the same code** (`restart.sh`): the same holder checks. It reads only the log lines written by THIS start
+  (a byte offset); a whole-log grep would match an earlier `(reused)` line and pass falsely. Then it runs `page-up.sh`.
+- **Rollback** (`rollback.sh [backup dir]`):
+  - It TERMs :8787, removes the two AUTO lines, and starts `~/code/starnet` at `ac37421a4` with the original env.
+  - With a backup dir it also restores the workspace, moving the current one aside, NOT deleting it. That discards
+    everything written since, so it is only for damaged data.
+- **The Overseer survives every restart** (`STARNET_OVERSEER_SESSION_KEEPALIVE=1`). `overseer-session.js` `start()`
+  resumes the saved conversation ONLY on a readable `claude agents` list that shows nobody holding it. An unreadable
+  list, or the conversation open in a terminal, is refused. The conversation running under another background job is
+  re-attached to, never resumed. Before this fix, one failed `claude agents` call meant a second Proxima.
+- **Restart policy** (Proxima, 11-14): a provider or step fix is proven END TO END on a throwaway station with BOTH
+  models before the live station is touched: a full line job delivered on Opus and on Sonnet, with the oracle line
+  quoted. Live restarts are batched; at most one more a day unless something is broken for the Commander.
+
+### One page, always
+
+- Builds and `station.test_line` go to EVERY attached station page, and the first answer wins. Two pages build twice.
+- The live builds use ONE headless page (`page-up.sh`): a FRESH Chrome profile every launch, because a reused profile
+  restored the previous tab and gave two pages.
+- `pageguard.sh` runs before every build. It counts a PAGE as a client holding the SSE stream: a socket where the
+  client is silent and only the station writes, keep-alives about every 25 s. Plain polling is not a page, e.g. a tab
+  from before a restart that the station refuses with "forbidden token".
+- A fresh page counts only after the first keep-alive (~25 s), so `page-up.sh` waits for the guard.
+- Run the guard UNPIPED: `pageguard.sh | tail` takes `tail`'s exit status.
+- A page reload clears the lead's one-step UNDO record. A build from before the reload is then removed with an ordinary
+  refit delete; the undo is refused with "nothing of the lead's to undo".
+
+### Models and cost
+
+- Judgment steps run on Opus, ingest/check/package steps on Sonnet (Proxima's rule).
+- A crew agent's model is its roster pin: `station.control agent.model`.
+- The LEAD's own build runs use `--model claude-sonnet-5-5`. An Opus lead twice produced a runaway turn: 119k in,
+  128k OUT, no tool call, then Opus's safeguards flagged it. That is what looked like a 600 s "hang". Open item.
+- A recruit only comes with a NEW line (`station.plan` `agent: "new"`). Staffing an empty step of a standing line by
+  crew name works since `0720512df`; before that it was refused as "changes how an existing line routes".
+
+### Crew-skill steps: one message, no arguments
+
+- Claude Code substitutes `$1`/`$2`/`$ARGUMENTS` in a skill's body with the slash command's arguments. So
+  `/<skill> <hand-off>` turned meshflow-social's "under $1,000/yr" into "under HANDOFF,000/yr" in every step.
+- A second user message for the hand-off is not reliable either: Opus merged the two queued messages into one turn.
+- Since `b9c95a737` a step is ONE message, `/<skill>` alone; the hand-off rides `--append-system-prompt-file`.
+- **A step-level bug becomes memory.** StarNet's learning loop saved the corrupted output as FACTS in two bay agents'
+  notebooks. After fixing one, sweep the bay agents' `<id>.notebook.json` and remove the false notes with
+  `station.control memory.forget`.
+- A skill step reads only inside its folder; a `Read` outside it is refused in `-p`. So a bay's folder must hold what
+  it reads.
+- `~/code` is trusted by the Commander, so any folder under it can be bound. Bind the narrowest one.
+
+### The workflows on the live base
+
+| Area · line | Steps (agent · model) | Skill · folder | Cost per job (11-14) | Proof |
+|---|---|---|---|---|
+| SOCIAL · SOCIAL POST | DRAFT (SOCIAL-DRAFT · Opus) → CHECK + PACKAGE (SOCIAL · Sonnet) | meshflow-social · `~/code/meshFlow` | 366k tokens, 74 s | `job-2602b2a42e18` delivered |
+| BRIEFING · MORNING BRIEF | READ (BRIEFING · Sonnet) → BRIEF (BRIEFING-WRITER · Opus) → CHECK (BRIEFING · Sonnet) | meshflow-overseer · `~/code/meshFlow-office` (the ledger only) | 599k, 141 s (READ ingests the whole ledger) | `job-f93e2366fb54` delivered |
+| RELEASE · RELEASE READINESS | COLLECT (RELEASE-CHECK · Sonnet) → VERDICT (RELEASE-JUDGE · Opus) → CHECK + PACKAGE (RELEASE-CHECK · Sonnet) | meshflow-dev · `~/code/meshFlow-dev-snapshot` | 1.46M, 146 s | `job-20fcfb80ea46` delivered |
+
+- **Release readiness reads a SNAPSHOT.** The main `~/code/meshFlow` checkout is stale (`release/0.1.14`) and a skill
+  step cannot run git. So it reads `~/code/meshFlow-dev-snapshot`, a `git archive` of origin/dev. Its `SNAPSHOT.txt`
+  names the commit and the one-line refresh. Whoever asks for a check refreshes it first, and every verdict names the
+  commit it judged.
+- **Every line only drafts or reads.** No SEND TO, no channel, no schedule. A skill step has `Read`/`Grep`/`Glob`
+  only, no MCP and no session file.
+- **On the live station PROXIMA has `approvalMode=full`** (the Commander's setting), so the lead's `station.control`
+  calls do not ask. The limits on money and escalations rest on the prompts and the confirm-every-time/hardline tiers.
+  No StarNet credits account is linked, so `make_prop` cannot spend.
+- **Not built yet:** CAD part readiness (solidcraft-dev), upstream pre-flight (solidcraft-dev), and the on-demand
+  export-compliance, security and quality lines. No schedules are on; any periodic line (e.g. the morning brief) waits
+  for Proxima's go.
+
 ## Remote access to the station (phone)
 
 The sidecar binds loopback only, and the API pins `Host` to loopback as its DNS-rebinding defense.
