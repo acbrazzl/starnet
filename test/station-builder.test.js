@@ -1419,6 +1419,25 @@ for (const c of T.catalog) {
     const n9 = SB.planEdit(st.serialize(), { staff: { line: 'BUILD + TEST', steps: [{ step: 9, agent: 'rex' }] } }, E);
     A.ok(!n9.ok && /^step is a number from 1 to 2/.test(n9.error), 'a step that is not there is refused');
   }
+  // STAFF AN EMPTY STEP OF A LINE THAT STANDS (fork, 2026-11-14, live station): a line laid with its later steps empty, then
+  // staffed by crew NAME — the route the refusal of "new" itself names ("staff an existing line with crew names") — was
+  // refused "that would change how an existing line routes". Staffing an empty bay extends THAT line's own chain; the check
+  // is there for the OTHER lines, which must route exactly as before.
+  {
+    const st = fresh();
+    const lay = SB.planBuild(st.serialize(), { rooms: [{ name: 'Works', size: 'large', lines: [{ line: 'build_test', staff: [{ step: 1, agent: 'rex' }] }] }] }, E);
+    A.ok(lay.ok && SB.apply(st, lay.plan, E).ok, 'fixture: a line with step 2 empty (' + (lay.error || '') + ')');
+    const label = (lay.plan && lay.plan.lines && lay.plan.lines[0] && (lay.plan.lines[0].name || lay.plan.lines[0].label)) || 'BUILD + TEST';
+    const before = snap(st);
+    const r = SB.planEdit(st.serialize(), { staff: { line: label, steps: [{ step: 2, agent: 'rex' }] } }, E);
+    A.ok(r.ok, 'an empty step of a standing line is staffed by crew name: ' + (r.error || (r.plan && r.plan.summary) || '').slice(0, 200));
+    if (r.ok) {
+      const a = SB.apply(st, r.plan, E);
+      A.ok(a.ok, 'it builds (' + (a.error || '') + ')');
+      A.eq(st.props().filter(p => p.t === 'bay' && p.agentId === 'rex').length, 2, 'REX stands at both steps');
+      A.ok(st.undo().ok); A.eq(snap(st), before, 'one undo empties step 2 again');
+    }
+  }
   // A CONCOURSE GROWS IN PLACE (09-30 gap hunt): on a concourse station a new room takes the next place down the same
   // concourse (across from its twin, then a new pair, the spine lengthened), a big hall the far end, and a concourse asked
   // again never builds a second one
