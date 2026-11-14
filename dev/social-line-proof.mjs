@@ -200,11 +200,13 @@ async function main() {
   console.log('\nRESULT: ' + (pass ? 'PASS' : 'FAIL') + (fixtureArm ? ' (fixture arm: the job was expected to fail on the openrouter pin)' : ARM === 'skill-off' ? ' (skill-off arm: the bind was expected to be denied)' : ''));
   process.exit(pass ? 0 : 1);
 }
-// node dev/social-line-proof.mjs --report <kept workspace> <out.md>: re-write the per-step report of a kept run
+// node dev/social-line-proof.mjs --report <kept workspace> <out.md> [jobId]: re-write the per-step report of a kept run
+// (the newest delivered job, or the named one)
 if (process.argv[2] === '--report') {
   const ws = process.argv[3], f = process.argv[4];
   const findJobs = o => !o || typeof o !== 'object' ? null : Array.isArray(o.jobs) ? o.jobs : Object.values(o).map(findJobs).find(Boolean) || null;
-  const job = (findJobs(JSON.parse(readFileSync(join(ws, 'line-jobs.json'), 'utf8'))) || []).filter(j => j.status === 'delivered').pop();
+  const all = findJobs(JSON.parse(readFileSync(join(ws, 'line-jobs.json'), 'utf8'))) || [];
+  const job = process.argv[5] ? all.find(j => j.id === process.argv[5]) : all.filter(j => j.status === 'delivered').pop();   // optional 5th arg: a job id
   const ids = new Set(((job && job.runs) || []).map(r => r.runId));
   const steps = readJsonl(join(ws, 'runs.jsonl')).filter(r => ids.has(r.runId)).sort((a, b) => (a.ts || 0) - (b.ts || 0));
   writeFileSync(f, job ? stepReport(ws, job, steps) : 'no delivered job in ' + ws + '\n'); console.log('wrote ' + f); process.exit(job ? 0 : 1);

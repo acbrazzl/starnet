@@ -287,6 +287,13 @@ words. The scripts are in `~/code/starnet-worktrees/cutover/`.
   from before a restart that the station refuses with "forbidden token".
 - A fresh page counts only after the first keep-alive (~25 s), so `page-up.sh` waits for the guard.
 - Run the guard UNPIPED: `pageguard.sh | tail` takes `tail`'s exit status.
+- **Watch a build while it runs.** `build-run.sh <prompt> <tag>` starts a `starnet -p` only with exactly one page, then
+  re-checks every 2 s and cancels the run with SIGINT (the CLI POSTs `/api/cancel`) when a second page appears.
+  - Proven on a throwaway: a second page attached at 17:41:57 and the run stopped at 17:42:15.
+  - Window: a fresh page counts only after ~15-25 s of SSE silence.
+  - node clients are ignored: the CLI's own run stream has a page's shape and tripped the first proof falsely.
+- **The lead can read files too.** It used `fs_list`/`fs_read` on a bound snapshot. A skill bay is limited to its
+  folder; the lead is not.
 - **Stop the page when no build or line test is running.** The station UI renders continuously: the headless page's
   renderer held about 85% CPU and 1.5 GB on the shared box. `kill -TERM $(cat page.pid)`, then `page-up.sh` when
   needed.
@@ -322,6 +329,7 @@ words. The scripts are in `~/code/starnet-worktrees/cutover/`.
 | SOCIAL · SOCIAL POST | DRAFT (SOCIAL-DRAFT · Opus) → CHECK + PACKAGE (SOCIAL · Sonnet) | meshflow-social · `~/code/meshFlow` | 366k tokens, 74 s | `job-2602b2a42e18` delivered |
 | BRIEFING · MORNING BRIEF | READ (BRIEFING · Sonnet) → BRIEF (BRIEFING-WRITER · Opus) → CHECK (BRIEFING · Sonnet) | meshflow-overseer · `~/code/meshFlow-office` (the ledger only) | 322k, 119 s since READ was trimmed (newest brief + Waiting + entries since; was 599k with the whole ledger) | `job-f3bb88f815fe` delivered |
 | RELEASE · RELEASE READINESS | COLLECT (RELEASE-CHECK · Sonnet) → VERDICT (RELEASE-JUDGE · Opus) → CHECK + PACKAGE (RELEASE-CHECK · Sonnet) | meshflow-dev · `~/code/meshFlow-dev-snapshot` | 1.46M, 146 s | `job-20fcfb80ea46` delivered |
+| UPSTREAM · UPSTREAM PRE-FLIGHT | RULES (PREFLIGHT-CHECK · Sonnet) → JUDGE (PREFLIGHT-JUDGE · Opus) → SCRUB + PACKAGE (PREFLIGHT-CHECK · Sonnet) | solidcraft-dev · `~/code/solidcraft-upstream-rules-snapshot` (upstream's rule files only, `git archive` of upstream/main) | 636k, 172 s | `job-18873e4d553a` delivered (#16712: FIX FIRST, cited) |
 
 - **Release readiness reads a SNAPSHOT.** The main `~/code/meshFlow` checkout is stale (`release/0.1.14`) and a skill
   step cannot run git. So it reads `~/code/meshFlow-dev-snapshot`, a `git archive` of origin/dev. Its `SNAPSHOT.txt`
@@ -332,7 +340,15 @@ words. The scripts are in `~/code/starnet-worktrees/cutover/`.
 - **On the live station PROXIMA has `approvalMode=full`** (the Commander's setting), so the lead's `station.control`
   calls do not ask. The limits on money and escalations rest on the prompts and the confirm-every-time/hardline tiers.
   No StarNet credits account is linked, so `make_prop` cannot spend.
-- **Not built yet:** CAD part readiness (solidcraft-dev), upstream pre-flight (solidcraft-dev), and the on-demand
+- **Upstream pre-flight takes its draft as a FILE.** A station job carries at most 2,000 characters, and the lead
+  condensed a 10 KB PR body to fit, so the draft goes in `drafts/` inside the bound snapshot and the job says
+  "Pre-flight drafts/<file>".
+- **Upstream pre-flight runs ONE job per run.** A job built from untrusted text taints the lead's run, and the next
+  `station.test_line` in that run was DENIED by the taint lock, as designed.
+- **Upstream pre-flight is proven.** On a throwaway it caught a planted missing `Changes a default:` line, an edited
+  test expectation and an undeclared flag, each with file:line.
+- **Not built yet:** CAD part readiness (solidcraft-dev; waits until the Proto Labs model passes, notes/checklist only,
+  no part geometry or dimensions in any notebook or output) and the on-demand
   export-compliance, security and quality lines. No schedules are on; any periodic line (e.g. the morning brief) waits
   for Proxima's go.
 
