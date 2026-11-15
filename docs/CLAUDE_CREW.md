@@ -330,16 +330,26 @@ words. The scripts are in `~/code/starnet-worktrees/cutover/`.
 | BRIEFING · MORNING BRIEF | READ (BRIEFING · Sonnet) → BRIEF (BRIEFING-WRITER · Opus) → CHECK (BRIEFING · Sonnet) | meshflow-overseer · `~/code/meshFlow-office` (the ledger only) | 322k, 119 s since READ was trimmed (newest brief + Waiting + entries since; was 599k with the whole ledger) | `job-f3bb88f815fe` delivered |
 | RELEASE · RELEASE READINESS | COLLECT (RELEASE-CHECK · Sonnet) → VERDICT (RELEASE-JUDGE · Opus) → CHECK + PACKAGE (RELEASE-CHECK · Sonnet) | meshflow-dev · `~/code/meshFlow-dev-snapshot` | 1.46M, 146 s | `job-20fcfb80ea46` delivered |
 | UPSTREAM · UPSTREAM PRE-FLIGHT | RULES (PREFLIGHT-CHECK · Sonnet) → JUDGE (PREFLIGHT-JUDGE · Opus) → SCRUB + PACKAGE (PREFLIGHT-CHECK · Sonnet) | solidcraft-dev · `~/code/solidcraft-upstream-rules-snapshot` (upstream's rule files only, `git archive` of upstream/main) | 636k, 172 s | `job-18873e4d553a` delivered (#16712: FIX FIRST, cited) |
+| SECURITY · SECURITY SWEEP (11-15) | SWEEP (SWEEPER · session slot `security` = `reviews/run-sweep.sh security`, no model) → DIGEST (SWEEP-DIGEST · Opus) | DIGEST: meshflow-security · `~/code/meshFlow-office` | the sweep session's own cost + the digest | throwaway proofs (manual + schedule, Sonnet + Opus); first live run 2026-11-16 09:13 ET (one-shot routine), REPLACING that Monday's cron line |
+| DECISIONS · DECISIONS DIGEST (11-15) | GATHER + RELEVANCE (DECISIONS-CHECK · Sonnet) → CARDS (DECISIONS-CARDS · Opus) | meshflow-overseer · `~/code/meshFlow-office` (+ `crew-needs.json`) | 387k, ~2 min | `job-b620ab80c678` delivered 12 cards; daily 08:45 ET |
 
 - **Release readiness reads a SNAPSHOT.** The main `~/code/meshFlow` checkout is stale (`release/0.1.14`) and a skill
   step cannot run git. So it reads `~/code/meshFlow-dev-snapshot`, a `git archive` of origin/dev. Its `SNAPSHOT.txt`
   names the commit and the one-line refresh. Whoever asks for a check refreshes it first, and every verdict names the
   commit it judged.
-- **Every line only drafts or reads.** No SEND TO, no channel, no schedule. A skill step has `Read`/`Grep`/`Glob`
+- **Every line only drafts or reads, and none has a SEND TO or a channel.** SECURITY SWEEP's first bay is the exception: it launches the real sweep session, the same as cron does. Schedules: SECURITY SWEEP once on 11-16 and DECISIONS DIGEST daily, both on Proxima's go. A skill step has `Read`/`Grep`/`Glob`
   only, no MCP and no session file.
 - **On the live station PROXIMA has `approvalMode=full`** (the Commander's setting), so the lead's `station.control`
   calls do not ask. The limits on money and escalations rest on the prompts and the confirm-every-time/hardline tiers.
   No StarNet credits account is linked, so `make_prop` cannot spend.
+- **DECISIONS DIGEST feeds the decisions page; it never writes to it.** It runs GATHER (newest brief's waiting list +
+  the standing section + `crew-needs.json`), then RELEVANCE (the Commander's rule: an item done/decided/overtaken in a
+  later ledger line is listed under "OVERTAKEN - close these" with its file:line), then CARDS (the page's schema plus
+  `key`, a stable slug for de-duplication across days). Proxima reviews the cards, adds them to the page and closes the
+  overtaken ones. `crew-needs.json` is written every 10 min by a user cron job
+  (`cutover/crew-needs-snapshot.sh`, needs lines only, no transcripts), because a skill step cannot read `~/.claude`.
+  The output is lines of JSON, one card per line starting with `{`, kept under 10k: a line job's recorded output is cut
+  at 12,000 characters, and one run's outbox gained a stray ``` line that the step's own text did not have.
 - **Upstream pre-flight takes its draft as a FILE.** A station job carries at most 2,000 characters, and the lead
   condensed a 10 KB PR body to fit, so the draft goes in `drafts/` inside the bound snapshot and the job says
   "Pre-flight drafts/<file>".
