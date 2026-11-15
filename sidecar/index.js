@@ -5726,6 +5726,9 @@ const claudeSessionBays = require('./claude-session-bays.js').makeClaudeSessionB
   jobState: id => { try { return JSON.parse(fs.readFileSync(path.join(CLAUDE_HOME_DIR, 'jobs', String(id), 'state.json'), 'utf8')); } catch (_) { return null; } },
   transcriptPath: (cwd, sid) => (cwd && sid) ? path.join(CLAUDE_HOME_DIR, 'projects', String(cwd).replace(/[^A-Za-z0-9]/g, '-'), String(sid) + '.jsonl') : null,
   readFile: f => { try { return fs.readFileSync(f, 'utf8'); } catch (_) { return null; } },
+  // CAD-priority guards: every process's command line (null = unreadable: the bay refuses) and MemAvailable in GB
+  procList: () => { try { return fs.readdirSync('/proc').filter(d => /^\d+$/.test(d)).map(d => { try { return fs.readFileSync('/proc/' + d + '/cmdline', 'utf8').split('\0').join(' '); } catch (_) { return ''; } }); } catch (_) { return null; } },
+  availGB: () => { try { const m = /MemAvailable:\s+(\d+) kB/.exec(fs.readFileSync('/proc/meminfo', 'utf8')); return m ? Number(m[1]) / 1048576 : null; } catch (_) { return null; } },
   load: () => { try { return JSON.parse(fs.readFileSync(path.join(WORKSPACES, 'claude-session-bays.json'), 'utf8')); } catch (_) { return null; } },
   save: (obj) => { const f = path.join(WORKSPACES, 'claude-session-bays.json'); fs.writeFileSync(f + '.tmp', JSON.stringify(obj, null, 2)); fs.renameSync(f + '.tmp', f); }
 });
@@ -23177,7 +23180,11 @@ async function runOnceCore(o) {
       const queue = [];
       let out = null, wake = null;
       const ping = () => { if (wake) { const w = wake; wake = null; w(); } };
-      claudeSessionBays.runStep(sessionBinding.slot, { taintedBy: execution.taintedBy(), signal: req && req.signal,
+      // the job text reaches ONLY a parameterised slot, and only as one checked token (claude-session-bays.js jobArg)
+      const lastUser = (req && Array.isArray(req.messages) ? req.messages : []).filter(m => m && m.role === 'user').pop();
+      const jobText = !lastUser ? '' : typeof lastUser.content === 'string' ? lastUser.content
+        : (Array.isArray(lastUser.content) ? lastUser.content.filter(b => b && b.type === 'text').map(b => b.text).join('\n') : '');
+      claudeSessionBays.runStep(sessionBinding.slot, { taintedBy: execution.taintedBy(), signal: req && req.signal, jobText,
         onWait: (phase, note) => { queue.push({ type: 'waiting', phase, note }); ping(); } })
         .then(r => r, e => ({ ok: false, text: 'SESSION BAY ERROR — ' + String((e && e.message) || e).slice(0, 300) }))
         .then(r => { out = r; ping(); });

@@ -139,6 +139,56 @@ const report = JSON.stringify({ type: 'assistant', message: { content: [{ type: 
     const r = await bays.runStep('security', { signal: ac.signal });
     A.equal(r.end, 'left-running'); A.equal(w.stopped.length, 0, 'cancel does not stop the session');
   }
+  // CAD SLOT (2026-11-15, Proxima): one checked design name, CAD-priority guards, and a status-file report that withholds geometry
+  {
+    const { jobArg, GEOMETRY_RE } = require('../sidecar/claude-session-bays.js');
+    A.equal(jobArg('Reconstruct NVGRA-31_v2'), 'NVGRA-31_v2'); A.equal(jobArg('  PROOF-A '), 'PROOF-A');
+    for (const bad of ['Reconstruct ../etc', 'Reconstruct a/b', 'Reconstruct A B', '', 'Reconstruct -x', 'Reconstruct ' + 'x'.repeat(49), 'rm -rf ~']) A.equal(jobArg(bad), null, 'refused: ' + bad);
+    for (const geo of ['Blocked on: fillet 0.59', 'wall .5', 'gap 3 mm', 'gap 3mm']) A.ok(GEOMETRY_RE.test(geo), 'geometry caught: ' + geo);
+    for (const ok of ['State: done\nSteps: 41 matched of 46, 5 omitted\nUpdated: 2026-11-15T14:02:11-05:00', 'command comment summary']) A.ok(!GEOMETRY_RE.test(ok), 'clean passes: ' + ok);
+  }
+  const CAD = { cad: { run: ['/cad/launch.sh'], session: 'cad-reconstruct-', arg: 'design', busyPrefixes: ['solidcraft-', 'cad-', 'nvgra-', 'dims-'], busyProcess: 'solidcraft-cli',
+    minAvailGB: 12, capMin: 360, report: 'statusFile', statusFile: '/home/x/cad-status/{arg}.md', label: 'CAD SESSION' } };
+  function cadWorld(o) {
+    o = o || {};
+    const w = world({ endAfter: 1, endState: { tempo: 'idle', state: 'working' }, sessions: o.sessions });
+    w.execFile = (file, args, opts, cb) => {
+      w.launched.push([file].concat(args));
+      w.sessions.push({ shortId: 'cad00001', sessionId: '11111111-2222-3333-4444-555555555555', name: 'cad-reconstruct-' + args[args.length - 1], cwd: '/home/x/cad', busy: true });
+      w.jobs.cad00001 = { state: 'working', tempo: 'working' };
+      cb(null, '', '');
+    };
+    w.files = o.files || {};
+    w.bays = makeClaudeSessionBays({ enabled: true, slots: CAD, crew: w.crew, execFile: (...a) => w.execFile(...a), now: () => w.t, today: () => w.day, sleep: w.sleep, pollMs: 60000,
+      jobState: id => w.jobs[id] || null, transcriptPath: () => '/home/x/.claude/projects/t.jsonl', readFile: f => (f in w.files ? w.files[f] : null),
+      procList: () => (o.procs === undefined ? ['node sidecar/index.js'] : o.procs), availGB: () => (o.gb === undefined ? 20 : o.gb), save: v => { w.saved = v; } });
+    return w;
+  }
+  {
+    const w = cadWorld({ files: { '/home/x/cad-status/PROOF-A.md': 'State: done\nSteps: 41 matched of 46, 5 omitted\nBlocked on: nothing\nNext: none\nUpdated: 2026-11-15T14:02:11-05:00',
+      '/home/x/.claude/projects/t.jsonl': JSON.stringify({ type: 'assistant', message: { content: 'radius 0.59 at the boss' } }) } });
+    const r = await w.bays.runStep('cad', { jobText: 'Reconstruct PROOF-A' });
+    A.deepEqual(w.launched, [['/cad/launch.sh', 'PROOF-A']], 'the checked design name is the launcher\'s only extra argument');
+    A.match(r.text, /^CAD SESSION cad-reconstruct-PROOF-A/); A.match(r.text, /41 matched of 46/, 'the status file is forwarded');
+    A.ok(!/0\.59/.test(r.text), 'the session TRANSCRIPT is never read for a status-file slot');
+    A.ok(w.saved.launches['cad:PROOF-A'], 'the daily cap is per design');
+  }
+  {
+    const w = cadWorld({ files: { '/home/x/cad-status/PROOF-NUM.md': 'State: blocked\nBlocked on: the lip at 0.4 thick' } });
+    const r = await w.bays.runStep('cad', { jobText: 'Reconstruct PROOF-NUM' });
+    A.match(r.text, /STATUS WITHHELD/); A.ok(!/0\.4/.test(r.text), 'a status file with a decimal is withheld, not forwarded');
+  }
+  {
+    const w = cadWorld();
+    A.match((await w.bays.runStep('cad', { jobText: 'Reconstruct ../../etc/passwd' })).text, /REFUSED.*exactly ONE design/, 'a bad design name is refused at the bay'); A.equal(w.launched.length, 0);
+    A.match((await cadWorld({ gb: 8 }).bays.runStep('cad', { jobText: 'PROOF-A' })).text, /REFUSED.*only 8 GB.*12 GB/, 'memory floor');
+    A.match((await cadWorld({ gb: null }).bays.runStep('cad', { jobText: 'PROOF-A' })).text, /REFUSED.*memory is unreadable/, 'unreadable memory fails closed');
+    A.match((await cadWorld({ procs: ['/usr/bin/solidcraft-cli replay x'] }).bays.runStep('cad', { jobText: 'PROOF-A' })).text, /REFUSED.*solidcraft-cli process is running/, 'a CAD process blocks');
+    A.match((await cadWorld({ procs: null }).bays.runStep('cad', { jobText: 'PROOF-A' })).text, /REFUSED.*process list is unreadable/, 'unreadable process list fails closed');
+    A.match((await cadWorld({ sessions: [{ shortId: 'aaaa1111', name: 'solidcraft-cliff', busy: false }] }).bays.runStep('cad', { jobText: 'PROOF-A' })).text, /REFUSED.*solidcraft-cliff is live/, 'an IDLE CAD crew session still blocks');
+    const p = parseSlots({ x: Object.assign({}, CAD.cad, { arg: 'path' }) }); A.equal(p.slots.size, 0, 'arg can only be design');
+    const q = parseSlots({ x: Object.assign({}, CAD.cad, { statusFile: 'relative/{arg}.md' }) }); A.equal(q.slots.size, 0, 'a status file must be absolute with {arg}');
+  }
   // WIRING (index.js): a session step calls no model, is offered no tools and never falls back to one; the tool always asks
   {
     const src = require('./helpers/source.js').readSidecarSource();
@@ -149,6 +199,7 @@ const report = JSON.stringify({ type: 'assistant', message: { content: [{ type: 
     A.ok(/const toolDefs = \(isTask && !routedToOverseer && !skillBinding && !sessionBinding\)/.test(src), 'a session step is offered no StarNet tools');
     A.ok(/const fallbacks = sessionBinding \? \[\] :/.test(src), 'a session step never falls back to a model');
     A.ok(/taintedBy: execution\.taintedBy\(\)/.test(src), 'the run\'s taint reaches the launch check');
+    A.ok(/procList: \(\) =>/.test(src) && /availGB: \(\) =>/.test(src) && /jobText,/.test(src), 'the CAD guards and the job text are wired');
     A.ok(/enabled: \/\^\(1\|true\|yes\|on\)\$\/i\.test\(String\(ENV\('SESSION_BAYS'\)/.test(src), 'off unless STARNET_SESSION_BAYS=1');
   }
   console.log('claude-session-bay: ok');

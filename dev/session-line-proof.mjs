@@ -46,13 +46,13 @@ function seedClaudeLogin(ws) {
   writeFileSync(rosterFile, JSON.stringify(roster, null, 2));
 }
 
-async function station(ws, { bays }) {
+async function station(ws, { bays, slots }) {
   const port = await freePort(), cdpPort = await freePort();
   const env = Object.assign({}, process.env, { STARNET_WORKSPACES: ws, SKYNET_WORKSPACES: ws, STARNET_PORT: String(port), SKYNET_PORT: String(port), SKYNET_DEV: '1', STARNET_AUTO_BUILD: '1' });
   for (const k of ['SKYNET_FULL_ACCESS', 'STARNET_FULL_ACCESS', 'SKYNET_AUTO_BUILD', 'STARNET_AUTO_BUILD_CREW', 'SKYNET_AUTO_BUILD_CREW', 'STARNET_OVERSEER_SESSION',
     'STARNET_SESSION_BAYS', 'SKYNET_SESSION_BAYS', 'STARNET_SESSION_BAY_SLOTS', 'SKYNET_SESSION_BAY_SLOTS', 'OPENROUTER_API_KEY', 'ANTHROPIC_API_KEY']) delete env[k];
   env.STARNET_CLAUDE_CREW = '1';   // the session list + managed record the bay uses
-  env.STARNET_SESSION_BAY_SLOTS = JSON.stringify({ proof: { run: [LAUNCHER, 'proof', join(ws, 'launcher.log')], session: 'proof-sweep-', capMin: 10 } });
+  env.STARNET_SESSION_BAY_SLOTS = JSON.stringify(slots || { proof: { run: [LAUNCHER, 'proof', join(ws, 'launcher.log')], session: 'proof-sweep-', capMin: 10 } });
   if (bays) env.STARNET_SESSION_BAYS = '1';
   const side = spawn(process.execPath, [join(REPO, 'sidecar', 'index.js')], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   const logs = []; side.stdout.on('data', d => logs.push(d)); side.stderr.on('data', d => logs.push(d));
@@ -87,7 +87,82 @@ const jobsOf = ws => findJobs(existsSync(join(ws, 'line-jobs.json')) ? JSON.pars
 const launches = ws => existsSync(join(ws, 'launcher.log')) ? readFileSync(join(ws, 'launcher.log'), 'utf8').split('\n').filter(l => / launching /.test(l)).length : 0;
 const testJob = (line, job) => 'Send ONE test job down the workflow line "' + line + '" with station.test_line, job text: "' + job + '". Do not change the line, do not build anything, do not test again, do not ask me anything. Report the delivered output verbatim, or the error.';
 
+// CAD ARM (PROOF_ARM=cad): the reconstruct line — one checked design name, a status-file report that withholds geometry,
+// CAD-priority guards. Stand-in launcher cutover/proof-cad.sh + a fake queue (proof-cad/QUEUE.md) + a status dir.
+const CAD_DIR = join(REPO, '..', 'proof-cad');
+const cadSlots = (ws, busyPrefixes) => ({ cad: { run: [join(REPO, '..', 'cutover', 'proof-cad.sh'), join(CAD_DIR, 'QUEUE.md'), join(CAD_DIR, 'status'), join(ws, 'launcher.log')],
+  session: 'proofcad-reconstruct-', arg: 'design', busyPrefixes, busyProcess: 'proofcad-cli-never', minAvailGB: 12, capMin: 10,
+  report: 'statusFile', statusFile: join(CAD_DIR, 'status', '{arg}.md'), label: 'CAD SESSION' } });
+async function cadMain() {
+  const ws = mkdtempSync(join(tmpdir(), 'sn-cadline-'));
+  cpSync(join(REPO, 'dev', 'fixtures', 'seed-workspace'), ws, { recursive: true });
+  seedClaudeLogin(ws);
+  for (const f of ['PROOF-A.md', 'PROOF-NUM.md']) rmSync(join(CAD_DIR, 'status', f), { force: true });
+  const out = process.env.PROOF_OUT || ws; mkdirSync(out, { recursive: true });
+  const verdict = {}; const stopIds = [];
+  const lines = () => existsSync(join(ws, 'launcher.log')) ? readFileSync(join(ws, 'launcher.log'), 'utf8') : '';
+  const nLaunch = () => (lines().match(/ launching /g) || []).length;
+  const last = () => { const j = jobsOf(ws).slice(-1)[0] || {}; return String(j.output || '') + ' ' + String(j.error || ''); };
+  // the SESSION BAY's own words (step 1 of the newest job), not the STATUS step's paraphrase of them
+  const bay1 = () => {
+    const j = jobsOf(ws).slice(-1)[0] || {};
+    const ids = (j.runs || []).map(r => r.runId);
+    const steps = readJsonl(join(ws, 'runs.jsonl')).filter(r => ids.indexOf(r.runId) >= 0).sort((a, b) => (a.ts || 0) - (b.ts || 0));
+    const tdir = join(ws, 'transcript-history-v2');
+    const rows = existsSync(tdir) ? readdirSync(tdir).filter(f => f.endsWith('.jsonl')).flatMap(f => readJsonl(join(tdir, f))) : [];
+    return steps[0] ? rows.filter(t => t.sourceRunId === steps[0].runId && t.role === 'assistant').map(t => String(t.content || '')).join('\n') : '';
+  };
+  try {
+    let st = await station(ws, { bays: true, slots: cadSlots(ws, ['proofcad-busy-']) });
+    st.lead('Build a new room named "CAD DECK" beside the main room, joined by a hallway, with ONE workflow line named "RECONSTRUCT": an intake, then two bays, then an outbox. '
+      + 'Bay 1 "RECONSTRUCT": staff it with ONE NEW specialist recruited for it (station.plan staff with agent "new"). '
+      + 'Bay 2 "STATUS": staff it with yourself; its brief: report the reconstruct session\'s outcome and its status file as handed to you (State, Steps, Blocked on, Next, Updated). If the status was WITHHELD or the bay REFUSED or failed, say exactly that and nothing more. Never add numbers. '
+      + 'First read station.map and station.map {catalog:true}, plan with station.plan, build with station.build. Do NOT test the line and do not schedule anything. Do not ask me anything. Report what was built.', 'build');
+    await st.stop();
+    const recruits = JSON.parse(readFileSync(join(ws, 'agent.roster.json'), 'utf8')).agents.filter(a => a.agentId !== 'agent').map(a => a.agentId);
+    if (!recruits.length) throw new Error('no recruit to bind');
+    writeFileSync(join(ws, 'claude-session-bays.json'), JSON.stringify({ agents: Object.fromEntries(recruits.map(id => [id, { slot: 'cad' }])), launches: {} }, null, 2));
+    st = await station(ws, { bays: true, slots: cadSlots(ws, ['proofcad-busy-']) });
+    st.lead(testJob('RECONSTRUCT', 'Reconstruct PROOF-A'), 'run');
+    const runOut = last(); writeFileSync(join(out, 'cad-run.md'), runOut);
+    verdict.run = /41 matched of 46/.test(runOut) && nLaunch() === 1 && existsSync(join(CAD_DIR, 'status', 'PROOF-A.md'));
+    console.log('RUN: status forwarded=' + /41 matched of 46/.test(runOut) + ' launches=' + nLaunch());
+    st.lead(testJob('RECONSTRUCT', 'Reconstruct PROOF-NUM'), 'num');
+    const numOut = last(); writeFileSync(join(out, 'cad-num.md'), numOut);
+    const numFile = existsSync(join(CAD_DIR, 'status', 'PROOF-NUM.md')) ? readFileSync(join(CAD_DIR, 'status', 'PROOF-NUM.md'), 'utf8') : '';
+    verdict.withheld = /0\.4/.test(numFile) && /WITHHELD/.test(bay1()) && !/0\.4/.test(bay1()) && !/0\.4/.test(numOut) && nLaunch() === 2;
+    console.log('NUM: file has the decimal=' + /0\.4/.test(numFile) + ' withheld=' + /WITHHELD/.test(numOut) + ' decimal leaked=' + /0\.4/.test(numOut) + ' launches=' + nLaunch());
+    st.lead(testJob('RECONSTRUCT', 'Reconstruct ../../etc/passwd'), 'badname');
+    const badOut = bay1() + '\n--- outbox ---\n' + last();
+    verdict.badname = /exactly ONE design/.test(bay1()) && nLaunch() === 2 && !/REFUSED pattern/.test(lines());
+    console.log('BADNAME: refused at the bay=' + /exactly ONE design/.test(bay1()) + ' launcher never ran=' + !/REFUSED pattern/.test(lines()));
+    st.lead(testJob('RECONSTRUCT', 'Reconstruct NOTQUEUED'), 'queue');
+    const qOut = bay1() + '\n--- outbox ---\n' + last();
+    verdict.queue = /launcher refused or failed: REFUSED: 'NOTQUEUED' is not a design in/.test(bay1()) && /REFUSED queue 'NOTQUEUED'/.test(lines()) && nLaunch() === 2;
+    console.log('QUEUE: launcher refused=' + /REFUSED queue 'NOTQUEUED'/.test(lines()) + ' said by the bay=' + /launcher refused or failed: REFUSED: 'NOTQUEUED' is not a design in/.test(bay1()));
+    await st.stop();
+    // BUSY: the REAL CAD crews on this box (solidcraft-* sessions) block a launch
+    st = await station(ws, { bays: true, slots: cadSlots(ws, ['solidcraft-', 'cad-', 'nvgra-', 'dims-']) });
+    st.lead(testJob('RECONSTRUCT', 'Reconstruct PROOF-B'), 'busy');   // a design never launched today: only the busy guard can refuse
+    const busyOut = bay1() + '\n--- outbox ---\n' + last();
+    verdict.busy = /is live \(a CAD crew session/.test(bay1()) && nLaunch() === 2;
+    console.log('BUSY: refused=' + /is live \(a CAD crew session/.test(bay1()) + ' launches still=' + nLaunch());
+    await st.stop();
+    const rec = JSON.parse(readFileSync(join(ws, 'claude-session-bays.json'), 'utf8')).launches || {};
+    for (const k of Object.keys(rec)) if (rec[k].shortId) stopIds.push(rec[k].shortId);
+    writeFileSync(join(out, 'refusals.md'), '# BADNAME\n' + badOut + '\n# QUEUE\n' + qOut + '\n# BUSY\n' + busyOut + '\n');
+  } finally {
+    for (const id of stopIds) { try { execFileSync('claude', ['stop', id], { stdio: 'ignore', timeout: 30000 }); console.log('stopped ' + id); } catch (_) { console.log('could not stop ' + id); } }
+    if (existsSync(join(ws, 'launcher.log'))) writeFileSync(join(out, 'launcher.log'), readFileSync(join(ws, 'launcher.log')));
+    if (!process.env.PROOF_KEEP) try { rmSync(ws, { recursive: true, force: true }); } catch (_) {} else console.log('workspace kept: ' + ws);
+  }
+  const pass = verdict.run && verdict.withheld && verdict.badname && verdict.queue && verdict.busy;
+  console.log('\nverdict: ' + JSON.stringify(verdict) + '\nRESULT: ' + (pass ? 'PASS' : 'FAIL'));
+  process.exit(pass ? 0 : 1);
+}
+
 async function main() {
+  if (process.env.PROOF_ARM === 'cad') return cadMain();
   const ws = mkdtempSync(join(tmpdir(), 'sn-sessionline-'));
   cpSync(join(REPO, 'dev', 'fixtures', 'seed-workspace'), ws, { recursive: true });
   seedClaudeLogin(ws);

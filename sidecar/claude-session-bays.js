@@ -31,6 +31,17 @@
 const SLOT_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const PREFIX_RE = /^[A-Za-z0-9._-]{1,32}$/;
 const REPORT_MAX = 6000;
+// the ONE token a parameterised slot passes to its launcher (a design name): plain name characters only, no path
+const ARG_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/;
+// a status file that carries any decimal number or a millimetre unit is WITHHELD, never forwarded (part geometry must
+// never leave the CAD area — belt and braces on top of the skill's own fixed headings)
+const GEOMETRY_RE = /\d*\.\d+|\bmm\b|\dmm\b/i;
+
+/* jobArg(text) -> the design name from a job "Reconstruct <DESIGN>" or "<DESIGN>", else null. Exactly one token. */
+function jobArg(text) {
+  const m = String(text == null ? '' : text).trim().match(/^(?:reconstruct\s+)?(\S+)$/i);
+  return m && ARG_RE.test(m[1]) ? m[1] : null;
+}
 
 /* parseSlots(raw) -> { slots: Map<name, {run, session, capMin}>, errors: [] }. raw = the env JSON (string) or an object. */
 function parseSlots(raw, isAbs) {
@@ -49,7 +60,18 @@ function parseSlots(raw, isAbs) {
     const session = String((s && s.session) || '');
     if (!PREFIX_RE.test(session)) { errors.push('slot "' + name + '": session must be the session-name prefix the launcher produces'); continue; }
     const capMin = Number(s.capMin) > 0 ? Math.min(Number(s.capMin), 24 * 60) : 180;
-    slots.set(name, { run, session, capMin });
+    // CAD-shaped options (2026-11-15, Proxima): one checked parameter, busy guards, a memory floor, a status-file report
+    if (s.arg != null && s.arg !== 'design') { errors.push('slot "' + name + '": arg can only be "design"'); continue; }
+    const busyPrefixes = Array.isArray(s.busyPrefixes) ? s.busyPrefixes.map(String) : [];
+    if (busyPrefixes.some(p => !PREFIX_RE.test(p))) { errors.push('slot "' + name + '": busyPrefixes must be session-name prefixes'); continue; }
+    const busyProcess = s.busyProcess == null ? '' : String(s.busyProcess);
+    if (busyProcess && !/^[A-Za-z0-9._-]{3,64}$/.test(busyProcess)) { errors.push('slot "' + name + '": busyProcess must be a plain program name'); continue; }
+    const minAvailGB = Number(s.minAvailGB) > 0 ? Number(s.minAvailGB) : 0;
+    const report = s.report === 'statusFile' ? 'statusFile' : 'session';
+    const statusFile = report === 'statusFile' ? String(s.statusFile || '') : '';
+    if (report === 'statusFile' && (!abs(statusFile) || statusFile.indexOf('{arg}') < 0 || !s.arg)) { errors.push('slot "' + name + '": a statusFile report needs arg and an absolute statusFile path containing {arg}'); continue; }
+    const label = /^[A-Z][A-Z0-9 -]{0,31}$/.test(String(s.label || '')) ? String(s.label) : 'SWEEP SESSION';
+    slots.set(name, { run, session, capMin, arg: s.arg || null, busyPrefixes, busyProcess, minAvailGB, report, statusFile, label });
   }
   return { slots, errors };
 }
@@ -81,6 +103,8 @@ function makeClaudeSessionBays(o) {
   const jobState = typeof o.jobState === 'function' ? o.jobState : () => null;   // (shortId) -> state.json object | null
   const now = typeof o.now === 'function' ? o.now : () => 0;
   const today = typeof o.today === 'function' ? o.today : () => '';
+  const procList = typeof o.procList === 'function' ? o.procList : () => null;   // -> [cmdline strings] | null (unreadable)
+  const availGB = typeof o.availGB === 'function' ? o.availGB : () => null;      // -> number | null (unreadable)
   const sleep = typeof o.sleep === 'function' ? o.sleep : (ms => new Promise(r => setTimeout(r, ms)));
   const pollMs = Number(o.pollMs) > 0 ? Number(o.pollMs) : 15000;
   const findMs = Number(o.findMs) > 0 ? Number(o.findMs) : 90000;
@@ -115,23 +139,42 @@ function makeClaudeSessionBays(o) {
     if (!c.ok) return refusal(c.error);
     const { spec } = c;
     if (ctx.taintedBy) return refusal('this run carries untrusted text (' + String(ctx.taintedBy).slice(0, 120) + '); a session bay launches only from a clean run, so put it FIRST on its line');
+    let arg = null;
+    if (spec.arg) {
+      arg = jobArg(ctx.jobText);
+      if (!arg) return refusal('the job must name exactly ONE ' + spec.arg + ' — "Reconstruct <' + spec.arg.toUpperCase() + '>", letters, digits, . _ - only, no path — but it was: "' + String(ctx.jobText == null ? '' : ctx.jobText).trim().slice(0, 80) + '"');
+    }
+    const capKey = c.slot + (arg ? ':' + arg : '');
     const day = today();
-    const last = launches[c.slot];
-    if (day && last && last.day === day) return refusal('the "' + c.slot + '" slot already launched today (' + (last.name || last.shortId || 'unidentified') + '); at most one launch a day');
+    const last = launches[capKey];
+    if (day && last && last.day === day) return refusal('the "' + capKey + '" slot already launched today (' + (last.name || last.shortId || 'unidentified') + '); at most one launch a day');
+    if (spec.minAvailGB) {
+      const gb = availGB();
+      if (gb == null || !Number.isFinite(Number(gb))) return refusal('available memory is unreadable, and this slot needs at least ' + spec.minAvailGB + ' GB free');
+      if (gb < spec.minAvailGB) return refusal('only ' + Math.floor(gb) + ' GB of memory is available; this slot needs at least ' + spec.minAvailGB + ' GB (CAD work has priority on this box)');
+    }
+    if (spec.busyProcess) {
+      const procs = procList();
+      if (!Array.isArray(procs)) return refusal('the process list is unreadable, and a launch is never made blind');
+      if (procs.some(cmd => String(cmd).indexOf(spec.busyProcess) >= 0)) return refusal('a ' + spec.busyProcess + ' process is running (CAD work has priority on this box)');
+    }
     const before = await liveSessions();
     if (!before) return refusal('the Claude session list is unreadable right now, and a launch is never made blind');
     const working = before.find(s => String(s.name || '').startsWith(spec.session) && (s.busy || s.needsInput));
     if (working) return refusal(working.name + ' is still ' + (working.needsInput ? 'waiting on the Commander' : 'working') + '; one session per job');
+    // CAD priority: ANY live (listed) session of a CAD crew blocks a launch, idle or not (Proxima, 2026-11-15)
+    const cad = spec.busyPrefixes.length ? before.find(s => spec.busyPrefixes.some(p => String(s.name || '').startsWith(p))) : null;
+    if (cad) return refusal(cad.name + ' is live (a CAD crew session; CAD work has priority on this box)');
     const known = new Set(before.map(s => s.shortId).filter(Boolean));
 
-    launches[c.slot] = { day, shortId: null, name: null, at: now() };   // counted BEFORE the launch: a lost id still used the day
+    launches[capKey] = { day, shortId: null, name: null, at: now() };   // counted BEFORE the launch: a lost id still used the day
     persist();
     const r = await new Promise(resolve => {
       if (typeof execFile !== 'function') return resolve({ err: new Error('no process runner') });
-      execFile(spec.run[0], spec.run.slice(1), { timeout: launchTimeoutMs, windowsHide: true, maxBuffer: 1024 * 1024 },
+      execFile(spec.run[0], spec.run.slice(1).concat(arg ? [arg] : []), { timeout: launchTimeoutMs, windowsHide: true, maxBuffer: 1024 * 1024 },
         (err, stdout, stderr) => resolve({ err, stdout: String(stdout || ''), stderr: String(stderr || '') }));
     });
-    if (r.err) return { ok: false, text: 'SESSION BAY LAUNCH FAILED — the "' + c.slot + '" launcher exited with an error: ' + String((r.stderr || r.err.message || '')).trim().slice(0, 300) };
+    if (r.err) return { ok: false, text: 'SESSION BAY LAUNCH FAILED — the "' + c.slot + '" launcher refused or failed: ' + String((r.stderr || r.err.message || '')).trim().slice(0, 300) };
 
     // find the session the launcher started: a NEW background session with the slot's prefix
     let sess = null;
@@ -144,7 +187,7 @@ function makeClaudeSessionBays(o) {
       await sleep(Math.min(pollMs, 5000));
     }
     if (!sess) return { ok: false, text: 'SESSION BAY LAUNCH UNCONFIRMED — the "' + c.slot + '" launcher ran, but no new ' + spec.session + '* session appeared within ' + Math.round(findMs / 1000) + ' s. Check `claude agents` before running the line again (today\'s launch is spent).' };
-    launches[c.slot] = { day, shortId: sess.shortId, name: sess.name, at: launches[c.slot].at };
+    launches[capKey] = { day, shortId: sess.shortId, name: sess.name, at: launches[capKey].at };
     persist();
     if (crew && typeof crew.claimLaunched === 'function') crew.claimLaunched(sess.shortId, sess.name);
 
@@ -171,22 +214,33 @@ function makeClaudeSessionBays(o) {
       await sleep(pollMs);
     }
 
-    const tp = transcriptPath(sess.cwd, sess.sessionId);
-    let report = tp ? lastAssistantText(readFile(tp)) : '';
-    if (report.length > REPORT_MAX) report = report.slice(0, REPORT_MAX) + '\n…(report cut at ' + REPORT_MAX + ' chars; the full text is in the session)';
+    let report = '', reportHead = 'The session\'s final report:';
+    if (spec.report === 'statusFile') {
+      // NEVER the session transcript for this slot: only its status file, and only when it carries no geometry
+      const sf = spec.statusFile.split('{arg}').join(arg);
+      const st = readFile(sf);
+      reportHead = 'Its status file (' + sf + '):';
+      if (st == null) report = '(no status file was written)';
+      else if (GEOMETRY_RE.test(st)) report = 'STATUS WITHHELD — the status file contains a decimal number or "mm", and part geometry must never leave the CAD area. Nothing from it is forwarded; the CAD crew fixes the file.';
+      else report = String(st).trim().slice(0, REPORT_MAX);
+    } else {
+      const tp = transcriptPath(sess.cwd, sess.sessionId);
+      report = tp ? lastAssistantText(readFile(tp)) : '';
+      if (report.length > REPORT_MAX) report = report.slice(0, REPORT_MAX) + '\n…(report cut at ' + REPORT_MAX + ' chars; the full text is in the session)';
+    }
     const how = {
       finished: 'finished', 'needs-you': 'is WAITING ON THE COMMANDER' + (needs ? ': ' + needs.slice(0, 200) : ''),
       capped: 'was STOPPED at the ' + spec.capMin + '-minute wall-clock cap', gone: 'ended (no longer listed)',
       failed: 'FAILED', stopped: 'was stopped', 'left-running': 'is still running (this line run was cancelled; the session was left to finish)'
     }[end] || end;
-    const head = 'SWEEP SESSION ' + sess.name + ' (job ' + sess.shortId + ') ' + how + ' after ' + Math.round((now() - started) / 60000) + ' min.' +
+    const head = spec.label + ' ' + sess.name + ' (job ' + sess.shortId + ') ' + how + ' after ' + Math.round((now() - started) / 60000) + ' min.' +
       (sess.remoteUrl ? '\nRemote Control: ' + sess.remoteUrl : '');
-    return { ok: end === 'finished', end, shortId: sess.shortId, name: sess.name, text: head + '\n\nThe session\'s final report:\n' + (report || '(it wrote no report text)') };
+    return { ok: end === 'finished', end, shortId: sess.shortId, name: sess.name, text: head + '\n\n' + reportHead + '\n' + (report || '(it wrote no report text)') };
   }
 
   return {
     enabled, slotErrors,
-    slots: () => Array.from(slots, ([name, s]) => ({ name, launcher: s.run.join(' '), session: s.session, capMin: s.capMin })),
+    slots: () => Array.from(slots, ([name, s]) => ({ name, launcher: s.run.join(' '), session: s.session, capMin: s.capMin, arg: s.arg, report: s.report })),
     get(agentId) { const b = agents.get(String(agentId || '')); return b ? { slot: b.slot } : null; },
     list() { return Array.from(agents, ([agentId, b]) => ({ agentId, slot: b.slot })); },
     launches: () => Object.assign({}, launches),
@@ -206,4 +260,4 @@ function makeClaudeSessionBays(o) {
   };
 }
 
-module.exports = { makeClaudeSessionBays, parseSlots, lastAssistantText };
+module.exports = { makeClaudeSessionBays, parseSlots, lastAssistantText, jobArg, GEOMETRY_RE };
