@@ -110,6 +110,33 @@ async function main() {
     if (!recruits.length) throw new Error('the lead recruited no one — nothing to bind');
     writeFileSync(join(ws, 'claude-session-bays.json'), JSON.stringify({ agents: Object.fromEntries(recruits.map(id => [id, { slot: 'proof' }])), launches: {} }, null, 2));
 
+    phases: {
+    if (process.env.PROOF_ARM === 'schedule') {
+      // SCHEDULE ARM: the line started by its own schedule (a routine), not a test job — the path a live Monday run takes.
+      // Oracle: a delivered job carrying the session's codeword, and exactly one launch.
+      st = await station(ws, { bays: true });
+      st.lead('Set the workflow line "SWEEP" to start on a schedule with station.start_line: schedule "in 2m", job "Run today\'s sweep." Do not change or test the line. Do not ask me anything. Report what station.start_line said.', 'schedule');
+      // a scheduled line runs as a ROUTINE: its steps land in runs.jsonl + the transcript store under a cron-<routine> stream
+      // (line-jobs.json holds test_line jobs only). Oracle: both steps 'done' on that stream, the LAST step's reply carries
+      // the session's codeword, exactly one launch.
+      const tdir = join(ws, 'transcript-history-v2');
+      const said = () => (existsSync(tdir) ? readdirSync(tdir).filter(f => f.endsWith('.jsonl')).flatMap(f => readJsonl(join(tdir, f))) : [])
+        .filter(t => t.role === 'assistant' && /^cron-/.test(String(t.streamId || '')));
+      const steps = () => readJsonl(join(ws, 'runs.jsonl')).filter(r => /^cron-/.test(String(r.streamId || '')) && r.dockId);
+      for (let i = 0; i < 60 && steps().length < 2; i++) await sleep(10000);
+      await sleep(3000);
+      const ss = steps().sort((a, b) => (a.ts || 0) - (b.ts || 0));
+      for (const r of ss) console.log('  scheduled step bay=' + r.dockId + ' agent=' + r.agentId + ' stream=' + r.streamId + ' model=' + r.model + ' reason=' + r.reason);
+      const last = ss[ss.length - 1];
+      const lastSaid = last ? said().filter(t => t.sourceRunId === last.runId).map(t => String(t.content || '')).join('\n') : '';
+      verdict.schedule = ss.length >= 2 && ss.every(r => r.reason === 'done') && new RegExp(CODEWORD).test(lastSaid) && launches(ws) === 1;
+      console.log('SCHEDULE: steps=' + ss.length + ' all done=' + ss.every(r => r.reason === 'done') + ' codeword in the last step=' + new RegExp(CODEWORD).test(lastSaid) + ' launches=' + launches(ws));
+      writeFileSync(join(out, 'schedule-delivered.md'), said().map(t => '## ' + t.agentId + '\n\n' + String(t.content || '')).join('\n\n') + '\n');
+      const rec = JSON.parse(readFileSync(join(ws, 'claude-session-bays.json'), 'utf8'));
+      sessionId = rec.launches && rec.launches.proof && rec.launches.proof.shortId;
+      await st.stop();
+      break phases;
+    }
     // 3 RUN + 4 CAP + 5 TAINT
     st = await station(ws, { bays: true });
     const n0 = jobsOf(ws).length;
@@ -153,12 +180,13 @@ async function main() {
     writeFileSync(join(out, 'line-jobs.json'), readFileSync(join(ws, 'line-jobs.json')));
     writeFileSync(join(out, 'refusals.md'), '# CAP\n\n' + capText + '\n\n# TAINT\n\n' + taintText + '\n\n# OFF\n\n' + offText + '\n');
     sessionId = shortId;
+    }
   } finally {
     if (sessionId) { try { execFileSync('claude', ['stop', sessionId], { stdio: 'ignore', timeout: 30000 }); console.log('stopped the proof session ' + sessionId); } catch (_) { console.log('could not stop ' + sessionId); } }
     if (existsSync(join(ws, 'launcher.log'))) writeFileSync(join(out, 'launcher.log'), readFileSync(join(ws, 'launcher.log')));
     if (!process.env.PROOF_KEEP) try { rmSync(ws, { recursive: true, force: true }); } catch (_) {} else console.log('workspace kept: ' + ws);
   }
-  const pass = verdict.run && verdict.cap && verdict.taint && verdict.off;
+  const pass = process.env.PROOF_ARM === 'schedule' ? !!verdict.schedule : (verdict.run && verdict.cap && verdict.taint && verdict.off);
   console.log('\nverdict: ' + JSON.stringify(verdict) + ' (digest step model ' + STEP_MODEL + ')\nRESULT: ' + (pass ? 'PASS' : 'FAIL'));
   process.exit(pass ? 0 : 1);
 }

@@ -5720,7 +5720,7 @@ const claudeSessionBays = require('./claude-session-bays.js').makeClaudeSessionB
   slots: String(ENV('SESSION_BAY_SLOTS') || ''),
   isAbs: p => path.isAbsolute(String(p)),
   crew: claudeCrew,
-  execFile: (file, args, opts, cb) => require('node:child_process').execFile(file, args, opts, cb),
+  execFile,   // the station's guarded child_process (child-env.js): a launcher gets the scrubbed child env
   now: () => Date.now(),
   today: () => { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); },
   jobState: id => { try { return JSON.parse(fs.readFileSync(path.join(CLAUDE_HOME_DIR, 'jobs', String(id), 'state.json'), 'utf8')); } catch (_) { return null; } },
