@@ -352,6 +352,21 @@ words. The scripts are in `~/code/starnet-worktrees/cutover/`.
   export-compliance, security and quality lines. No schedules are on; any periodic line (e.g. the morning brief) waits
   for Proxima's go.
 
+### The Commander's decisions page (where a line's "needs you" goes)
+
+The Commander decides on his phone in the Claude app, with no VPN. He uses a private claude.ai artifact,
+"Commander's Decisions", whose address is in the `commander-decisions-page` memory note.
+
+- **Each item is a card** in its `items` collection: `title` (the recommendation), `why`, `severity`, `sevRank`,
+  `waitingSince`, `cite`, `source`, `area` and `order`. Only admin and above write them.
+- **He answers** with Approve / Reject / Discuss (+ note) in `decisions`. Only the owner writes there; a contributor
+  write was verified refused.
+- **Proxima owns the read-back and the routing.** Once it acts it sets `items/<id>.status = "done"` and an `outcome`,
+  and the page shows the card under Done.
+- **A line that ends in "needs you" ADDS cards; it never routes a decision.**
+- **Card rule: no part dimensions or geometry on the page, ever.** The store is on claude.ai, off the box. Name the
+  feature by location and cite the on-box file that holds the numbers.
+
 ## Remote access to the station (phone)
 
 The sidecar binds loopback only, and the API pins `Host` to loopback as its DNS-rebinding defense.
