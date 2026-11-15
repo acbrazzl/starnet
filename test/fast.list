@@ -154,6 +154,7 @@ test/claude-cli-persist-review.test.js
 test/claude-cli-persist-loop.test.js
 test/claude-cli-lifecycle.test.js
 test/claude-skill-bay.test.js
+test/claude-session-bay.test.js
 test/provider-accounts.test.js
 test/claude-cli-login.test.js
 test/claude-cli-signin-engine.test.js

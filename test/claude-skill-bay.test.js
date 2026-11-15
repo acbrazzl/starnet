@@ -153,9 +153,9 @@ const flag = (args, f) => args.indexOf(f) >= 0 ? args[args.indexOf(f) + 1] : und
     const src = require('./helpers/source.js').readSidecarSource();
     const capReg = require('fs').readFileSync(path.join(__dirname, '..', 'sidecar', 'capability', 'registry.js'), 'utf8');
     A.ok(capReg.includes("capId: 'orchestrator', tool: 'claude.skill_agent', scope: 'write', requiresConsent: true"), 'claude.skill_agent is on the orchestrator allowlist (lead-only, asks)');
-    A.ok(/const skillBinding = routedToOverseer \? null : claudeSkillAgents\.resolve\(agentId\);/.test(src), 'every run resolves (and re-checks) its agent\'s binding');
+    A.ok(/const skillBinding = \(routedToOverseer \|\| sessionBinding\) \? null : claudeSkillAgents\.resolve\(agentId\);/.test(src), 'every run resolves (and re-checks) its agent\'s binding');
     A.ok(/if \(skillBinding && \(!skillBinding\.ok \|\| providerId !== 'claude-cli'\)\)/.test(src), 'a broken binding or a non-Claude provider refuses the step');
-    A.ok(/const toolDefs = \(isTask && !routedToOverseer && !skillBinding\)/.test(src), 'a skill step is offered no StarNet tools');
+    A.ok(/const toolDefs = \(isTask && !routedToOverseer && !skillBinding && !sessionBinding\)/.test(src), 'a skill step is offered no StarNet tools');
     A.ok(/claudeSkill: skillBinding\.skill, claudeDir: skillBinding\.dir/.test(src), 'the provider request carries the skill and directory');
     A.ok(/rotationFallbacks = rotationFallbacks\.map\(f => Object\.assign\(\{\}, f, \{ provider: asSkill\(f\.provider\) \}\)\)/.test(src), 'a rotation to another Claude sign-in keeps the skill');
   }

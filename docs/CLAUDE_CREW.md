@@ -352,6 +352,38 @@ words. The scripts are in `~/code/starnet-worktrees/cutover/`.
   export-compliance, security and quality lines. No schedules are on; any periodic line (e.g. the morning brief) waits
   for Proxima's go.
 
+### Crew-session bays: a line step that IS the work (2026-11-15)
+
+A crew-skill bay runs one read-only `claude -p` turn, so it can read and draft but never do the work. The Commander asked
+(2026-11-15): "wouldn't we want the sweep themselves to be a workflow?" A **session bay** makes the line LAUNCH that work.
+Its step starts a real Claude Code background session, waits for it, and hands the session's own final report to the next
+bay. Code: `sidecar/claude-session-bays.js`; tool `claude.session_agent`.
+
+- **Only named slots.** The Commander configures them in the env, and the lead can bind an agent only to a slot name, never
+  to a command:
+  `STARNET_SESSION_BAY_SLOTS='{"security":{"run":["/home/brazz/code/meshFlow-office/reviews/run-sweep.sh","security"],"session":"security-sweep-","capMin":180}}'`.
+  The launcher is the SAME script cron runs, so a line-launched sweep has the same name, brief, worktree/branch scheme and
+  permission mode as a cron one (Proxima's condition). The bay's job text is **never** passed to the session.
+- **Off unless `STARNET_SESSION_BAYS=1`.** Unsetting it is the kill switch: bound bays then refuse.
+- **Guardrails, re-checked on every run.** Each one is a said refusal that becomes the step's text, never a fallback to a
+  model:
+  - **Taint lock.** A run handed upstream text never launches, so the bay must be FIRST on its line.
+  - **One launch a day per slot.** The launch is recorded before the launcher runs.
+  - **One at a time.** Refused while a session with the slot's prefix is still working, e.g. cron's.
+  - **Fail closed.** An unreadable session list refuses.
+  - **Wall-clock cap.** At `capMin` the station stops the session it launched.
+  - **Never stopped when it waits on the Commander.** That session is left alone and the wait is reported.
+  - **A cancelled run leaves the session to finish.**
+- **The launched session is the station's.** It is recorded in `claude-crew.managed.json` (`via: session-bay`), so it shows
+  on the crew rail and `claude.stop` can stop it.
+- **Binding always asks.** `claude.session_agent` is not on either AUTO-BUILD list.
+- **The session finishes as it would under cron.** Its draft PRs and its report to Proxima are unchanged. The line adds the
+  digest step and the outbox.
+- **Proof:** `dev/session-line-proof.mjs` runs on a throwaway station with a stand-in launcher
+  (`cutover/proof-sweep.sh`): run-sweep.sh's shape, a real `claude --bg` session, a tiny read-only brief. It shows one
+  launch delivered, then three refusals: the daily cap, the taint lock and the kill switch. It runs once per digest model.
+- **The live switch is Proxima's word after the proof.** The crontab sweeps stay until the line has run one clean real week.
+
 ### The Commander's decisions page (where a line's "needs you" goes)
 
 The Commander decides on his phone in the Claude app, with no VPN. He uses a private claude.ai artifact,
