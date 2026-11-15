@@ -366,6 +366,14 @@ The Commander decides on his phone in the Claude app, with no VPN. He uses a pri
 - **A line that ends in "needs you" ADDS cards; it never routes a decision.**
 - **Card rule: no part dimensions or geometry on the page, ever.** The store is on claude.ai, off the box. Name the
   feature by location and cite the on-box file that holds the numbers.
+- **A decision that stems from a geometry choice carries the images needed to decide it** (the Commander, 2026-11-15).
+  The page shows `images: [{url, caption}]` from its asset store, plus optional `context` and `options`. Images are
+  renders or looks with no dimension annotations.
+- **Re-check relevance before acting on a decision** (the Commander, 2026-11-15: "when we work a decision, a check
+  should be made to see if they are still relevant"). Re-verify each card against current code, infra and PR state
+  first. If it has been overtaken, close it with `status: "done"` and `outcome: "No longer relevant: <evidence>"`. The
+  first check, on 2026-11-15, found four of five networking cards already decided or fixed.
+- **He discusses decisions with Proxima**, not with the line builder.
 
 ## Remote access to the station (phone)
 
