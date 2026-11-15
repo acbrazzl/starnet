@@ -333,6 +333,7 @@ words. The scripts are in `~/code/starnet-worktrees/cutover/`.
 | SECURITY · SECURITY SWEEP (11-15) | SWEEP (SWEEPER · session slot `security` = `reviews/run-sweep.sh security`, no model) → DIGEST (SWEEP-DIGEST · Opus) | DIGEST: meshflow-security · `~/code/meshFlow-office` | the sweep session's own cost + the digest | throwaway proofs (manual + schedule, Sonnet + Opus); first live run 2026-11-16 09:13 ET (one-shot routine), REPLACING that Monday's cron line |
 | DECISIONS · DECISIONS DIGEST (11-15) | GATHER + RELEVANCE (DECISIONS-CHECK · Sonnet) → CARDS (DECISIONS-CARDS · Opus) | meshflow-overseer · `~/code/meshFlow-office` (+ `crew-needs.json`) | 387k, ~2 min | `job-b620ab80c678` delivered 12 cards; daily 08:45 ET |
 | POST LOG · POST LOG + NEXT POST (11-15) | NUMBERS (POSTLOG · Sonnet) → NEXT POST (NEXT-POST · Opus) → CREATE (NEXT-POST · Opus) | meshflow-social · `~/code/meshFlow-office` (the posting log is in the skill; plans in `social*`) | ~270k, ~90 s | two jobs, the Commander's ask: (a) Insights numbers → the HISTORY table of every post (rebuilt from the log each run; the line cannot write it) + drafted log cell + rank at the same age; (b) 'Make a post about <topic>' → next-post pick + POST DRAFT. `job-14cfd23999c8` (real ep 1 3h numbers), `job-a903e4d5e64f` (a post about the sweep line: history of 15 posts, new-asset spec, caption) |
+| CAD · RECONSTRUCT (11-15) | RECONSTRUCT (RECONSTRUCTOR · session slot `cad` = `cutover/cad-reconstruct.sh <DESIGN_TOKEN>`, no model) → STATUS (CAD-STATUS · Opus) | STATUS: solidcraft-dev · `~/code/solidcraft-upstream-rules-snapshot` (the station's code hands it the status text; it never reads `~/cad`) | the session's own cost | throwaway proof PASS (run, decimal withheld, bad name, unqueued name, live CAD crew); live slot without busyPrefixes (Proxima: idle crews don't load the box); NO run until Proxima's word |
 
 - **Release readiness reads a SNAPSHOT.** The main `~/code/meshFlow` checkout is stale (`release/0.1.14`) and a skill
   step cannot run git. So it reads `~/code/meshFlow-dev-snapshot`, a `git archive` of origin/dev. Its `SNAPSHOT.txt`
@@ -394,6 +395,23 @@ bay. Code: `sidecar/claude-session-bays.js`; tool `claude.session_agent`.
   (`cutover/proof-sweep.sh`): run-sweep.sh's shape, a real `claude --bg` session, a tiny read-only brief. It shows one
   launch delivered, then three refusals: the daily cap, the taint lock and the kill switch. It runs once per digest model.
 - **The live switch is Proxima's word after the proof.** The crontab sweeps stay until the line has run one clean real week.
+
+### The CAD reconstruct slot (2026-11-15)
+
+- **One checked parameter.** `arg: "design"` lets the session bay pass ONE token from the job ("Reconstruct <DESIGN>",
+  `/^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/`), refused loudly otherwise. The launcher maps `_` to a space and refuses any name
+  that is not EXACTLY a design in `~/cad/studio/QUEUE.md` (backticks stripped, a prefix never matches). The launcher only
+  READS that file in `~/cad`.
+- **The status file, never the transcript.** `report: "statusFile"` forwards only `~/cad-status/<TOKEN>.md` (five fixed
+  headings, counts only, written by the solidcraft-fusion-reconstruct skill). The CODE withholds a file holding any
+  decimal number or "mm" (`GEOMETRY_RE`), so part geometry cannot reach the line even if the skill slips.
+- **CAD priority.** The slot refuses while a `solidcraft-cli` process runs (`busyProcess`), or below 12 GB available
+  (`minAvailGB`); both fail closed when unreadable. `busyPrefixes` (refuse while any listed session has the prefix) exists
+  but is OFF for this slot: idle crew sessions don't load the box (Proxima's option a). Heavy work runs under
+  `systemd-run` with MemoryMax=10G. Cap: 6 h. The daily cap is per design.
+- **The brief the launcher hands the session.** If the design is BLOCKED, re-check the blocking step on the newest
+  upstream build first. Write the status file. No pushes, PRs, issues or comments. Pictures go to Proxima as paths.
+  An unbuildable blend is omitted and listed, and a set counts as rounded only by an oracle.
 
 ### The Commander's decisions page (where a line's "needs you" goes)
 
