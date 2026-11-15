@@ -28,7 +28,12 @@ function world(opts) {
   };
   // each sleep advances the clock and, on the Nth poll, moves the job to its scripted end state
   let polls = 0;
-  w.sleep = async ms => { w.t += ms; polls++; if (opts.endAfter && polls === opts.endAfter && w.jobs.abcd1234) Object.assign(w.jobs.abcd1234, opts.endState); };
+  w.sleep = async ms => { w.t += ms; polls++;
+    if (opts.endAfter && polls === opts.endAfter) for (const id of Object.keys(w.jobs)) {
+      Object.assign(w.jobs[id], opts.endState);
+      // the listing follows the job, unless the test pins it busy (the live 11-15 case: tempo idle, listing still busy)
+      if (!opts.listStaysBusy) for (const s of w.sessions) if (s.shortId === id) s.busy = opts.endState.tempo === 'working';
+    } };
   w.bays = makeClaudeSessionBays(Object.assign({
     enabled: true, slots: JSON.stringify(SLOTS), crew: w.crew, execFile: w.execFile, now: () => w.t, today: () => w.day, sleep: w.sleep,
     pollMs: 60000, findMs: 30000, jobState: id => w.jobs[id] || null,
@@ -102,6 +107,29 @@ const report = JSON.stringify({ type: 'assistant', message: { content: [{ type: 
     A.equal(w.saved.launches.security.shortId, 'abcd1234', 'today\'s launch is recorded');
     const again = await w.bays.runStep('security', {});
     A.match(again.text, /already launched today/, 'the second run that day is refused');
+  }
+  // LIVE REGRESSION (2026-11-15, R31): the job's tempo went idle while `claude agents` still listed the session busy (a
+  // background build) — the bay ended "finished after 7 min". Both signals must agree, twice, before it is finished.
+  {
+    const w = world({ endAfter: 1, endState: { tempo: 'idle', state: 'working' }, listStaysBusy: true, transcript: report });
+    const r = await w.bays.runStep('security', {});
+    A.notEqual(r.end, 'finished', 'tempo idle + listing busy is NOT finished');
+    A.equal(r.end, 'capped', 'it keeps waiting (here until the cap)');
+  }
+  {
+    // one idle poll is not enough either: a flicker back to working resets it
+    const w = world({ transcript: report });
+    let n = 0;
+    w.sleep = async ms => { w.t += ms; n++;
+      const j = w.jobs.abcd1234, sx = w.sessions.find(x => x.shortId === 'abcd1234');
+      if (!j || !sx) return;
+      if (n === 1) { j.tempo = 'idle'; sx.busy = false; }      // idle once…
+      if (n === 2) { j.tempo = 'working'; sx.busy = true; }    // …then back to work
+      if (n === 4) { j.tempo = 'idle'; sx.busy = false; } };
+    const bays = makeClaudeSessionBays({ enabled: true, slots: SLOTS, crew: w.crew, execFile: w.execFile, now: () => w.t, today: () => w.day,
+      sleep: w.sleep, pollMs: 60000, jobState: id => w.jobs[id] || null, transcriptPath: () => '/t', readFile: () => report });
+    const r = await bays.runStep('security', {});
+    A.equal(r.end, 'finished'); A.ok(n >= 5, 'finished only after two consecutive idle polls, not the first flicker (polls=' + n + ')');
   }
   // the daily launch is counted BEFORE the launcher runs: a failed launcher still spends the day
   {

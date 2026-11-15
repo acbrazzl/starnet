@@ -194,22 +194,29 @@ function makeClaudeSessionBays(o) {
     // wait for it to finish: idle after having worked, waiting on the Commander, gone, or the cap
     const started = now();
     const capMs = spec.capMin * 60000;
-    let sawWork = false, end = null, needs = '';
+    /* FINISHED needs BOTH signals to agree, twice in a row (live 2026-11-15: the R31 reconstruct session waited on a
+       background build with its job tempo 'idle' while `claude agents` still listed it busy, and the bay ended "finished
+       after 7 min" while the session worked on). Idle = the job's tempo is idle AND the listing does not show it busy. */
+    let sawWork = false, end = null, needs = '', idleStreak = 0;
     for (;;) {
       if (ctx.signal && ctx.signal.aborted) { end = 'left-running'; break; }
       const job = jobState(sess.shortId) || {};
       const tempo = String(job.tempo || ''), state = String(job.state || '');
-      if (tempo === 'working' || (state === 'working' && tempo !== 'blocked' && tempo !== 'idle')) sawWork = true;
+      const l = await liveSessions();
+      const listed = l ? l.find(s => s.shortId === sess.shortId) : undefined;
+      if (l && !listed) { end = 'gone'; break; }
+      const listedBusy = !!(listed && listed.busy);
+      if (tempo === 'working' || listedBusy || (state === 'working' && tempo !== 'blocked' && tempo !== 'idle')) sawWork = true;
       if (state === 'done' || state === 'failed' || state === 'stopped') { end = state === 'done' ? 'finished' : state; break; }
       if (tempo === 'blocked' && sawWork) { end = 'needs-you'; needs = String(job.needs || ''); break; }
-      if (tempo === 'idle' && (sawWork || now() - started > 120000)) { end = 'finished'; break; }
+      const idleNow = tempo === 'idle' && l != null && !listedBusy && (sawWork || now() - started > 120000);
+      idleStreak = idleNow ? idleStreak + 1 : 0;
+      if (idleStreak >= 2) { end = 'finished'; break; }
       if (now() - started >= capMs) {
         end = 'capped';
         if (crew && typeof crew.stop === 'function') await crew.stop(sess.shortId);
         break;
       }
-      const l = await liveSessions();
-      if (l && !l.some(s => s.shortId === sess.shortId)) { end = 'gone'; break; }
       wait('working', sess.name + ' working · ' + Math.round((now() - started) / 60000) + ' min');
       await sleep(pollMs);
     }
