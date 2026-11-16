@@ -425,6 +425,12 @@ The Commander decides on his phone in the Claude app, with no VPN. He uses a pri
 - **Proxima owns the read-back and the routing.** Once it acts it sets `items/<id>.status = "done"` and an `outcome`,
   and the page shows the card under Done.
 - **A line that ends in "needs you" ADDS cards; it never routes a decision.**
+- **The page's source is `~/code/meshFlow-office/pages/decisions-page.html`** (Proxima, version 4, 2026-11-16). Edit
+  that file, never an older copy (the first versions were built from a scratch copy in a job folder).
+- **The `/_blob/` link trap.** An uploaded picture's URL (`/_blob/<id>`) resolves only inside the artifact. Opened in a
+  new tab it is a bare URL that 404s, so a picture the Commander taps to enlarge showed nothing. Version 4 opens pictures
+  in an in-page full-screen viewer (fit/full-size, pan/pinch, Esc/Close) and shows them at full card width. Never link a
+  picture out of the page.
 - **Card rule: no part dimensions or geometry on the page, ever.** The store is on claude.ai, off the box. Name the
   feature by location and cite the on-box file that holds the numbers.
 - **A decision that stems from a geometry choice carries the images needed to decide it** (the Commander, 2026-11-15).
