@@ -88,6 +88,10 @@ function lastAssistantText(jsonl) {
     const c = j.message.content;
     const text = typeof c === 'string' ? c : (Array.isArray(c) ? c.filter(b => b && b.type === 'text' && b.text).map(b => b.text).join('\n') : '');
     if (text.trim()) return text.trim();
+    // a crew session often ENDS by reporting through SendMessage (to proxima): that tool call IS its final report
+    // (live 2026-11-16: the Monday sweep's last turn was a SendMessage, and the bay handed on "no report text")
+    const sent = Array.isArray(c) ? c.filter(b => b && b.type === 'tool_use' && b.name === 'SendMessage' && b.input && typeof b.input.message === 'string') : [];
+    if (sent.length) return ('(its report, sent to ' + String(sent[sent.length - 1].input.to || '?') + ')\n' + sent[sent.length - 1].input.message).trim();
   }
   return '';
 }

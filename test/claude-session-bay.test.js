@@ -55,6 +55,12 @@ const report = JSON.stringify({ type: 'assistant', message: { content: [{ type: 
   }
   A.equal(lastAssistantText([report, '{"type":"user","message":{"content":"x"}}', '{partial'].join('\n')), 'Area: loopback. 2 hypotheses killed, 1 draft PR #700.', 'the final report is the last assistant text');
 
+  {
+    // live 2026-11-16: a sweep's last turn is a SendMessage to proxima, with no text block — that message is the report
+    const sendOnly = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'SendMessage', input: { to: 'proxima', message: 'Area 8: 1 MEDIUM fixed in draft #675.' } }] } });
+    const earlier = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'starting the sweep' }] } });
+    A.equal(lastAssistantText([earlier, sendOnly].join('\n')), '(its report, sent to proxima)\nArea 8: 1 MEDIUM fixed in draft #675.', 'a final SendMessage is the report, not an earlier text');
+  }
   // BINDING: only to a named slot, and only while bays are on
   {
     const w = world();
