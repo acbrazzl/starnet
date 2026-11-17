@@ -5787,7 +5787,9 @@ if (claudeCrew.enabled && /^(1|true|yes|on)$/i.test(String(ENV('OVERSEER_SESSION
     enabled: true, execFile, fs, path, now: () => Date.now(), stateDir: WORKSPACES,
     claudeHome: String(ENV('CLAUDE_HOME') || path.join(require('node:os').homedir(), '.claude')),
     cwd: CLAUDE_CREW_DIR || require('node:os').homedir(), bin: String(ENV('CLAUDE_BIN') || 'claude'),
-    name: () => overseerDocs().name, model: () => overseerDocs().model,
+    // STARNET_OVERSEER_MODEL pins the Overseer session's model verbatim (e.g. claude-fable-5-2[1m]), overriding the
+    // station's stored alias; '[1m]' keeps the 1M window for the 70% cleaning rule (overseer-session.js windowFor)
+    name: () => overseerDocs().name, model: () => String(ENV('OVERSEER_MODEL') || '').trim() || overseerDocs().model,
     permissionMode: claudeCrew.defaultMode, fresh: /^(1|true|yes|on)$/i.test(String(ENV('OVERSEER_SESSION_FRESH') || '').trim()),
     keepAlive: /^(1|true|yes|on)$/i.test(String(ENV('OVERSEER_SESSION_KEEPALIVE') || '').trim()),   // survive StarNet restarts (same link)
     // one brain: scheduled check-ins replace StarNet's own autopilot for the Overseer (hours; 0 = off) + a morning one

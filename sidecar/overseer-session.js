@@ -35,7 +35,9 @@ const DAILY_MS = 24 * 3600 * 1000;
 const ANSI_RE = /\x1b\[[0-9;?]*[ -\/]*[@-~]|\x1b\][^\x07]*\x07/g;
 
 function cwdSlug(cwd) { return String(cwd || '').replace(/[^A-Za-z0-9]/g, '-'); }
-function windowFor(model) { return /\[1m\]/i.test(String(model || '')) ? 1000000 : 200000; }
+// 1M: an explicit '[1m]', or Fable 5.x (measured 2026-11-17: claude-fable-5-2 reports contextWindow 1000000 with or
+// without the suffix)
+function windowFor(model) { return /\[1m\]|fable/i.test(String(model || '')) ? 1000000 : 200000; }
 /* The station stores the brain as a plain alias ('opus'); the Commander's own sessions run Opus with the 1M window
    ('opus[1m]'). Launch the Overseer the same way, so its window — and the 70% cleaning rule — match reality. */
 function sessionModel(model) { const m = String(model || '').trim(); return m === 'opus' ? 'opus[1m]' : m; }
