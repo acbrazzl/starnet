@@ -734,7 +734,7 @@ if (!workspaceOwnerClaim.ok) {
   console.error('[process-fault] CRASH LOOP — ' + crashLedger.describe() + '; holding a degraded listener on :' + PORT + ' instead of exiting 73 again');
   const holding = http.createServer((req, res) => {
     // same rebinding floor as the main server: the hold reason names the workspace path + holder PID
-    if (!isAllowedHost(req.headers.host)) { res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('forbidden host'); }
+    if (!isAllowedHost(req.headers.host, REMOTE_HOSTS)) { res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('forbidden host'); }
     const url = String(req.url || '');
     if (url === '/api/health' || url.indexOf('/api/health?') === 0) {
       res.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -11771,7 +11771,8 @@ const server = http.createServer((req, res) => {
   // ONE exemption: a line-trigger webhook POST /api/hooks/trg_… may arrive through a tunnel the Commander set up
   // (cloudflared/ngrok forward the PUBLIC Host). It is fenced by its own per-trigger secret and returns no token.
   const triggerHook = req.method === 'POST' ? TRIGGER_HOOK_RX.exec(String(req.url || '')) : null;
-  if (!triggerHook && !isAllowedHost(req.headers.host)) { noteApiRefusal(req, 'forbidden host'); res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('forbidden host'); }
+  // the Commander's opt-in remote hosts (STARNET_REMOTE_HOSTS, the phone over ZeroTier) pass exactly as at the /api gate
+  if (!triggerHook && !isAllowedHost(req.headers.host, REMOTE_HOSTS)) { noteApiRefusal(req, 'forbidden host'); res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('forbidden host'); }
   // Once an uncaught exception has made this process's in-memory state unprovable, the server becomes a recovery
   // shell. Static GET/HEAD keeps the already-installed UI reloadable; health + authenticated diagnostics explain
   // the fault. Every other API, external-harness, artifact and mutation surface fails closed with 503. This gate
