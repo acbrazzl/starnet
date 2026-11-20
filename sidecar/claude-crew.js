@@ -362,6 +362,16 @@ function makeClaudeCrew(opts) {
     return { ok: true, shortId };
   }
 
+  /* claimLaunched(shortId, name) — a session the station started through a fixed launcher (claude-session-bays.js) rather
+     than spawn(): recorded as launched exactly like a spawn, so the crew rail and claude.stop treat it as the station's. */
+  function claimLaunched(shortId, name) {
+    const id = str(shortId, 16);
+    if (!SHORT_ID_RE.test(id)) return false;
+    const m = loadManaged(); m.launched[id] = { name: str(name, 40), at: now ? now() : null, via: 'session-bay' }; saveManaged(m);
+    cache = null;
+    return true;
+  }
+
   /* stopManaged(key) — the lead's stop: by name or id, and only a managed background session. */
   async function stopManaged(key) {
     if (!enabled) return { ok: false, error: 'claude crew disabled' };
@@ -419,7 +429,7 @@ function makeClaudeCrew(opts) {
     return Object.assign({ to: target.name }, verdict);
   }
 
-  return { list, spawn, stop, stopManaged, adopt, release, remoteUrl, listSkills, send, enabled, defaultMode, allowBypass, modes: modesFor(allowBypass) };
+  return { list, spawn, claimLaunched, stop, stopManaged, adopt, release, remoteUrl, listSkills, send, enabled, defaultMode, allowBypass, modes: modesFor(allowBypass) };
 }
 
 module.exports = { makeClaudeCrew, normalizeSessions, parseRemoteUrl, remoteUrlFromBridge, parseRelay, buildRelayArgs, relayPrompt, buildSpawnArgs, parseBackgroundId, parseSkill, SPAWN_MODES, ID_PREFIX, DEFAULT_SKILL_PROMPT };

@@ -153,6 +153,8 @@ test/claude-cli-persist.test.js
 test/claude-cli-persist-review.test.js
 test/claude-cli-persist-loop.test.js
 test/claude-cli-lifecycle.test.js
+test/claude-skill-bay.test.js
+test/claude-session-bay.test.js
 test/provider-accounts.test.js
 test/claude-cli-login.test.js
 test/claude-cli-signin-engine.test.js
@@ -288,6 +290,7 @@ test/capsummary-room-scope.test.js
 test/boot-security.test.js
 test/sidecar-fixture.test.js
 test/sidecar.security.test.js
+test/remote-host-floor.test.js
 test/agent-color-escape.test.js
 test/tauri.hardening.test.js
 test/desktop-csp-inline-scan.test.js

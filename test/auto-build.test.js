@@ -47,7 +47,19 @@ const broker = (o) => makeConsentBroker(Object.assign({ surface: 'autonomous', a
   A.eq([...hostSet].sort(), [...NAMED].sort(), 'the host set is exactly the named build/workflow/schedule tools');
   A.ok(!hostSet.has('station.make_prop') && !hostSet.has('station.power') && !hostSet.has('station.control'), 'paid and escalating tools are not in it');
   A.ok(/AUTO_BUILD = \/\^\(1\|true\|yes\|on\)\$\/i\.test\(String\(ENV\('AUTO_BUILD'\)/.test(src), 'opt-in: off unless STARNET_AUTO_BUILD is set');
-  A.ok(/AUTO_BUILD && String\(agentId \|\| ''\) === 'agent'/.test(src), 'the lead only');
+  // the predicate itself, run from the host source under each switch (AUTO-BUILD CREW, 2026-11-14: a SEPARATE opt-in)
+  const block = /const AUTO_BUILD = [\s\S]*?\nfunction autoBuildAllows\(agentId, call\) \{[\s\S]*?\n\}/.exec(src);
+  A.ok(!!block, 'the AUTO_BUILD switches and autoBuildAllows are declared together');
+  const allows = env => require('vm').runInNewContext((block ? block[0] : '') + '\n;autoBuildAllows', { ENV: k => env[k], String, Set });
+  const off = allows({}), on = allows({ AUTO_BUILD: '1' }), crew = allows({ AUTO_BUILD: '1', AUTO_BUILD_CREW: '1' }), crewOnly = allows({ AUTO_BUILD_CREW: '1' });
+  A.eq(off('agent', call('station.build')), false, 'off unless STARNET_AUTO_BUILD is set');
+  A.eq(on('agent', call('station.build')), true, 'AUTO_BUILD allows the named build tools for the lead');
+  A.eq(on('engineer', call('station.build')), false, 'the lead only');
+  A.eq([on('agent', call('team.summon')), on('agent', call('claude.skill_agent'))], [false, false], 'AUTO_BUILD alone does NOT cover adding crew or binding a skill (the 11-02 list is not widened)');
+  A.eq([crew('agent', call('team.summon')), crew('agent', call('claude.skill_agent'))], [true, true], 'STARNET_AUTO_BUILD_CREW=1 adds team.summon + claude.skill_agent');
+  A.eq(crew('engineer', call('claude.skill_agent')), false, 'still the lead only');
+  A.eq([crewOnly('agent', call('claude.skill_agent')), crewOnly('agent', call('station.build'))], [false, false], 'the crew switch does nothing without AUTO_BUILD itself');
+  A.eq([crew('agent', call('station.make_prop')), crew('agent', call('station.control')), crew('agent', call('claude.adopt'))], [false, false, false], 'the crew switch covers nothing else (paid prop, control, adopt still ask)');
   A.ok(/autoBuild: \(call\) => autoBuildAllows\(agentId, call\)/.test(src), 'every run\'s broker gets the predicate');
   A.ok(/const routedToOverseer = [^\n]*&& !o\.stationClient\);/.test(src), 'a terminal/editor run is never routed into the Overseer session');
   A.ok(/stationClient: \(body && \(body\.client === 'terminal' \|\| body\.client === 'editor'\)\) \? body\.client : ''/.test(src), '/api/run passes the client through');

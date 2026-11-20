@@ -152,6 +152,296 @@ adds two things so the Overseer session can drive it in plain words:
 station tab open anywhere, `station.map`, `station.plan` and `station.build` fail visibly with a reason instead of
 pretending. Routines (`routine.*`, server-side cron store) do not need a page.
 
+## Workflow lines that run on the Claude login (base building, 2026-11-14)
+
+The lead builds rooms **and working workflow lines** from plain words, and the line's steps run on the Commander's own
+`claude` login. Proof: `SKYNET_CHROME=~/.local/bin/chrome-nosandbox node dev/social-line-proof.mjs` (see below).
+
+**A line's bays run on the STATION DEFAULT.** A bay staffed by an agent with no model pin (the lead, or a recruited
+specialist) follows the hero's OWN roster pin, provider and model together (`channelRunConfigFor` →
+`stationDefaultFor`). So the station default must be `claude-cli` plus a model, or every test job fails at $0 before any
+step: "target agent agent has no roster model" (no model pin) or "connect a OPENROUTER API key for target agent agent"
+(the fixture's `prov: "openrouter"`). The UI paths (model dock, WAKE, resume) set provider and model together. Setting
+only the page's wire (`Harness.setProv/setModel`) or `App.applyConfig({ model })` leaves the provider pin where it was.
+`starnet -p --provider claude-cli --model …` sets **only the lead's own run**, not the bays. The live station's roster is
+`claudecode` (= `claude-cli`) on every agent.
+
+### Crew-skill bays: a step that uses the crew's own skill and memory
+
+A bay's ordinary step is a stateless StarNet agent turn: it knows its brief, nothing else. A **crew-skill agent** instead
+hands each of its steps to one of the Commander's Claude Code skills:
+
+- `claude.skill_agent { agent, skill, dir }` (lead-only) binds a crew agent to a skill. `{ agent, clear: true }` unbinds
+  it, and `{}` lists the bindings and installed skills. The binding is sidecar-owned in
+  `WORKSPACES/claude-skill-agents.json`, because the page-owned roster would drop a field it does not know.
+- **Refused unless** the skill is a plain name installed at `~/.claude/skills/<skill>/SKILL.md` (plus
+  `STARNET_CLAUDE_SKILL_DIRS`) **and** `dir` is an absolute folder Claude Code **already trusts** (it or an ancestor has
+  `hasTrustDialogAccepted: true` in `~/.claude.json`; never `~/.claude`). StarNet never accepts a trust prompt. Both are
+  re-checked at every step: a withdrawn trust or a removed skill makes the step refuse with its reason.
+- Each step of a bound agent is ONE `claude -p` run IN `dir`, with stdin `/<skill>\n\n<the hand-off>`. It uses the user's
+  own settings, so the skill, the project's `CLAUDE.md` and its auto-memory load. StarNet's stage brief rides
+  `--append-system-prompt-file`, so Claude Code keeps its own system prompt.
+- **Read-only:** `--tools Read,Grep,Glob`, `--strict-mcp-config` with no servers (no connector can post), and
+  `--no-session-persistence`. StarNet's tools are never offered. The step cannot post, write files or run commands, so a
+  skill's "append to the posting log" stays a human step.
+- A bound agent's run must resolve to `claude-cli`; otherwise it is refused (`runOnce`, `skillBinding`).
+- **`STARNET_AUTO_BUILD_CREW=1`** is OFF by default and needs `STARNET_AUTO_BUILD=1`. It lets the lead use `team.summon`
+  and `claude.skill_agent` with no approval card. It is a SEPARATE switch, so the Commander's 11-02 AUTO-BUILD list is not
+  widened. Neither tool can spend: a summon is the page's local `summonAgent()`, and a binding only routes later steps
+  onto the Claude login. Without the switch both ask, and a `starnet -p` run (no one to ask) is refused.
+- `team.summon` answers only on a run whose stream reaches a page. A `starnet -p` lead recruits a bay's specialist with
+  `station.plan { staff: { line, steps: [{ step, agent: "new" }] } }` + `station.build`, which is already AUTO-BUILD.
+
+### How Proxima (or any Claude Code session) builds through the lead
+
+1. The station runs with `STARNET_AUTO_BUILD=1` (and `STARNET_AUTO_BUILD_CREW=1` for crew-skill bays). Its station
+   default is `claude-cli` plus a model.
+2. **A build or a line test needs an attached station page.** `station.map/plan/build` are page-owned, and
+   `station.test_line` asks the page for the line too: with no page, it was refused after the bridge's 6 s wait with "no
+   station page answered — open StarNet to run station commands" (measured 2026-11-14). `claude.skill_agent` and
+   `routine.*` need no page. With no browser tab open, keep
+   a headless one attached for the build:
+   `SKYNET_CHROME=~/.local/bin/chrome-nosandbox node dev/station-page.mjs --port <port>` (prints `PAGE READY`, stays
+   until SIGTERM). ⚠ The page is a WRITER (roster + save). On the live station, attach it only while no other station
+   tab is open, and close it after.
+3. Hand the work to the lead: `node ~/code/starnet/bin/starnet.js --port <port> --json -p "<plain words>"`. Never
+   `--yes`. Anything outside AUTO-BUILD is refused, and the receipt's `toolCalls` say which.
+4. Read the result from the station's records, not the lead's account. A line test's job is in `WORKSPACES/line-jobs.json`
+   (status + output), and each step is a `runs.jsonl` row with `streamId` = the job's sample stream, bay (`dockId`),
+   `provider`, `model`, `tokens` and `reason`. A step's own reply is the assistant row with that `sourceRunId` in
+   `transcript-history-v2/`. `node dev/social-line-proof.mjs --report <workspace> <out.md>` writes all of it as one file.
+
+### The proof (`dev/social-line-proof.mjs`)
+
+A throwaway station: a scratch copy of `dev/fixtures/seed-workspace`, an OS-assigned port, Full Access OFF and
+`STARNET_AUTO_BUILD=1`. It attaches a headless page and runs ONE `starnet -p` that builds room SOCIAL STUDIO and line
+SOCIAL POST (intake → PLAN → CAPTION → CLAIMS CHECK → PACKAGE → outbox), then sends a `station.test_line` job. Drafts
+only: no channel, no connector, no SEND TO.
+
+| Arm (`PROOF_ARM`) | Setup | Must show |
+|---|---|---|
+| *(default)* | station default `claude-cli` | job `delivered`; four `runs.jsonl` rows at four distinct bays, all `done`, all `claude-cli` |
+| `fixture` | the fixture's own default (openrouter, no model) | the job FAILS at $0 with "has no roster model" / "connect a OPENROUTER API key" (the 2026-11-13 trial) |
+| `skill` | + `STARNET_AUTO_BUILD_CREW=1`; bay 2 = a new specialist bound to `meshflow-social` in `~/code/meshFlow` | the binding on disk; that agent's row is `claude-cli`/`done`; its OWN reply names the skill's standing CTA "Join the free alpha — link in bio.", a line only the skill knows (the plain line wrote "Grab MeshFlow 0.1.23 on Google Play (link in bio)") |
+| `skill-off` | the same prompt, crew switch off | `claude.skill_agent` denied, nothing bound |
+
+**Results, 2026-11-14, all four arms PASS** (model `claude-sonnet-5-5`, every step $0 on the subscription):
+
+- default: one `starnet -p` (52 s) built the room and line. Job `job-467493b55ad6` was delivered (1,526 chars) with four
+  steps at bays p35–p38, 24–28k tokens each.
+- `fixture`: the job failed at $0 with "target agent agent has no roster model". The lead then tried `station.control`
+  to fix the pin, which was denied.
+- `skill`: the lead built the line, recruited bay 2's specialist (SCRIPTWRITER, id `writer`) with `station.plan` staff
+  "new", and bound it with `claude.skill_agent` (no approval card). Job `job-620ffb6cd28d` was delivered. The `writer`
+  step (bay p36, `claude-cli`, `done`) quoted skill-only rules: the Commander's 2026-10-30 caption format, the hashtag
+  rotation, "never a store link until it exists", and "the standing CTA is 'Join the free alpha, link in bio.'". It
+  replaced that CTA with a Play CTA because the job states no pricing. The PACKAGE bay's posting note carried the
+  posting log's lesson: real ATAK footage from frame 0, title-card openers averaged about 4 s watch.
+- `skill-off`: `claude.skill_agent` was denied, nothing was bound, and the line still delivered with plain bays.
+- Page need, measured on the `skill` arm's kept workspace after a station RESTART: with no page, a `starnet -p` asking for
+  `station.test_line` was refused ("no station page answered") and no job was recorded. With `dev/station-page.mjs`
+  attached, the same request delivered a second job, including the `writer` skill step, so the binding survived the
+  restart.
+
+The lead staffs a bay with a crew agent by its roster name or id, and binding the lead itself is refused. Recruited bay
+specialists follow the station default (here `claude-cli`).
+
+## The live base (2026-11-14): cut-over, operating rules, workflows
+
+The Commander's live station (:8787) has run this branch since **2026-11-14 15:40Z**, with `STARNET_AUTO_BUILD=1`
+and `STARNET_AUTO_BUILD_CREW=1` in `~/.config/starnet/remote.env`. The lead built every area and line below from plain
+words. The scripts are in `~/code/starnet-worktrees/cutover/`.
+
+### Cut-over, restart, rollback
+
+- **Cut-over** (`cutover.sh`; ran 15:40Z):
+  - It requires exactly one holder of the Overseer's conversation (`claude agents --json`), then TERMs the old station
+    and waits for :8787 to be free.
+  - It checks that the Overseer only DETACHED (keep-alive) and still has one holder.
+  - It backs up the workspace, `remote.env` and `station.log` to `~/.local/share/StarNet/backup-cutover-<UTC>/`,
+    verified with `diff -rq`.
+  - It adds the two AUTO lines and starts this tree with the same env.
+  - It passes only on `online <job> (reused)` with one holder.
+  - Backup of the 15:40 cut-over: `~/.local/share/StarNet/backup-cutover-20261114T154001Z`.
+- **Restart on the same code** (`restart.sh`): the same holder checks. It reads only the log lines written by THIS start
+  (a byte offset); a whole-log grep would match an earlier `(reused)` line and pass falsely. Then it runs `page-up.sh`.
+- **Rollback** (`rollback.sh [backup dir]`):
+  - It TERMs :8787, removes the two AUTO lines, and starts `~/code/starnet` at `ac37421a4` with the original env.
+  - With a backup dir it also restores the workspace, moving the current one aside, NOT deleting it. That discards
+    everything written since, so it is only for damaged data.
+- **The Overseer survives every restart** (`STARNET_OVERSEER_SESSION_KEEPALIVE=1`). `overseer-session.js` `start()`
+  resumes the saved conversation ONLY on a readable `claude agents` list that shows nobody holding it. An unreadable
+  list, or the conversation open in a terminal, is refused. The conversation running under another background job is
+  re-attached to, never resumed. Before this fix, one failed `claude agents` call meant a second Proxima.
+- **Restart policy** (Proxima, 11-14): a provider or step fix is proven END TO END on a throwaway station with BOTH
+  models before the live station is touched: a full line job delivered on Opus and on Sonnet, with the oracle line
+  quoted. Live restarts are batched; at most one more a day unless something is broken for the Commander.
+
+### One page, always
+
+- Builds and `station.test_line` go to EVERY attached station page, and the first answer wins. Two pages build twice.
+- The live builds use ONE headless page (`page-up.sh`): a FRESH Chrome profile every launch, because a reused profile
+  restored the previous tab and gave two pages.
+- `pageguard.sh` runs before every build. It counts a PAGE as a client holding the SSE stream: a socket where the
+  client is silent and only the station writes, keep-alives about every 25 s. Plain polling is not a page, e.g. a tab
+  from before a restart that the station refuses with "forbidden token".
+- A fresh page counts only after the first keep-alive (~25 s), so `page-up.sh` waits for the guard.
+- Run the guard UNPIPED: `pageguard.sh | tail` takes `tail`'s exit status.
+- **Watch a build while it runs.** `build-run.sh <prompt> <tag>` starts a `starnet -p` only with exactly one page, then
+  re-checks every 2 s and cancels the run with SIGINT (the CLI POSTs `/api/cancel`) when a second page appears.
+  - Proven on a throwaway: a second page attached at 17:41:57 and the run stopped at 17:42:15.
+  - Window: a fresh page counts only after ~15-25 s of SSE silence.
+  - node clients are ignored: the CLI's own run stream has a page's shape and tripped the first proof falsely.
+- **The lead can read files too.** It used `fs_list`/`fs_read` on a bound snapshot. A skill bay is limited to its
+  folder; the lead is not.
+- **Stop the page when no build or line test is running.** The station UI renders continuously: the headless page's
+  renderer held about 85% CPU and 1.5 GB on the shared box. `kill -TERM $(cat page.pid)`, then `page-up.sh` when
+  needed.
+- A page reload clears the lead's one-step UNDO record. A build from before the reload is then removed with an ordinary
+  refit delete; the undo is refused with "nothing of the lead's to undo".
+
+### Models and cost
+
+- Judgment steps run on Opus, ingest/check/package steps on Sonnet (Proxima's rule).
+- A crew agent's model is its roster pin: `station.control agent.model`.
+- The LEAD's own build runs use `--model claude-sonnet-5-5`. An Opus lead twice produced a runaway turn: 119k in,
+  128k OUT, no tool call, then Opus's safeguards flagged it. That is what looked like a 600 s "hang". Open item.
+- A recruit only comes with a NEW line (`station.plan` `agent: "new"`). Staffing an empty step of a standing line by
+  crew name works since `0720512df`; before that it was refused as "changes how an existing line routes".
+
+### Crew-skill steps: one message, no arguments
+
+- Claude Code substitutes `$1`/`$2`/`$ARGUMENTS` in a skill's body with the slash command's arguments. So
+  `/<skill> <hand-off>` turned meshflow-social's "under $1,000/yr" into "under HANDOFF,000/yr" in every step.
+- A second user message for the hand-off is not reliable either: Opus merged the two queued messages into one turn.
+- Since `b9c95a737` a step is ONE message, `/<skill>` alone; the hand-off rides `--append-system-prompt-file`.
+- **A step-level bug becomes memory, so sweep the bay notebooks after fixing one.** StarNet's learning loop saved the corrupted output as FACTS in two bay agents'
+  notebooks. After fixing one, sweep the bay agents' `<id>.notebook.json` and remove the false notes with
+  `station.control memory.forget`.
+- A skill step reads only inside its folder; a `Read` outside it is refused in `-p`. So a bay's folder must hold what
+  it reads.
+- `~/code` is trusted by the Commander, so any folder under it can be bound. Bind the narrowest one.
+
+### The workflows on the live base
+
+| Area · line | Steps (agent · model) | Skill · folder | Cost per job (11-14) | Proof |
+|---|---|---|---|---|
+| SOCIAL · SOCIAL POST | DRAFT (SOCIAL-DRAFT · Opus) → CHECK + PACKAGE (SOCIAL · Sonnet) | meshflow-social · `~/code/meshFlow` | 366k tokens, 74 s | `job-2602b2a42e18` delivered |
+| BRIEFING · MORNING BRIEF | READ (BRIEFING · Sonnet) → BRIEF (BRIEFING-WRITER · Opus) → CHECK (BRIEFING · Sonnet) | meshflow-overseer · `~/code/meshFlow-office` (the ledger only) | 322k, 119 s since READ was trimmed (newest brief + Waiting + entries since; was 599k with the whole ledger) | `job-f3bb88f815fe` delivered |
+| RELEASE · RELEASE READINESS | COLLECT (RELEASE-CHECK · Sonnet) → VERDICT (RELEASE-JUDGE · Opus) → CHECK + PACKAGE (RELEASE-CHECK · Sonnet) | meshflow-dev · `~/code/meshFlow-dev-snapshot` | 1.46M, 146 s | `job-20fcfb80ea46` delivered |
+| UPSTREAM · UPSTREAM PRE-FLIGHT | RULES (PREFLIGHT-CHECK · Sonnet) → JUDGE (PREFLIGHT-JUDGE · Opus) → SCRUB + PACKAGE (PREFLIGHT-CHECK · Sonnet) | solidcraft-dev · `~/code/solidcraft-upstream-rules-snapshot` (upstream's rule files only, `git archive` of upstream/main) | 636k, 172 s | `job-18873e4d553a` delivered (#16712: FIX FIRST, cited) |
+| SECURITY · SECURITY SWEEP (11-15) | SWEEP (SWEEPER · session slot `security` = `reviews/run-sweep.sh security`, no model) → DIGEST (SWEEP-DIGEST · Opus) | DIGEST: meshflow-security · `~/code/meshFlow-office` | the sweep session's own cost + the digest | throwaway proofs (manual + schedule, Sonnet + Opus); first live run 2026-11-16 09:13 ET (one-shot routine), REPLACING that Monday's cron line |
+| DECISIONS · DECISIONS DIGEST (11-15) | GATHER + RELEVANCE (DECISIONS-CHECK · Sonnet) → CARDS (DECISIONS-CARDS · Opus) | meshflow-overseer · `~/code/meshFlow-office` (+ `crew-needs.json`) | 387k, ~2 min | `job-b620ab80c678` delivered 12 cards; daily 08:45 ET |
+| POST LOG · POST LOG + NEXT POST (11-15) | NUMBERS (POSTLOG · Sonnet) → NEXT POST (NEXT-POST · Opus) → CREATE (NEXT-POST · Opus) | meshflow-social · `~/code/meshFlow-office` (the posting log is in the skill; plans in `social*`) | ~270k, ~90 s | two jobs, the Commander's ask: (a) Insights numbers → the HISTORY table of every post (rebuilt from the log each run; the line cannot write it) + drafted log cell + rank at the same age; (b) 'Make a post about <topic>' → next-post pick + POST DRAFT. `job-14cfd23999c8` (real ep 1 3h numbers), `job-a903e4d5e64f` (a post about the sweep line: history of 15 posts, new-asset spec, caption) |
+| CAD · RECONSTRUCT (11-15) | RECONSTRUCT (RECONSTRUCTOR · session slot `cad` = `cutover/cad-reconstruct.sh <DESIGN_TOKEN>`, no model) → STATUS (CAD-STATUS · Opus) | STATUS: solidcraft-dev · `~/code/solidcraft-upstream-rules-snapshot` (the station's code hands it the status text; it never reads `~/cad`) | the session's own cost | throwaway proof PASS (run, decimal withheld, bad name, unqueued name, live CAD crew); live slot without busyPrefixes (Proxima: idle crews don't load the box); NO run until Proxima's word |
+
+- **Release readiness reads a SNAPSHOT.** The main `~/code/meshFlow` checkout is stale (`release/0.1.14`) and a skill
+  step cannot run git. So it reads `~/code/meshFlow-dev-snapshot`, a `git archive` of origin/dev. Its `SNAPSHOT.txt`
+  names the commit and the one-line refresh. Whoever asks for a check refreshes it first, and every verdict names the
+  commit it judged.
+- **Every line only drafts or reads, and none has a SEND TO or a channel.** SECURITY SWEEP's first bay is the exception: it launches the real sweep session, the same as cron does. Schedules: SECURITY SWEEP once on 11-16 and DECISIONS DIGEST daily, both on Proxima's go. A skill step has `Read`/`Grep`/`Glob`
+  only, no MCP and no session file.
+- **On the live station PROXIMA has `approvalMode=full`** (the Commander's setting), so the lead's `station.control`
+  calls do not ask. The limits on money and escalations rest on the prompts and the confirm-every-time/hardline tiers.
+  No StarNet credits account is linked, so `make_prop` cannot spend.
+- **DECISIONS DIGEST feeds the decisions page; it never writes to it.** It runs GATHER (newest brief's waiting list +
+  the standing section + `crew-needs.json`), then RELEVANCE (the Commander's rule: an item done/decided/overtaken in a
+  later ledger line is listed under "OVERTAKEN - close these" with its file:line), then CARDS (the page's schema plus
+  `key`, a stable slug for de-duplication across days). Proxima reviews the cards, adds them to the page and closes the
+  overtaken ones. `crew-needs.json` is written every 10 min by a user cron job
+  (`cutover/crew-needs-snapshot.sh`, needs lines only, no transcripts), because a skill step cannot read `~/.claude`.
+  The output is lines of JSON, one card per line starting with `{`, kept under 10k: a line job's recorded output is cut
+  at 12,000 characters, and one run's outbox gained a stray ``` line that the step's own text did not have.
+- **Upstream pre-flight takes its draft as a FILE.** A station job carries at most 2,000 characters, and the lead
+  condensed a 10 KB PR body to fit, so the draft goes in `drafts/` inside the bound snapshot and the job says
+  "Pre-flight drafts/<file>".
+- **Upstream pre-flight runs ONE job per run.** A job built from untrusted text taints the lead's run, and the next
+  `station.test_line` in that run was DENIED by the taint lock, as designed.
+- **Upstream pre-flight is proven.** On a throwaway it caught a planted missing `Changes a default:` line, an edited
+  test expectation and an undeclared flag, each with file:line.
+- **Not built yet:** CAD part readiness (solidcraft-dev; waits until the Proto Labs model passes, notes/checklist only,
+  no part geometry or dimensions in any notebook or output) and the on-demand
+  export-compliance, security and quality lines. No schedules are on; any periodic line (e.g. the morning brief) waits
+  for Proxima's go.
+
+### Crew-session bays: a line step that IS the work (2026-11-15)
+
+A crew-skill bay runs one read-only `claude -p` turn, so it can read and draft but never do the work. The Commander asked
+(2026-11-15): "wouldn't we want the sweep themselves to be a workflow?" A **session bay** makes the line LAUNCH that work.
+Its step starts a real Claude Code background session, waits for it, and hands the session's own final report to the next
+bay. Code: `sidecar/claude-session-bays.js`; tool `claude.session_agent`.
+
+- **Only named slots.** The Commander configures them in the env, and the lead can bind an agent only to a slot name, never
+  to a command:
+  `STARNET_SESSION_BAY_SLOTS='{"security":{"run":["/home/brazz/code/meshFlow-office/reviews/run-sweep.sh","security"],"session":"security-sweep-","capMin":180}}'`.
+  The launcher is the SAME script cron runs, so a line-launched sweep has the same name, brief, worktree/branch scheme and
+  permission mode as a cron one (Proxima's condition). The bay's job text is **never** passed to the session.
+- **Off unless `STARNET_SESSION_BAYS=1`.** Unsetting it is the kill switch: bound bays then refuse.
+- **Guardrails, re-checked on every run.** Each one is a said refusal that becomes the step's text, never a fallback to a
+  model:
+  - **Taint lock.** A run handed upstream text never launches, so the bay must be FIRST on its line.
+  - **One launch a day per slot.** The launch is recorded before the launcher runs.
+  - **One at a time.** Refused while a session with the slot's prefix is still working, e.g. cron's.
+  - **Fail closed.** An unreadable session list refuses.
+  - **Wall-clock cap.** At `capMin` the station stops the session it launched.
+  - **Never stopped when it waits on the Commander.** That session is left alone and the wait is reported.
+  - **A cancelled run leaves the session to finish.**
+- **The launched session is the station's.** It is recorded in `claude-crew.managed.json` (`via: session-bay`), so it shows
+  on the crew rail and `claude.stop` can stop it.
+- **Binding always asks.** `claude.session_agent` is not on either AUTO-BUILD list.
+- **The session finishes as it would under cron.** Its draft PRs and its report to Proxima are unchanged. The line adds the
+  digest step and the outbox.
+- **Proof:** `dev/session-line-proof.mjs` runs on a throwaway station with a stand-in launcher
+  (`cutover/proof-sweep.sh`): run-sweep.sh's shape, a real `claude --bg` session, a tiny read-only brief. It shows one
+  launch delivered, then three refusals: the daily cap, the taint lock and the kill switch. It runs once per digest model.
+- **The live switch is Proxima's word after the proof.** The crontab sweeps stay until the line has run one clean real week.
+
+### The CAD reconstruct slot (2026-11-15)
+
+- **One checked parameter.** `arg: "design"` lets the session bay pass ONE token from the job ("Reconstruct <DESIGN>",
+  `/^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/`), refused loudly otherwise. The launcher maps `_` to a space and refuses any name
+  that is not EXACTLY a design in `~/cad/studio/QUEUE.md` (backticks stripped, a prefix never matches). The launcher only
+  READS that file in `~/cad`.
+- **The status file, never the transcript.** `report: "statusFile"` forwards only `~/cad-status/<TOKEN>.md` (five fixed
+  headings, counts only, written by the solidcraft-fusion-reconstruct skill). The CODE withholds a file holding any
+  decimal number or "mm" (`GEOMETRY_RE`), so part geometry cannot reach the line even if the skill slips.
+- **CAD priority.** The slot refuses while a `solidcraft-cli` process runs (`busyProcess`), or below 12 GB available
+  (`minAvailGB`); both fail closed when unreadable. `busyPrefixes` (refuse while any listed session has the prefix) exists
+  but is OFF for this slot: idle crew sessions don't load the box (Proxima's option a). Heavy work runs under
+  `systemd-run` with MemoryMax=10G. Cap: 6 h. The daily cap is per design.
+- **The brief the launcher hands the session.** If the design is BLOCKED, re-check the blocking step on the newest
+  upstream build first. Write the status file. No pushes, PRs, issues or comments. Pictures go to Proxima as paths.
+  An unbuildable blend is omitted and listed, and a set counts as rounded only by an oracle.
+
+### The Commander's decisions page (where a line's "needs you" goes)
+
+The Commander decides on his phone in the Claude app, with no VPN. He uses a private claude.ai artifact,
+"Commander's Decisions", whose address is in the `commander-decisions-page` memory note.
+
+- **Each item is a card** in its `items` collection: `title` (the recommendation), `why`, `severity`, `sevRank`,
+  `waitingSince`, `cite`, `source`, `area` and `order`. Only admin and above write them.
+- **He answers** with Approve / Reject / Discuss (+ note) in `decisions`. Only the owner writes there; a contributor
+  write was verified refused.
+- **Proxima owns the read-back and the routing.** Once it acts it sets `items/<id>.status = "done"` and an `outcome`,
+  and the page shows the card under Done.
+- **A line that ends in "needs you" ADDS cards; it never routes a decision.**
+- **The page's source is `~/code/meshFlow-office/pages/decisions-page.html`** (Proxima, version 4, 2026-11-16). Edit
+  that file, never an older copy (the first versions were built from a scratch copy in a job folder).
+- **The `/_blob/` link trap.** An uploaded picture's URL (`/_blob/<id>`) resolves only inside the artifact. Opened in a
+  new tab it is a bare URL that 404s, so a picture the Commander taps to enlarge showed nothing. Version 4 opens pictures
+  in an in-page full-screen viewer (fit/full-size, pan/pinch, Esc/Close) and shows them at full card width. Never link a
+  picture out of the page.
+- **Card rule: no part dimensions or geometry on the page, ever.** The store is on claude.ai, off the box. Name the
+  feature by location and cite the on-box file that holds the numbers.
+- **A decision that stems from a geometry choice carries the images needed to decide it** (the Commander, 2026-11-15).
+  The page shows `images: [{url, caption}]` from its asset store, plus optional `context` and `options`. Images are
+  renders or looks with no dimension annotations.
+- **Re-check relevance before acting on a decision** (the Commander, 2026-11-15: "when we work a decision, a check
+  should be made to see if they are still relevant"). Re-verify each card against current code, infra and PR state
+  first. If it has been overtaken, close it with `status: "done"` and `outcome: "No longer relevant: <evidence>"`. The
+  first check, on 2026-11-15, found four of five networking cards already decided or fixed.
+- **He discusses decisions with Proxima**, not with the line builder.
+
 ## Remote access to the station (phone)
 
 The sidecar binds loopback only, and the API pins `Host` to loopback as its DNS-rebinding defense.
@@ -183,4 +473,7 @@ Chrome adds a shortcut rather than an installed app).
 - `sidecar/apiauth.js` — `parseRemoteHosts`, `isAllowedHost(host, remoteHosts)`, `isAllowedApiOrigin(origin, port, remoteHosts)`
 - `frontend/app/claude-crew.js` — floor bodies (`cc-<sessionId>`), the list, session and new-session cards
 - `dev/overlay-forward.js`, `dev/remote-station-zerotier.sh`, `dev/remote-station.sh` — phone access
-- `test/claude-crew.test.js`, `test/claude-cli-provider.test.js`, `test/apiauth.test.js` — unit coverage
+- `sidecar/claude-skill-agents.js`, `sidecar/tools/builtin/claude-skill-agent.js` — crew-skill bindings + `claude.skill_agent`
+- `dev/social-line-proof.mjs` (base-building proof, all arms), `dev/station-page.mjs` (a headless station page for builds)
+- `test/claude-crew.test.js`, `test/claude-cli-provider.test.js`, `test/apiauth.test.js`, `test/claude-skill-bay.test.js`,
+  `test/auto-build.test.js` — unit coverage

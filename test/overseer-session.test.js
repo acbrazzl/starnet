@@ -12,6 +12,9 @@ const S = require('../sidecar/overseer-session.js');
   A.eq(S.cwdSlug('/home/u/code/meshFlow'), '-home-u-code-meshFlow', 'transcript dir slug matches Claude Code\'s');
   A.eq([S.windowFor('opus[1m]'), S.windowFor('sonnet'), S.windowFor('--model opus')], [1000000, 200000, 200000], 'context window from the model');
   A.eq([S.sessionModel('opus'), S.sessionModel('sonnet'), S.sessionModel('opus[1m]')], ['opus[1m]', 'sonnet', 'opus[1m]'], 'the Overseer launches Opus with the 1M window, like the Commander\'s sessions');
+  A.eq([S.windowFor('claude-fable-5-2[1m]'), S.windowFor('claude-fable-5-2'), S.sessionModel('claude-fable-5-2[1m]')], [1000000, 1000000, 'claude-fable-5-2[1m]'], 'a pinned Fable Overseer keeps the 1M window and its id passes through verbatim');
+  { const src = require('fs').readFileSync(require('path').join(__dirname, '..', 'sidecar', 'index.js'), 'utf8');
+    A.ok(/model: \(\) => String\(ENV\('OVERSEER_MODEL'\) \|\| ''\)\.trim\(\) \|\| overseerDocs\(\)\.model/.test(src), 'STARNET_OVERSEER_MODEL overrides the stored alias'); }
   A.eq(S.isRealUserTurn({ type: 'user', message: { content: 'hello' } }), true, 'typed text is a real user turn');
   A.eq(S.isRealUserTurn({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't' }] } }), false, 'a tool result is not');
   A.eq(S.isRealUserTurn({ type: 'user', message: { content: '<command-name>/compact</command-name>' } }), false, 'a slash-command echo is not');
@@ -167,5 +170,42 @@ const S = require('../sidecar/overseer-session.js');
   A.eq((await S.makeOverseerSession({ enabled: false }).start()).ok, false, 'disabled: never launches');
 
   fs.rmSync(root, { recursive: true, force: true });
+  // ---- NEVER A SECOND COPY (2026-11-14, before moving the live station): start() launches `claude --bg --resume <saved
+  //      conversation>` only when it is SURE no process holds that conversation. Each case gets its own fake CLI.
+  {
+    const mkGuard = (agentsReply) => {
+      const gws = fs.mkdtempSync(path.join(os.tmpdir(), 'ovs-guard-'));
+      fs.writeFileSync(path.join(gws, 'overseer-session.json'), JSON.stringify({ shortId: 'ec249cf9', sessionId: sid }));
+      const gcalls = [];
+      const gexec = (bin, args, opts, cb) => { gcalls.push(args); if (args[0] === 'agents') return agentsReply(cb); if (args[0] === '--bg') return cb(null, 'backgrounded · 99999999\n', ''); cb(null, '', ''); };
+      return { ov: S.makeOverseerSession({ enabled: true, execFile: gexec, spawnPty, fs, path, now: () => t, stateDir: gws, claudeHome: home, cwd, name: () => 'PROXIMA', model: () => 'opus', permissionMode: 'bypassPermissions', appendPrompt: () => '' }), gcalls, gws };
+    };
+    const launched = c => c.some(a => a[0] === '--bg');
+    // 1. the session list cannot be read (error / timeout / garbage): refuse, launch nothing
+    for (const [label, reply] of [['errors', cb => cb(new Error('ETIMEDOUT'), '', '')], ['returns garbage', cb => cb(null, 'not json', '')]]) {
+      const g = mkGuard(reply);
+      const r = await g.ov.start();
+      A.eq([r.ok, launched(g.gcalls)], [false, false], 'claude agents ' + label + ': no launch — a resume could start a second copy');
+      A.ok(/second copy|could not/.test(r.error || ''), 'and it says why (' + label + ')');
+    }
+    // 2. the saved conversation is open in a TERMINAL (listed with no job id): refuse — the double-resume trap
+    { const g = mkGuard(cb => cb(null, JSON.stringify([{ sessionId: sid, kind: 'interactive' }]), ''));
+      const r = await g.ov.start();
+      A.eq([r.ok, launched(g.gcalls)], [false, false], 'the conversation is open in a terminal: no second copy'); }
+    // 3. the saved conversation runs under ANOTHER background job: re-attach to that job, never resume
+    { const g = mkGuard(cb => cb(null, JSON.stringify([{ id: 'feedf00d', sessionId: sid }]), ''));
+      const r = await g.ov.start();
+      A.eq([r.ok, r.reused, r.id, launched(g.gcalls)], [true, true, 'feedf00d', false], 'the conversation runs under another job: re-attached to it');
+      A.eq(JSON.parse(fs.readFileSync(path.join(g.gws, 'overseer-session.json'), 'utf8')).shortId, 'feedf00d', 'and that job id is saved'); }
+    // 4. the saved job is listed: re-attach (the keep-alive restart)
+    { const g = mkGuard(cb => cb(null, JSON.stringify([{ id: 'ec249cf9', sessionId: sid }]), ''));
+      const r = await g.ov.start();
+      A.eq([r.ok, r.reused, r.id, launched(g.gcalls)], [true, true, 'ec249cf9', false], 'keep-alive restart: the same job, no launch'); }
+    // 5. readable list, conversation nowhere: the one case that resumes
+    { const g = mkGuard(cb => cb(null, '[]', ''));
+      const r = await g.ov.start();
+      A.eq([r.ok, launched(g.gcalls)], [true, true], 'nothing holds the conversation: resume it'); }
+  }
+
   A.report('overseer-session.test');
 })().catch(e => { console.error(e); process.exit(1); });

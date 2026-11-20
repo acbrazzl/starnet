@@ -1075,9 +1075,11 @@
     const was = new Set([...before.errs].map(keyOf));
     for (const e of after.errs) if (!was.has(keyOf(e))) return refuse('that would add a routing problem (' + e.split(':')[0] + ')');
     const inMoved = t => moved && t && moved.rects.some(r => t.x >= r.x1 && t.x <= r.x2 && t.y >= r.y1 && t.y <= r.y2);
+    const own = new Set((spec && Array.isArray(spec.ownLine)) ? spec.ownLine : []);   // a restaffed line's own docks (editStaff)
     for (const dock in before.chains) {
       const t0 = (before.chains[dock] || {}).tile;
       if (inMoved(t0)) continue;   // a moved room's own lines move with it, as a whole
+      if (own.has(dock)) continue;   // the line being restaffed: its own route is what the edit changes
       if (!(dock in after.chains)) { if (inGoneTile(t0)) continue; return refuse('that would change how an existing line routes'); }
       if (JSON.stringify(before.chains[dock]) !== JSON.stringify(after.chains[dock])) return refuse('that would change how an existing line routes (a line elsewhere runs into what changes)');
     }
@@ -1455,7 +1457,10 @@
     const pr = env.WorldModel.create(clone(live.serialize()));
     for (const a of assign) pr.assignPropAgent(a.id, a.agentId);
     const crewIds = (env.crew || []).map(a => a && a.id).filter(Boolean), rd = readLine(pr, ln.comp.props, env, crewIds);
-    return { ok: true, spec: { kind: 'edit', assign, briefs }, mark: ln.room ? ln.room.id : null, where: 'the crew of the line ' + ln.label,
+    // ownLine: this line's pieces. Staffing an EMPTY step extends this line's own chain; editChecks holds every OTHER line to
+    // routing exactly as before (fork 2026-11-14: crew-name staffing of a line with empty steps was refused as "changes how an
+    // existing line routes", which left the route the "new" refusal names — staff by crew names — unusable)
+    return { ok: true, spec: { kind: 'edit', assign, briefs, ownLine: ln.comp.props.slice() }, mark: ln.room ? ln.room.id : null, where: 'the crew of the line ' + ln.label,
       steps: out.map(r => ({ step: r.step, role: r.role, agent: r.agent, instructions: r.instructions })),
       summary: 'Staff the line ' + ln.label + ': ' + out.map(r => 'step ' + r.step + ' (' + r.role + ')' + (r.agent ? ' → ' + r.agent : '') + (r.instructions ? (r.agent ? ', with' : ' gets') + ' new instructions' : '')).join('; ') + '. '
         + (rd.ready ? 'It will be ready to run.' : 'Still to do after: ' + rd.blocking.join('; ') + '.') + ' Nothing on the floor moves; one UNDO in Build mode puts the crew back.' };

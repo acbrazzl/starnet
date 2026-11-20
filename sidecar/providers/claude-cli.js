@@ -795,6 +795,40 @@
     }
 
     const effortOf = req => { const e = String(req.reasoningEffort || '').trim().toLowerCase(); return EFFORTS.indexOf(e) >= 0 ? e : ''; };
+    /* CREW-SKILL STEP (fork, 2026-11-14; sidecar/claude-skill-agents.js): a request carrying claudeSkill + claudeDir is a
+       line step handed to one of the Commander's own Claude Code skills. It runs as ONE `claude -p` IN that directory with
+       the user's own settings (so the skill, the project's CLAUDE.md and its auto-memory load) and slash commands on (the
+       prompt opens with /<skill>), but READ-ONLY: only Read/Grep/Glob exist, no MCP server (no connector can post), no
+       session file. StarNet's stage brief is APPENDED to Claude Code's own system prompt, never replacing it (that prompt
+       is what carries memory and the skill list). StarNet's tools are never offered: the step answers in text. */
+    function skillArgs(cmd, req, appendFile) {
+      const args = cmd.pre.concat(['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--input-format', 'stream-json',
+        '--tools', 'Read,Grep,Glob', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--no-session-persistence']);
+      if (req.model) args.push('--model', String(req.model));
+      const effort = effortOf(req);
+      if (effort) args.push('--effort', effort);
+      if (appendFile) args.push('--append-system-prompt-file', appendFile);
+      return args;
+    }
+    const textOf = c => typeof c === 'string' ? c : Array.isArray(c) ? c.map(b => (b && typeof b.text === 'string') ? b.text : '').filter(Boolean).join('\n') : '';
+    /* the step's prompt: ONE stream-json user message, `/<skill>` ALONE, and the hand-off in the APPENDED system prompt.
+       - never "/<skill> <hand-off>": Claude Code substitutes $1/$2/$ARGUMENTS in a skill's body with the command's arguments,
+         so the posting log's "under $1,000/yr" read "under HANDOFF,000/yr" in every step (live 11-14);
+       - never a second user message for the hand-off: whether the CLI runs two queued messages as two turns or merges them
+         into one is not fixed (Sonnet: two results; Opus: one), so a reader that skips "the load turn" dropped Opus's answer.
+       One message is one turn and one result on every model (measured 11-14, Sonnet and Opus). */
+    function skillPrompt(req) {
+      const msgs = (Array.isArray(req.messages) ? req.messages : []).filter(m => m && m.role !== 'system');
+      const body = msgs.length === 1 ? textOf(msgs[0].content).trim()
+        : msgs.map(m => '<' + (m.role === 'assistant' ? 'assistant' : 'user') + '>\n' + textOf(m.content).trim() + '\n</' + (m.role === 'assistant' ? 'assistant' : 'user') + '>').join('\n\n');
+      const stage = (Array.isArray(req.messages) ? req.messages : []).filter(m => m && m.role === 'system').map(m => textOf(m.content).trim()).filter(Boolean).join('\n\n');
+      const skill = String(req.claudeSkill).replace(/^\//, '');
+      return {
+        system: (stage ? stage + '\n\n' : '') + 'THE JOB HANDED TO THIS STEP — do it now with the /' + skill + ' skill that was just invoked; your reply is this step\'s answer:\n\n' + body,
+        input: JSON.stringify({ type: 'user', message: { role: 'user', content: '/' + skill } }) + '\n'
+      };
+    }
+
     function cliArgs(cmd, req, sysFile) {
       // stdin is always stream-json user messages: one block per transcript entry keeps the prompt cache hitting
       const args = cmd.pre.concat(['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--input-format', 'stream-json'], NO_TOOLS_ARGS);
@@ -949,7 +983,13 @@
       if (!cmd) throw notInstalled();
       // The persistent child serves the agent loop (a turn that carries tools). A side call (summary, vision, wire test)
       // or a second request while the child is mid-turn runs its own one-shot child and never touches it.
-      const persistent = persistOn && Array.isArray(req.tools) && req.tools.length > 0 && !(session && session.busy);
+      if (req.claudeSkill) {
+        // a skill step runs only in an absolute directory the caller checked (claude-skill-agents: installed + trusted);
+        // never somewhere else, never the tmp dir a plain turn uses
+        if (!req.claudeDir || !path.isAbsolute(String(req.claudeDir))) throw new Error('a crew-skill step needs the absolute project directory it runs in');
+        req = Object.assign({}, req, { tools: [] });   // StarNet's tools are never offered to a skill step
+      }
+      const persistent = !req.claudeSkill && persistOn && Array.isArray(req.tools) && req.tools.length > 0 && !(session && session.busy);
       const box = {};   // the turn's line reader (makeTurn), once the turn has one: what its init line said about billing
       const turn = persistent ? persistentStream(req, cmd, box) : oneShotStream(req, cmd, box);
       const logUsage = envOf('STARNET_CLAUDE_CLI_PERSIST_LOG') === '1';
@@ -973,11 +1013,12 @@
     const ONE_SHOT_EXIT_GRACE_MS = Number(opts.oneShotExitGraceMs) > 0 ? Number(opts.oneShotExitGraceMs) : 3000;   // after its result line a child normally exits by itself in ~2 s
     async function* oneShotStream(req, cmd, box) {
       const signal = req.signal;
-      const prompt = buildPrompt(req.messages, req.tools, req.cacheSystemPrefix);
+      const skillStep = !!req.claudeSkill;
+      const prompt = skillStep ? skillPrompt(req) : buildPrompt(req.messages, req.tools, req.cacheSystemPrefix);
       const turn = ++seq;
       const sysFile = path.join(os.tmpdir(), 'starnet-claude-cli-' + process.pid + '-' + turn + '-' + require('crypto').randomBytes(6).toString('hex') + '.txt');
-      const args = cliArgs(cmd, req, '');
-      if (prompt.system) { fs.writeFileSync(sysFile, prompt.system, { encoding: 'utf8', mode: 0o600 }); args.push('--system-prompt-file', sysFile); }
+      const args = skillStep ? skillArgs(cmd, req, '') : cliArgs(cmd, req, '');
+      if (prompt.system) { fs.writeFileSync(sysFile, prompt.system, { encoding: 'utf8', mode: 0o600 }); args.push(skillStep ? '--append-system-prompt-file' : '--system-prompt-file', sysFile); }
 
       // Child output is bridged into this generator through a small queue so events are yielded as they arrive.
       const queue = [];
@@ -993,7 +1034,7 @@
       };
       const onAbort = () => { killTree(child); push(null); };
       try {
-        child = spawn(cmd.file, args, { env: childEnv(), cwd: os.tmpdir(), windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+        child = spawn(cmd.file, args, { env: childEnv(), cwd: skillStep ? String(req.claudeDir) : os.tmpdir(), windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
       } catch (e) {
         removeFile(sysFile);
         throw notInstalled();

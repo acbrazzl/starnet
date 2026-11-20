@@ -734,7 +734,7 @@ if (!workspaceOwnerClaim.ok) {
   console.error('[process-fault] CRASH LOOP — ' + crashLedger.describe() + '; holding a degraded listener on :' + PORT + ' instead of exiting 73 again');
   const holding = http.createServer((req, res) => {
     // same rebinding floor as the main server: the hold reason names the workspace path + holder PID
-    if (!isAllowedHost(req.headers.host)) { res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('forbidden host'); }
+    if (!isAllowedHost(req.headers.host, REMOTE_HOSTS)) { res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('forbidden host'); }
     const url = String(req.url || '');
     if (url === '/api/health' || url.indexOf('/api/health?') === 0) {
       res.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -5699,6 +5699,40 @@ const claudeCrew = require('./claude-crew.js').makeClaudeCrew({
   skillDirs: [path.join(require('node:os').homedir(), '.claude', 'skills')]
     .concat(String(ENV('CLAUDE_SKILL_DIRS') || '').split(path.delimiter).filter(Boolean)),
 });
+/* CREW-SKILL BAYS (fork, 2026-11-14; sidecar/claude-skill-agents.js): agents bound to one of the Commander's Claude Code
+   skills + a directory Claude Code already trusts. A bound agent's steps run as ONE read-only `claude -p "/<skill> …"`
+   there (runOnce, the claudeSkill request fields). Sidecar-owned: the page-owned roster would drop an unknown field. */
+const claudeSkillAgents = require('./claude-skill-agents.js').makeClaudeSkillAgents({
+  fs, path, home: require('node:os').homedir(),
+  claudeJson: path.join(require('node:os').homedir(), '.claude.json'),
+  skillDirs: [path.join(String(ENV('CLAUDE_HOME') || path.join(require('node:os').homedir(), '.claude')), 'skills')]
+    .concat(String(ENV('CLAUDE_SKILL_DIRS') || '').split(path.delimiter).filter(Boolean)),
+  load: () => { try { return JSON.parse(fs.readFileSync(path.join(WORKSPACES, 'claude-skill-agents.json'), 'utf8')); } catch (_) { return null; } },
+  save: (obj) => { const f = path.join(WORKSPACES, 'claude-skill-agents.json'); fs.writeFileSync(f + '.tmp', JSON.stringify(obj, null, 2)); fs.renameSync(f + '.tmp', f); }
+});
+/* CREW-SESSION BAYS (fork, 2026-11-15; sidecar/claude-session-bays.js): a line step that LAUNCHES a real crew session through a
+   launcher the Commander configured (STARNET_SESSION_BAY_SLOTS, e.g. the cron sweep script), waits for it and hands its final
+   report on. OFF unless STARNET_SESSION_BAYS=1 — unsetting it is the kill switch. Bindings + the per-slot daily launch record
+   live in WORKSPACES/claude-session-bays.json. */
+const CLAUDE_HOME_DIR = String(ENV('CLAUDE_HOME') || path.join(require('node:os').homedir(), '.claude'));
+const claudeSessionBays = require('./claude-session-bays.js').makeClaudeSessionBays({
+  enabled: /^(1|true|yes|on)$/i.test(String(ENV('SESSION_BAYS') || '').trim()),
+  slots: String(ENV('SESSION_BAY_SLOTS') || ''),
+  isAbs: p => path.isAbsolute(String(p)),
+  crew: claudeCrew,
+  execFile,   // the station's guarded child_process (child-env.js): a launcher gets the scrubbed child env
+  now: () => Date.now(),
+  today: () => { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); },
+  jobState: id => { try { return JSON.parse(fs.readFileSync(path.join(CLAUDE_HOME_DIR, 'jobs', String(id), 'state.json'), 'utf8')); } catch (_) { return null; } },
+  transcriptPath: (cwd, sid) => (cwd && sid) ? path.join(CLAUDE_HOME_DIR, 'projects', String(cwd).replace(/[^A-Za-z0-9]/g, '-'), String(sid) + '.jsonl') : null,
+  readFile: f => { try { return fs.readFileSync(f, 'utf8'); } catch (_) { return null; } },
+  // CAD-priority guards: every process's command line (null = unreadable: the bay refuses) and MemAvailable in GB
+  procList: () => { try { return fs.readdirSync('/proc').filter(d => /^\d+$/.test(d)).map(d => { try { return fs.readFileSync('/proc/' + d + '/cmdline', 'utf8').split('\0').join(' '); } catch (_) { return ''; } }); } catch (_) { return null; } },
+  availGB: () => { try { const m = /MemAvailable:\s+(\d+) kB/.exec(fs.readFileSync('/proc/meminfo', 'utf8')); return m ? Number(m[1]) / 1048576 : null; } catch (_) { return null; } },
+  load: () => { try { return JSON.parse(fs.readFileSync(path.join(WORKSPACES, 'claude-session-bays.json'), 'utf8')); } catch (_) { return null; } },
+  save: (obj) => { const f = path.join(WORKSPACES, 'claude-session-bays.json'); fs.writeFileSync(f + '.tmp', JSON.stringify(obj, null, 2)); fs.renameSync(f + '.tmp', f); }
+});
+for (const e of claudeSessionBays.slotErrors) console.warn('[session-bays] ' + e);
 /* AUTO-BUILD (fork, opt-in STARNET_AUTO_BUILD=1 — the Commander's decision 2026-11-02): the LEAD builds the station, lays
    out workflow lines and sets schedules without an approval card. One-step UNDO (station.plan { undo: true } / Build mode
    UNDO) is the safety net. Named tools only: station.make_prop (spends StarNet credits), station.power / station.control
@@ -5706,8 +5740,20 @@ const claudeCrew = require('./claude-crew.js').makeClaudeCrew({
 const AUTO_BUILD = /^(1|true|yes|on)$/i.test(String(ENV('AUTO_BUILD') || '').trim());
 const AUTO_BUILD_TOOLS = new Set(['station.plan', 'station.build', 'station.test_line', 'station.start_line',
   'routine.create', 'routine.manage', 'task.create', 'task.manage']);
+/* AUTO-BUILD CREW (fork, opt-in STARNET_AUTO_BUILD_CREW=1, OFF by default; Proxima 2026-11-14, pending the Commander): on top
+   of AUTO_BUILD, the lead may also add a crew agent (team.summon) and bind it to a Claude Code skill (claude.skill_agent)
+   with no approval card, so a line with a crew-skill bay is buildable from plain words. A SEPARATE switch, so the
+   Commander's 11-02 AUTO-BUILD list is not widened. Neither tool can spend: a summon is the page's local summonAgent() (no
+   network, no credits; its desk is a free seed prop, never make_prop), and a binding only routes the agent's later steps
+   onto the Claude login. Note team.summon answers only on a run with a page on its stream; a `starnet -p` lead recruits a
+   bay's specialist through station.plan staff { agent: "new" } + station.build instead (already AUTO-BUILD). */
+const AUTO_BUILD_CREW = AUTO_BUILD && /^(1|true|yes|on)$/i.test(String(ENV('AUTO_BUILD_CREW') || '').trim());
+const AUTO_BUILD_CREW_TOOLS = new Set(['team.summon', 'claude.skill_agent']);
 function autoBuildAllows(agentId, call) {
-  return AUTO_BUILD && String(agentId || '') === 'agent' && !!call && AUTO_BUILD_TOOLS.has(String(call.name || ''));
+  if (!AUTO_BUILD || String(agentId || '') !== 'agent' || !call) return false;
+  const name = String(call.name || '');
+  if (AUTO_BUILD_TOOLS.has(name)) return true;
+  return AUTO_BUILD_CREW && AUTO_BUILD_CREW_TOOLS.has(name);
 }
 // where the Overseer's claude.launch works by default (an absolute dir Claude Code already trusts)
 const CLAUDE_CREW_DIR = String(ENV('CLAUDE_CREW_DIR') || '');
@@ -5741,7 +5787,9 @@ if (claudeCrew.enabled && /^(1|true|yes|on)$/i.test(String(ENV('OVERSEER_SESSION
     enabled: true, execFile, fs, path, now: () => Date.now(), stateDir: WORKSPACES,
     claudeHome: String(ENV('CLAUDE_HOME') || path.join(require('node:os').homedir(), '.claude')),
     cwd: CLAUDE_CREW_DIR || require('node:os').homedir(), bin: String(ENV('CLAUDE_BIN') || 'claude'),
-    name: () => overseerDocs().name, model: () => overseerDocs().model,
+    // STARNET_OVERSEER_MODEL pins the Overseer session's model verbatim (e.g. claude-fable-5-2[1m]), overriding the
+    // station's stored alias; '[1m]' keeps the 1M window for the 70% cleaning rule (overseer-session.js windowFor)
+    name: () => overseerDocs().name, model: () => String(ENV('OVERSEER_MODEL') || '').trim() || overseerDocs().model,
     permissionMode: claudeCrew.defaultMode, fresh: /^(1|true|yes|on)$/i.test(String(ENV('OVERSEER_SESSION_FRESH') || '').trim()),
     keepAlive: /^(1|true|yes|on)$/i.test(String(ENV('OVERSEER_SESSION_KEEPALIVE') || '').trim()),   // survive StarNet restarts (same link)
     // one brain: scheduled check-ins replace StarNet's own autopilot for the Overseer (hours; 0 = off) + a morning one
@@ -11725,7 +11773,8 @@ const server = http.createServer((req, res) => {
   // ONE exemption: a line-trigger webhook POST /api/hooks/trg_… may arrive through a tunnel the Commander set up
   // (cloudflared/ngrok forward the PUBLIC Host). It is fenced by its own per-trigger secret and returns no token.
   const triggerHook = req.method === 'POST' ? TRIGGER_HOOK_RX.exec(String(req.url || '')) : null;
-  if (!triggerHook && !isAllowedHost(req.headers.host)) { noteApiRefusal(req, 'forbidden host'); res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('forbidden host'); }
+  // the Commander's opt-in remote hosts (STARNET_REMOTE_HOSTS, the phone over ZeroTier) pass exactly as at the /api gate
+  if (!triggerHook && !isAllowedHost(req.headers.host, REMOTE_HOSTS)) { noteApiRefusal(req, 'forbidden host'); res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('forbidden host'); }
   // Once an uncaught exception has made this process's in-memory state unprovable, the server becomes a recovery
   // shell. Static GET/HEAD keeps the already-installed UI reloadable; health + authenticated diagnostics explain
   // the fault. Every other API, external-harness, artifact and mutation surface fails closed with 503. This gate
@@ -22424,6 +22473,20 @@ async function runOnceCore(o) {
   // claude.crew / claude.launch / claude.stop — the lead staffs the Commander's own Claude Code sessions
   // (tools/builtin/claude-crew.js). Lead-only via the orchestrator capability; launch/stop are consent-gated.
   require('./tools/builtin/claude-crew.js').makeClaudeCrewTools({ crew: claudeCrew, defaultCwd: CLAUDE_CREW_DIR }).register(registry);
+  // claude.skill_agent — the lead binds a crew agent to a Claude Code skill (crew-skill bays, sidecar/claude-skill-agents.js)
+  require('./tools/builtin/claude-skill-agent.js').makeClaudeSkillAgentTool({
+    store: claudeSkillAgents,
+    hasAgent: id => agentRoster.has(String(id || '')),
+    nameOf: id => { const r = agentRoster.get(String(id || '')); return (r && r.name) || String(id || ''); },
+    resolveAgent: a => { const k = String(a || '').trim(); if (agentRoster.has(k)) return k; const lc = k.toLowerCase(); for (const [id, r] of agentRoster) if (String((r && r.name) || '').toLowerCase() === lc) return id; return ''; },
+    skills: () => { try { return claudeCrew.listSkills ? claudeCrew.listSkills().map(x => (x && x.name) || x) : []; } catch (e) { failNote('skillagent.skills', e); return []; } }
+  }).register(registry);
+  // claude.session_agent — the lead binds a crew agent to a configured crew-session slot (sidecar/claude-session-bays.js)
+  require('./tools/builtin/claude-session-agent.js').makeClaudeSessionAgentTool({
+    store: claudeSessionBays,
+    nameOf: id => { const r = agentRoster.get(String(id || '')); return (r && r.name) || String(id || ''); },
+    resolveAgent: a => { const k = String(a || '').trim(); if (agentRoster.has(k)) return k; const lc = k.toLowerCase(); for (const [id, r] of agentRoster) if (String((r && r.name) || '').toLowerCase() === lc) return id; return ''; }
+  }).register(registry);
   /* channel.targets / channel.send — OUTBOUND messaging reach (see tools/builtin/comms.js for the security
      rationale on known-targets-only). Both hang off the placed DISH under their own 'comms' capId. */
   makeCommsTools({
@@ -22974,6 +23037,19 @@ async function runOnceCore(o) {
   // A terminal (`starnet -p`) or editor (ACP) run is NOT the Commander typing in COMMS: it keeps the station's own brain
   // and tools, so the Overseer session can hand station work (build, lay out a line, schedule) to the station's lead.
   const routedToOverseer = !!(overseerSession && providerId === 'claude-cli' && agentId === 'agent' && !internal && surface === 'interactive' && !workflowLine && !o.stationClient);
+  /* CREW-SKILL STEP: an agent bound to a Claude Code skill runs on the Claude login only, with the binding re-checked now
+     (installed skill, still-trusted dir). Refused with its reason otherwise — never quietly run as a plain step. */
+  /* CREW-SESSION STEP: an agent bound to a session slot does not call a model at all — its "stream" launches the slot's
+     crew session, waits for it, and yields that session's final report as the step's text (claude-session-bays.js). */
+  const sessionBinding = routedToOverseer ? null : claudeSessionBays.resolve(agentId);
+  const skillBinding = (routedToOverseer || sessionBinding) ? null : claudeSkillAgents.resolve(agentId);
+  if (skillBinding && (!skillBinding.ok || providerId !== 'claude-cli')) {
+    const why = !skillBinding.ok ? skillBinding.error : ('it runs on the Claude login (claude-cli), but this run resolved to ' + providerId);
+    emit('agent.run.start', { agentId, runId, trigger: trigger, model, ...runStartExtra });
+    emit('agent.run.error', { agentId, runId, transient: false, message: 'crew-skill agent ' + agentId + ' cannot run this step: ' + why });
+    emit('agent.run.end', { agentId, runId, reason: 'error', turns: 0, usd: 0 });
+    return;
+  }
   // Codex (personal ChatGPT subscription) authenticates with a freshly-refreshed OAuth access_token instead of
   // an API key. A dead/missing token surfaces as a clean run.error so the UI can prompt a re-sign-in; everything
   // downstream of the provider seam (loop, cost, gauge) is identical to the OpenRouter path.
@@ -23100,6 +23176,39 @@ async function runOnceCore(o) {
     if (first.id) { provider = onAccount(first); auxVisionProvider = provider; studioModelProvider = provider; }
     rotationFallbacks = ordered.slice(1).map(k => { const a = byKey.get(k); return { provider: onAccount(a), providerId, model, credKey: k, account: a.label }; });
   }
+  if (sessionBinding) {
+    // never a fallback to a model: every outcome (refusals included) is the step's said text
+    const sessionStream = async function* (req) {
+      // the session runs for minutes to hours: its wait notes are yielded LIVE (the run shows "<name> working · N min")
+      const queue = [];
+      let out = null, wake = null;
+      const ping = () => { if (wake) { const w = wake; wake = null; w(); } };
+      // the job text reaches ONLY a parameterised slot, and only as one checked token (claude-session-bays.js jobArg)
+      const lastUser = (req && Array.isArray(req.messages) ? req.messages : []).filter(m => m && m.role === 'user').pop();
+      const jobText = !lastUser ? '' : typeof lastUser.content === 'string' ? lastUser.content
+        : (Array.isArray(lastUser.content) ? lastUser.content.filter(b => b && b.type === 'text').map(b => b.text).join('\n') : '');
+      claudeSessionBays.runStep(sessionBinding.slot, { taintedBy: execution.taintedBy(), signal: req && req.signal, jobText,
+        onWait: (phase, note) => { queue.push({ type: 'waiting', phase, note }); ping(); } })
+        .then(r => r, e => ({ ok: false, text: 'SESSION BAY ERROR — ' + String((e && e.message) || e).slice(0, 300) }))
+        .then(r => { out = r; ping(); });
+      while (!out || queue.length) {
+        if (queue.length) { yield queue.shift(); continue; }
+        await new Promise(r => { wake = r; });
+      }
+      yield { type: 'text', delta: out.text };
+      yield { type: 'usage', usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } };
+      yield { type: 'done', finishReason: 'stop', truncated: false };
+    };
+    provider = Object.assign({}, provider, { stream: sessionStream });
+    auxVisionProvider = provider; studioModelProvider = provider;
+    rotationFallbacks = [];
+  }
+  if (skillBinding) {
+    // every attempt of this run (the primary and each subscription it may rotate to) carries the skill + directory
+    const asSkill = pv => Object.assign({}, pv, { stream: req => pv.stream(Object.assign({}, req, { claudeSkill: skillBinding.skill, claudeDir: skillBinding.dir })) });
+    provider = asSkill(provider); auxVisionProvider = provider; studioModelProvider = provider;
+    rotationFallbacks = rotationFallbacks.map(f => Object.assign({}, f, { provider: asSkill(f.provider) }));
+  }
   if (oauthAccounts && oauthAccounts.length > 1) {
     activePrimaryKey = oauthAccounts[0].credKey;
     rotationFallbacks = oauthAccounts.slice(1).map(a => ({ provider: oauthAccountProvider(providerId, a, baseUrl, reasoningEffort), providerId, model, credKey: a.credKey, account: a.label }));
@@ -23131,7 +23240,7 @@ async function runOnceCore(o) {
       maxCostUsd: Math.min(runCapUsd, (o.maxCostUsd > 0 && isFinite(o.maxCostUsd)) ? o.maxCostUsd : fbUnmetered ? Infinity : (effectiveCaps.perRun > 0 ? effectiveCaps.perRun : Infinity)),
       maxUnpricedTokens: fbUnmetered ? Infinity : CAPS.maxUnpricedTokens });
   }
-  const fallbacks = rotationFallbacks
+  const fallbacks = sessionBinding ? [] : rotationFallbacks   // a session step never falls back to a model
     .concat(fallbackModels.map(m => ({ provider, providerId, model: m })))
     .concat(providerFallbacks);
   // INTERNAL self-talk (a title, session ideas, a goal plan) is reason-only aux work: it runs on the aux effort, not the
@@ -23310,9 +23419,9 @@ async function runOnceCore(o) {
   const deferredNames = new Set((deferralOff ? [] : (resolved.deferred || [])).filter(n => !directDomainWithheld(n)));
   const coreNames = resolved.tools.filter(n => !deferredNames.has(n) && !directDomainWithheld(n));
   // tool.search names a listed tool as callable instead of offering the nearest hidden one (see listedMatch)
-  capCtx.advertised = (isTask && !routedToOverseer) ? coreNames : [];   // a routed Overseer run gets no StarNet tools
-  const toolDefs = (isTask && !routedToOverseer) ? registry.wireFormat(registry.list(new Set(coreNames))) : [];
-  const deferredToolDefs = (isTask && !routedToOverseer) ? registry.wireFormat(registry.list(deferredNames)) : [];
+  capCtx.advertised = (isTask && !routedToOverseer && !skillBinding && !sessionBinding) ? coreNames : [];   // a routed Overseer run gets no StarNet tools
+  const toolDefs = (isTask && !routedToOverseer && !skillBinding && !sessionBinding) ? registry.wireFormat(registry.list(new Set(coreNames))) : [];
+  const deferredToolDefs = (isTask && !routedToOverseer && !skillBinding && !sessionBinding) ? registry.wireFormat(registry.list(deferredNames)) : [];
   // A tool deferred because it CANNOT work this run keeps that fact on its own declaration, so a model that
   // reveals it reads why and how to enable it before calling. wireFormat returns fresh objects: the registry's
   // description is untouched, and only a revealed declaration ever reaches the wire.

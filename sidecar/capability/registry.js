@@ -345,7 +345,10 @@
       { capId: 'orchestrator', tool: 'claude.launch', scope: 'write', requiresConsent: false, network: true },
       { capId: 'orchestrator', tool: 'claude.stop', scope: 'write', requiresConsent: false, network: false },
       { capId: 'orchestrator', tool: 'claude.send', scope: 'write', requiresConsent: false, network: true },
-      { capId: 'orchestrator', tool: 'claude.adopt', scope: 'write', requiresConsent: true, network: false }
+      { capId: 'orchestrator', tool: 'claude.adopt', scope: 'write', requiresConsent: true, network: false },
+      // CREW-SKILL BAYS (2026-11-14): bind a crew agent to a Claude Code skill; asks unless STARNET_AUTO_BUILD_CREW=1
+      { capId: 'orchestrator', tool: 'claude.skill_agent', scope: 'write', requiresConsent: true, network: false },
+      { capId: 'orchestrator', tool: 'claude.session_agent', scope: 'write', requiresConsent: true, network: false }
     ],
     /* BUILDER (2026-10-11, the delegated Build Manager): a SLICE of the lead's station builder — see the floor, plan on a
        copy, build behind the Commander's approval card — LENT by the lead to ONE dispatched worker for ONE job
